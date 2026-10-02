@@ -100,6 +100,14 @@ Continue read-only graphics-contract work before driver bring-up:
    Compare with the generic sender, the observed consumer and the gates. No kernel
    debugging, messages, callbacks, connections or GPU work.
 
+Status 2026-10-02: parked by the user before any instructions were read; another
+agent may resume it. Partial ignored evidence is in `out/ioaccel-family-replies/`:
+tool versions (cctools-1040, Apple LLVM 21.0.0) and `otool -h`/`-l` captures of
+both kernel collections. The family is the fileset entry
+`com.apple.iokit.IOAcceleratorFamily2` in `SystemKernelExtensions.kc`, not the
+boot collection. No tool for reading a single entry's instructions had been
+settled on; confirm the approach with the user before continuing.
+
 Success means an attributed static map from family send sites to consumer
 expectations, or a documented limit if the fileset or symbols are unavailable.
 It does not establish runtime delivery, ordering, cancellation, drain or GPU
