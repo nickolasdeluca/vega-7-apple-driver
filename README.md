@@ -78,4 +78,5 @@ it is skipped elsewhere. Host observations require independent system queries.
 - [IOAccel submission block ownership](docs/ioaccel-block-ownership.md)
 - [IOAccel callback aliases and storage reuse](docs/ioaccel-buffer-reuse.md)
 - [Generic XNU mapping and user-client teardown](docs/xnu-mapping-lifecycle.md)
+- [Generic async replies and wake-port ownership](docs/xnu-async-replies.md)
 - [Milestones and discovery decisions](docs/discovery-plan.md)

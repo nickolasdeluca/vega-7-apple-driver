@@ -269,8 +269,10 @@ The [reset/reuse study](ioaccel-buffer-reuse.md) records the inspected alias,
 wait and storage-cleanup graph, with indirect/vendor access and outer callback
 drain boundaries unresolved. The [generic mapping study](xnu-mapping-lifecycle.md)
 adds source-backed owners and teardown paths while keeping installed family
-behavior unavailable. Generic async-reply construction and wake-port ownership
-are next. Do not create buffers/mappings, invoke reset, open
+behavior unavailable. The [async-reply study](xnu-async-replies.md) adds generic
+port/message accounting, separate from retained blocks and queue objects;
+actual family production remains unavailable. Installed IOKit dispatch/wrapper
+comparison is next. Do not create buffers/mappings, invoke reset, open
 experimental clients or submit work on the working GPU.
 
 Future experiments require an available experimental environment and recovery

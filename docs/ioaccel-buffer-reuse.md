@@ -293,8 +293,9 @@ print(json.dumps({'section_bytes': len(data), 'candidate_symbols': len(candidate
 The [generic XNU study](xnu-mapping-lifecycle.md) now records map ownership,
 explicit unmap, close/no-senders and task VM removal. It distinguishes its pinned
 source revision from the different installed kernel and unavailable family
-hooks. The next focused read-only task is generic async-reply construction and
-wake-port ownership; actual family production/cardinality remains unavailable.
+hooks. The [async-reply study](xnu-async-replies.md) adds generic message and port
+accounting, while actual family production/cardinality remains unavailable.
+Installed IOKit dispatch/wrapper comparison is the next focused read-only task.
 Do not create mappings, open experimental clients or exercise teardown on the
 working GPU. Vendor reset dispatch and transitive resource methods remain
 separate unresolved interfaces.

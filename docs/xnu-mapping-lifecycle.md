@@ -298,11 +298,11 @@ No mappings or teardown paths were dynamically exercised.
 
 ## Remaining interfaces and measurable gates
 
-The next focused read-only task is generic XNU async-reply construction and
-wake-port ownership. Compare its primary-source packing/release behavior with
-the saved notification consumers and block producer, keeping actual private
-reply production/cardinality unavailable. No manual callbacks, client opens or
-GPU requests are authorized.
+The [async-reply study](xnu-async-replies.md) now records generic message packing,
+port acquisition/release and send/dispatch limits, compared with the saved
+consumer. Actual private production/cardinality remains unavailable. Installed
+IOKit dispatch/wrapper comparison is next. No manual callbacks, experimental
+client opens or GPU requests are authorized.
 
 Future dynamic work requires an experimental environment and recovery path
 under [AGENTS.md](../AGENTS.md):

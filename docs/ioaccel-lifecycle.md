@@ -194,7 +194,10 @@ invoked and no GPU work submitted.
 The [generic XNU study](xnu-mapping-lifecycle.md) now records map owners,
 explicit unmap, close/no-senders and task address-space removal. Its source
 revision differs from the host kernel; installed family cleanup remains
-unverified. Generic async-reply construction and wake-port ownership are next.
+unverified. The [async-reply study](xnu-async-replies.md) adds generic port and
+packing accounting: registration references differ from reply arguments, and
+generic count limits do not establish the consumer's minimum field span.
+Installed IOKit dispatch/wrapper comparison is next.
 A full bind inventory would narrow the symbol-search limitation but would not
 alone settle mapping lifetime.
 

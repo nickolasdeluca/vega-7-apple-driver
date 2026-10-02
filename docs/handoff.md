@@ -6,8 +6,8 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current research checkpoint: generic mapping and user-client teardown, 2026-10-02,
-on branch `cezanne-discovery`, extending `3d33ece`. This handoff is committed
+Current research checkpoint: generic async replies and wake-port ownership, 2026-10-02,
+on branch `cezanne-discovery`, extending `7f8f0ae`. This handoff is committed
 with the continuation; check Git history for its commit rather than assuming a
 recorded hash is HEAD.
 The project remains in **read-only discovery and specification**. No independent
@@ -59,6 +59,12 @@ Completed work:
   exported map ports have different ownership paths; extra references and a
   mapping-set port can delay destruction. Generic cleanup does not establish
   installed family reclamation, backing release or GPU request termination.
+- Generic async registration references, wake-port acquisitions/releases,
+  message packing, send limits and IOKitUser dispatch arity:
+  [async replies](xnu-async-replies.md). Offline layout/field fixtures distinguish
+  registration count from reply count, padding from argument data and Mach port
+  ownership from retained blocks/queues. Send success does not establish delivery;
+  actual private reply production and installed dispatch equivalence remain open.
 
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
@@ -66,24 +72,24 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: trace generic async replies and wake-port ownership
+## Next task: compare installed IOKit async dispatch and wrappers
 
 Continue read-only graphics-contract work before driver bring-up:
 
-1. Read the [lifecycle](ioaccel-lifecycle.md), [block ownership](ioaccel-block-ownership.md)
-   and [generic mapping](xnu-mapping-lifecycle.md) studies. Reuse saved callback
-   payload/refcon consumers and source provenance; avoid repeating inspection.
-2. Trace generic XNU async-result construction and wake-port ownership in pinned
-   primary source, with matching IOKitUser message dispatch declarations/code.
-   Account for reference packing, argument counts/bounds, port acquisition/release
-   and error reporting. Keep actual private-family reply production unavailable.
-3. Produce an attributed packing/ownership graph, reproducible source locations
-   and measurable delivery/teardown gates. Do not send callbacks, open
-   experimental clients, exercise teardown or submit work on the working GPU.
+1. Read the [async-reply study](xnu-async-replies.md) and reuse saved queue/callback
+   evidence. Use the unchanged public metadata child and current-launch,
+   bounded own-child instruction inspection under a new ignored directory.
+2. Locate installed `IODispatchCalloutFromMessage`, its CF-message dispatcher,
+   `IOConnectCallAsyncMethod` and relevant async wrapper/trampoline. Compare
+   header offsets, size/count/arity checks and wrapper arguments with the
+   pinned IOKitUser source and SDK. Preserve unavailable symbols and differences.
+3. Produce an attributed source/runtime comparison and reproduction. Do not
+   invoke callbacks, send messages, open experimental clients, create mappings
+   or queues, exercise teardown or submit work on the working GPU.
 
-Success means generic source-backed message construction and port accounting,
-compared with saved consumers, with an explicit boundary at unavailable family
-production and the different installed kernel. This does not verify acceptance,
+Success means a static comparison of the installed user-space dispatch/wrapper
+paths with source expectations, with unsupported assumptions corrected. It does
+not establish the private kernel producer, message validity, acceptance,
 exactly-once delivery, ordering, cancellation or GPU completion. Installed mapping
 reclamation, vendor/indirect alias access, cross-thread reuse and complete commit
 dispatch remain separate open interfaces.
@@ -111,6 +117,8 @@ Saved evidence on this workspace is ignored and contains sensitive/raw details:
 | `out/ioaccel-buffer-reuse/` | Reset/wait/storage-pool disassembly, bounded alias scan, controlled bound rejection, SDK/primary contracts, host queries and verification index |
 | `out/xnu-mapping-lifecycle/` | Pinned XNU/IOKitUser source and metadata, source/blob hashes, OS/kernel queries, preserved provenance failure and verification index |
 | `out/xnu-mapping-reproduced/` | Fresh documented collection: 25 captured downloads and 21 verified source/header/license files |
+| `out/xnu-async-replies/` | OS/kernel/SDK queries, offline layout build and bounded fixture checks, supplementary source reads, preserved lookup/web failures and verification index |
+| `out/xnu-async-sources/`, `out/xnu-async-reproduced/` | Initial and final pinned source collection; final collector captured 28 downloads and verified 24 source/header/license files |
 | `out/discovery-progress.md` | Local execution ledger; supplementary to this tracked handoff |
 
 A fresh clone will not contain `out/`. Tracked documents supply reproduction
@@ -125,22 +133,23 @@ manual private invocation or independent-driver proof.
 
 ## Verification record and commands
 
-The generic mapping continuation ran all 13 existing tests successfully and
-reproduced the documented source collector: 25 downloads and 21 source/header/
-license files, verified against both pinned commit trees using Git blob hashes
-and SHA-256. The embedded collector matches the executed script. Source locations,
-borrowed evidence, 114 relative README/docs links and whitespace were checked.
-The failed commit-named tree assertion is preserved with exit 1; the collector
-using the explicit tree succeeded. Fresh OS/kernel queries establish the
-source/runtime version mismatch.
-The collector also rejected an existing output directory with exit 1 before
-downloads; source hashes remained unchanged.
+The async continuation ran all 13 existing tests successfully and reproduced
+the documented source collector: 28 downloads and 24 source/header/license files,
+verified against both pinned commit trees with Git blob hashes and SHA-256.
+The documented layout probe built with warnings as errors and reproduced the
+64-bit body geometry. The bounded reader passed 17 count/layout cases and two
+sufficient field fixtures, rejected five incomplete/excess fixtures and modeled
+LP64 unsigned underflow, cross-checked by the compiler, without invoking Apple's
+dispatcher. Source/inspection-code digests, borrowed evidence, 124 relative
+README/docs links and whitespace were checked. Fresh OS/kernel queries retain
+the source/runtime version mismatch. Lookup/web-reader failures are preserved;
+primary collection succeeded.
 No new LLDB session, mappings, experimental clients or teardown operations were
-performed. These checks verify collection and document consistency, not installed
-kernel cleanup or GPU functionality. Detailed records remain in the local
-execution ledger and experiment index. Independent review verified the corrected
-qualification for family flags, with no Critical, Important or Minor issues remaining.
-Verify new changes before claiming they pass.
+performed. These checks verify collection and offline reasoning, not installed
+dispatch, kernel cleanup, callback delivery or GPU functionality. Detailed records
+remain in the local execution ledger and experiment index. Independent review
+verified the LP64 arithmetic correction and corrected flag-definition citation,
+with no remaining findings. Verify new changes before claiming they pass.
 
 ```sh
 python3 -m unittest discover -s tests -v
