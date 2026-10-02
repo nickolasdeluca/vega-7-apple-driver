@@ -56,6 +56,13 @@ The [IOAccel inventory](ioaccel-abi.md) separates SDK legacy surface definitions
 from statically recovered private Metal transport. Neither establishes acceptance
 of our own service/bundle or successful GPU submission.
 
+The [admission requirements](metal-admission-requirements.md) add protection and
+WindowServer library-validation observations; an authorized third-party admission
+route remains unverified. The [field study](ioaccel-shared-memory.md) names partial
+configuration and allocation outputs and traces dirty-ring publication. These
+consumer expectations still lack complete kernel validation, ownership and
+cross-process synchronization contracts.
+
 ```mermaid
 flowchart TB
   App[Application: Metal public API] --> Metal[Metal.framework]

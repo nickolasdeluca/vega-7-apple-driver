@@ -7,6 +7,10 @@ and buffer sizes, but **not complete kernel structures or a usable submission
 ABI**. Numeric selectors are scoped to a connection type and OS build; do not
 send the values below to the working driver as probes.
 
+The [field study](ioaccel-shared-memory.md) now identifies partial configuration
+fields, shared-memory tuple names and dirty-ring consumers. Kernel acceptance,
+negotiation, protection and complete synchronization/lifetime rules remain open.
+
 ## Evidence and version boundaries
 
 Read-only study on 2026-10-02: macOS 26.4.1 build 25E253, x86_64,
@@ -95,13 +99,13 @@ unavailable unless explicitly stated.
 | Connection / wrapper | Selector and public transport call | Scalar inputs / structure bytes supplied | Output capacity / remaining unknown |
 | --- | --- | --- | --- |
 | Device / optional API-property setup | 9, `IOConnectCallStructMethod` | 16-byte bounded string buffer | None; API negotiation semantics/status handling incomplete |
-| Device / initial configuration query | 2, struct call | No input | 600 bytes; fields and accepted configuration version unknown |
-| Device / subsequent query | 0, struct call | No input | 64 bytes; field semantics unknown |
+| Device / initial configuration query | 2, struct call | No input | 600 bytes; partial counter/base data flow identified in the field study; complete layout and accepted configuration version unknown |
+| Device / subsequent query | 0, struct call | No input | 64 bytes; partial bits, memory and peer fields identified in the field study |
 | Device / further query | 7, struct call | No input | 24 bytes; field semantics unknown |
 | Shared / creation query | 9, struct call | No input | 16 bytes; not the same selector contract as device selector 9 |
-| Shared / `IOAccelSharedSetupDirtyRing` | 10, struct call | No input | 24 bytes; ring layout, mapping lifetime and ordering incomplete |
+| Shared / `IOAccelSharedSetupDirtyRing` | 10, struct call | No input | 24 bytes; consumer/capacity, producer and entry pointers identified; mapping lifetime and complete ordering contract unknown |
 | Shared / `IOAccelSharedAllocateFenceMemory` | 12, struct call | 8-byte structure containing forwarded argument | 8 bytes; exact allocation/result semantics unknown |
-| Shared / `IOAccelSharedCreateDeviceShmem` | 7, `IOConnectCallMethod` | One scalar, no structure | 16-byte structure; wrapper consumes one 64-bit and two 32-bit fields; names/version unknown |
+| Shared / `IOAccelSharedCreateDeviceShmem` | 7, `IOConnectCallMethod` | One scalar, no structure | 16-byte structure; virtual address (64-bit), size and ID (32-bit each) inferred from named consumers; version/protection/ownership incomplete |
 | Shared / `IOAccelSharedDestroyDeviceShmem` | 8, scalar call | One scalar | None; associated allocation/lifetime rules incomplete |
 | Queue / async callback registration during creation | 0, `IOConnectCallAsyncScalarMethod` | Wake port, reference count 3, no scalar payload | No scalar output; notification/fence protocol incomplete |
 | Queue / creation process-information call | 5, struct call | 1028 bytes | None; not a command-buffer format |
@@ -115,8 +119,10 @@ table into guessed headers or calls against the live driver.
 Recovered size arithmetic does not supply a versioned submission structure.
 Neither zero-sized input nor a pointer-like output establishes whether the
 kernel maps storage, returns a user address, or transfers a handle. No complete
-mapping type, mapping protection, resource descriptor, shared-memory header,
-atomic ordering or cross-process ownership contract has been established.
+mapping contract, mapping protection, resource descriptor, shared-memory header,
+atomic ordering or cross-process ownership contract has been established. The
+field study records the context mapping types found later without assuming a
+complete context or kernel contract.
 
 ## Ownership and failure observations
 

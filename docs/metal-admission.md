@@ -8,6 +8,11 @@ It does **not** demonstrate admission of our own bundle or supply a supported
 vendor SDK. Trust, application library validation, and the kernel ABI remain
 separate feasibility requirements.
 
+The [requirements follow-up](metal-admission-requirements.md) records this host's
+protection status, directory protection and WindowServer library-validation
+metadata. It identifies the unresolved third-party installation and application
+policy gates; no independent bundle admission has been demonstrated.
+
 ## Experiment record and method
 
 Read-only investigation on 2026-10-02, macOS 26.4.1 build 25E253, x86_64,

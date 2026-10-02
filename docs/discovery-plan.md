@@ -81,10 +81,19 @@ bounded debugger reads and source checks were verified; no private calls were
 manually sent to the driver. Actual independent admission, configuration fields,
 shared-memory layout/ordering and kernel-side negotiation remain unresolved.
 
-The next concrete work is a read-only third-party admission-policy specification
-and field-level IOAccel configuration/shared-memory study, with offline firmware
-provenance/header and compiler-target work. Synthetic independent discovery
-remains gated on an experimental environment
+The [requirements follow-up](metal-admission-requirements.md) now records reported
+SIP/authenticated-root status, protected GPU-bundle directories and WindowServer's
+library-validation flag. It identifies the unresolved authorized installation
+and application-policy route without assuming a Developer ID signature closes it.
+The [field study](ioaccel-shared-memory.md) names partial configuration fields,
+allocation address/size/ID, dirty-ring pointers/entries and publication instructions.
+These are static consumer expectations, not observed kernel response or GPU work.
+
+The next read-only work is notification/cancellation and mapping-cleanup study,
+primary vendor admission-contract evidence if available, and offline firmware
+provenance/header and compiler-target work. Kernel validation, negotiation,
+complete ownership/ordering and actual independent bundle admission remain open.
+Synthetic independent discovery remains gated on an experimental environment
 and recovery path. If the required Metal integration interface cannot be established,
 record that feasibility limit before investing in a large hardware stack. Do not
 claim that a framebuffer, an LLVM target or registry metadata alone closes it.

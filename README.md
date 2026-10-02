@@ -70,5 +70,7 @@ it is skipped elsewhere. Host observations require independent system queries.
 - [Tahoe graphics contracts and experiments](docs/graphics-contract.md)
 - [Metal loader and factory investigation](docs/metal-loader-study.md)
 - [Metal bundle admission and construction](docs/metal-admission.md)
+- [Third-party Metal admission requirements](docs/metal-admission-requirements.md)
 - [IOAccel communication ABI inventory](docs/ioaccel-abi.md)
+- [IOAccel configuration and shared-memory fields](docs/ioaccel-shared-memory.md)
 - [Milestones and discovery decisions](docs/discovery-plan.md)
