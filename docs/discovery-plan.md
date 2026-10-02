@@ -99,8 +99,12 @@ boundary. The [reset/reuse study](ioaccel-buffer-reuse.md) then traces completio
 predicates, reset state and pooled/unpooled storage cleanup. Its bounded code
 scan validates only the two alias-slot producer references under supported
 encodings; indirect/vendor accesses and outer callback drain remain unresolved.
-Primary-source XNU map/unmap and user-client teardown ownership are the next
-focused read-only task. Separate future studies include primary vendor
+The [generic mapping study](xnu-mapping-lifecycle.md) identifies client-set and
+task-port owners, explicit unmap, close/no-senders and task VM removal in pinned
+XNU source. The host reports a different XNU revision; installed family cleanup
+and backing/GPU ownership remain unverified. Generic async-reply construction
+and wake-port ownership are the next focused read-only task. Separate future
+studies include primary vendor
 admission-contract evidence and offline firmware
 provenance/header and compiler-target work. Kernel validation, negotiation,
 complete ownership/ordering and actual independent bundle admission remain open.

@@ -191,10 +191,12 @@ The completion predicate is not shown to drain outer callback/storage releases.
 Kernel message validation remains unresolved; no callback should be manually
 invoked and no GPU work submitted.
 
-A primary-source study is next for XNU map/unmap and user-client teardown
-ownership. It must distinguish generic source behavior from private-family
-behavior and the installed kernel revision. A full bind inventory would narrow
-the symbol-search limitation but would not alone settle mapping lifetime.
+The [generic XNU study](xnu-mapping-lifecycle.md) now records map owners,
+explicit unmap, close/no-senders and task address-space removal. Its source
+revision differs from the host kernel; installed family cleanup remains
+unverified. Generic async-reply construction and wake-port ownership are next.
+A full bind inventory would narrow the symbol-search limitation but would not
+alone settle mapping lifetime.
 
 Future dynamic gates require an experimental environment and recovery path per
 [AGENTS.md](../AGENTS.md); none is authorized on the working host:

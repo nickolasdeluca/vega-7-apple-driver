@@ -77,4 +77,5 @@ it is skipped elsewhere. Host observations require independent system queries.
 - [IOAccel notification and mapping lifecycle](docs/ioaccel-lifecycle.md)
 - [IOAccel submission block ownership](docs/ioaccel-block-ownership.md)
 - [IOAccel callback aliases and storage reuse](docs/ioaccel-buffer-reuse.md)
+- [Generic XNU mapping and user-client teardown](docs/xnu-mapping-lifecycle.md)
 - [Milestones and discovery decisions](docs/discovery-plan.md)

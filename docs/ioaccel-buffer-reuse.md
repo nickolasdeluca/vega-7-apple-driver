@@ -290,15 +290,14 @@ print(json.dumps({'section_bytes': len(data), 'candidate_symbols': len(candidate
 
 ## Remaining experiments and gates
 
-The next focused read-only task is a primary-source XNU map/unmap and user-client
-teardown study. Reuse the context mapping/finalization observations and trace
-generic ownership for explicit unmap, connection close/client death and task
-exit in a pinned source revision. Success is an attributed ownership graph with
-reproducible source locations, cleanup boundaries and an explicit distinction
-between generic code and this unverified private family/installed kernel.
+The [generic XNU study](xnu-mapping-lifecycle.md) now records map ownership,
+explicit unmap, close/no-senders and task VM removal. It distinguishes its pinned
+source revision from the different installed kernel and unavailable family
+hooks. The next focused read-only task is generic async-reply construction and
+wake-port ownership; actual family production/cardinality remains unavailable.
 Do not create mappings, open experimental clients or exercise teardown on the
-working GPU. Vendor reset dispatch, transitive resource methods and the callback
-message producer remain separate unresolved interfaces.
+working GPU. Vendor reset dispatch and transitive resource methods remain
+separate unresolved interfaces.
 
 Future implementation gates require an experimental environment and recovery
 path under [AGENTS.md](../AGENTS.md):
