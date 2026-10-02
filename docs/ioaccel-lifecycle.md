@@ -57,13 +57,37 @@ These are consequences of the public text, not observations of the live driver.
 4. **Ordering between unmap, notification destroy and close is unspecified.**
    Nothing public requires or forbids any order.
 
+## Bounded finalizer and mapping observations
+
+From the saved `cleanup-static` capture (exit 0, 2026-10-02 13:47 UTC, already
+cited by the [ABI inventory](ioaccel-abi.md)); static reading only, nothing
+invoked:
+
+| Finalizer | Cleanup steps visible in its instructions | Not visible |
+| --- | --- | --- |
+| `ioAccelDeviceFinalize` | Frees a buffer unless it is null or the inline storage, calls `IOConnectRelease`, zeroes the stored handle. | Any unmap, or wait for outstanding work. |
+| `ioAccelSharedFinalize` | Releases a stored block, calls `IOConnectRelease`, zeroes the handle, then under an unfair lock walks and frees a tracking list, calling an optional hook per entry. | Any unmap; whether the per-entry hook releases kernel-side allocations is unresolved. |
+| `ioAccelCommandQueueFinalize` | Destroys the notification port if present, calls `IOConnectRelease`, zeroes the handle, atomically decrements a global context count. | Any cancellation of requests registered against the port, or wait for completion. |
+
+Across all saved captures, the only function containing `IOConnectMapMemory` is
+`IOAccelContextGetFenceBuffer` (two call sites). **No captured function
+references `IOConnectUnmapMemory`.** This covers only the functions disassembled
+in this study. It does not show the framework lacks an unmap path, so the
+absence is not evidence that mappings leak. It means mapping reclamation, if
+any, is either elsewhere or left to connection close or process exit, and that
+is unverified.
+
+Resulting gap: the three finalizers close connections but show no explicit
+cancellation, drain or unmap. Whether the kernel reclaims state at the final
+`IOConnectRelease` is a kernel-side guarantee this study cannot establish.
+
 ## Unresolved paths
 
 | Question | Why it is open | Evidence needed |
 | --- | --- | --- |
 | Callback payload for the private command-queue notification | Public typedefs leave the extra arguments family-defined. | Bounded static data flow of the private callback consumer, or an own protocol on an experimental host. |
 | Cancellation of an in-flight queue request | No public text covers destroying a port with outstanding async work. | Kernel-side behavior; not available from user-space declarations. |
-| Whether mappings from `IOAccelContextGetFenceBuffer` are ever unmapped | The earlier study notes the first mapping is not undone on the second mapping's failure path; cleanup elsewhere is untraced. | Locate any unmap call sites, or confirm close-time reclamation on a recoverable test machine. |
+| Whether mappings from `IOAccelContextGetFenceBuffer` are ever unmapped | No unmap appears in any captured function; the first mapping is not undone on the second mapping's failure path. | A framework-wide symbol-import check for `IOConnectUnmapMemory` and its callers, or close-time reclamation on a recoverable test machine. |
 | Kernel guarantees at close | Public docs state the implicit close only. | Experimental host with recovery path. |
 | Behavior under GPU hang or process exit | Not observable statically. | Future gated experiments below. |
 

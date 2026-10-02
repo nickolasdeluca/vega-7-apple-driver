@@ -31,8 +31,10 @@ Completed work:
 - Public-declaration lifecycle contract for notification ports, async calls,
   mappings and connection release, with future test gates:
   [lifecycle](ioaccel-lifecycle.md). Its private-wrapper callback payload and
-  cancellation paths were **not** extended; an automated safety check stopped
-  the attempted private-queue disassembly walkthrough, so that part is open.
+  cancellation paths were **not** extended (an automated safety check stopped a
+  private-queue disassembly walkthrough). Only the committed finalizers and a
+  map/unmap search of saved captures were added; no unmap call site was found
+  in the captured functions. A framework-wide import check remains open.
 
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
