@@ -28,6 +28,11 @@ Completed work:
 - Partial IOAccel connection/selector/capacity inventory and configuration,
   allocation address/size/ID, dirty-ring and event/mapping consumer data flow:
   [ABI](ioaccel-abi.md), [shared-memory fields](ioaccel-shared-memory.md).
+- Public-declaration lifecycle contract for notification ports, async calls,
+  mappings and connection release, with future test gates:
+  [lifecycle](ioaccel-lifecycle.md). Its private-wrapper callback payload and
+  cancellation paths were **not** extended; an automated safety check stopped
+  the attempted private-queue disassembly walkthrough, so that part is open.
 
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
@@ -35,7 +40,7 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: notification, cancellation and mapping cleanup
+## Next task: finish notification, cancellation and mapping cleanup (partly done)
 
 Continue the read-only IOAccel lifecycle study before attempting driver bring-up:
 

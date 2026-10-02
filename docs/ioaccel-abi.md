@@ -169,7 +169,7 @@ architectures or runtime versions as verified wire formats.
 | Next experiment | Scope | Measurable gate |
 | --- | --- | --- |
 | Versioned configuration/shared-memory inventory | Offline primary definitions and bounded static data flow | Field-level layouts, version/capability negotiation, mapping protections and ownership; missing evidence remains unavailable |
-| Notification/fence lifetime study | Read-only declarations/call sites | Identify references, callback payload, success/error/cancellation paths and close behavior; separate source inferences from observed completions |
+| Notification/fence lifetime study (public declarations done: [lifecycle](ioaccel-lifecycle.md)) | Read-only declarations/call sites | Identify references, callback payload, success/error/cancellation paths and close behavior; separate source inferences from observed completions |
 | Independent diagnostic protocol | Later implementation within repository; no host driver loading | Own versioned protocol with explicit sizes and validation; do not label it Metal-compatible without matching the required boundary |
 | Compatible service and submission | Deferred to experimental boot/recovery and verified hardware queues | Initialization negotiates correctly; guarded copy/shader results match references; shared-memory bounds, isolation, timeout and cleanup tested |
 
