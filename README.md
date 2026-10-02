@@ -74,4 +74,6 @@ it is skipped elsewhere. Host observations require independent system queries.
 - [Third-party Metal admission requirements](docs/metal-admission-requirements.md)
 - [IOAccel communication ABI inventory](docs/ioaccel-abi.md)
 - [IOAccel configuration and shared-memory fields](docs/ioaccel-shared-memory.md)
+- [IOAccel notification and mapping lifecycle](docs/ioaccel-lifecycle.md)
+- [IOAccel submission block ownership](docs/ioaccel-block-ownership.md)
 - [Milestones and discovery decisions](docs/discovery-plan.md)

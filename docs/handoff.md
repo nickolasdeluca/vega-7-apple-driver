@@ -6,8 +6,8 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current research checkpoint: lifecycle continuation, 2026-10-02, on branch
-`cezanne-discovery`, extending `103559f` and `f21be70`. This handoff is committed
+Current research checkpoint: callback-block ownership, 2026-10-02, on branch
+`cezanne-discovery`, extending `a3b779e`. This handoff is committed
 with the continuation; check Git history for its commit rather than assuming a
 recorded hash is HEAD.
 The project remains in **read-only discovery and specification**. No independent
@@ -39,6 +39,12 @@ Completed work:
   absence of indirect or kernel cleanup. Earlier claims of guaranteed mapping
   survival and immediate close were corrected, along with selector 5's output
   capacity (8 bytes).
+- Metal submission producer fields, separate scheduling/completion block copies,
+  their object captures and local transport-failure cleanup:
+  [block ownership](ioaccel-block-ownership.md). These provide an ownership graph
+  for inspected normal/error paths. Exactly one kernel delivery per distinct
+  copy would balance the normal path, but actual message production, callback
+  cardinality and reset/reuse remain unverified.
 
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
@@ -46,24 +52,28 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: trace callback-block producers and ownership
+## Next task: trace callback-pointer aliases and command-buffer reuse
 
 Continue read-only graphics-contract work before driver bring-up:
 
-1. Read the [lifecycle study](ioaccel-lifecycle.md) and reuse the saved creation,
-   submission and callback captures. A positive submission entry retains its
-   queue twice; the registered callback releases it once per invocation.
-2. Locate Metal's submission call sites and block creation/copy/transfer paths.
-   Account for the two retains and block ownership on normal/error paths without
-   assuming two callbacks merely from arithmetic. Do not manually invoke these
-   methods, create queues or submit work.
-3. Update the contract with supported producer/consumer connections and explicit
-   missing kernel/message boundaries, reproducible inspection commands and
-   measurable future validation gates.
+1. Read the [block-ownership study](ioaccel-block-ownership.md) and reuse its
+   submission, descriptor/helper and completion/deallocation captures. The
+   copied pointers are also stored directly in the command buffer's
+   `_scheduledCallbackBlockPtr` and `_completedCallbackBlockPtr` aliases.
+2. Trace `commitAndReset`, storage deallocation and reachable alias reads/writes.
+   Account for clearing, reuse, waits and cleanup without treating direct pointer
+   stores as extra owned references. Keep subclass dispatch and transitive
+   cleanup boundaries explicit. Do not invoke reset, create buffers/queues or
+   submit work.
+3. Record an evidence-backed reset/cleanup graph, reproducible inspection commands
+   and measurable future validation gates. Keep kernel acceptance, reply
+   cardinality, status/time units and cancellation unverified unless independent
+   producer evidence actually establishes them.
 
-Success means an evidence-backed ownership graph, or a precise boundary where
-producer evidence ends. It does not mean successful GPU completion or proven
-concurrency. A separate primary-source map/unmap and user-client teardown study
+Success means an evidence-backed alias/reset ownership graph, or a precise
+boundary where available implementation evidence ends. It does not mean
+successful GPU completion or proven concurrency. A separate primary-source
+map/unmap and user-client teardown study
 can narrow generic lifetime rules, but must not be presented as proof of this
 private family's behavior on the installed kernel.
 
@@ -86,6 +96,7 @@ Saved evidence on this workspace is ignored and contains sensitive/raw details:
 | `out/metal-abi-verified/` | Verified public-child, SDK-layout and root-inspection examples |
 | `out/metal-contract-detail/` | Field/ring/mapping and policy captures, source digests and `experiment-index.json` |
 | `out/ioaccel-lifecycle-detail/` | Queue/callback/notification/context disassembly, module symbols, primary sources, host queries and verification index |
+| `out/ioaccel-block-ownership/` | Metal block producers/callers, descriptor/helper reads, completion/deallocation, preserved lookup failures, host queries, primary references and verification index |
 | `out/discovery-progress.md` | Local execution ledger; supplementary to this tracked handoff |
 
 A fresh clone will not contain `out/`. Tracked documents supply reproduction
@@ -100,15 +111,18 @@ manual private invocation or independent-driver proof.
 
 ## Verification record and commands
 
-The lifecycle continuation ran all 13 existing tests successfully, rebuilt the
-public metadata child and reproduced the documented 14-command LLDB inspection
-batch. Source/header digests, relative links and whitespace were checked. Raw
-captures preserve diagnostics, including an enumeration locale warning; a
-missing optional private SDK header is explicitly unavailable. These checks
-verify evidence collection and document consistency, not GPU functionality.
-Independent review found no Critical, Important or Minor issues. Detailed
-verification records remain in the local execution ledger and experiment index.
-Verify new changes before claiming they pass.
+The block-ownership continuation ran all 13 existing tests successfully, rebuilt
+the unchanged public metadata child and reproduced 14 documented LLDB read
+commands (12 disassemblies, a module-scoped lookup and the bounded helper reader).
+The reader reproduced descriptor sizes 40/48/52 and both notification signatures.
+Source/header digests, 91 relative links and whitespace were checked. Raw
+captures retain two all-image lookup timeouts, two absent guessed method-owner
+names, an enumeration locale warning and a GitHub HTML 503; module-scoped
+lookups, inherited-owner disassemblies and primary-source fallbacks succeeded.
+These checks verify evidence collection and document consistency, not GPU
+functionality. Independent review found no Critical, Important or Minor issues.
+Detailed verification records remain in the local execution
+ledger and experiment index. Verify new changes before claiming they pass.
 
 ```sh
 python3 -m unittest discover -s tests -v

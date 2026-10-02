@@ -109,7 +109,7 @@ unavailable unless explicitly stated.
 | Shared / `IOAccelSharedDestroyDeviceShmem` | 8, scalar call | One scalar | None; associated allocation/lifetime rules incomplete |
 | Queue / async callback registration during creation | 0, `IOConnectCallAsyncScalarMethod` | Wake port, reference count 3, no scalar payload | No scalar output; callback/refcon slots and partial consumer recorded in the lifecycle study |
 | Queue / creation process-information call | 5, struct call | 1028 bytes | 8-byte initial output capacity; not a command-buffer format |
-| Queue / `IOAccelCommandQueueSubmitCommandBuffers` | 1, `IOConnectCallMethod` | No scalar input; structure size `8 + 24*n` on the positive-count path; `n` read from header offset 4 | No output; entry fields, handles, synchronization and kernel bounds checks unknown |
+| Queue / `IOAccelCommandQueueSubmitCommandBuffers` | 1, `IOConnectCallMethod` | No scalar input; structure size `8 + 24*n` on the positive-count path; `n` read from header offset 4 | No output; Metal producer writes two 32-bit shmem IDs and two copied block pointers per entry; complete format, handle validation, synchronization and kernel bounds checks unknown |
 
 The public [IOKit call API](https://developer.apple.com/documentation/iokit/1514240-ioconnectcallmethod)
 defines scalar/structure transport, not private selector meanings. Identical
@@ -144,10 +144,12 @@ fallback behavior. Future adapter code needs bounded failure handling rather
 than copying observed process-fatal behavior.
 
 For submission, the studied wrapper validates some user-space object/count
-conditions, retains the queue around accepted pending work and releases retained
+conditions, retains the queue before the transport call and releases retained
 references on submission failure. The [lifecycle study](ioaccel-lifecycle.md)
-counts two retains per positive entry and one release per callback; callback
-cardinality and full ownership remain unresolved. It also traces asynchronous
+counts two retains per positive entry and one release per callback. The
+[block-producer study](ioaccel-block-ownership.md) identifies scheduling/completion
+copies and local failure cleanup; actual kernel delivery, reset/reuse and full
+ownership remain unresolved. The lifecycle study also traces asynchronous
 notification-port cleanup and corrects selector 5's output capacity to 8 bytes.
 Completion behavior and kernel resource lifetimes were not exercised. Successful
 enumeration does not verify submission, fences, cancellation or cleanup after

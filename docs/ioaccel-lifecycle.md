@@ -6,6 +6,10 @@ teardown cancels a dispatch source asynchronously. **Neither this cancellation
 nor a successful transport call proves GPU completion or cancellation.** Mapping
 reclamation and kernel-side ownership remain unresolved.
 
+The [block-producer continuation](ioaccel-block-ownership.md) now connects two
+distinct scheduling/completion copies to the submission entries and accounts
+for local transport-failure cleanup. Kernel delivery remains unobserved.
+
 This extends the earlier public-declaration and saved-finalizer study. It does
 not implement a private protocol or exercise queues. See the
 [transport inventory](ioaccel-abi.md) and [field study](ioaccel-shared-memory.md).
@@ -125,11 +129,12 @@ reference array and selects callback arity from message length. This explains
 how public callback types connect to the private consumer, without proving the
 host's entire dispatch path or a private message's validity.
 
-Two submission retains versus one release per callback suggests two callbacks
-per entry **if this is the only balancing path**. The producer and all block
-construction/ownership paths have not been traced; callback cardinality is an
-unverified hypothesis. Nothing here proves successful completion, balanced
-lifetimes under loss/duplicates, or GPU fence semantics.
+The [producer continuation](ioaccel-block-ownership.md) identifies two copied
+blocks per entry, for scheduling and completion, plus local failure cleanup.
+This supports an expected two-event design beyond retain-count arithmetic.
+Exactly one kernel delivery for each copy would balance the inspected normal
+path, but callback cardinality remains unverified. Nothing here proves successful
+completion, balanced lifetimes under loss/duplicates, or GPU fence semantics.
 
 ## Notification cancellation and finalization
 
@@ -179,12 +184,12 @@ remain possible. Do not infer either a leak or guaranteed close-time cleanup.
 
 ## Next experiments and measurable gates
 
-The next read-only task is to trace creation/copying of the callback blocks and
-their transfer to submission, accounting for both queue retains per entry. Start
-from Metal's submission call sites and block producers, keeping resource and
-kernel message validation explicitly unresolved. Success means an evidence-backed
-ownership graph for normal/error paths, or a precise missing producer boundary;
-no callback should be manually invoked and no GPU work submitted.
+The [block-producer study](ioaccel-block-ownership.md) supplies an ownership graph
+for the inspected normal/error paths. The next read-only task is to trace
+callback-pointer alias use and command-buffer reset/reuse, including storage
+cleanup. Success means an evidence-backed reset/cleanup graph or a precise missing
+implementation boundary. Kernel message validation remains unresolved; no callback
+should be manually invoked and no GPU work submitted.
 
 A separate primary-source study can trace XNU map/unmap and user-client teardown
 ownership. It must distinguish generic source behavior from private-family

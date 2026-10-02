@@ -92,8 +92,12 @@ These are static consumer expectations, not observed kernel response or GPU work
 The [lifecycle continuation](ioaccel-lifecycle.md) now identifies the notification
 callback, submission retains, callback release, asynchronous dispatch cancellation
 and context finalization. Mapping reclamation and callback cardinality remain
-unverified. The next read-only work is callback-block producer/ownership tracing,
-primary vendor admission-contract evidence if available, and offline firmware
+unverified. The [block-producer study](ioaccel-block-ownership.md) then connects
+two scheduling/completion copies to each entry, traces retained captures and
+local transport-failure cleanup, and stops at the unobserved kernel delivery
+boundary. Callback-pointer alias use and command-buffer reset/reuse are the
+next focused read-only task. Separate future studies include primary vendor
+admission-contract evidence and offline firmware
 provenance/header and compiler-target work. Kernel validation, negotiation,
 complete ownership/ordering and actual independent bundle admission remain open.
 Synthetic independent discovery remains gated on an experimental environment
