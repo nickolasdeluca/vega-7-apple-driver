@@ -64,9 +64,11 @@ Shader compilation belongs to a separate subsystem. The
 [AMD Vega ISA](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/vega-shader-instruction-set-architecture.pdf)
 describes instructions, registers, wave execution and memory operations; it
 does not specify Metal's compilation ABI. The
-[LLVM AMDGPU backend](https://llvm.org/docs/AMDGPUUsage.html) lists `gfx90c` as
-a Cezanne target. A backend targeting that ISA is a candidate, not proof that
-its code-object ABI or resource descriptors match our queues or Metal.
+[LLVM AMDGPU backend](https://llvm.org/docs/AMDGPUUsage.html) documents `gfx90c`
+for Ryzen 4000 APUs in the related family. It is a candidate compiler target for
+this study; establish the Cezanne mapping independently before selecting it.
+A target's availability does not prove its code-object ABI or resource
+descriptors match our queues or Metal.
 
 ## Proposed bring-up dependencies
 
