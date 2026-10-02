@@ -95,8 +95,12 @@ and context finalization. Mapping reclamation and callback cardinality remain
 unverified. The [block-producer study](ioaccel-block-ownership.md) then connects
 two scheduling/completion copies to each entry, traces retained captures and
 local transport-failure cleanup, and stops at the unobserved kernel delivery
-boundary. Callback-pointer alias use and command-buffer reset/reuse are the
-next focused read-only task. Separate future studies include primary vendor
+boundary. The [reset/reuse study](ioaccel-buffer-reuse.md) then traces completion
+predicates, reset state and pooled/unpooled storage cleanup. Its bounded code
+scan validates only the two alias-slot producer references under supported
+encodings; indirect/vendor accesses and outer callback drain remain unresolved.
+Primary-source XNU map/unmap and user-client teardown ownership are the next
+focused read-only task. Separate future studies include primary vendor
 admission-contract evidence and offline firmware
 provenance/header and compiler-target work. Kernel validation, negotiation,
 complete ownership/ordering and actual independent bundle admission remain open.

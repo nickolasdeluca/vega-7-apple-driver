@@ -185,13 +185,13 @@ remain possible. Do not infer either a leak or guaranteed close-time cleanup.
 ## Next experiments and measurable gates
 
 The [block-producer study](ioaccel-block-ownership.md) supplies an ownership graph
-for the inspected normal/error paths. The next read-only task is to trace
-callback-pointer alias use and command-buffer reset/reuse, including storage
-cleanup. Success means an evidence-backed reset/cleanup graph or a precise missing
-implementation boundary. Kernel message validation remains unresolved; no callback
-should be manually invoked and no GPU work submitted.
+for the inspected normal/error paths. The [reset/reuse study](ioaccel-buffer-reuse.md)
+adds bounded alias-reference results, completion predicates and storage pooling.
+The completion predicate is not shown to drain outer callback/storage releases.
+Kernel message validation remains unresolved; no callback should be manually
+invoked and no GPU work submitted.
 
-A separate primary-source study can trace XNU map/unmap and user-client teardown
+A primary-source study is next for XNU map/unmap and user-client teardown
 ownership. It must distinguish generic source behavior from private-family
 behavior and the installed kernel revision. A full bind inventory would narrow
 the symbol-search limitation but would not alone settle mapping lifetime.

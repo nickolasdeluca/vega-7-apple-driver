@@ -172,6 +172,11 @@ methods contain no direct release of the two callback-pointer aliases. That
 limited observation does not inventory transitive storage cleanup or prove that
 reset/deallocation can never access or release an alias.
 
+The [reset/reuse continuation](ioaccel-buffer-reuse.md) now traces the completion
+predicate, reset state and storage pooling. A bounded Metal code scan validates
+only the two producer references to the alias slots under its supported encodings;
+global alias access/clearing and cross-thread reuse safety remain unresolved.
+
 Capture helpers keep the command buffer alive while either notification copy
 owns it, and keep the Metal queue alive while the completion copy owns it.
 The separate CF queue retains can keep its finalizer from running while expected
@@ -260,13 +265,12 @@ print(json.dumps({'block_descriptors_in_producer_order': descriptors}))
 
 ## Next experiments and measurable gates
 
-The next focused read-only task is callback-pointer alias use and command-buffer
-reset/reuse: trace `commitAndReset`, storage deallocation and reachable alias
-reads/writes. Success is an evidence-backed reset/cleanup ownership graph or a
-precise unresolved dispatch/implementation boundary. Do not create a command
-buffer, invoke reset, or submit work. A separate generic XNU map/unmap and
-user-client teardown source study remains useful, with private-family and
-installed-kernel behavior kept distinct.
+The [reset/reuse study](ioaccel-buffer-reuse.md) records the inspected alias,
+wait and storage-cleanup graph, with indirect/vendor access and outer callback
+drain boundaries unresolved. The next focused read-only task is generic XNU
+map/unmap and user-client teardown ownership, keeping private-family and installed
+kernel behavior distinct. Do not create buffers/mappings, invoke reset, open
+experimental clients or submit work on the working GPU.
 
 Future experiments require an available experimental environment and recovery
 path under [AGENTS.md](../AGENTS.md):

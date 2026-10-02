@@ -6,8 +6,8 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current research checkpoint: callback-block ownership, 2026-10-02, on branch
-`cezanne-discovery`, extending `a3b779e`. This handoff is committed
+Current research checkpoint: callback aliases and storage reuse, 2026-10-02,
+on branch `cezanne-discovery`, extending `520a44b`. This handoff is committed
 with the continuation; check Git history for its commit rather than assuming a
 recorded hash is HEAD.
 The project remains in **read-only discovery and specification**. No independent
@@ -45,6 +45,12 @@ Completed work:
   for inspected normal/error paths. Exactly one kernel delivery per distinct
   copy would balance the normal path, but actual message production, callback
   cardinality and reset/reuse remain unverified.
+- Completion predicates, reset state, synchronous-debug semaphore prerequisite
+  and pooled/unpooled storage cleanup:
+  [buffer reuse](ioaccel-buffer-reuse.md). The bounded Metal code scan validates
+  only the two producer references to alias slots under supported encodings.
+  Completion wait does not establish outer callback/storage drain. Indirect or
+  vendor alias access/clearing and cross-thread reuse remain unresolved.
 
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
@@ -52,30 +58,27 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: trace callback-pointer aliases and command-buffer reuse
+## Next task: trace generic map/unmap and user-client teardown ownership
 
 Continue read-only graphics-contract work before driver bring-up:
 
-1. Read the [block-ownership study](ioaccel-block-ownership.md) and reuse its
-   submission, descriptor/helper and completion/deallocation captures. The
-   copied pointers are also stored directly in the command buffer's
-   `_scheduledCallbackBlockPtr` and `_completedCallbackBlockPtr` aliases.
-2. Trace `commitAndReset`, storage deallocation and reachable alias reads/writes.
-   Account for clearing, reuse, waits and cleanup without treating direct pointer
-   stores as extra owned references. Keep subclass dispatch and transitive
-   cleanup boundaries explicit. Do not invoke reset, create buffers/queues or
-   submit work.
-3. Record an evidence-backed reset/cleanup graph, reproducible inspection commands
-   and measurable future validation gates. Keep kernel acceptance, reply
-   cardinality, status/time units and cancellation unverified unless independent
-   producer evidence actually establishes them.
+1. Read the [lifecycle](ioaccel-lifecycle.md) and [reuse](ioaccel-buffer-reuse.md)
+   studies. Reuse context mapping/finalization and storage release observations;
+   no explicit unmap was identified in the earlier inspected wrapper paths.
+2. Trace generic XNU map/unmap and user-client teardown in a pinned primary-source
+   revision. Account for memory-map ownership, explicit unmap, connection
+   close/client death and task exit. Record source version/provenance and which
+   private-family callbacks or overrides remain unavailable.
+3. Produce an attributed ownership graph, reproducible source locations and
+   measurable future cleanup gates. Do not create mappings, open experimental
+   clients, exercise teardown or submit work on the working GPU.
 
-Success means an evidence-backed alias/reset ownership graph, or a precise
-boundary where available implementation evidence ends. It does not mean
-successful GPU completion or proven concurrency. A separate primary-source
-map/unmap and user-client teardown study
-can narrow generic lifetime rules, but must not be presented as proof of this
-private family's behavior on the installed kernel.
+Success means generic source-backed ownership/cleanup boundaries and an explicit
+limit where private-family or installed-kernel evidence ends. Source revision
+agreement with the installed kernel must not be assumed. This does not verify
+mapping reclamation, callback cancellation, cross-thread reuse or GPU completion
+on this host. Alias accesses through vendor/indirect paths and complete commit
+dispatch remain separate open interfaces.
 
 Parallel areas of future investigation, when relevant: primary vendor admission
 contracts, offline firmware provenance/header validation and shader target
@@ -97,6 +100,7 @@ Saved evidence on this workspace is ignored and contains sensitive/raw details:
 | `out/metal-contract-detail/` | Field/ring/mapping and policy captures, source digests and `experiment-index.json` |
 | `out/ioaccel-lifecycle-detail/` | Queue/callback/notification/context disassembly, module symbols, primary sources, host queries and verification index |
 | `out/ioaccel-block-ownership/` | Metal block producers/callers, descriptor/helper reads, completion/deallocation, preserved lookup failures, host queries, primary references and verification index |
+| `out/ioaccel-buffer-reuse/` | Reset/wait/storage-pool disassembly, bounded alias scan, controlled bound rejection, SDK/primary contracts, host queries and verification index |
 | `out/discovery-progress.md` | Local execution ledger; supplementary to this tracked handoff |
 
 A fresh clone will not contain `out/`. Tracked documents supply reproduction
@@ -111,18 +115,20 @@ manual private invocation or independent-driver proof.
 
 ## Verification record and commands
 
-The block-ownership continuation ran all 13 existing tests successfully, rebuilt
-the unchanged public metadata child and reproduced 14 documented LLDB read
-commands (12 disassemblies, a module-scoped lookup and the bounded helper reader).
-The reader reproduced descriptor sizes 40/48/52 and both notification signatures.
-Source/header digests, 91 relative links and whitespace were checked. Raw
-captures retain two all-image lookup timeouts, two absent guessed method-owner
-names, an enumeration locale warning and a GitHub HTML 503; module-scoped
-lookups, inherited-owner disassemblies and primary-source fallbacks succeeded.
-These checks verify evidence collection and document consistency, not GPU
-functionality. Independent review found no Critical, Important or Minor issues.
-Detailed verification records remain in the local execution
-ledger and experiment index. Verify new changes before claiming they pass.
+The reuse continuation ran all 13 existing tests successfully, rebuilt the
+unchanged public metadata child and reproduced 19 documented LLDB read commands
+(18 disassemblies and the bounded alias reader). The reader validates the two
+producer references within 2,144,545 bytes of Metal code. A controlled one-byte
+bound rejects the scan with an assertion before the bulk section read, although
+LLDB exits 0; diagnostics are checked separately. Source/header and borrowed
+evidence digests, 103 relative links and whitespace were checked. Raw captures
+retain a function-name lookup failure for ivar data, an enumeration locale warning
+and web-reader source failures; disassembly-only reproduction and official source
+captures succeeded. These checks verify evidence collection and document
+consistency, not GPU functionality. Detailed verification records remain in the
+local execution ledger and experiment index. Independent review found no
+Critical or Important issues; its wording correction was verified, with no
+Minor issues remaining. Verify new changes before claiming they pass.
 
 ```sh
 python3 -m unittest discover -s tests -v
