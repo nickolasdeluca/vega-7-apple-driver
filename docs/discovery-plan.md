@@ -89,7 +89,10 @@ The [field study](ioaccel-shared-memory.md) names partial configuration fields,
 allocation address/size/ID, dirty-ring pointers/entries and publication instructions.
 These are static consumer expectations, not observed kernel response or GPU work.
 
-The next read-only work is notification/cancellation and mapping-cleanup study,
+The [lifecycle continuation](ioaccel-lifecycle.md) now identifies the notification
+callback, submission retains, callback release, asynchronous dispatch cancellation
+and context finalization. Mapping reclamation and callback cardinality remain
+unverified. The next read-only work is callback-block producer/ownership tracing,
 primary vendor admission-contract evidence if available, and offline firmware
 provenance/header and compiler-target work. Kernel validation, negotiation,
 complete ownership/ordering and actual independent bundle admission remain open.

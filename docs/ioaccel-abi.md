@@ -107,8 +107,8 @@ unavailable unless explicitly stated.
 | Shared / `IOAccelSharedAllocateFenceMemory` | 12, struct call | 8-byte structure containing forwarded argument | 8 bytes; exact allocation/result semantics unknown |
 | Shared / `IOAccelSharedCreateDeviceShmem` | 7, `IOConnectCallMethod` | One scalar, no structure | 16-byte structure; virtual address (64-bit), size and ID (32-bit each) inferred from named consumers; version/protection/ownership incomplete |
 | Shared / `IOAccelSharedDestroyDeviceShmem` | 8, scalar call | One scalar | None; associated allocation/lifetime rules incomplete |
-| Queue / async callback registration during creation | 0, `IOConnectCallAsyncScalarMethod` | Wake port, reference count 3, no scalar payload | No scalar output; notification/fence protocol incomplete |
-| Queue / creation process-information call | 5, struct call | 1028 bytes | None; not a command-buffer format |
+| Queue / async callback registration during creation | 0, `IOConnectCallAsyncScalarMethod` | Wake port, reference count 3, no scalar payload | No scalar output; callback/refcon slots and partial consumer recorded in the lifecycle study |
+| Queue / creation process-information call | 5, struct call | 1028 bytes | 8-byte initial output capacity; not a command-buffer format |
 | Queue / `IOAccelCommandQueueSubmitCommandBuffers` | 1, `IOConnectCallMethod` | No scalar input; structure size `8 + 24*n` on the positive-count path; `n` read from header offset 4 | No output; entry fields, handles, synchronization and kernel bounds checks unknown |
 
 The public [IOKit call API](https://developer.apple.com/documentation/iokit/1514240-ioconnectcallmethod)
@@ -145,9 +145,13 @@ than copying observed process-fatal behavior.
 
 For submission, the studied wrapper validates some user-space object/count
 conditions, retains the queue around accepted pending work and releases retained
-references on submission failure. Completion behavior and kernel resource
-lifetimes were not exercised. Successful enumeration does not verify submission,
-fences, cancellation or cleanup after GPU failure.
+references on submission failure. The [lifecycle study](ioaccel-lifecycle.md)
+counts two retains per positive entry and one release per callback; callback
+cardinality and full ownership remain unresolved. It also traces asynchronous
+notification-port cleanup and corrects selector 5's output capacity to 8 bytes.
+Completion behavior and kernel resource lifetimes were not exercised. Successful
+enumeration does not verify submission, fences, cancellation or cleanup after
+GPU failure.
 
 ## Reproduction and next gates
 
@@ -169,7 +173,7 @@ architectures or runtime versions as verified wire formats.
 | Next experiment | Scope | Measurable gate |
 | --- | --- | --- |
 | Versioned configuration/shared-memory inventory | Offline primary definitions and bounded static data flow | Field-level layouts, version/capability negotiation, mapping protections and ownership; missing evidence remains unavailable |
-| Notification/fence lifetime study (public declarations done: [lifecycle](ioaccel-lifecycle.md)) | Read-only declarations/call sites | Identify references, callback payload, success/error/cancellation paths and close behavior; separate source inferences from observed completions |
+| Notification/fence lifetime study (partial consumer/cleanup traced: [lifecycle](ioaccel-lifecycle.md)) | Read-only declarations/call sites | Identify references, callback payload, success/error/cancellation paths and close behavior; separate source inferences from observed completions |
 | Independent diagnostic protocol | Later implementation within repository; no host driver loading | Own versioned protocol with explicit sizes and validation; do not label it Metal-compatible without matching the required boundary |
 | Compatible service and submission | Deferred to experimental boot/recovery and verified hardware queues | Initialization negotiates correctly; guarded copy/shader results match references; shared-memory bounds, isolation, timeout and cleanup tested |
 

@@ -6,8 +6,10 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Last research batch: `49a7adf`, 2026-10-02, on branch `cezanne-discovery`.
-Check current Git status/history rather than assuming this remains HEAD.
+Current research checkpoint: lifecycle continuation, 2026-10-02, on branch
+`cezanne-discovery`, extending `103559f` and `f21be70`. This handoff is committed
+with the continuation; check Git history for its commit rather than assuming a
+recorded hash is HEAD.
 The project remains in **read-only discovery and specification**. No independent
 hardware, display or acceleration driver has been implemented or loaded.
 
@@ -28,13 +30,15 @@ Completed work:
 - Partial IOAccel connection/selector/capacity inventory and configuration,
   allocation address/size/ID, dirty-ring and event/mapping consumer data flow:
   [ABI](ioaccel-abi.md), [shared-memory fields](ioaccel-shared-memory.md).
-- Public-declaration lifecycle contract for notification ports, async calls,
-  mappings and connection release, with future test gates:
-  [lifecycle](ioaccel-lifecycle.md). Its private-wrapper callback payload and
-  cancellation paths were **not** extended (an automated safety check stopped a
-  private-queue disassembly walkthrough). Only the committed finalizers and a
-  map/unmap search of saved captures were added; no unmap call site was found
-  in the captured functions. A framework-wide import check remains open.
+- Notification callback/refcon registration, partial callback payload consumers,
+  two queue retains per submission entry versus one release per callback,
+  asynchronous notification-port cancellation and context finalization:
+  [lifecycle](ioaccel-lifecycle.md). The earlier automated safety-check stop did
+  not recur during ordinary read-only own-child inspection. A loaded-module
+  symbol/trampoline search found no explicit unmap symbol; this does not prove
+  absence of indirect or kernel cleanup. Earlier claims of guaranteed mapping
+  survival and immediate close were corrected, along with selector 5's output
+  capacity (8 bytes).
 
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
@@ -42,26 +46,26 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: finish notification, cancellation and mapping cleanup (partly done)
+## Next task: trace callback-block producers and ownership
 
-Continue the read-only IOAccel lifecycle study before attempting driver bring-up:
+Continue read-only graphics-contract work before driver bring-up:
 
-1. Reuse saved queue creation/submission/finalizer and context-mapping captures.
-   Start with `IOAccelCommandQueueCreateWithQoS`,
-   `IOAccelCommandQueueSubmitCommandBuffers`, `ioAccelCommandQueueFinalize`,
-   `ioAccelSharedFinalize` and `IOAccelContextGetFenceBuffer`.
-2. Trace notification registration, callback payloads, retained references,
-   success/error/cancellation and connection/mapping cleanup. Use primary
-   declarations and targeted static inspection of general OS frameworks.
-3. Produce a lifecycle contract document with sourced facts, local observations,
-   unresolved paths, reproducible commands and measurable future test gates.
-   Update the existing inventories where new evidence resolves their limits.
+1. Read the [lifecycle study](ioaccel-lifecycle.md) and reuse the saved creation,
+   submission and callback captures. A positive submission entry retains its
+   queue twice; the registered callback releases it once per invocation.
+2. Locate Metal's submission call sites and block creation/copy/transfer paths.
+   Account for the two retains and block ownership on normal/error paths without
+   assuming two callbacks merely from arithmetic. Do not manually invoke these
+   methods, create queues or submit work.
+3. Update the contract with supported producer/consumer connections and explicit
+   missing kernel/message boundaries, reproducible inspection commands and
+   measurable future validation gates.
 
-Success means documenting callback/ownership/close data flow to the extent
-supported by evidence, and clearly identifying missing cancellation, unmapping
-and kernel-side guarantees. Static inspection cannot verify GPU completion or
-concurrency. Do not manually invoke private helpers/selectors, open experimental
-user clients, create queues/mappings or submit work on the working host.
+Success means an evidence-backed ownership graph, or a precise boundary where
+producer evidence ends. It does not mean successful GPU completion or proven
+concurrency. A separate primary-source map/unmap and user-client teardown study
+can narrow generic lifetime rules, but must not be presented as proof of this
+private family's behavior on the installed kernel.
 
 Parallel areas of future investigation, when relevant: primary vendor admission
 contracts, offline firmware provenance/header validation and shader target
@@ -81,6 +85,7 @@ Saved evidence on this workspace is ignored and contains sensitive/raw details:
 | `out/metal-abi-study/` | Loader/trust/connection/queue/finalizer captures and source indexes |
 | `out/metal-abi-verified/` | Verified public-child, SDK-layout and root-inspection examples |
 | `out/metal-contract-detail/` | Field/ring/mapping and policy captures, source digests and `experiment-index.json` |
+| `out/ioaccel-lifecycle-detail/` | Queue/callback/notification/context disassembly, module symbols, primary sources, host queries and verification index |
 | `out/discovery-progress.md` | Local execution ledger; supplementary to this tracked handoff |
 
 A fresh clone will not contain `out/`. Tracked documents supply reproduction
@@ -95,11 +100,15 @@ manual private invocation or independent-driver proof.
 
 ## Verification record and commands
 
-The last research batch verified all 13 existing tests, the documented 15-command
-static-inspection batch and six policy queries, source digests, relative links
-and whitespace. Independent review checked the field/policy claims; a scope
-sentence was clarified to distinguish manual calls from internal initialization.
-These are past results; verify new changes before claiming they pass.
+The lifecycle continuation ran all 13 existing tests successfully, rebuilt the
+public metadata child and reproduced the documented 14-command LLDB inspection
+batch. Source/header digests, relative links and whitespace were checked. Raw
+captures preserve diagnostics, including an enumeration locale warning; a
+missing optional private SDK header is explicitly unavailable. These checks
+verify evidence collection and document consistency, not GPU functionality.
+Independent review found no Critical, Important or Minor issues. Detailed
+verification records remain in the local execution ledger and experiment index.
+Verify new changes before claiming they pass.
 
 ```sh
 python3 -m unittest discover -s tests -v
