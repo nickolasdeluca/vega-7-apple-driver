@@ -6,6 +6,12 @@ entry-point names and type encodings, **not a usable independent-driver ABI**.
 Bundle admission, invocation order, ownership, and kernel communication remain
 unresolved. Do not start a vendor plugin by calling these private methods.
 
+Follow-up: the [admission study](metal-admission.md) now establishes ordered search
+roots, named/principal-class precedence, the `_MTLDevice` class check and observed
+enumeration call path. The [IOAccel inventory](ioaccel-abi.md) records partial
+transport contracts. Our own bundle admission and a complete usable ABI remain
+unproven; the text below records the earlier investigation's evidence limits.
+
 ## Experiment and evidence
 
 Read-only study on 2026-10-02: macOS 26.4.1, build 25E253, x86_64;

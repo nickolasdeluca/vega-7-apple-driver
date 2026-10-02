@@ -72,9 +72,19 @@ Green Sardine APU flag and records conditional IP dispatch/firmware selection.
 Actual host IP revisions and firmware artifact versions/digests remain unavailable.
 No firmware was acquired or loaded.
 
-The next concrete work is read-only loader call-site/policy study and an IOAccel
-boundary inventory, with offline firmware provenance/header and compiler-target
-work. Synthetic independent discovery remains gated on an experimental environment
+The [admission study](metal-admission.md) subsequently establishes ordered resolver
+roots, class precedence and the `_MTLDevice` check, records a public-enumeration
+loader backtrace, and identifies a separate rootless trust layer. The
+[IOAccel inventory](ioaccel-abi.md) records legacy SDK layouts and partial private
+connection/selector/size/lifetime data from static call sites. Probe builds/runs,
+bounded debugger reads and source checks were verified; no private calls were
+manually sent to the driver. Actual independent admission, configuration fields,
+shared-memory layout/ordering and kernel-side negotiation remain unresolved.
+
+The next concrete work is a read-only third-party admission-policy specification
+and field-level IOAccel configuration/shared-memory study, with offline firmware
+provenance/header and compiler-target work. Synthetic independent discovery
+remains gated on an experimental environment
 and recovery path. If the required Metal integration interface cannot be established,
 record that feasibility limit before investing in a large hardware stack. Do not
 claim that a framebuffer, an LLVM target or registry metadata alone closes it.

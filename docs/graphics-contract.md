@@ -50,6 +50,12 @@ class as `GFX9_MtlDevice`, distinct from the registry class-name string, and rec
 candidate private registration/initializer metadata. Bundle admission and the
 usable vendor ABI remain unresolved; these methods were not invoked.
 
+The next [admission investigation](metal-admission.md) establishes lookup roots,
+class precedence, trust-helper dependencies and a public-enumeration backtrace.
+The [IOAccel inventory](ioaccel-abi.md) separates SDK legacy surface definitions
+from statically recovered private Metal transport. Neither establishes acceptance
+of our own service/bundle or successful GPU submission.
+
 ```mermaid
 flowchart TB
   App[Application: Metal public API] --> Metal[Metal.framework]
