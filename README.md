@@ -5,6 +5,7 @@ macOS 26.4.1. Current milestone: read-only hardware discovery and graphics
 interface specification. No independent driver is implemented or loaded yet.
 
 Read [AGENTS.md](AGENTS.md) before working on the project.
+For current progress and where to resume, read [the project handoff](docs/handoff.md).
 
 ## Capture the baseline
 

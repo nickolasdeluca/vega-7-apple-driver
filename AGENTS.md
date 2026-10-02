@@ -1,5 +1,19 @@
 # Cezanne driver operating rules
 
+## Starting or resuming work
+
+- Read [the project handoff](docs/handoff.md) for the current checkpoint, next
+  task, evidence locations and verification commands. Read its linked studies
+  as needed; conversation history is not required to resume.
+- Check `git status --short` and recent history before making changes. Preserve
+  unrelated work and do not redo completed investigation merely because the
+  context is fresh.
+- Treat ignored `out/` captures as local evidence, not files guaranteed to exist
+  in another checkout. If missing, use the tracked reproduction instructions
+  within the host constraint below, and record unavailable evidence explicitly.
+- Update the handoff after each completed batch when the checkpoint, next task,
+  verification or blocking requirements change.
+
 ## Target and scope
 
 Build independent hardware, display, and acceleration drivers for the AMD
