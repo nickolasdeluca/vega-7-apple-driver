@@ -58,7 +58,23 @@ Cezanne core, IOKit adapter, user-space driver and shader backend separate.
 | 5. Metal | Own discoverable vendor plugin, rendering, surfaces and presentation | Enumeration and correct rendering/presentation without Apple AMD binaries; cross-process sharing and lifetime verification |
 | 6. Desktop and resilience | Composition, recovery, sleep/wake, multiple workloads | Reliable desktop, logged recovery, repeated suspend/resume and broader correctness/performance checks |
 
-The next concrete work is the read-only vendor-loader/factory study and offline
-target manifest. If the required Metal integration interface cannot be established,
+## Follow-up investigation record
+
+The [loader/factory study](metal-loader-study.md) identifies the observed
+`GFX9_MtlDevice` class hierarchy and candidate registration/initialization
+metadata. Its documented metadata probe compiles and reproduces the observation;
+failed standalone-binary, signature and cache-section inspections are preserved.
+Lookup roots, signing admission, invocation order and the usable IOAccel ABI
+remain unresolved. No private candidate methods were called.
+
+The [offline target manifest](cezanne-target-manifest.md) traces `1638` to the
+Green Sardine APU flag and records conditional IP dispatch/firmware selection.
+Actual host IP revisions and firmware artifact versions/digests remain unavailable.
+No firmware was acquired or loaded.
+
+The next concrete work is read-only loader call-site/policy study and an IOAccel
+boundary inventory, with offline firmware provenance/header and compiler-target
+work. Synthetic independent discovery remains gated on an experimental environment
+and recovery path. If the required Metal integration interface cannot be established,
 record that feasibility limit before investing in a large hardware stack. Do not
 claim that a framebuffer, an LLVM target or registry metadata alone closes it.

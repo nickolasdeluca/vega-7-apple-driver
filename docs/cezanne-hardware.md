@@ -53,6 +53,10 @@ header bounds and versions before loading. See
 [amdgpu_ucode.c](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.c)
 and the block references above.
 
+The follow-up [target manifest](cezanne-target-manifest.md) traces `1638` to the
+Green Sardine APU flag, records conditional IP dispatch and firmware consumers,
+and leaves unmeasured host versions and firmware artifacts explicitly unavailable.
+
 AMD microcode is permitted. Host-side header/size checks and cryptographic
 signature acceptance by the security processor are separate requirements;
 checksums do not replace signed-image validation. Never assume modified images

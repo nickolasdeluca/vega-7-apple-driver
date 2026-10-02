@@ -39,8 +39,16 @@ The installed X5000 kext Info.plist's Vega10 personality uses
 `IOPropertyMatch={LoadAccelerator=true}`, and a discrete-Vega PCI match list
 that does not include `1638`. The current patching stack is loaded. Therefore
 the installed plist is insufficient to explain live matching; the mechanism
-and modified behavior remain unresolved. Installed bundle metadata was inspected
+and exact installed patch behavior remain unresolved. The pinned NootedRed
+comparison in the [target manifest](cezanne-target-manifest.md) contains a matching
+`1638` personality, but is not proof of the installed binary's source revision.
+Installed bundle metadata was inspected
 read-only; no AMD binary code was copied or modified.
+
+The follow-up [Metal loader study](metal-loader-study.md) identifies the returned
+class as `GFX9_MtlDevice`, distinct from the registry class-name string, and records
+candidate private registration/initializer metadata. Bundle admission and the
+usable vendor ABI remain unresolved; these methods were not invoked.
 
 ```mermaid
 flowchart TB

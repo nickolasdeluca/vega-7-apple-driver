@@ -66,5 +66,7 @@ it is skipped elsewhere. Host observations require independent system queries.
 
 - [Hardware baseline](docs/hardware-baseline.md)
 - [Cezanne hardware blocks](docs/cezanne-hardware.md)
+- [Target IP and firmware selection manifest](docs/cezanne-target-manifest.md)
 - [Tahoe graphics contracts and experiments](docs/graphics-contract.md)
+- [Metal loader and factory investigation](docs/metal-loader-study.md)
 - [Milestones and discovery decisions](docs/discovery-plan.md)
