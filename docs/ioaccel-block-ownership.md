@@ -271,8 +271,10 @@ drain boundaries unresolved. The [generic mapping study](xnu-mapping-lifecycle.m
 adds source-backed owners and teardown paths while keeping installed family
 behavior unavailable. The [async-reply study](xnu-async-replies.md) adds generic
 port/message accounting, separate from retained blocks and queue objects;
-actual family production remains unavailable. Installed IOKit dispatch/wrapper
-comparison is next. Do not create buffers/mappings, invoke reset, open
+actual family production remains unavailable. The
+[installed dispatch comparison](iokit-async-dispatch.md) matches the user-space
+receive path and wrappers with source; IOAcceleratorFamily2 reply production is
+next. Do not create buffers/mappings, invoke reset, open
 experimental clients or submit work on the working GPU.
 
 Future experiments require an available experimental environment and recovery

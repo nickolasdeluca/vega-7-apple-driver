@@ -83,7 +83,8 @@ successful kernel calls:
 3. Queue selector 0 registers with `IOConnectCallAsyncScalarMethod`: wake port,
    reference count 3, no scalar payload or output. Reference slot 1 holds
    `ioAccelCommandQueueBlockFenceCallback`; slot 2 holds the queue object as
-   refcon. XNU's public indices identify these positions; slot 0 is reserved.
+   refcon. XNU's public indices identify these positions; slot 0 is reserved and
+   left unwritten by this caller; the generic kernel helper replaces it.
    No additional `CFRetain` appears at this registration site.
 4. Association/dispatch-queue creation failures release the CF object. A
    notification-port creation failure first releases the local dispatch queue.
@@ -126,8 +127,9 @@ message length and producer-side validation remain unknown.
 
 The pinned IOKitUser dispatcher obtains function/refcon from the notification
 reference array and selects callback arity from message length. This explains
-how public callback types connect to the private consumer, without proving the
-host's entire dispatch path or a private message's validity.
+how public callback types connect to the private consumer. The host's installed
+dispatch path was later [compared](iokit-async-dispatch.md); a private message's
+validity remains unproven.
 
 The [producer continuation](ioaccel-block-ownership.md) identifies two copied
 blocks per entry, for scheduling and completion, plus local failure cleanup.
@@ -197,7 +199,9 @@ revision differs from the host kernel; installed family cleanup remains
 unverified. The [async-reply study](xnu-async-replies.md) adds generic port and
 packing accounting: registration references differ from reply arguments, and
 generic count limits do not establish the consumer's minimum field span.
-Installed IOKit dispatch/wrapper comparison is next.
+The [installed dispatch comparison](iokit-async-dispatch.md) confirms that the
+host's dispatcher enforces no argument minimum or maximum; IOAcceleratorFamily2
+reply production is next.
 A full bind inventory would narrow the symbol-search limitation but would not
 alone settle mapping lifetime.
 

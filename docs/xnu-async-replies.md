@@ -322,13 +322,13 @@ cleanup or GPU functionality.
 
 ## Remaining interfaces and gates
 
-The next read-only task is to compare installed IOKit async dispatch and wrapper
-instructions with these source expectations. Use the existing public metadata
-child and bounded own-child inspection to identify header offsets, count/arity
-logic, checks and wrapper arguments. Success means an attributed comparison
-with explicit differences/unavailable symbols, without invoking callbacks or
-opening experimental clients. Private-family/kernel production remains a
-separate missing interface.
+The [installed dispatch comparison](iokit-async-dispatch.md) found the host's
+IOKit dispatcher, dispatch-queue callout, async wrappers and generated client stub
+consistent with these source expectations. Two differences do not affect behavior:
+the callouts do not set up arguments the dispatcher ignores. The comparison adds
+client-only count checks, a shared output-count hazard and an unwritten
+registration slot 0. Private-family/kernel production remains the next missing
+interface.
 
 Future dynamic work requires an experimental environment and recovery path
 under [AGENTS.md](../AGENTS.md):
@@ -341,6 +341,6 @@ under [AGENTS.md](../AGENTS.md):
 | Send failure/backpressure | Queue saturation, timeout, null/dead destination and receiver exit have bounded outcomes and preserve actual error/cleanup accounting. |
 | Teardown and reuse | A verified drain/invalidation boundary protects callback state, mappings and replacement storage, independently of receive-port or connection destruction. |
 
-No installed dispatch equivalence, private reply count/order, actual wake-port
+No private reply count/order, actual wake-port
 release schedule, callback cancellation, GPU completion or independent Metal
 admission has been dynamically verified.

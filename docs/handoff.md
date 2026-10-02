@@ -6,8 +6,8 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current research checkpoint: generic async replies and wake-port ownership, 2026-10-02,
-on branch `cezanne-discovery`, extending `7f8f0ae`. This handoff is committed
+Current research checkpoint: installed IOKit async dispatch and wrappers, 2026-10-02,
+on branch `cezanne-discovery`, extending `7f4f0c0`. This handoff is committed
 with the continuation; check Git history for its commit rather than assuming a
 recorded hash is HEAD.
 The project remains in **read-only discovery and specification**. No independent
@@ -64,7 +64,16 @@ Completed work:
   [async replies](xnu-async-replies.md). Offline layout/field fixtures distinguish
   registration count from reply count, padding from argument data and Mach port
   ownership from retained blocks/queues. Send success does not establish delivery;
-  actual private reply production and installed dispatch equivalence remain open.
+  actual private reply production remains open.
+- Installed IOKit dispatch-queue callout, dispatcher, async wrappers and generated
+  `io_connect_async_method` stub compared with pinned source/IDL:
+  [installed dispatch](iokit-async-dispatch.md). All compared offsets, limits,
+  constants and argument orders match. The callouts do not set up arguments the
+  dispatcher ignores. The stub enforces client-only count limits and writes reply
+  scalar counts into a shared static used for `NULL` output counts. The IOAccel
+  registration leaves reference slot 0 unwritten and treats a zero wake port as
+  a fatal assertion. The dispatcher enforces no argument minimum or maximum; the
+  producer must supply the consumer's seven words.
 
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
@@ -72,27 +81,31 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: compare installed IOKit async dispatch and wrappers
+## Next task: trace IOAcceleratorFamily2 queue reply production
 
 Continue read-only graphics-contract work before driver bring-up:
 
-1. Read the [async-reply study](xnu-async-replies.md) and reuse saved queue/callback
-   evidence. Use the unchanged public metadata child and current-launch,
-   bounded own-child instruction inspection under a new ignored directory.
-2. Locate installed `IODispatchCalloutFromMessage`, its CF-message dispatcher,
-   `IOConnectCallAsyncMethod` and relevant async wrapper/trampoline. Compare
-   header offsets, size/count/arity checks and wrapper arguments with the
-   pinned IOKitUser source and SDK. Preserve unavailable symbols and differences.
-3. Produce an attributed source/runtime comparison and reproduction. Do not
-   invoke callbacks, send messages, open experimental clients, create mappings
-   or queues, exercise teardown or submit work on the working GPU.
+1. Read the [installed dispatch comparison](iokit-async-dispatch.md) and the
+   [async-reply study](xnu-async-replies.md); reuse the saved consumer, producer
+   and dispatch evidence. Use a new ignored output directory.
+2. Locate `com.apple.iokit.IOAcceleratorFamily2` inside the world-readable kernel
+   collections with read-only file inspection tools. Its bundle on disk holds
+   metadata only. Record tool versions, failures and symbol availability; stripped
+   symbols are unavailable, not absent code. Use no tool mode that builds, loads,
+   installs or rewrites collections or extensions.
+3. Map the command queue's async-reference storage and `sendAsyncResult64`-family
+   send sites. For each, record the argument count, the words written at the
+   consumer's offsets 0/16/32/48, sends per submitted entry and the
+   error/cancellation/teardown paths. Also map `releaseAsyncReference64` sites.
+   Compare with the generic sender, the observed consumer and the gates. No kernel
+   debugging, messages, callbacks, connections or GPU work.
 
-Success means a static comparison of the installed user-space dispatch/wrapper
-paths with source expectations, with unsupported assumptions corrected. It does
-not establish the private kernel producer, message validity, acceptance,
-exactly-once delivery, ordering, cancellation or GPU completion. Installed mapping
-reclamation, vendor/indirect alias access, cross-thread reuse and complete commit
-dispatch remain separate open interfaces.
+Success means an attributed static map from family send sites to consumer
+expectations, or a documented limit if the fileset or symbols are unavailable.
+It does not establish runtime delivery, ordering, cancellation, drain or GPU
+completion. Installed mapping reclamation, vendor/indirect alias access,
+cross-thread reuse, kernel MIG server validation, libdispatch receive handling
+and complete commit dispatch remain separate open interfaces.
 
 Parallel areas of future investigation, when relevant: primary vendor admission
 contracts, offline firmware provenance/header validation and shader target
@@ -119,6 +132,8 @@ Saved evidence on this workspace is ignored and contains sensitive/raw details:
 | `out/xnu-mapping-reproduced/` | Fresh documented collection: 25 captured downloads and 21 verified source/header/license files |
 | `out/xnu-async-replies/` | OS/kernel/SDK queries, offline layout build and bounded fixture checks, supplementary source reads, preserved lookup/web failures and verification index |
 | `out/xnu-async-sources/`, `out/xnu-async-reproduced/` | Initial and final pinned source collection; final collector captured 28 downloads and verified 24 source/header/license files |
+| `out/iokit-async-dispatch/` | OS/kernel/SDK queries, probe build, IOKit symbol lookups, readable and normalized disassembly, layout build, IDL routine IDs, checker and mutation results, preserved inspection-code failures, kernel-collection availability and verification index |
+| `out/iokit-async-reproduced/` | Fresh documented reproduction from extracted document code: separate launch, identical normalized instructions, 16 comparison groups, nine rejected mutations |
 | `out/discovery-progress.md` | Local execution ledger; supplementary to this tracked handoff |
 
 A fresh clone will not contain `out/`. Tracked documents supply reproduction
@@ -133,23 +148,25 @@ manual private invocation or independent-driver proof.
 
 ## Verification record and commands
 
-The async continuation ran all 13 existing tests successfully and reproduced
-the documented source collector: 28 downloads and 24 source/header/license files,
-verified against both pinned commit trees with Git blob hashes and SHA-256.
-The documented layout probe built with warnings as errors and reproduced the
-64-bit body geometry. The bounded reader passed 17 count/layout cases and two
-sufficient field fixtures, rejected five incomplete/excess fixtures and modeled
-LP64 unsigned underflow, cross-checked by the compiler, without invoking Apple's
-dispatcher. Source/inspection-code digests, borrowed evidence, 124 relative
-README/docs links and whitespace were checked. Fresh OS/kernel queries retain
-the source/runtime version mismatch. Lookup/web-reader failures are preserved;
-primary collection succeeded.
-No new LLDB session, mappings, experimental clients or teardown operations were
-performed. These checks verify collection and offline reasoning, not installed
-dispatch, kernel cleanup, callback delivery or GPU functionality. Detailed records
-remain in the local execution ledger and experiment index. Independent review
-verified the LP64 arithmetic correction and corrected flag-definition citation,
-with no remaining findings. Verify new changes before claiming they pass.
+The installed-dispatch continuation ran all 13 existing tests successfully. It
+rebuilt the unchanged public metadata child and stopped it at `probe.m:48` under
+LLDB in separate launches. Nine IOKit functions and two statics resolved, and
+eleven functions were normalized without runtime addresses. A layout probe built
+with warnings as errors from SDK Mach headers and the pinned notification header.
+IDL counting gave message IDs 2866/2966. The offline checker passed 16 comparison
+groups, including 208,192 count-arithmetic samples. Nine controlled mutations
+were each rejected by the intended check: message ID, reference bound, receive
+size, request ID, an injected argument maximum, a content-size read, a slot-0
+write, the caller's wake-port assertion and a missing dump. The documented code
+was extracted from the tracked study, verified byte-identical to the executed
+code and reproduced in a fresh directory, with identical normalized instructions
+across launches. Inspection-code defects (bit-field `offsetof`, a misaligned
+format edit, padding classification and a same-file copy) are preserved and
+corrected. No callbacks, messages, experimental clients, mappings, queues or GPU
+work were created. These checks verify a user-space code comparison, not kernel
+reply production, delivery or GPU functionality. Detailed records remain in the
+local execution ledger and experiment index. Verify new changes before claiming
+they pass.
 
 ```sh
 python3 -m unittest discover -s tests -v

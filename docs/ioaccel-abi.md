@@ -107,7 +107,7 @@ unavailable unless explicitly stated.
 | Shared / `IOAccelSharedAllocateFenceMemory` | 12, struct call | 8-byte structure containing forwarded argument | 8 bytes; exact allocation/result semantics unknown |
 | Shared / `IOAccelSharedCreateDeviceShmem` | 7, `IOConnectCallMethod` | One scalar, no structure | 16-byte structure; virtual address (64-bit), size and ID (32-bit each) inferred from named consumers; version/protection/ownership incomplete |
 | Shared / `IOAccelSharedDestroyDeviceShmem` | 8, scalar call | One scalar | None; associated allocation/lifetime rules incomplete |
-| Queue / async callback registration during creation | 0, `IOConnectCallAsyncScalarMethod` | Wake port, reference count 3, no scalar payload | No scalar output; callback/refcon slots and partial consumer recorded in the lifecycle study |
+| Queue / async callback registration during creation | 0, `IOConnectCallAsyncScalarMethod` | Wake port, reference count 3, no scalar payload | `NULL` output count: IOKit substitutes a shared zero capacity and stores the reply's scalar count back into it ([installed dispatch](iokit-async-dispatch.md)); callback/refcon slots and partial consumer recorded in the lifecycle study |
 | Queue / creation process-information call | 5, struct call | 1028 bytes | 8-byte initial output capacity; not a command-buffer format |
 | Queue / `IOAccelCommandQueueSubmitCommandBuffers` | 1, `IOConnectCallMethod` | No scalar input; structure size `8 + 24*n` on the positive-count path; `n` read from header offset 4 | No output; Metal producer writes two 32-bit shmem IDs and two copied block pointers per entry; complete format, handle validation, synchronization and kernel bounds checks unknown |
 

@@ -104,8 +104,12 @@ task-port owners, explicit unmap, close/no-senders and task VM removal in pinned
 XNU source. The host reports a different XNU revision; installed family cleanup
 and backing/GPU ownership remain unverified. The [async-reply study](xnu-async-replies.md)
 then traces generic message packing, port ownership, send limits and dispatch
-arity. Its offline layout/field fixtures are not live reply evidence. Installed
-IOKit dispatch/wrapper comparison is the next focused read-only task. Separate future
+arity. Its offline layout/field fixtures are not live reply evidence. The
+[installed dispatch comparison](iokit-async-dispatch.md) finds the IOKit receive
+path, wrappers and generated client stub consistent with that source and IDL.
+It adds client-only count checks and a shared output-count hazard. Static
+inspection of IOAcceleratorFamily2 reply production is the next focused read-only
+task. Separate future
 studies include primary vendor
 admission-contract evidence and offline firmware
 provenance/header and compiler-target work. Kernel validation, negotiation,

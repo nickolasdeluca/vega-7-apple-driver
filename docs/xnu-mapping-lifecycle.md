@@ -300,8 +300,9 @@ No mappings or teardown paths were dynamically exercised.
 
 The [async-reply study](xnu-async-replies.md) now records generic message packing,
 port acquisition/release and send/dispatch limits, compared with the saved
-consumer. Actual private production/cardinality remains unavailable. Installed
-IOKit dispatch/wrapper comparison is next. No manual callbacks, experimental
+consumer. Actual private production/cardinality remains unavailable. The
+[installed dispatch comparison](iokit-async-dispatch.md) matches the user-space
+side; IOAcceleratorFamily2 reply production is next. No manual callbacks, experimental
 client opens or GPU requests are authorized.
 
 Future dynamic work requires an experimental environment and recovery path

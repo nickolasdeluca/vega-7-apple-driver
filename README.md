@@ -79,4 +79,5 @@ it is skipped elsewhere. Host observations require independent system queries.
 - [IOAccel callback aliases and storage reuse](docs/ioaccel-buffer-reuse.md)
 - [Generic XNU mapping and user-client teardown](docs/xnu-mapping-lifecycle.md)
 - [Generic async replies and wake-port ownership](docs/xnu-async-replies.md)
+- [Installed IOKit async dispatch and wrappers](docs/iokit-async-dispatch.md)
 - [Milestones and discovery decisions](docs/discovery-plan.md)
