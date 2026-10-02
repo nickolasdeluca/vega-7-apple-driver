@@ -69,8 +69,11 @@ remain unresolved. No private candidate methods were called.
 
 The [offline target manifest](cezanne-target-manifest.md) traces `1638` to the
 Green Sardine APU flag and records conditional IP dispatch/firmware selection.
-Actual host IP revisions and firmware artifact versions/digests remain unavailable.
-No firmware was acquired or loaded.
+Actual host IP revisions remain unavailable. The
+[firmware provenance study](firmware-provenance.md) pins the candidate images to
+linux-firmware `20260916`, verifies them over two routes, records license
+constraints and validates their documented headers with a tested bounded parser.
+No firmware was loaded or interpreted beyond its headers.
 
 The [admission study](metal-admission.md) subsequently establishes ordered resolver
 roots, class precedence and the `_MTLDevice` check, records a public-enumeration
@@ -111,8 +114,7 @@ It adds client-only count checks and a shared output-count hazard. Static
 inspection of IOAcceleratorFamily2 reply production is the next focused read-only
 task. Separate future
 studies include primary vendor
-admission-contract evidence and offline firmware
-provenance/header and compiler-target work. Kernel validation, negotiation,
+admission-contract evidence and offline compiler-target work. Kernel validation, negotiation,
 complete ownership/ordering and actual independent bundle admission remain open.
 Synthetic independent discovery remains gated on an experimental environment
 and recovery path. If the required Metal integration interface cannot be established,

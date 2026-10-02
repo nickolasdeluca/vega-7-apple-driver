@@ -82,10 +82,13 @@ MODULE_FIRMWARE declarations alone do not prove a file is mandatory for every
 device. This is not a complete boot image set: PSP system/secure-OS boot state,
 SMU residency and optional payloads remain unresolved.
 
-No firmware bytes were downloaded, extracted, tracked or loaded. For every
-candidate, artifact provenance, license, size, digest, header/feature versions,
-payload bounds and signature acceptance remain **unavailable**. Do not fill
-those fields from source filenames. Hash validation and host-side header checks
+This study downloaded no firmware. The later
+[provenance study](firmware-provenance.md) pins linux-firmware `20260916` and
+records the license, size, SHA-256 and documented header/feature versions and
+payload bounds for each candidate. It adds `green_sardine_dmcub.bin`, which display
+selects only through a hardware-revision rule. Signature acceptance and the host's
+actual IP versions remain **unavailable**; do not fill them from file headers or
+source filenames. Hash validation and host-side header checks
 do not substitute for security-processor acceptance of signed images.
 
 Before acquisition/use, record an exact AMD firmware source revision and license
@@ -116,7 +119,7 @@ material, not incorporated driver code. Review per-file licensing before reuse.
 
 | Next experiment | Scope | Success criterion |
 | --- | --- | --- |
-| Firmware provenance/header specification | Offline, read-only reference and license study | Exact release/license for each needed image; bounded parser design and required/optional decisions; no invented target firmware version |
+| Firmware provenance/header specification | Done: [provenance study](firmware-provenance.md) | Exact release/license for each image, bounded parser and required/optional decisions recorded |
 | Compiler target mapping | Offline primary-source study | Establish Cezanne-to-compiler mapping independently of a product string; verify emitted ISA/resource metadata before selecting `gfx90c` |
 | Target IP validation | Deferred to experimental boot | Checked discovery/IP identity and instance counts agree with selected handlers; unsupported versions stop initialization |
 | Firmware and copy/fence | Deferred to own PCI ownership and recovery | Signed image acceptance, bounded rejection behavior, guarded byte-for-byte DMA copy and reliable fence/interrupt completion |

@@ -6,8 +6,8 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current research checkpoint: installed IOKit async dispatch and wrappers, 2026-10-02,
-on branch `cezanne-discovery`, extending `7f4f0c0`. This handoff is committed
+Current research checkpoint: Green Sardine firmware provenance and header
+validation, 2026-10-02, on branch `cezanne-discovery`, extending `4a12148`. This handoff is committed
 with the continuation; check Git history for its commit rather than assuming a
 recorded hash is HEAD.
 The project remains in **read-only discovery and specification**. No independent
@@ -75,13 +75,42 @@ Completed work:
   a fatal assertion. The dispatcher enforces no argument minimum or maximum; the
   producer must supply the consumer's seven words.
 
+- Green Sardine firmware candidates pinned to linux-firmware `20260916`
+  (`ab23307…`), verified over kernel.org downloads and GitLab mirror blob IDs,
+  with license constraints and a tested bounded header parser,
+  `tools/amdgpu_firmware.py`: [firmware provenance](firmware-provenance.md). All
+  eleven images pass; MEC2 is byte-identical to MEC and unused for GC 9.3.0.
+  Display firmware choice depends on a hardware revision below `0x5E`. AMD's
+  license allows binary-only redistribution with notices and forbids reverse
+  engineering or disassembly, so payloads stay opaque and untracked. Signature
+  acceptance and host IP versions remain unverified.
+
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
 concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: trace IOAcceleratorFamily2 queue reply production
+## Next task: qualify the shader compiler target
+
+Continue offline work before driver bring-up:
+
+1. Read the [hardware map](cezanne-hardware.md), [target manifest](cezanne-target-manifest.md),
+   [firmware provenance](firmware-provenance.md) and the shader row of the
+   [graphics contract](graphics-contract.md). Use a new ignored output directory.
+2. Using pinned primary sources (LLVM AMDGPU processor tables and documentation,
+   Linux v6.12 GC 9.3.0 code), establish how a GC 9.3.0 / Green Sardine identity
+   maps to an LLVM processor, independently of product names. Record the evidence
+   for and against `gfx90c`, including feature flags (XNACK, SRAM ECC, wave size).
+3. Compile one fixed, trivial kernel offline with a locally available LLVM, if
+   one targets AMDGPU; otherwise record that as unavailable. Record inputs, the
+   emitted ISA and code-object metadata, and errors. Do not dispatch anything.
+
+Success means a sourced target decision or an explicit list of what blocks one,
+plus reproducible compiler evidence. Compiling a kernel does not show that the
+hardware runs it, and an LLVM target does not supply a Metal backend.
+
+## Parked task: trace IOAcceleratorFamily2 queue reply production
 
 Continue read-only graphics-contract work before driver bring-up:
 
@@ -116,8 +145,7 @@ cross-thread reuse, kernel MIG server validation, libdispatch receive handling
 and complete commit dispatch remain separate open interfaces.
 
 Parallel areas of future investigation, when relevant: primary vendor admission
-contracts, offline firmware provenance/header validation and shader target
-qualification. Keep those separate from a focused lifecycle batch. Driver
+contracts and the PSP/ASD/TA service questions in the firmware study. Keep those separate from a focused lifecycle batch. Driver
 installation/loading, PCI ownership, register writes or GPU takeover require an
 explicitly available experimental environment and recovery path; this handoff
 does not authorize them.
@@ -141,6 +169,8 @@ Saved evidence on this workspace is ignored and contains sensitive/raw details:
 | `out/xnu-async-replies/` | OS/kernel/SDK queries, offline layout build and bounded fixture checks, supplementary source reads, preserved lookup/web failures and verification index |
 | `out/xnu-async-sources/`, `out/xnu-async-reproduced/` | Initial and final pinned source collection; final collector captured 28 downloads and verified 24 source/header/license files |
 | `out/iokit-async-dispatch/` | OS/kernel/SDK queries, probe build, IOKit symbol lookups, readable and normalized disassembly, layout build, IDL routine IDs, checker and mutation results, preserved inspection-code failures, kernel-collection availability and verification index |
+| `out/firmware-provenance/` | Pinned firmware, `WHENCE`, license, Linux v6.12 sources, GitLab partial clone, artifact index, parser output, tool mutation check, test run and preserved failures; firmware is never tracked |
+| `out/firmware-provenance-reproduced/` | Fresh run of the documented download, blob verification and parser commands |
 | `out/iokit-async-reproduced/` | Fresh documented reproduction from extracted document code: separate launch, identical normalized instructions, 16 comparison groups, nine rejected mutations |
 | `out/discovery-progress.md` | Local execution ledger; supplementary to this tracked handoff |
 
@@ -156,25 +186,18 @@ manual private invocation or independent-driver proof.
 
 ## Verification record and commands
 
-The installed-dispatch continuation ran all 13 existing tests successfully. It
-rebuilt the unchanged public metadata child and stopped it at `probe.m:48` under
-LLDB in separate launches. Nine IOKit functions and two statics resolved, and
-eleven functions were normalized without runtime addresses. A layout probe built
-with warnings as errors from SDK Mach headers and the pinned notification header.
-IDL counting gave message IDs 2866/2966. The offline checker passed 16 comparison
-groups, including 208,192 count-arithmetic samples. Nine controlled mutations
-were each rejected by the intended check: message ID, reference bound, receive
-size, request ID, an injected argument maximum, a content-size read, a slot-0
-write, the caller's wake-port assertion and a missing dump. The documented code
-was extracted from the tracked study, verified byte-identical to the executed
-code and reproduced in a fresh directory, with identical normalized instructions
-across launches. Inspection-code defects (bit-field `offsetof`, a misaligned
-format edit, padding classification and a same-file copy) are preserved and
-corrected. No callbacks, messages, experimental clients, mappings, queues or GPU
-work were created. These checks verify a user-space code comparison, not kernel
-reply production, delivery or GPU functionality. Detailed records remain in the
-local execution ledger and experiment index. Verify new changes before claiming
-they pass.
+The firmware continuation ran all 26 tests successfully: 13 existing and 13 new
+synthetic-fixture parser tests. All 13 pinned files matched across the kernel.org
+download and GitLab mirror blob IDs, and the parser accepted all 11 images.
+Disabling any of ten parser rules in a scratch copy made the tests fail. The
+documented download, verification and parser commands were rerun into a fresh
+directory with identical results. Preserved failures: the license's moved path
+(HTTP 404), a kernel.org partial-fetch timeout, an equivalent mutant and a
+documented `ls-tree` glob that matched literally. No firmware was loaded, sent
+to the GPU or interpreted beyond its documented headers. Detailed records remain
+in the local execution ledger. The previous installed-dispatch verification is
+recorded in [its study](iokit-async-dispatch.md). Verify new changes before
+claiming they pass.
 
 ```sh
 python3 -m unittest discover -s tests -v

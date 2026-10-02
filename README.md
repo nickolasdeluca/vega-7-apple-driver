@@ -51,6 +51,20 @@ driver internally. Exit 2 means no device was returned; inspect stderr and
 execution restrictions before interpreting that result. The working stack is
 an observation reference; its AMD binaries are excluded from the finished stack.
 
+## Check firmware headers
+
+```sh
+python3 tools/amdgpu_firmware.py path/to/green_sardine_*.bin
+```
+
+This reads AMD GPU microcode files and validates only the header fields Linux
+v6.12 defines, plus the byte ranges its consumers use. Payloads are not decoded:
+AMD's license forbids reverse engineering, decompiling or disassembling them.
+Nothing is loaded or sent to hardware. Exit 0 means every file was accepted; 2
+means at least one was rejected (see its `error`); 1 means a file could not be
+read. Keep firmware under ignored `out/`; see
+[firmware provenance](docs/firmware-provenance.md) for the pinned release.
+
 ## Verify
 
 ```sh
@@ -68,6 +82,7 @@ it is skipped elsewhere. Host observations require independent system queries.
 - [Hardware baseline](docs/hardware-baseline.md)
 - [Cezanne hardware blocks](docs/cezanne-hardware.md)
 - [Target IP and firmware selection manifest](docs/cezanne-target-manifest.md)
+- [Green Sardine firmware provenance and header validation](docs/firmware-provenance.md)
 - [Tahoe graphics contracts and experiments](docs/graphics-contract.md)
 - [Metal loader and factory investigation](docs/metal-loader-study.md)
 - [Metal bundle admission and construction](docs/metal-admission.md)
