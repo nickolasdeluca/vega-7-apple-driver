@@ -36,6 +36,10 @@ REMOVED_KEXTS = {
     "NootedRed.kext": "drives the Cezanne iGPU through Apple's AMD kexts",
     "SMCRadeonSensors.kext": "reads AMD GPU sensor registers itself",
 }
+# Misc.Debug.Target bit that writes opencore-*.txt to the boot volume. On a
+# USB 2.0 stick every flush takes ~0.7 s: the first stage 0 boot took 51 s to
+# reach the filesystem scan, with a blank screen. On-screen logging stays.
+FILE_LOG_BIT = 0x40
 DRIVER_BUNDLE = "CezanneGPU.kext"
 DRIVER_ENTRY = {
     "Arch": "x86_64",
@@ -49,7 +53,7 @@ DRIVER_ENTRY = {
 }
 # The only config values the test EFI may change.
 EXPECTED_CHANGES = {"Kernel.Add", "NVRAM.Add.%s.boot-args" % APPLE_BOOT_GUID,
-                    "Misc.Security.AllowSetDefault"}
+                    "Misc.Security.AllowSetDefault", "Misc.Debug.Target"}
 IGNORED_NAMES = (".DS_Store",)
 
 
@@ -134,6 +138,11 @@ def derive(config, kexts_dir, stage):
     test["Kernel"]["Add"] = kept + [dict(DRIVER_ENTRY)]
     test["NVRAM"]["Add"].setdefault(APPLE_BOOT_GUID, {})["boot-args"] = args
     test["Misc"]["Security"]["AllowSetDefault"] = False
+    target = config["Misc"].get("Debug", {}).get("Target")
+    if not isinstance(target, int) or not target & FILE_LOG_BIT:
+        raise Rejected("known-good Misc.Debug.Target %r has no file logging to disable; review "
+                       "FILE_LOG_BIT before building" % (target,))
+    test["Misc"]["Debug"]["Target"] = target & ~FILE_LOG_BIT
     return test, removed_ids
 
 

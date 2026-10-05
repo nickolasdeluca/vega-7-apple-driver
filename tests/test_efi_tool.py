@@ -38,7 +38,8 @@ def config():
         "ACPI": {"Add": []},
         "Kernel": {"Add": [entry("Lilu.kext"), entry("NootedRed.kext"), entry("SMCRadeonSensors.kext"),
                            entry("Other.kext")]},
-        "Misc": {"Boot": {"LauncherOption": "Disabled"}, "Security": {"AllowSetDefault": True}},
+        "Misc": {"Boot": {"LauncherOption": "Disabled"}, "Debug": {"Target": 67},
+                 "Security": {"AllowSetDefault": True}},
         "NVRAM": {"Add": {GUID: {"boot-args": "-NRedRBPlus", "csr-active-config": b"\0\0\0\0"}},
                   "Delete": {GUID: ["boot-args", "csr-active-config"]}},
         "PlatformInfo": {"Generic": {"SystemSerialNumber": "FIXTURE"}},
@@ -96,6 +97,7 @@ class TestEfiTests(unittest.TestCase):
         self.assertEqual(test["NVRAM"]["Add"][GUID]["boot-args"],
                          "-v keepsyms=1 debug=0x100 msgbuf=1048576 cezanne-stage=1")
         self.assertFalse(test["Misc"]["Security"]["AllowSetDefault"])
+        self.assertEqual(test["Misc"]["Debug"]["Target"], 3)  # on-screen only, no log file
         self.assertEqual(test["PlatformInfo"], config()["PlatformInfo"])
         self.assertFalse((self.output / "EFI" / "OC" / "Kexts" / "NootedRed.kext").exists())
         self.assertFalse((self.output / "EFI" / "OC" / "Config.plist.bak-old").exists())
@@ -149,6 +151,12 @@ class TestEfiTests(unittest.TestCase):
         value["Misc"]["Boot"]["LauncherOption"] = "Full"
         self.write_config(value)
         self.assert_rejected("LauncherOption must be Disabled")
+
+    def test_rejects_config_without_file_logging(self):
+        value = config()
+        value["Misc"]["Debug"]["Target"] = 3
+        self.write_config(value)
+        self.assert_rejected("has no file logging to disable")
 
     def test_rejects_config_without_a_gpu_kext_to_remove(self):
         value = config()

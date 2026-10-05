@@ -1,9 +1,10 @@
 # USB test boot
 
-Status, 2026-10-05: stage 0 and stage 1 test EFIs prepared and verified
-offline; **neither has been booted**. They are assembled under ignored
-`out/test-efi/usb-stage0/` and `out/test-efi/usb-stage1/` and wait for a USB
-drive.
+Status, 2026-10-05: the first stage 0 boot did not reach the OpenCore picker
+(see [Test boot log](#test-boot-log)); OpenCore file logging to the USB 2.0
+stick was the cause. The stage 0 and stage 1 test EFIs were rebuilt without
+file logging under ignored `out/test-efi/usb-stage0/` and
+`out/test-efi/usb-stage1/`; the rebuilt stage 0 EFI has not been booted yet.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -52,6 +53,7 @@ rejects the result unless the configurations differ in exactly these values:
 | `Kernel → Add` | includes NootedRed, SMCRadeonSensors | both removed; `CezanneGPU.kext` appended (`MinKernel` 25.0.0, x86_64) | NootedRed drives the iGPU through Apple's AMD kexts; SMCRadeonSensors reads GPU sensor registers itself. Nothing else may touch the GPU. |
 | `NVRAM → Add → 7C436110-…:boot-args` | `-NRedRBPlus` | `-v keepsyms=1 debug=0x100 msgbuf=1048576 cezanne-stage=N` | Verbose boot, symbolized panics, a halt on panic instead of a reboot, a larger kernel log buffer, and the driver's stage |
 | `Misc → Security → AllowSetDefault` | `true` | `false` | The test picker cannot store a new default boot entry in shared NVRAM |
+| `Misc → Debug → Target` | `67` (`0x43`) | `3` | Drops bit `0x40`, the `opencore-*.txt` log file. On the USB 2.0 stick each flush took about 0.7 s, and the first boot spent 51 s logging before the filesystem scan. On-screen logging (warnings and errors) stays. |
 
 Everything else is byte-identical: ACPI tables, quirks, kernel patches, device
 properties, UEFI drivers, OpenCore binaries and `PlatformInfo` (SMBIOS), so
@@ -296,8 +298,7 @@ Any other stage 1 result (for example `not-in-d0` or `memory-decode-disabled`)
 is a valid observation of the device's state and ends that boot's experiment.
 A freeze or panic is a failure: record it as rule 6 requires.
 
-Failure evidence: the OpenCore log `opencore-*.txt` at the root of the USB
-drive, panic reports in `/Library/Logs/DiagnosticReports/*.panic` (read from
+Failure evidence: panic reports in `/Library/Logs/DiagnosticReports/*.panic` (read from
 the known-good boot), and screen photos.
 
 ## Return to the known-good boot
@@ -315,10 +316,37 @@ diskutil unmount /Volumes/EFI
 ignoring the config backups the test EFI does not copy. Both manifests record
 the same known-good hashes.
 
+## Test boot log
+
+**Boot 1, 2026-10-05, stage 0** (manifest built 2026-10-05T14:07:34Z, with file
+logging; kept as `out/test-efi/superseded-filelog-usb-stage0/`).
+
+- Firmware boot menu showed two USB partitions. Partition 1 failed; partition 2
+  started OpenCore.
+- About 10–20 s of no visible progress, then a black screen. No picker appeared
+  within about a minute; the user forced a power-off.
+- The OpenCore log (copied to ignored `out/test-efi/boot-1-stage0/`; it holds
+  SMBIOS values) has 304 lines over 51 s and ends at `OCB: Found 12 potentially
+  bootable filesystems`, before the picker. Typical lines took 27 ms and 55
+  lines took about 0.7 s each: file-log flushes to the USB 2.0 stick. No
+  OpenCore error preceded the stop. macOS was never chosen, so the driver
+  never loaded.
+- The next power-on was slow and the firmware no longer listed the stick;
+  macOS did not see it on USB either until it was unplugged and reinserted.
+  Its EFI then still matched the manifest. Cutting power during a file write
+  likely left the stick unresponsive; this is not confirmed.
+- Change: file logging removed from the test EFI (see
+  [What the test EFI changes](#what-the-test-efi-changes)). If a later boot
+  stops before the picker again, a build with file logging is the diagnostic,
+  preferably on a faster USB 3 stick and with several minutes' wait.
+
 ## Unknowns and limits
 
-- Untested: whether the firmware lists and boots the USB FAT32 partition, the
-  display state without NootedRed, the kext's acceptance, where the driver's
+- The firmware lists both partitions `eraseDisk … GPT` creates. Partition 1 is
+  the empty EFI system partition and fails; partition 2 (`CZTEST`) starts
+  OpenCore.
+- Untested: whether the OpenCore picker appears from USB without file logging,
+  the display state without NootedRed, the kext's acceptance, where the driver's
   `IOLog` lines appear in the unified log, and the device's power and decoding
   state when no driver has initialized it.
 - The preparation checks prove the configs and files differ only as intended
