@@ -133,17 +133,15 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: choose the next driver stage
+## Next task: stage 5 USB test boot
 
 Stages 0–4 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-The measured IP inventory, GC layout (7 of 8 CUs, 2 RBs) and the
-`GB_ADDR_CONFIG` trace are in the
-[target manifest](cezanne-target-manifest.md#measured-ip-inventory-stage-2-test-boot-2026-10-05).
-At stage 4, `sudo cezanne-diag` re-reads every allowlisted register from the
-running system. Read-only access is exhausted for the current allowlist: the
-next candidates are more read-only registers (each still needs a reviewed
-allowlist change and a boot) and the first reviewed register write. Neither
-is authorized; each needs a test-boot.md update and the user's approval.
+Stage 5 adds 38 read-only power, clock-gating, engine and memory-hub registers
+to the diagnostic interface to prepare the first reviewed write; it is
+authorized and built under `out/test-efi/usb-stage5/`. Follow
+[test-boot.md](test-boot.md#stage-5-power-clock-and-engine-state), run
+`sudo out/diag/cezanne-diag --repeat 3 | tee …` and record the values. Then
+write the first-write proposal from them; the write itself is not authorized.
 
 ## Offline task while waiting: Metal shader frontend boundary
 

@@ -6,8 +6,9 @@ the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
 discovery table from the carveout without writes. Stage 3 read the GC
 configuration: 7 of 8 CUs and both RBs active. Stage 4's root-only, read-only
-diagnostic interface re-read every register from the running system. No later
-stage is authorized.
+diagnostic interface re-read every register from the running system. Stage 5
+(38 more read-only registers through the diagnostic interface) is authorized
+and built under ignored `out/test-efi/usb-stage5/`; it has not been booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -45,6 +46,10 @@ off restores the known-good boot. This is the experimental environment
    - **Stage 4** (authorized by the user on 2026-10-05): stage 3 plus a
      root-only diagnostic interface that re-reads stage 3 registers on
      request, described [below](#stage-4-diagnostic-interface). Still no write.
+   - **Stage 5** (authorized by the user on 2026-10-05): stage 4 plus 38
+     read-only power, clock-gating, engine and memory-hub registers, read only
+     through the diagnostic interface, described
+     [below](#stage-5-power-clock-and-engine-state). Still no write.
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -357,6 +362,97 @@ Expected stage 4 values: the boot-time results as in boot 5, `CezanneGPU
 diagnostics` `true`, and `sudo cezanne-diag` reading the same values (with
 `GRBM_STATUS` possibly varying).
 
+### Stage 5: power, clock and engine state
+
+Prepares the first reviewed write by recording what the firmware left running.
+The boot does exactly what stage 4 does; the 38 new registers are read **only
+on demand** through `cezanne-diag`, never during boot. The tool prints and
+flushes each register's name before reading it, so if a read ever hangs the
+machine, the last line on screen names the register.
+
+Clock frequencies are not among them: on Renoir, Linux gets clocks from the
+SMU's metrics table, which takes SMU messages (register writes). Stage 5 reads
+the clock-gating and power-gating state instead, from the same registers
+Linux's `get_clockgating_state` functions read.
+
+Each register is read by Linux v6.12 as noted. Offsets come from the
+`asic_reg` headers that the Linux block includes (`smuio_12_0_0`, `mp_12_0_0`,
+`gc_9_0`, `sdma0_4_0`/`4_2` (equal), `hdp_4_0`, `athub_1_0`, `mmhub_1_0`,
+`osssys_4_0`). The block bases are the ones measured in this host's discovery
+table at stage 2, and each equals `renoir_ip_offset.h`. All lie inside BAR5.
+
+| Register | BAR5 byte offset | Linux v6.12 use |
+| --- | --- | --- |
+| `SMUIO_GFX_MISC_CNTL` | `0x5a320` | smu_v12_0_get_gfxoff_status: PWR_GFXOFF_STATUS 2:1, 2 = GFX on |
+| `MP1_SMN_C2PMSG_66` | `0x58a08` | renoir_ppt SMU message register |
+| `MP1_SMN_C2PMSG_82` | `0x58a48` | renoir_ppt SMU argument register |
+| `MP1_SMN_C2PMSG_90` | `0x58a68` | renoir_ppt SMU response register |
+| `MP0_SMN_C2PMSG_35` | `0x5818c` | psp_v12_0: bootloader ready, bit 31 |
+| `MP0_SMN_C2PMSG_81` | `0x58244` | psp_v12_0: secure OS sign of life |
+| `RLC_CGTT_MGCG_OVERRIDE` | `0x3b120` | gfx_v9_0_get_clockgating_state (GFX-gated) |
+| `RLC_CGCG_CGLS_CTRL` | `0x3b124` | gfx_v9_0_get_clockgating_state (GFX-gated) |
+| `RLC_CGCG_CGLS_CTRL_3D` | `0x3b314` | gfx_v9_0_get_clockgating_state (GFX-gated) |
+| `RLC_MEM_SLP_CNTL` | `0x3b018` | gfx_v9_0_get_clockgating_state (GFX-gated) |
+| `CP_MEM_SLP_CNTL` | `0x0c1e4` | gfx_v9_0_get_clockgating_state (GFX-gated) |
+| `RLC_PG_CNTL` | `0x3b10c` | gfx_v9_0 power gating (read-modify-write) (GFX-gated) |
+| `GRBM_STATUS2` | `0x08008` | gc_reg_list_9 (IP dump) (GFX-gated) |
+| `GRBM_STATUS_SE0` | `0x08014` | gc_reg_list_9 (IP dump) (GFX-gated) |
+| `CP_BUSY_STAT` | `0x0867c` | gc_reg_list_9 (IP dump) (GFX-gated) |
+| `CP_CPF_STATUS` | `0x0821c` | gc_reg_list_9 (IP dump) (GFX-gated) |
+| `CP_ME_CNTL` | `0x086d8` | gfx_v9_0_cp_gfx_enable (read-modify-write) (GFX-gated) |
+| `CP_MEC_CNTL` | `0x08234` | gc_reg_list_9 (IP dump) (GFX-gated) |
+| `RLC_CNTL` | `0x3b000` | gfx_v9_0 RLC state read (GFX-gated) |
+| `RLC_STAT` | `0x3b010` | gc_reg_list_9 (IP dump) (GFX-gated) |
+| `CP_PFP_INSTR_PNTR` | `0x08694` | gc_reg_list_9 (IP dump) (GFX-gated) |
+| `CP_ME_INSTR_PNTR` | `0x08698` | gc_reg_list_9 (IP dump) (GFX-gated) |
+| `CP_MEC1_INSTR_PNTR` | `0x086a0` | gc_reg_list_9 (IP dump) (GFX-gated) |
+| `SDMA0_CLK_CTRL` | `0x049ec` | sdma_v4_0_get_clockgating_state |
+| `SDMA0_POWER_CNTL` | `0x049e8` | sdma_v4_0_get_clockgating_state |
+| `SDMA0_F32_CNTL` | `0x04a28` | sdma_v4_0: engine halt state |
+| `SDMA0_STATUS_REG` | `0x04a14` | sdma_v4_0 idle checks |
+| `SDMA0_GFX_RB_CNTL` | `0x04b80` | sdma_v4_0 ring enable |
+| `HDP_MEM_POWER_LS` | `0x03fd0` | hdp_v4_0_get_clockgating_state |
+| `ATHUB_MISC_CNTL` | `0x030a8` | athub_v1_0_get_clockgating |
+| `ATC_L2_MISC_CG` | `0x69928` | mmhub_v1_0_get_clockgating |
+| `DAGB0_CNTL_MISC2` | `0x6818c` | mmhub_v1_0_get_clockgating |
+| `MC_VM_FB_LOCATION_BASE (MMHUB)` | `0x6a0b0` | mmhub_v1_0_get_fb_location |
+| `MC_VM_FB_LOCATION_TOP (MMHUB)` | `0x6a0b4` | mmhub_v1_0_get_fb_location |
+| `VM_L2_CNTL (MMHUB)` | `0x69a00` | mmhub_v1_0 cache setup (read-modify-write) |
+| `VM_CONTEXT0_CNTL (MMHUB)` | `0x69b00` | mmhub_v1_0 (read-modify-write) |
+| `MC_VM_MX_L1_TLB_CNTL (MMHUB)` | `0x6a0cc` | mmhub_v1_0 (read-modify-write) |
+| `IH_RB_CNTL` | `0x04480` | vega10_ih ring control |
+
+**GFX-gated registers.** Linux disables GFXOFF before its GC IP dump. Stage 5
+cannot send that SMU message, so for each GC register the driver first reads
+`SMUIO_GFX_MISC_CNTL` and reads the register only if `PWR_GFXOFF_STATUS` is
+2 (GFX on); otherwise it returns `gfx-not-on`. The stage 1–3 GC registers
+were read at boot without this gate and returned plausible values.
+
+**What the values answer before a write:** the GFXOFF state and the SMU
+mailbox (whether something already talked to the SMU, and its last response);
+whether the PSP's secure OS is running (`C2PMSG_81`), which decides how
+firmware gets loaded; which clock and power gating features the firmware
+enabled; whether the CP, RLC, SDMA and IH engines are halted or have rings
+enabled; and how the firmware configured the memory hub's framebuffer
+location, L2 and context 0.
+
+Guards, tested offline: the stage 5 registers are refused at stage 4 and
+below; the stage 3 list is a prefix of the stage 5 list; every offset is
+aligned, unique and inside BAR5; a GFX-gated read consults SMUIO first and is
+refused unless the status is 2; an ungated read does not consult it. Two more
+weakened cores (the GFX gate, stage 4/5 gating) must fail the suite. The tool
+names every stage 5 register in list order.
+
+Expected stage 5 values: stages 1–4 as in boot 6. `PWR_GFXOFF_STATUS` 2
+(nothing enabled GFXOFF). For the others there is no prediction beyond
+"engines idle": `GRBM_STATUS` has been idle in every boot.
+
+Stage 5 risks: each register is a status or control register Linux reads; none
+is a data port, FIFO or counter that clears on read (`HDP_EDC_CNT` and indexed
+`*_DATA` registers were deliberately left out). A read that hangs would freeze
+the machine with that register's name on screen; power off and boot the
+known-good EFI. Nothing is written.
+
 Stage 4 risks: it adds a kernel entry point. It is limited to root and to the
 reads stages 1–3 already made, but a defect in the user client could panic
 the kernel. Reads happen while the system runs, still with no graphics
@@ -374,7 +470,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4; do
+for stage in 0 1 2 3 4 5; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -481,6 +577,11 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 5 succeeds when the stage 4 conditions hold with `CezanneGPU stage` 5
+and `sudo cezanne-diag --repeat 3` prints all 48 registers. Statuses other
+than `ok` (for example `gfx-not-on`) are observations to record, not failures.
+Save the output with `tee` in an ignored directory.
 
 Stage 4 succeeds when the stage 3 conditions hold with `CezanneGPU stage` 4,
 `CezanneGPU diagnostics` is `true`, and `sudo cezanne-diag --repeat 3` (built

@@ -37,7 +37,8 @@ Experimental booting is available only through the USB test EFI in
   [docs/test-boot.md](docs/test-boot.md) (currently stage 0, passive;
   stage 1, read-only device access; stage 2, a write-free read of the IP
   discovery table from the carveout; stage 3, read-only GC configuration
-  registers; and stage 4, a root-only, read-only diagnostic interface). Advancing
+  registers; stage 4, a root-only, read-only diagnostic interface; and stage
+  5, 38 more read-only state registers through that interface). Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS
   volume, or load it with `kmutil`. The user performs disk, EFI and reboot steps.
