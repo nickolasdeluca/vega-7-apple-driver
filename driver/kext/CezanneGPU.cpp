@@ -35,9 +35,10 @@
 //   Stage 8: on request, after the same mailbox check, send DisallowGfxOff
 //            and wait for SMUIO to report GFX on, as Linux does.
 //   Stage 9: on request, in three ordered steps, check one fixed carveout
-//            page is unused, give the SMU its GPU address and ask it to write
-//            its metrics table there, then read the page back through a
-//            read-only mapping and verify only the table changed.
+//            page is not being written (two reads ~1 s apart) and snapshot
+//            it, give the SMU its GPU address and ask it to write its metrics
+//            table there, then read the page back through a read-only mapping
+//            and verify only the table bytes changed.
 //            Apart from the stage 6 to 9 tests, nothing is written to
 //            configuration space, registers or memory, and every mapping and
 //            the provider are released before start() returns.
@@ -114,6 +115,8 @@ private:
     enum MetricsState { kMetricsIdle, kMetricsChecked, kMetricsTransferred };
     MetricsState metricsState_ = kMetricsIdle;
     const void *metricsOwner_ = nullptr;
+    // The check region as read before the transfer; too large for the stack.
+    uint32_t metricsSnapshot_[cezanne::kMetricsCheckSize / 4];
     // writablePage: 0 for none, else kScratchPageOffset or kSmuPageOffset.
     cezanne::Status accessDevice(uint32_t writablePage, DeviceOperation operation, void *argument);
     cezanne::Status restoreLocked();
@@ -196,7 +199,8 @@ static bool refuseWrite(void *, uint32_t, uint32_t)
 
 static void pauseOneMillisecond(void *)
 {
-    IODelay(1000);
+    // A sleeping wait: the stage 9 stability check pauses for about 1 s.
+    IOSleep(1);
 }
 
 IOService *CezanneGPU::probe(IOService *provider, SInt32 *score)
@@ -740,6 +744,7 @@ struct MetricsArgument {
     cezanne::MetricsTarget *target;
     uint32_t *responses;
     cezanne::SmuMetrics *metrics;
+    uint32_t *snapshot;
 };
 
 static cezanne::Status metricsCheckOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
@@ -753,8 +758,10 @@ static cezanne::Status metricsCheckOperation(UInt32 stage, const cezanne::Regist
                                              metrics->target);
     }
     if (status == cezanne::kOK) {
-        status = withMetricsMemory(cezanne::kMetricsCheckSize, [writer](const cezanne::MemoryReader &memory) {
-            return cezanne::checkRegionUnused(memory, cezanne::kMetricsCheckSize, *writer);
+        uint32_t *snapshot = metrics->snapshot;
+        status = withMetricsMemory(cezanne::kMetricsCheckSize, [writer, snapshot](const cezanne::MemoryReader &memory) {
+            return cezanne::checkRegionStable(memory, cezanne::kMetricsCheckSize, *writer,
+                                              cezanne::kMetricsStablePauses, snapshot);
         });
     }
     return status;
@@ -769,9 +776,11 @@ static cezanne::Status metricsTransferOperation(UInt32 stage, const cezanne::Reg
 static cezanne::Status metricsReadOperation(UInt32, const cezanne::RegisterReader &, UInt64,
                                             const cezanne::RegisterWriter *, void *argument)
 {
-    cezanne::SmuMetrics *metrics = static_cast<MetricsArgument *>(argument)->metrics;
-    return withMetricsMemory(cezanne::kPageSize, [metrics](const cezanne::MemoryReader &page) {
-        return cezanne::verifyMetricsPage(page, metrics);
+    MetricsArgument *read = static_cast<MetricsArgument *>(argument);
+    cezanne::SmuMetrics *metrics = read->metrics;
+    const uint32_t *snapshot = read->snapshot;
+    return withMetricsMemory(cezanne::kPageSize, [metrics, snapshot](const cezanne::MemoryReader &page) {
+        return cezanne::verifyMetricsPage(page, snapshot, metrics);
     });
 }
 
@@ -792,7 +801,7 @@ cezanne::Status CezanneGPU::metricsCheck(const void *owner, cezanne::MetricsTarg
         return status;
     }
     IOLockLock(lock_);
-    MetricsArgument metrics = {ranges, count, target, nullptr, nullptr};
+    MetricsArgument metrics = {ranges, count, target, nullptr, nullptr, metricsSnapshot_};
     status = accessDevice(0, metricsCheckOperation, &metrics);
     metricsState_ = status == cezanne::kOK ? kMetricsChecked : kMetricsIdle;
     metricsOwner_ = owner;
@@ -806,7 +815,7 @@ cezanne::Status CezanneGPU::metricsTransfer(const void *owner, uint32_t response
     IOLockLock(lock_);
     cezanne::Status status = cezanne::kMetricsOutOfOrder;
     if (metricsState_ == kMetricsChecked && metricsOwner_ == owner) {
-        MetricsArgument metrics = {nullptr, 0, nullptr, responses, nullptr};
+        MetricsArgument metrics = {nullptr, 0, nullptr, responses, nullptr, nullptr};
         status = accessDevice(cezanne::kSmuPageOffset, metricsTransferOperation, &metrics);
         metricsState_ = status == cezanne::kOK ? kMetricsTransferred : kMetricsIdle;
         IOLog(LOG_PREFIX "metrics transfer: %s, responses 0x%x 0x%x 0x%x\n", cezanne::statusName(status),
@@ -822,7 +831,7 @@ cezanne::Status CezanneGPU::metricsRead(const void *owner, cezanne::SmuMetrics *
     IOLockLock(lock_);
     cezanne::Status status = cezanne::kMetricsOutOfOrder;
     if (metricsState_ == kMetricsTransferred && metricsOwner_ == owner) {
-        MetricsArgument argument = {nullptr, 0, nullptr, nullptr, metrics};
+        MetricsArgument argument = {nullptr, 0, nullptr, nullptr, metrics, metricsSnapshot_};
         status = accessDevice(0, metricsReadOperation, &argument);
         metricsState_ = kMetricsIdle;
         IOLog(LOG_PREFIX "metrics read: %s\n", cezanne::statusName(status));
