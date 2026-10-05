@@ -27,7 +27,12 @@
 //            the 4 KiB BAR5 page holding SCRATCH_REG0 is mapped writable, and
 //            only during those steps. A connection closed after the write
 //            has its original value restored.
-//            Apart from the stage 6 scratch test, nothing is written to
+//   Stage 7: the first SMU messages. On request, after a check that the MP1
+//            mailbox is idle, send GetDriverIfVersion and GetSmuVersion as
+//            Linux does first, writing only the allowlisted mailbox values.
+//            Only the 4 KiB BAR5 page holding the mailbox is mapped writable,
+//            and only during a query.
+//            Apart from the stage 6 and 7 tests, nothing is written to
 //            configuration space, registers or memory, and every mapping and
 //            the provider are released before start() returns.
 //
@@ -53,9 +58,12 @@ struct Aperture {
     UInt32 stage;
 };
 
-// The writable 4 KiB page holding SCRATCH_REG0 (stage 6 only).
+// The writable 4 KiB BAR5 page of a stage 6 or 7 test: SCRATCH_REG0's or the
+// SMU mailbox's.
 struct WritePage {
     volatile UInt32 *base;
+    uint32_t pageOffset;
+    UInt32 stage;
 };
 
 // One device operation run by CezanneGPU::accessDevice with the checks done
@@ -83,13 +91,18 @@ public:
     cezanne::Status scratchWrite(const void *owner, uint32_t *readback);
     cezanne::Status scratchRestore(const void *owner, uint32_t *readback);
     void scratchAbandon(const void *owner);
+    cezanne::Status smuCheck(const void *owner, cezanne::SmuMailbox *mailbox);
+    cezanne::Status smuQuery(const void *owner, uint32_t message, uint32_t *response, uint32_t *answer);
 
 private:
     enum ScratchState { kScratchIdle, kScratchChecked, kScratchWritten };
     ScratchState scratchState_ = kScratchIdle;
     const void *scratchOwner_ = nullptr;
     uint32_t scratchOriginal_ = 0;
-    cezanne::Status accessDevice(bool writable, DeviceOperation operation, void *argument);
+    bool smuChecked_ = false;
+    const void *smuOwner_ = nullptr;
+    // writablePage: 0 for none, else kScratchPageOffset or kSmuPageOffset.
+    cezanne::Status accessDevice(uint32_t writablePage, DeviceOperation operation, void *argument);
     cezanne::Status restoreLocked();
     UInt32 stage_ = 0;
     bool diagnosticsReady_ = false; // stage 3 succeeded, so the GC bases are confirmed
@@ -155,11 +168,11 @@ static bool registerWrite(void *context, uint32_t offset, uint32_t value)
 {
     WritePage *page = static_cast<WritePage *>(context);
     // The core already checks this; the adapter refuses independently.
-    if (!cezanne::writeAllowed(offset, cezanne::kScratchStage) || offset < cezanne::kScratchPageOffset ||
-        offset + 4ull > uint64_t(cezanne::kScratchPageOffset) + cezanne::kScratchPageSize) {
+    if (!cezanne::writeAllowed(offset, value, page->stage) || offset < page->pageOffset ||
+        offset + 4ull > uint64_t(page->pageOffset) + cezanne::kPageSize) {
         return false;
     }
-    page->base[(offset - cezanne::kScratchPageOffset) / 4] = value;
+    page->base[(offset - page->pageOffset) / 4] = value;
     return true;
 }
 
@@ -438,9 +451,12 @@ void CezanneGPU::free()
     IOService::free();
 }
 
-cezanne::Status CezanneGPU::accessDevice(bool writable, DeviceOperation operation, void *argument)
+cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation operation, void *argument)
 {
     // Caller holds lock_.
+    if (writablePage != 0 && writablePage != cezanne::kScratchPageOffset && writablePage != cezanne::kSmuPageOffset) {
+        return cezanne::kRegisterNotAllowed;
+    }
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, getProvider());
     if (pci == nullptr || !pci->open(this)) {
         return cezanne::kProviderOpenFailed;
@@ -465,13 +481,12 @@ cezanne::Status CezanneGPU::accessDevice(bool writable, DeviceOperation operatio
     }
     IODeviceMemory *pageMemory = nullptr;
     IOMemoryMap *pageMap = nullptr;
-    WritePage page = {nullptr};
-    if (status == cezanne::kOK && writable) {
-        // The only writable mapping: one page of BAR5, for the scratch test.
-        pageMemory = IODeviceMemory::withRange((state.bar5 & ~0xFull) + cezanne::kScratchPageOffset,
-                                               cezanne::kScratchPageSize);
+    WritePage page = {nullptr, writablePage, stage_};
+    if (status == cezanne::kOK && writablePage != 0) {
+        // The only writable mapping: one page of BAR5, for a stage 6 or 7 test.
+        pageMemory = IODeviceMemory::withRange((state.bar5 & ~0xFull) + writablePage, cezanne::kPageSize);
         pageMap = pageMemory != nullptr ? pageMemory->map(kIOMapInhibitCache) : nullptr;
-        if (pageMap == nullptr || pageMap->getLength() < cezanne::kScratchPageSize) {
+        if (pageMap == nullptr || pageMap->getLength() < cezanne::kPageSize) {
             status = cezanne::kApertureUnavailable;
         } else {
             page.base = reinterpret_cast<volatile UInt32 *>(pageMap->getVirtualAddress());
@@ -479,7 +494,7 @@ cezanne::Status CezanneGPU::accessDevice(bool writable, DeviceOperation operatio
     }
     if (status == cezanne::kOK) {
         cezanne::RegisterReader registers = {registerRead, &aperture};
-        cezanne::RegisterWriter writer = {writable ? registerWrite : refuseWrite, pauseOneMillisecond, &page};
+        cezanne::RegisterWriter writer = {writablePage != 0 ? registerWrite : refuseWrite, pauseOneMillisecond, &page};
         status = operation(stage_, registers, aperture.length, &writer, argument);
     }
     if (pageMap != nullptr) {
@@ -515,7 +530,7 @@ cezanne::Status CezanneGPU::diagnosticRead(uint32_t offset, uint32_t *value)
     }
     ReadArgument read = {offset, value};
     IOLockLock(lock_);
-    cezanne::Status status = accessDevice(false, readOperation, &read);
+    cezanne::Status status = accessDevice(0, readOperation, &read);
     IOLockUnlock(lock_);
     return status;
 }
@@ -557,7 +572,7 @@ cezanne::Status CezanneGPU::scratchCheck(const void *owner, cezanne::ScratchChec
     // A written value must be restored before another test starts.
     if (scratchState_ != kScratchWritten) {
         ScratchArgument scratch = {0, nullptr, check};
-        status = accessDevice(false, scratchCheckOperation, &scratch);
+        status = accessDevice(0, scratchCheckOperation, &scratch);
         scratchState_ = status == cezanne::kOK ? kScratchChecked : kScratchIdle;
         scratchOwner_ = owner;
         scratchOriginal_ = check->original;
@@ -573,7 +588,7 @@ cezanne::Status CezanneGPU::scratchWrite(const void *owner, uint32_t *readback)
     cezanne::Status status = cezanne::kScratchOutOfOrder;
     if (scratchState_ == kScratchChecked && scratchOwner_ == owner) {
         ScratchArgument scratch = {scratchOriginal_, readback, nullptr};
-        status = accessDevice(true, scratchWriteOperation, &scratch);
+        status = accessDevice(cezanne::kScratchPageOffset, scratchWriteOperation, &scratch);
         // A failed precondition or read stops before writing; anything after
         // the write call leaves the register to be restored.
         bool wrote = status == cezanne::kOK || status == cezanne::kScratchReadbackMismatch ||
@@ -588,7 +603,7 @@ cezanne::Status CezanneGPU::restoreLocked()
 {
     uint32_t readback = 0;
     ScratchArgument scratch = {scratchOriginal_, &readback, nullptr};
-    cezanne::Status status = accessDevice(true, scratchRestoreOperation, &scratch);
+    cezanne::Status status = accessDevice(cezanne::kScratchPageOffset, scratchRestoreOperation, &scratch);
     scratchState_ = kScratchIdle;
     return status;
 }
@@ -600,8 +615,62 @@ cezanne::Status CezanneGPU::scratchRestore(const void *owner, uint32_t *readback
     cezanne::Status status = cezanne::kScratchOutOfOrder;
     if (scratchState_ == kScratchWritten && scratchOwner_ == owner) {
         ScratchArgument scratch = {scratchOriginal_, readback, nullptr};
-        status = accessDevice(true, scratchRestoreOperation, &scratch);
+        status = accessDevice(cezanne::kScratchPageOffset, scratchRestoreOperation, &scratch);
         scratchState_ = kScratchIdle;
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+struct SmuArgument {
+    uint32_t message;
+    uint32_t *response;
+    uint32_t *answer;
+    cezanne::SmuMailbox *mailbox;
+};
+
+static cezanne::Status smuCheckOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                         const cezanne::RegisterWriter *, void *argument)
+{
+    return cezanne::checkSmu(registers, length, stage, static_cast<SmuArgument *>(argument)->mailbox);
+}
+
+static cezanne::Status smuQueryOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                         const cezanne::RegisterWriter *writer, void *argument)
+{
+    SmuArgument *smu = static_cast<SmuArgument *>(argument);
+    return cezanne::sendSmuQuery(registers, length, *writer, stage, smu->message, smu->response, smu->answer);
+}
+
+cezanne::Status CezanneGPU::smuCheck(const void *owner, cezanne::SmuMailbox *mailbox)
+{
+    *mailbox = cezanne::SmuMailbox();
+    if (!diagnosticsReady_ || stage_ < cezanne::kSmuStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IOLockLock(lock_);
+    SmuArgument smu = {0, nullptr, nullptr, mailbox};
+    cezanne::Status status = accessDevice(0, smuCheckOperation, &smu);
+    smuChecked_ = status == cezanne::kOK;
+    smuOwner_ = owner;
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::smuQuery(const void *owner, uint32_t message, uint32_t *response, uint32_t *answer)
+{
+    *response = 0;
+    *answer = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kSmuOutOfOrder;
+    // A query follows a passing check by the same connection; any failure
+    // ends the sequence, so nothing is retried without a new check.
+    if (smuChecked_ && smuOwner_ == owner) {
+        SmuArgument smu = {message, response, answer, nullptr};
+        status = accessDevice(cezanne::kSmuPageOffset, smuQueryOperation, &smu);
+        smuChecked_ = status == cezanne::kOK;
+        IOLog(LOG_PREFIX "SMU query 0x%x: %s, response 0x%x, answer 0x%08x\n", message, cezanne::statusName(status),
+              *response, *answer);
     }
     IOLockUnlock(lock_);
     return status;
@@ -613,6 +682,10 @@ void CezanneGPU::scratchAbandon(const void *owner)
         return;
     }
     IOLockLock(lock_);
+    if (smuOwner_ == owner) {
+        smuChecked_ = false;
+        smuOwner_ = nullptr;
+    }
     if (scratchOwner_ == owner) {
         if (scratchState_ == kScratchWritten) {
             cezanne::Status status = restoreLocked();
@@ -643,6 +716,8 @@ private:
     static IOReturn scratchCheck(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn scratchWrite(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn scratchRestore(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn smuCheck(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn smuQuery(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPUUserClient, IOUserClient)
@@ -713,6 +788,31 @@ IOReturn CezanneGPUUserClient::scratchRestore(OSObject *target, void *, IOExtern
     return kIOReturnSuccess;
 }
 
+IOReturn CezanneGPUUserClient::smuCheck(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    cezanne::SmuMailbox mailbox;
+    arguments->scalarOutput[0] = self->gpu_->smuCheck(self, &mailbox);
+    arguments->scalarOutput[1] = mailbox.message;
+    arguments->scalarOutput[2] = mailbox.argument;
+    arguments->scalarOutput[3] = mailbox.response;
+    return kIOReturnSuccess;
+}
+
+IOReturn CezanneGPUUserClient::smuQuery(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint64_t message = arguments->scalarInput[0];
+    if (message != cezanne::kSmuMsgGetSmuVersion && message != cezanne::kSmuMsgGetDriverIfVersion) {
+        return kIOReturnBadArgument;
+    }
+    uint32_t response = 0, answer = 0;
+    arguments->scalarOutput[0] = self->gpu_->smuQuery(self, static_cast<uint32_t>(message), &response, &answer);
+    arguments->scalarOutput[1] = response;
+    arguments->scalarOutput[2] = answer;
+    return kIOReturnSuccess;
+}
+
 IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                               IOExternalMethodDispatch *, OSObject *, void *reference)
 {
@@ -723,6 +823,8 @@ IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMetho
         {scratchCheck, 0, 0, 7, 0},   // kDiagnosticScratchCheck
         {scratchWrite, 0, 0, 2, 0},   // kDiagnosticScratchWrite
         {scratchRestore, 0, 0, 2, 0}, // kDiagnosticScratchRestore
+        {smuCheck, 0, 0, 4, 0},       // kDiagnosticSmuCheck
+        {smuQuery, 1, 0, 3, 0},       // kDiagnosticSmuQuery
     };
     if (selector >= cezanne::kDiagnosticSelectorCount) {
         return kIOReturnUnsupported;

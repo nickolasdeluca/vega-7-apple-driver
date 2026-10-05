@@ -43,12 +43,12 @@ def strip_comments(source):
     return re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.S)
 
 
-# The stage 6 scratch test's write path, and the only writable constructs allowed:
-# one writable map of the scratch page, one store (in registerWrite), and the
-# two non-const volatile pointers that carry it.
+# The stage 6 and 7 write path, and the only writable constructs allowed: one
+# writable map of the test's page, one store (in registerWrite), and the two
+# non-const volatile pointers that carry it.
 SCRATCH_MAP = "pageMemory->map(kIOMapInhibitCache)"
-SCRATCH_STORE = "page->base[(offset - cezanne::kScratchPageOffset) / 4] = value;"
-ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kScratchPageSize")
+SCRATCH_STORE = "page->base[(offset - page->pageOffset) / 4] = value;"
+ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize")
 ALLOWED_VOLATILE = 2
 
 
@@ -120,14 +120,23 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertEqual(source.count(SCRATCH_STORE), 1)
         write = re.search(r"static bool registerWrite\(.*?\n}\n", source, re.S).group(0)
         self.assertIn(SCRATCH_STORE, write)
-        self.assertLess(write.index("writeAllowed(offset, cezanne::kScratchStage)"), write.index(SCRATCH_STORE))
-        # Writable access is requested only by the scratch write and restore steps.
-        writable = sorted(re.findall(r"accessDevice\(true, (\w+)", source))
-        self.assertEqual(writable, ["scratchRestoreOperation", "scratchRestoreOperation", "scratchWriteOperation"])
-        self.assertEqual(re.findall(r"accessDevice\(false, (\w+)", source), ["readOperation", "scratchCheckOperation"])
-        page = re.search(r"IODeviceMemory::withRange\(\(state\.bar5 & ~0xFull\) \+ cezanne::kScratchPageOffset,"
-                         r"\s*cezanne::kScratchPageSize\)", source)
+        self.assertLess(write.index("writeAllowed(offset, value, page->stage)"), write.index(SCRATCH_STORE))
+        # Writable pages: the scratch page for its write and restore steps, the
+        # SMU mailbox page for a query; every other operation maps none.
+        writable = sorted(re.findall(r"accessDevice\((cezanne::k\w+PageOffset), (\w+)", source))
+        self.assertEqual(writable, [("cezanne::kScratchPageOffset", "scratchRestoreOperation"),
+                                    ("cezanne::kScratchPageOffset", "scratchRestoreOperation"),
+                                    ("cezanne::kScratchPageOffset", "scratchWriteOperation"),
+                                    ("cezanne::kSmuPageOffset", "smuQueryOperation")])
+        self.assertEqual(re.findall(r"accessDevice\(0, (\w+)", source),
+                         ["readOperation", "scratchCheckOperation", "smuCheckOperation"])
+        self.assertIn("writablePage != 0 && writablePage != cezanne::kScratchPageOffset && "
+                      "writablePage != cezanne::kSmuPageOffset", source)
+        page = re.search(r"IODeviceMemory::withRange\(\(state\.bar5 & ~0xFull\) \+ writablePage, cezanne::kPageSize\)",
+                         source)
         self.assertIsNotNone(page)
+        # An SMU query needs a passing check by the same connection.
+        self.assertIn("if (smuChecked_ && smuOwner_ == owner) {", source)
         # A connection closed mid-test restores the register.
         self.assertRegex(source, r"clientClose\(\)\s*\{\s*gpu_->scratchAbandon\(this\);")
 
@@ -143,7 +152,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 6;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 7;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
