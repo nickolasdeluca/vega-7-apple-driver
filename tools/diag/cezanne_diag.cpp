@@ -22,7 +22,8 @@ struct Named {
     uint32_t offset;
 };
 
-// Every register the driver allows from stage 3 on, in its list order.
+// Every register the driver allows at stage 5, in its list order; a stage 4
+// driver allows the first kStage3RegisterCount.
 const Named kRegisters[] = {
     {"MP0_SMN_C2PMSG_33", kRegC2PMsg33},
     {"RCC_CONFIG_MEMSIZE", kRegConfigMemsize},
@@ -34,8 +35,47 @@ const Named kRegisters[] = {
     {"CC_RB_BACKEND_DISABLE", kRegCcRbBackendDisable},
     {"GC_USER_RB_BACKEND_DISABLE", kRegUserRbBackendDisable},
     {"GB_ADDR_CONFIG", kRegGbAddrConfig},
+    // Stage 5.
+    {"SMUIO_GFX_MISC_CNTL", kRegSmuioGfxMiscCntl},
+    {"MP1_SMN_C2PMSG_66", kRegMp1C2PMsg66},
+    {"MP1_SMN_C2PMSG_82", kRegMp1C2PMsg82},
+    {"MP1_SMN_C2PMSG_90", kRegMp1C2PMsg90},
+    {"MP0_SMN_C2PMSG_35", kRegMp0C2PMsg35},
+    {"MP0_SMN_C2PMSG_81", kRegMp0C2PMsg81},
+    {"RLC_CGTT_MGCG_OVERRIDE", kRegRlcCgttMgcgOverride},
+    {"RLC_CGCG_CGLS_CTRL", kRegRlcCgcgCglsCtrl},
+    {"RLC_CGCG_CGLS_CTRL_3D", kRegRlcCgcgCglsCtrl3d},
+    {"RLC_MEM_SLP_CNTL", kRegRlcMemSlpCntl},
+    {"CP_MEM_SLP_CNTL", kRegCpMemSlpCntl},
+    {"RLC_PG_CNTL", kRegRlcPgCntl},
+    {"GRBM_STATUS2", kRegGrbmStatus2},
+    {"GRBM_STATUS_SE0", kRegGrbmStatusSe0},
+    {"CP_BUSY_STAT", kRegCpBusyStat},
+    {"CP_CPF_STATUS", kRegCpCpfStatus},
+    {"CP_ME_CNTL", kRegCpMeCntl},
+    {"CP_MEC_CNTL", kRegCpMecCntl},
+    {"RLC_CNTL", kRegRlcCntl},
+    {"RLC_STAT", kRegRlcStat},
+    {"CP_PFP_INSTR_PNTR", kRegCpPfpInstrPntr},
+    {"CP_ME_INSTR_PNTR", kRegCpMeInstrPntr},
+    {"CP_MEC1_INSTR_PNTR", kRegCpMec1InstrPntr},
+    {"SDMA0_CLK_CTRL", kRegSdma0ClkCtrl},
+    {"SDMA0_POWER_CNTL", kRegSdma0PowerCntl},
+    {"SDMA0_F32_CNTL", kRegSdma0F32Cntl},
+    {"SDMA0_STATUS_REG", kRegSdma0StatusReg},
+    {"SDMA0_GFX_RB_CNTL", kRegSdma0GfxRbCntl},
+    {"HDP_MEM_POWER_LS", kRegHdpMemPowerLs},
+    {"ATHUB_MISC_CNTL", kRegAthubMiscCntl},
+    {"ATC_L2_MISC_CG", kRegAtcL2MiscCg},
+    {"DAGB0_CNTL_MISC2", kRegDagb0CntlMisc2},
+    {"MC_VM_FB_LOCATION_BASE_MMHUB", kRegMmhubFbLocationBase},
+    {"MC_VM_FB_LOCATION_TOP_MMHUB", kRegMmhubFbLocationTop},
+    {"VM_L2_CNTL_MMHUB", kRegMmhubVmL2Cntl},
+    {"VM_CONTEXT0_CNTL_MMHUB", kRegMmhubVmContext0Cntl},
+    {"MC_VM_MX_L1_TLB_CNTL_MMHUB", kRegMmhubMxL1TlbCntl},
+    {"IH_RB_CNTL", kRegIhRbCntl},
 };
-static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage3RegisterCount, "one name per register");
+static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage5RegisterCount, "one name per register");
 
 void usage(FILE *out)
 {
@@ -103,24 +143,29 @@ int main(int argc, char **argv)
     std::printf("CezanneGPU diagnostics v%llu, driver stage %llu\n", static_cast<unsigned long long>(info[0]),
                 static_cast<unsigned long long>(info[1]));
 
+    const uint32_t count = info[1] >= 5 ? kStage5RegisterCount : kStage3RegisterCount;
     int failures = 0;
     for (unsigned long pass = 0; pass < repeat; pass++) {
         if (pass > 0) usleep(static_cast<useconds_t>(interval * 1000));
         if (repeat > 1) std::printf("-- pass %lu\n", pass + 1);
-        for (const Named &reg : kRegisters) {
+        for (uint32_t i = 0; i < count; i++) {
+            const Named &reg = kRegisters[i];
+            // Name first and flushed: if a read hangs the machine, the last
+            // line on screen identifies the register.
+            std::printf("%-30s 0x%05x  ", reg.name, reg.offset);
+            std::fflush(stdout);
             uint64_t input = reg.offset;
             uint64_t output[2] = {0, 0};
             uint32_t outputCount = 2;
             result = IOConnectCallScalarMethod(connection, kDiagnosticReadRegister, &input, 1, output, &outputCount);
             if (result != KERN_SUCCESS || outputCount != 2) {
-                std::printf("%-28s 0x%05x  call failed 0x%08x\n", reg.name, reg.offset, result);
+                std::printf("call failed 0x%08x\n", result);
                 failures++;
             } else if (output[0] != kOK) {
-                std::printf("%-28s 0x%05x  %s\n", reg.name, reg.offset, statusName(static_cast<Status>(output[0])));
+                std::printf("%s\n", statusName(static_cast<Status>(output[0])));
                 failures++;
             } else {
-                std::printf("%-28s 0x%05x  0x%08llx\n", reg.name, reg.offset,
-                            static_cast<unsigned long long>(output[1]));
+                std::printf("0x%08llx\n", static_cast<unsigned long long>(output[1]));
             }
         }
     }

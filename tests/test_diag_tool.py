@@ -18,10 +18,10 @@ class DiagSourceTests(unittest.TestCase):
         self.assertEqual(sorted(set(calls)), ["kDiagnosticGetInfo", "kDiagnosticReadRegister"])
         self.assertNotRegex(source, r"IOConnect(MapMemory|SetNotificationPort|CallAsync|CallStructMethod)")
 
-    def test_tool_names_every_stage_3_register_in_order(self):
+    def test_tool_names_every_stage_5_register_in_order(self):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
-        listed = re.search(r"kStage3Registers\[\] = \{([^}]*)\}", header).group(1)
+        listed = re.search(r"kStage5Registers\[\] = \{([^}]*)\}", header).group(1)
         expected = [name.strip() for name in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
 
