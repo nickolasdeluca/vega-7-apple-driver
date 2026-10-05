@@ -133,20 +133,20 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: SysReport dump boot, then revise stage 9's check
+## Next task: user review of the revised stage 9 check
 
-Stages 0–8 succeeded. Stage 9 stopped safely at its own check in boot 11:
-"all zero" is the wrong test, because unused carveout DRAM holds stale data
-(see the [test boot log](test-boot.md#test-boot-log)).
+Stages 0–8 succeeded. Stage 9 stopped safely in boot 11, because "all zero"
+is the wrong test.
 
-- **What to boot.** The approved fix is to read the VBIOS firmware-usage table
-  as Linux does. Boot `out/test-efi/usb-sysreport/` once, following
-  [test-boot.md](test-boot.md#sysreport-dump-boot): stage 0, OpenCore
-  SysReport on.
-- **Saving the dump.** Copy `SysReport/` into ignored `out/` and delete it
-  from the drive.
-- **Then.** Extract the VBIOS from `VFCT`, read `vram_usagebyfirmware`, and
-  propose the revised stage 9 check.
+- **What boot 12 showed.** The SysReport dump gave the VBIOS from `VFCT`:
+  - `vram_usagebyfirmware` is all zero, so the firmware reserves no carveout
+    memory;
+  - the boot framebuffer is the first 7.9 MiB.
+- **The proposal.** In
+  [test-boot.md](test-boot.md#proposed-revision-stage-9-free-page-check):
+  replace the zero test with a 1 s stability test, and compare the page after
+  the transfer with a snapshot taken before it.
+- **Not authorized.** Implement it only after the user approves.
 
 ## Offline task while waiting: Metal shader frontend boundary
 

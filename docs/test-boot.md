@@ -15,9 +15,9 @@ attempt reset before reaching macOS, cause unknown. Stage 8 sent
 `DisallowGfxOff`: response OK, GFX stayed on. Stage 9 (the SMU metrics
 table) stopped at its own check: the chosen carveout region is not all zero,
 so no SMU message was sent. Its check needs a better criterion before
-another attempt. To get the criterion Linux uses, a one-time
-[SysReport dump boot](#sysreport-dump-boot) is authorized and built under
-ignored `out/test-efi/usb-sysreport/`; it has not been booted.
+another attempt. The [SysReport dump boot](#sysreport-dump-boot) gave the
+VBIOS: the firmware reserves no carveout memory. A revised stage 9 check is
+[proposed](#proposed-revision-stage-9-free-page-check) for review.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -351,8 +351,8 @@ written.
 
 ### SysReport dump boot
 
-**Status:** approved by the user on 2026-10-05 and built, but not yet booted.
-This is a test-EFI configuration change, not a driver stage.
+**Status:** approved by the user on 2026-10-05 and done in boot 12. This is a
+test-EFI configuration change, not a driver stage.
 
 **Purpose.** Stage 9 needs to know which carveout memory the firmware uses.
 Linux reads this from the VBIOS firmware-usage table
@@ -391,6 +391,76 @@ check cannot use it yet.
 
 **Return:** put the stage 9 EFI (or any other) back on the drive before the
 next driver test. The SysReport EFI is only for this dump.
+
+**Result (boot 12, 2026-10-05, stage 0 with SysReport).** The boot reached the
+desktop (`cezanne-stage=0`). OpenCore wrote 33 files: 25 ACPI tables
+including `VFCT-1.aml`, SMBIOS, PCI, CPU, GOP and driver information. The
+user copied them to ignored `out/test-efi/sysreport/`.
+
+- **`VFCT`.** 55 428 bytes, image offset 76. One image: bus 10, device 0,
+  function 0, `1002:1638`, 55 296 bytes, starting `55AA` with an `ATOM`
+  header at `0x188`. It is saved as `out/test-efi/sysreport/vbios-1638.rom`
+  (ignored).
+- **Firmware-usage table.** The master data table (`0x94a0`) points
+  `vram_usagebyfirmware` at `0xcf2c`, revision 2.1. It reads
+  `start_address_in_kb` `0`, `used_by_firmware_in_kb` `0`,
+  `used_by_driver_in_kb` `0`. **The firmware reserves no carveout memory.**
+- **What Linux does with it.** Linux v6.12
+  `amdgpu_atomfirmware_allocate_fb_v2_1` reserves the firmware region only
+  when it carries the SR-IOV message-share flag. Otherwise the table only sizes
+  the AtomBIOS scratch area. On this host Linux would therefore reserve
+  nothing for the firmware.
+- **Boot framebuffer.** `GOPInfo.txt` reports 1920×1080, 4 bytes per pixel, at
+  `0xFFE0000000`, `0x7E9000` bytes (about 7.9 MiB). That is where the firmware
+  had placed BAR0, so the framebuffer is the first 7.9 MiB of the carveout.
+
+### Proposed revision: stage 9 free-page check
+
+**Status: proposal for the user's review. Not authorized, not implemented.**
+It replaces stage 9 step 1's "all zero" test, which boot 11 showed is wrong
+for stale DRAM.
+
+**What is known about the target page.** It lies 1 GiB into the carveout,
+GPU `0xF440000000`, CPU `0x600000000`. By the regions Linux reserves on this
+host, it is free:
+
+- **No firmware region.** The VBIOS reports none (boot 12).
+- **The boot framebuffer** (stolen VGA memory) is the first 7.9 MiB. The
+  check already avoids the lowest 64 MiB.
+- **The discovery binary** is in the top 64 KiB. The check already avoids the
+  highest 64 MiB.
+- **Everything else** Linux allocates itself. No GPU driver runs in a test
+  boot.
+
+**Revised step 1.** As before, with the zero test replaced:
+
+1. Mailbox idle; `MC_VM_FB_LOCATION_BASE` `0xf400` and `MC_VM_FB_OFFSET`
+   `0x5c0`; the region inside the carveout, outside both 64 MiB reserves and
+   every BAR.
+2. **Stability instead of zero.** Read the 64 KiB region twice, 1 s apart.
+   Require every word to be identical (`table-region-in-use` otherwise):
+   memory that something is actively writing changes; stale data does not.
+3. **Snapshot.** Keep a copy of the 4 KiB page as it was before the
+   transfer.
+
+**Revised step 4.** It compares against the snapshot rather than against
+zero:
+
+- Bytes 148–4095 must equal the snapshot (`table-overflow`).
+- Bytes 0–147 must differ from it somewhere (`table-not-written`).
+- If stale data happened to match the new table exactly, step 4 would report
+  `table-not-written`. That is a false alarm on the safe side.
+
+Steps 2 and 3 (the three messages) and every other guard are unchanged. The
+driver keeps the 4 KiB snapshot in its own memory and never writes the
+carveout.
+
+**What this does not establish.** A region that something writes rarely, or
+holds unchanged, would pass the stability test. That is acceptable here
+because no reserved region covers the page, and the write is 148 bytes into
+reserved, OS-unused memory. The misdirected-write response (power off at once
+on `table-not-written` or `table-overflow`) and the backup recommendation
+stay.
 
 ### Stage 4: diagnostic interface
 
