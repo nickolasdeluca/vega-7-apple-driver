@@ -1,7 +1,9 @@
 # USB test boot
 
-Status, 2026-10-05: prepared and verified offline; **not yet booted**. The test
-EFI is assembled under ignored `out/test-efi/usb/` and waits for a USB drive.
+Status, 2026-10-05: stage 0 and stage 1 test EFIs prepared and verified
+offline; **neither has been booted**. They are assembled under ignored
+`out/test-efi/usb-stage0/` and `out/test-efi/usb-stage1/` and wait for a USB
+drive.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -18,17 +20,25 @@ off restores the known-good boot. This is the experimental environment
    install them into `/Library/Extensions`, load them with `kmutil` or
    `kextload`, or add them to the known-good EFI. Anything installed on the
    macOS volume would also load in the known-good boot.
-3. The probe declines to attach unless the boot arguments contain
-   `-cezanne-probe`, which only the test EFI sets and the known-good EFI deletes.
-4. Only the current stage is authorized. **Stage 0** is passive: attach to the
-   Cezanne PCI device and record what the registry already reports. Each later
-   stage (register reads, then writes, firmware, memory mapping, interrupts)
-   needs its own reviewed update to this document and the user's approval
-   before it is built into the test EFI.
+3. The driver declines to attach unless the boot arguments contain
+   `cezanne-stage=N`, which only the test EFI sets and the known-good EFI
+   deletes. It also declines a stage above the one it was built for
+   (`kMaxStage` in `driver/core/cezanne_core.h`), and `tools/test_efi.py`
+   refuses to build a test EFI for a stage this document does not authorize.
+4. Only authorized stages may be built into a test EFI or booted:
+   - **Stage 0** (authorized): passive. Attach to the Cezanne PCI device and
+     record what the registry already reports.
+   - **Stage 1** (authorized by the user on 2026-10-05): read-only device
+     access, described [below](#stage-1-read-only-device-access). Boot it only
+     after stage 0 has met its success criteria.
+   - Each later stage (indexed register reads, any register or configuration
+     write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
+     update to this document and the user's approval before it is built.
 5. After any test boot from stage 1 on, shut down completely and wait a few
    seconds before booting the known-good EFI, so GPU and firmware state cannot
-   carry over a warm reboot. Stage 0 touches no hardware.
-6. Record every test boot: date, build, test EFI manifest time, what was
+   carry over a warm reboot. Stage 0 touches no hardware. Do not sleep the
+   machine during a test boot; the driver does not handle power transitions.
+6. Record every test boot: date, stage, build, test EFI manifest time, what was
    chosen at each menu, what the screen showed, and the commands and outputs
    listed below. Preserve failures.
 
@@ -39,8 +49,8 @@ rejects the result unless the configurations differ in exactly these values:
 
 | Setting | Known-good | Test | Why |
 | --- | --- | --- | --- |
-| `Kernel → Add` | includes NootedRed, SMCRadeonSensors | both removed; `CezanneProbe.kext` appended (`MinKernel` 25.0.0, x86_64) | NootedRed drives the iGPU through Apple's AMD kexts; SMCRadeonSensors reads GPU sensor registers itself. Nothing else may touch the GPU. |
-| `NVRAM → Add → 7C436110-…:boot-args` | `-NRedRBPlus` | `-v keepsyms=1 debug=0x100 msgbuf=1048576 -cezanne-probe` | Verbose boot, symbolized panics, a halt on panic instead of a reboot, a larger kernel log buffer, and the probe interlock |
+| `Kernel → Add` | includes NootedRed, SMCRadeonSensors | both removed; `CezanneGPU.kext` appended (`MinKernel` 25.0.0, x86_64) | NootedRed drives the iGPU through Apple's AMD kexts; SMCRadeonSensors reads GPU sensor registers itself. Nothing else may touch the GPU. |
+| `NVRAM → Add → 7C436110-…:boot-args` | `-NRedRBPlus` | `-v keepsyms=1 debug=0x100 msgbuf=1048576 cezanne-stage=N` | Verbose boot, symbolized panics, a halt on panic instead of a reboot, a larger kernel log buffer, and the driver's stage |
 | `Misc → Security → AllowSetDefault` | `true` | `false` | The test picker cannot store a new default boot entry in shared NVRAM |
 
 Everything else is byte-identical: ACPI tables, quirks, kernel patches, device
@@ -58,12 +68,12 @@ macOS and iCloud see the same machine. The tool also enforces these properties:
   `OSBundleLibraries`.
 - **Files outside the config are copied unchanged.** The test tree must equal the
   known-good tree minus the two removed bundles and the `Config.plist.bak-*`
-  backups, plus the probe; every common file must hash identically.
+  backups, plus the driver; every common file must hash identically.
 - **The result passes OpenCore's own validator,** `ocvalidate` from the same
   release.
 
 Both configs keep SIP fully enabled (`csr-active-config` `00000000`). OpenCore
-injects kexts at boot, so the probe needs no signing and no SIP change.
+injects kexts at boot, so the driver needs no signing and no SIP change.
 
 ## Known-good OpenCore provenance
 
@@ -78,34 +88,107 @@ GitHub asset digest. The installed `OpenCore.efi`, `BOOTx64.efi` and
 copies all of them unchanged. The release's `ocvalidate` reports no issues for
 either config.
 
-## The stage 0 probe
+## The driver
 
-`driver/probe/` builds `CezanneProbe.kext` (`org.cezanne-driver.probe` 0.1.0).
-It matches `IOPCIMatch` `0x16381002`, checks the interlock and the registry
-vendor/device IDs, then logs and publishes the registry's `vendor-id`,
-`device-id`, `revision-id`, subsystem IDs and `class-code` as `CezanneProbe …`
-properties. Missing values are logged as unavailable. It does not open its
-provider, touch PCI configuration space or BARs, change decoding or bus
-mastering, register interrupts or join power management. It has no
-`OSBundleRequired`, so it is not marked as needed for safe-mode boots.
+`driver/kext/build.sh` builds `CezanneGPU.kext` (`org.cezanne-driver.gpu`
+0.1.0) from the IOKit adapter in `driver/kext/` and the hardware core in
+`driver/core/`. It matches `IOPCIMatch` `0x16381002` and, in `probe()`, checks
+the stage argument and that the registry reports vendor `1002`, device `1638`
+and revision `c9`. It has no `OSBundleRequired`, so it is not marked as needed
+for safe-mode boots. All checks and results are logged with the prefix
+`CezanneGPU:` and published as `CezanneGPU …` registry properties.
 
-`tests/test_probe_kext.py` builds it and checks:
+### Stage 0: passive
 
-- The source contains none of the hardware-facing IOKit calls on its denylist.
-  Virtual calls are indirect in the binary, so this source check is the guard
-  for them.
-- Every direct call target in the binary is on a fixed passive list.
-- Every undefined symbol resolves through `kmutil libraries` to a declared
-  library on this host. `kmutil` silently omits a symbol it cannot resolve
-  (observed with a planted missing symbol), so the test compares against `nm -u`.
-  Pass `kmutil` a resolved path: it reported `No extension` for the same bundle
-  under the `/var` symlink.
+The driver publishes the registry's `vendor-id`, `device-id`, `revision-id`,
+subsystem IDs and `class-code` (missing values are logged as unavailable). It
+does not open its provider, touch PCI configuration space or BARs, change
+decoding or bus mastering, register interrupts or join power management.
 
-Building only produces files. The test never loads the kext. The linker warns
-that `libkmod.a` was built for macOS 26.5 while the kext targets 26.0; the host
-runs 26.4.1, and whether the kernel accepts it is checked at the first test boot.
+### Stage 1: read-only device access
 
-## Build the test EFI
+In `start()`, the driver additionally:
+
+1. Opens the PCI device, so no other driver can claim it while the reads run.
+2. Reads the standard configuration header (identity, revision, class,
+   command, status, BAR5) and walks the capability list, bounded to 48
+   entries, to the power-management capability's control register (PMCSR).
+3. Stops unless identity and revision match, the device is already in D0,
+   memory decoding is already enabled and BAR5 is a 32-bit memory BAR. It never
+   changes the device to make a check pass.
+4. Maps BAR5, the register aperture (Linux v6.12 `amdgpu_device_init` uses
+   BAR5 for CHIP_BONAIRE and later), **read-only and uncached**
+   (`kIOMapReadOnly | kIOMapInhibitCache`), so a stray store faults in the
+   kernel instead of reaching the GPU. It checks that the mapping's physical
+   address equals BAR5 and that it covers the registers below.
+5. Reads exactly two 32-bit registers, in this order:
+
+   | Register | BAR5 byte offset | Meaning |
+   | --- | --- | --- |
+   | `MP0_SMN_C2PMSG_33` | `0x58184` (dword `0x16061`) | Bit 31 set once IFWI initialization has completed |
+   | `RCC_CONFIG_MEMSIZE` | `0x378c` (dword `0xde3`) | Firmware-reserved VRAM size in MiB |
+
+   These are the registers Linux v6.12 reads in
+   `amdgpu_discovery_read_binary_from_mem` for discovery-based chips, before
+   that function writes any register. Renoir
+   (which includes `1638`) takes that path through the `default` case of
+   `amdgpu_discovery_set_ip_blocks`.
+   [amdgpu_discovery.c](https://github.com/torvalds/linux/blob/v6.12/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c)
+6. Releases the mapping, closes the device and stays attached with the results
+   published. A failed check is recorded as `CezanneGPU stage 1 result` and
+   does not unload the driver.
+
+Stage 1 never writes PCI configuration space or any register. In particular
+it does not use the `MM_INDEX`/`MM_DATA` indexed access Linux uses next to
+fetch the IP discovery table: that requires writing an index register. Linux
+looks for the table near the top of the carveout, which the known-good
+registry reports as 2 GiB, beyond this host's 256 MiB BAR0 aperture, so plain
+loads through BAR0 cannot reach it either.
+
+Guards, each tested offline:
+
+- The core (`driver/core/`) has read callbacks only; it has no write function,
+  no `volatile` access and no includes beyond `stdint.h`. Both the core and the
+  adapter refuse any register offset not on the stage 1 list, unaligned
+  offsets and offsets beyond the mapping.
+- `tests/test_core.py` runs the core against fake configuration space and
+  registers under AddressSanitizer and UBSan, and checks that five weakened
+  copies of the core (D0, decoding, capability bound, aperture bound,
+  all-ones detection) each fail the suite.
+- `tests/test_kext.py` builds the kext and checks:
+  - Source: none of the denylisted calls (configuration or register writes,
+    decode or bus-master changes, DMA, interrupts, power management). Every
+    BAR mapping carries `kIOMapReadOnly`, every `volatile` pointer is `const`,
+    and nothing is stored through the aperture. A planted violation of each
+    rule is detected.
+  - Binary: every direct call target is on a fixed list (metaclass plumbing,
+    logging, the boot argument, configuration reads, the mapping's physical
+    address and the core). Virtual calls are indirect, so the source check is
+    the guard for them. The compiled register read was also inspected: a
+    single 32-bit load from the mapping.
+  - Symbols: every undefined symbol resolves through `kmutil libraries` to a
+    declared library on this host. `kmutil` silently omits a symbol it cannot
+    resolve, so the test compares against `nm -u`, and it needs a resolved path
+    (it reported `No extension` for the same bundle under the `/var` symlink).
+
+Building only produces files; no test loads the kext. The linker warns that
+`libkmod.a` was built for macOS 26.5 while the kext targets 26.0. The host runs
+26.4.1; whether the kernel accepts the kext is checked at the first test boot.
+
+Expected stage 1 values, from the known-good boot's registry (an observation
+of the NootedRed stack, not proof of what the registers hold): BAR5 at
+`0xfca00000` with 512 KiB (`assigned-addresses`), and `VRAM,totalMB` 2048, so
+`RCC_CONFIG_MEMSIZE` should read `0x800`. Bit 31 of `C2PMSG_33` should be set,
+because firmware has finished before macOS starts.
+
+Stage 1 risks: the reads run while no driver has initialized the GPU since the
+firmware's GOP. A device that has stopped decoding returns all ones, which is
+reported as `device-not-responding`. A read that hangs the bus would freeze the
+machine during boot; power it off and boot the known-good EFI. Linux performs
+these same reads early in every boot of this chip family, before its discovery
+code writes a register, which is why they were chosen.
+
+## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
 `diskutil mount` command needs `sudo`):
@@ -115,33 +198,46 @@ sudo diskutil mount readOnly disk1s1     # internal EFI; identify it with diskut
 mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
-driver/probe/build.sh out/test-efi/probe
-python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
-  --kext out/test-efi/probe/CezanneProbe.kext --output out/test-efi/usb \
-  --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
+driver/kext/build.sh out/test-efi/driver
+for stage in 0 1; do
+  python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
+    --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
+    --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
+done
 ```
 
 `build` refuses an existing output. If any check fails it exits 2 and leaves
-the tree under `usb.rejected-<UTC time>`, never under the name the next steps
-copy. `out/test-efi/usb/manifest.json` records the SHA-256 of every file in
-both trees, the removed bundles and the `ocvalidate` output. The test EFI
-contains the host's SMBIOS serials; keep it in ignored `out/`.
+the tree under `usb-stageN.rejected-<UTC time>`, never under the name the next
+steps copy. Each `manifest.json` records the stage, the boot arguments, the
+SHA-256 of every file in both trees, the removed bundles and the `ocvalidate`
+output. The two test EFIs differ only in the `cezanne-stage` value. They
+contain the host's SMBIOS serials; keep them in ignored `out/`.
 
 ## Prepare the USB drive
 
 Erasing destroys the drive's contents. Identify it carefully: it must be the
 `external, physical` disk whose size matches the stick, never `disk0` or `disk1`.
+Start with stage 0:
 
 ```sh
 diskutil list external physical
 diskutil eraseDisk FAT32 CZTEST GPT /dev/diskN      # N from the line above
-ditto --norsrc --noextattr out/test-efi/usb/EFI /Volumes/CZTEST/EFI
-python3 tools/test_efi.py verify --manifest out/test-efi/usb/manifest.json --side test /Volumes/CZTEST/EFI
+ditto --norsrc --noextattr out/test-efi/usb-stage0/EFI /Volumes/CZTEST/EFI
+python3 tools/test_efi.py verify --manifest out/test-efi/usb-stage0/manifest.json --side test /Volumes/CZTEST/EFI
 diskutil eject /dev/diskN
 ```
 
 `verify` must report `"match": true` (exit 0). It ignores macOS `._*` and
 `.DS_Store` files.
+
+To switch the drive to stage 1 after stage 0 succeeded, replace its `EFI`
+folder and verify against the stage 1 manifest:
+
+```sh
+rm -rf /Volumes/CZTEST/EFI                          # the USB copy only; check the path
+ditto --norsrc --noextattr out/test-efi/usb-stage1/EFI /Volumes/CZTEST/EFI
+python3 tools/test_efi.py verify --manifest out/test-efi/usb-stage1/manifest.json --side test /Volumes/CZTEST/EFI
+```
 
 ## Before the first test boot
 
@@ -154,7 +250,7 @@ diskutil eject /dev/diskN
 - Find the motherboard's boot-menu key and confirm the internal disk remains the
   default boot device in firmware setup.
 
-## Run a stage 0 test boot
+## Run a test boot
 
 1. Plug in the drive, power on, open the firmware boot menu and choose the USB
    entry (often `UEFI: <drive name>`).
@@ -166,25 +262,39 @@ diskutil eject /dev/diskN
 Once macOS is up (locally or over SSH), record:
 
 ```sh
-sysctl kern.bootargs                               # must contain -cezanne-probe
+sysctl kern.bootargs                               # must contain cezanne-stage=N
 kmutil showloaded --list-only | grep -i -E 'cezanne|nootedred|radeon'
-ioreg -r -c CezanneProbe -l -w0
-/usr/bin/log show --last boot --predicate 'eventMessage CONTAINS "CezanneProbe:"'
-sudo dmesg | grep 'CezanneProbe:'                  # kernel buffer, if the log query is empty
+ioreg -r -c CezanneGPU -l -w0
+/usr/bin/log show --last boot --predicate 'eventMessage CONTAINS "CezanneGPU:"'
+sudo dmesg | grep 'CezanneGPU:'                    # kernel buffer, if the log query is empty
 ```
 
 Use `/usr/bin/log`: in zsh, a bare `log` is a shell builtin.
 
 Stage 0 succeeds when:
 
-- `org.cezanne-driver.probe` is loaded and NootedRed is not.
-- `ioreg` shows a `CezanneProbe` instance under the Cezanne PCI device with
-  `CezanneProbe vendor-id` `0x1002`, `device-id` `0x1638` and `revision-id`
-  `0xc9`.
-- The log shows the `attached passively` line.
+- `org.cezanne-driver.gpu` is loaded and NootedRed is not.
+- `ioreg` shows a `CezanneGPU` instance under the Cezanne PCI device with
+  `CezanneGPU stage` 0 and `CezanneGPU registry vendor-id` `0x1002`,
+  `device-id` `0x1638` and `revision-id` `0xc9`.
+- The log shows the `attached at stage 0` line.
 
-It also records the unknowns this boot answers: what the display does without
-NootedRed, and whether the 26.0-targeted kext loads.
+It also answers two unknowns: what the display does without NootedRed, and
+whether the 26.0-targeted kext loads.
+
+Stage 1 succeeds when:
+
+- The stage 0 conditions hold with `CezanneGPU stage` 1, and the machine
+  boots to the same point it reached at stage 0.
+- `CezanneGPU stage 1 result` is `ok`, and `CezanneGPU config bar5` and
+  `CezanneGPU bar5 length` agree with the registry's `assigned-addresses`.
+- `CezanneGPU MP0_SMN_C2PMSG_33` and `CezanneGPU RCC_CONFIG_MEMSIZE` are
+  recorded. Compare them with the expected values above; a mismatch is a
+  finding to investigate, not a reason to retry with writes.
+
+Any other stage 1 result (for example `not-in-d0` or `memory-decode-disabled`)
+is a valid observation of the device's state and ends that boot's experiment.
+A freeze or panic is a failure: record it as rule 6 requires.
 
 Failure evidence: the OpenCore log `opencore-*.txt` at the root of the USB
 drive, panic reports in `/Library/Logs/DiagnosticReports/*.panic` (read from
@@ -195,21 +305,22 @@ the known-good boot), and screen photos.
 Shut down, unplug the drive, and power on normally. Then confirm:
 
 ```sh
-sysctl kern.bootargs                               # -NRedRBPlus, no -cezanne-probe
+sysctl kern.bootargs                               # -NRedRBPlus, no cezanne-stage
 sudo diskutil mount readOnly disk1s1
-python3 tools/test_efi.py verify --manifest out/test-efi/usb/manifest.json --side known_good /Volumes/EFI/EFI
+python3 tools/test_efi.py verify --manifest out/test-efi/usb-stage0/manifest.json --side known_good /Volumes/EFI/EFI
 diskutil unmount /Volumes/EFI
 ```
 
 `verify --side known_good` compares the internal EFI with the build-time hashes,
-ignoring the config backups the test EFI does not copy. At preparation time it
-reported `"match": true` for all 32 files.
+ignoring the config backups the test EFI does not copy. Both manifests record
+the same known-good hashes.
 
 ## Unknowns and limits
 
 - Untested: whether the firmware lists and boots the USB FAT32 partition, the
-  display state without NootedRed, the kext's acceptance, and where the
-  probe's `IOLog` lines appear in the unified log.
+  display state without NootedRed, the kext's acceptance, where the driver's
+  `IOLog` lines appear in the unified log, and the device's power and decoding
+  state when no driver has initialized it.
 - The preparation checks prove the configs and files differ only as intended
   and that OpenCore's validator accepts them; they do not prove the boot works.
 - The known-good copy was taken from a read-write mount the user created; no

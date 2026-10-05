@@ -2,8 +2,9 @@
 
 Initial target: AMD Cezanne `1002:1638`, revision `c9`, Ryzen 5 5600GT,
 macOS 26.4.1. Current milestone: hardware discovery and graphics interface
-specification. A passive probe kext and a USB test boot are prepared; no
-independent driver has been loaded yet.
+specification. The first driver stages (passive attach, then read-only device
+access) and a USB test boot are prepared; no independent driver has been
+loaded yet.
 
 Read [AGENTS.md](AGENTS.md) before working on the project.
 For current progress and where to resume, read [the project handoff](docs/handoff.md).
@@ -68,9 +69,10 @@ read. Keep firmware under ignored `out/`; see
 
 ## Prepare the USB test boot
 
-`driver/probe/build.sh` builds the passive stage 0 kext and
-`tools/test_efi.py` derives a USB test EFI from a copy of the known-good
-OpenCore EFI, rejecting any change beyond the intended ones. Neither writes to
+`driver/kext/build.sh` builds `CezanneGPU.kext` from the IOKit adapter
+(`driver/kext/`) and the hardware core (`driver/core/`). `tools/test_efi.py
+build --stage N` derives a USB test EFI for an authorized stage from a copy of
+the known-good OpenCore EFI, rejecting any change beyond the intended ones. Neither writes to
 disks, NVRAM or EFI partitions. Follow [the test boot procedure](docs/test-boot.md);
 experiments run only from that USB EFI.
 
@@ -84,8 +86,9 @@ git diff --check
 Tests cover PCI byte order and topology, unavailable fields, profiler schema
 variants, malformed evidence, subprocess failures/timeouts, and overwrite
 protection, and test-EFI derivation and rejection on synthetic OpenCore trees.
-The native inventory and probe kext tests compile on macOS with `xcrun` (the
-kext is built, never loaded); they are skipped elsewhere. Host observations require independent system queries.
+The hardware core's unit tests run against fake configuration space and
+registers. The native inventory and kext tests compile on macOS with `xcrun`
+(the kext is built, never loaded); they are skipped elsewhere. Host observations require independent system queries.
 
 ## Specification
 

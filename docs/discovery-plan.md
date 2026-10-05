@@ -45,8 +45,9 @@ code. The references are study inputs.
 ## Subsequent milestones
 
 Experimental booting goes through a USB test EFI, with the untouched internal
-EFI as the recovery path ([test boot](test-boot.md)). A passive stage 0 probe
-precedes stage 1; each stage needs the user's approval. Investigate the Metal loader/factory
+EFI as the recovery path ([test boot](test-boot.md)). The driver's test
+stages are passive attach (0) and read-only device access (1), booted in that
+order; each later test stage needs a reviewed procedure and the user's approval. Investigate the Metal loader/factory
 contract before substantial hardware bring-up. The architecture keeps the
 Cezanne core, IOKit adapter, user-space driver and shader backend separate.
 

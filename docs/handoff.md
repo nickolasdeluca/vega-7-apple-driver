@@ -6,14 +6,15 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current research checkpoint: family queue reply production traced and USB test
-boot prepared, 2026-10-05, on branch `cezanne-discovery`, extending `aa1c1a1`.
+Current checkpoint: driver stages 0 and 1 built into USB test EFIs,
+2026-10-05, on branch `cezanne-discovery`, extending `14c14ca`.
 This handoff is committed
 with the continuation; check Git history for its commit rather than assuming a
 recorded hash is HEAD.
-The project remains in **discovery and specification**. A USB test EFI and a
-passive stage 0 probe kext are prepared and verified offline but not yet booted;
-no independent driver has been loaded.
+The project remains in **discovery and specification**, with driver
+implementation started: `CezanneGPU.kext` (stage 0 passive attach, stage 1
+read-only device access) and USB test EFIs for both stages are prepared and
+verified offline but not yet booted; no independent driver has been loaded.
 
 Initial target and observed host: PCI `1002:1638`, revision `c9`, reported Ryzen
 5 5600GT, macOS 26.4.1 build 25E253. SDK observations used 26.5 on x86_64; do not
@@ -107,16 +108,24 @@ Completed work:
   under `out/` (23.1.2 has no x86_64 macOS build). A wave32 request silently
   emits no kernel. The host's GC version and any execution remain unverified.
 - USB test boot prepared, not yet booted: [test boot](test-boot.md).
-  `tools/test_efi.py` derives a test EFI from a copy of the known-good OpenCore
-  1.0.7 EFI. It removes NootedRed and SMCRadeonSensors, adds the passive
-  `CezanneProbe.kext` (`driver/probe/`) and verbose boot arguments with the
-  `-cezanne-probe` interlock, and rejects any other config or file difference,
-  an NVRAM value the other boot would not reset, or a self-registering
-  launcher. The release `ocvalidate` accepts both configs. The probe reads only
-  registry properties; its build test checks call targets and symbol
-  resolution against this host's kernel. Display behaviour without NootedRed,
-  firmware boot-menu listing and the kext's acceptance are unknown until the
-  first boot.
+  `tools/test_efi.py build --stage N` derives a test EFI from a copy of the
+  known-good OpenCore 1.0.7 EFI. It removes NootedRed and SMCRadeonSensors,
+  adds `CezanneGPU.kext` and verbose boot arguments with `cezanne-stage=N`, and
+  rejects an unauthorized stage, any other config or file difference, an NVRAM
+  value the other boot would not reset, or a self-registering launcher. The
+  release `ocvalidate` accepts both configs. Display behaviour without
+  NootedRed, firmware boot-menu listing and the kext's acceptance are unknown
+  until the first boot.
+- Driver implementation started, built but never loaded:
+  `driver/core/` is the freestanding hardware core (identity, bounded
+  capability walk, D0/decode/BAR5 checks, two boot-state registers behind
+  read-only callbacks). `driver/kext/` is the IOKit adapter, `CezanneGPU`,
+  which replaced the passive probe. Stage 0 publishes registry identity. Stage
+  1 reads configuration space, maps BAR5 read-only and uncached, and reads
+  `MP0_SMN_C2PMSG_33` and `RCC_CONFIG_MEMSIZE`, the registers Linux v6.12 reads
+  before its discovery code writes any register. Core unit tests run under
+  ASan/UBSan with five rejected source mutants; kext tests check the source
+  denylist and read-only mapping, direct call targets and symbol resolution.
 
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
@@ -124,15 +133,23 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 0 USB test boot
+## Next task: stage 0, then stage 1, USB test boots
 
 Waits for the user's USB drive. Follow [test-boot.md](test-boot.md): the user
-erases the drive and performs every disk, EFI and reboot step. Before copying,
-rebuild the test EFI if the known-good EFI, the probe or the tool changed, and
-check the copy with `test_efi.py verify --side test`. Record the boot as the
-document lists. Success is the stage 0 criteria there; afterwards confirm the
-internal EFI with `verify --side known_good`. Stage 1 (register reads) needs a
-reviewed update to test-boot.md and the user's approval first.
+erases the drive and performs every disk, EFI and reboot step. Copy
+`out/test-efi/usb-stage0/` first. Before copying, rebuild the test EFIs if the
+known-good EFI, the driver or the tool changed, and check the copy with
+`test_efi.py verify --side test`. Record each boot as the document lists. Only
+after stage 0 meets its criteria, replace the USB `EFI` folder with
+`usb-stage1/` and run stage 1. Afterwards confirm the internal EFI with
+`verify --side known_good`.
+
+The next driver stage is not authorized. Candidates, each needing a reviewed
+update to test-boot.md and the user's approval: reading the IP discovery
+table (requires the `MM_INDEX` index-register write), which would replace the
+unmeasured IP versions in the [target manifest](cezanne-target-manifest.md),
+and a PCI-ownership diagnostic interface. Use stage 1's recorded values to
+decide.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
@@ -178,8 +195,8 @@ interfaces. The USB and offline frontend tasks above retain their scope.
 Parallel areas of future investigation, when relevant: primary vendor admission
 contracts and the PSP/ASD/TA service questions in the firmware study. Keep those separate from a focused lifecycle batch. Driver
 loading, PCI ownership, register access or GPU takeover happen only through the
-staged USB test boot in [test-boot.md](test-boot.md); this handoff authorizes
-stage 0 only.
+staged USB test boot in [test-boot.md](test-boot.md); stages 0 and 1 are
+authorized, in that order.
 
 ## Evidence and reproduction
 
@@ -207,7 +224,7 @@ Saved evidence on this workspace is ignored and contains sensitive/raw details:
 | `out/shader-target/` | Verified LLVM 20.1.7 archive, attestation and unpacked toolchain, pinned LLVM/Linux/Mesa sources, compile outputs, checker and mutation results, preserved failures |
 | `out/shader-target-reproduced/` | Fresh run of the documented scripts against the verified toolchain: identical objects and checker summary |
 | `out/iokit-async-reproduced/` | Fresh documented reproduction from extracted document code: separate launch, identical normalized instructions, 16 comparison groups, nine rejected mutations |
-| `out/test-efi/` | Known-good EFI copy, verified OpenCore 1.0.7 DEBUG release and `ocvalidate`, built probe, derived `usb/` test EFI with `manifest.json`; contains SMBIOS serials, never tracked |
+| `out/test-efi/` | Known-good EFI copy, verified OpenCore 1.0.7 DEBUG release and `ocvalidate`, built `driver/CezanneGPU.kext`, derived `usb-stage0/` and `usb-stage1/` test EFIs with `manifest.json`; the earlier probe build is kept as `superseded-probe*`; contains SMBIOS serials, never tracked |
 | `out/discovery-progress.md` | Local execution ledger; supplementary to this tracked handoff |
 
 A fresh clone will not contain `out/`. Tracked documents supply reproduction
@@ -231,6 +248,13 @@ in a fresh directory. The initial repository test capture passed all 26 tests;
 the final capture passed all 42, including the separately added test-boot tests. No installed
 family code was invoked. Tool/build/checker failures and denied sysctls remain
 preserved; details and runtime limits are in [the study](ioaccel-family-replies.md).
+
+The driver batch added 10 core/kext tests (replacing the 7 probe tests) and two
+stage tests for the test-EFI tool; all 47 tests pass. The real stage 0 and stage
+1 test EFIs passed `ocvalidate`, verified as copies, share identical known-good
+hashes and differ only in `cezanne-stage`; a stage 2 build was rejected. The
+internal EFI matched the known-good hashes again. The compiled register read is
+a single 32-bit load. Nothing was booted or loaded.
 
 The USB test boot preparation ran the probe build and test-EFI tests (16 new),
 built the real test EFI with `ocvalidate` exit 0, and confirmed the internal EFI
@@ -268,7 +292,7 @@ git status --short
 ```
 
 For documentation-only changes, check links, attribution and factual claims
-against evidence. For probe/tool changes, use meaningful failure-path tests and
+against evidence. For driver/tool changes, use meaningful failure-path tests and
 reproduce the affected read-only commands. Verify and commit small focused
 batches with the configured author and no agent co-author trailers. Keep raw
 captures, machine identifiers and runtime addresses untracked. Update this file
