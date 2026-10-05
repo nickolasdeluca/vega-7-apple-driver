@@ -43,6 +43,14 @@ const char *statusName(Status status)
     case kGcInfoUnavailable: return "gc-info-unavailable";
     case kGfxIndexNotSe0Sh0: return "gfx-index-not-se0-sh0";
     case kGfxNotOn: return "gfx-not-on";
+    case kCpNotHalted: return "cp-not-halted";
+    case kRlcEnabled: return "rlc-enabled";
+    case kGfxBusy: return "gfx-busy";
+    case kScratchUnstable: return "scratch-unstable";
+    case kRegisterWriteFailed: return "register-write-failed";
+    case kScratchReadbackMismatch: return "scratch-readback-mismatch";
+    case kScratchRestoreMismatch: return "scratch-restore-mismatch";
+    case kScratchOutOfOrder: return "scratch-out-of-order";
     }
     return "unknown";
 }
@@ -119,14 +127,15 @@ Status checkAperture(const PciState &state, uint64_t physical, uint64_t length)
 bool registerAllowed(uint32_t offset, uint32_t stage)
 {
     // Each stage's list extends the previous one (checked by the tests), so a
-    // prefix of the stage 5 list is the list for any stage.
-    uint32_t count = stage >= 5   ? kStage5RegisterCount
+    // prefix of the stage 6 list is the list for any stage.
+    uint32_t count = stage >= 6   ? kStage6RegisterCount
+                     : stage == 5 ? kStage5RegisterCount
                      : stage >= 3 ? kStage3RegisterCount
                      : stage == 2 ? kStage2RegisterCount
                      : stage == 1 ? kStage1RegisterCount
                                   : 0;
     for (uint32_t i = 0; i < count; i++) {
-        if (kStage5Registers[i] == offset) return true;
+        if (kStage6Registers[i] == offset) return true;
     }
     return false;
 }
@@ -381,6 +390,76 @@ Status readGfxConfig(const RegisterReader &registers, uint64_t apertureLength, c
     config->cuActiveCount = popcount(config->cuActiveMask);
     config->rbActiveCount = popcount(config->rbActiveMask);
     return kOK;
+}
+
+bool writeAllowed(uint32_t offset, uint32_t stage)
+{
+    return stage >= kScratchStage && offset == kRegScratchReg0;
+}
+
+// The only write site in the core.
+static Status writeRegister(const RegisterWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
+{
+    if (!writeAllowed(offset, stage)) return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+Status checkScratch(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                    uint32_t stage, ScratchCheck *check)
+{
+    *check = ScratchCheck();
+    if (!writeAllowed(kRegScratchReg0, stage)) return kRegisterNotAllowed;
+    Status status = readRegister(registers, apertureLength, stage, kRegSmuioGfxMiscCntl, &check->gfxMisc);
+    if (status != kOK) return status;
+    if (((check->gfxMisc & kGfxOffStatusMask) >> kGfxOffStatusShift) != kGfxOffStatusOn) return kGfxNotOn;
+    const struct {
+        uint32_t offset;
+        uint32_t *value;
+    } reads[] = {
+        {kRegCpMeCntl, &check->cpMeCntl},
+        {kRegCpMecCntl, &check->cpMecCntl},
+        {kRegRlcCntl, &check->rlcCntl},
+        {kRegGrbmStatus, &check->grbmStatus},
+        {kRegScratchReg0, &check->original},
+    };
+    for (const auto &read : reads) {
+        status = readRegister(registers, apertureLength, stage, read.offset, read.value);
+        if (status != kOK) return status;
+    }
+    if ((check->cpMeCntl & kCpMeHalts) != kCpMeHalts || (check->cpMecCntl & kCpMecHalts) != kCpMecHalts)
+        return kCpNotHalted;
+    if (check->rlcCntl != 0) return kRlcEnabled;
+    if ((check->grbmStatus & kGrbmGuiActive) != 0) return kGfxBusy;
+    writer.pause(writer.context);
+    status = readRegister(registers, apertureLength, stage, kRegScratchReg0, &check->original2);
+    if (status != kOK) return status;
+    return check->original2 == check->original ? kOK : kScratchUnstable;
+}
+
+Status writeScratchPattern(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                           uint32_t stage, uint32_t original, uint32_t *readback)
+{
+    *readback = 0;
+    ScratchCheck check;
+    Status status = checkScratch(registers, apertureLength, writer, stage, &check);
+    if (status != kOK) return status;
+    if (check.original != original) return kScratchUnstable;
+    status = writeRegister(writer, stage, kRegScratchReg0, kScratchPattern);
+    if (status != kOK) return status;
+    status = readRegister(registers, apertureLength, stage, kRegScratchReg0, readback);
+    if (status != kOK) return status;
+    return *readback == kScratchPattern ? kOK : kScratchReadbackMismatch;
+}
+
+Status restoreScratch(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, uint32_t original, uint32_t *readback)
+{
+    *readback = 0;
+    Status status = writeRegister(writer, stage, kRegScratchReg0, original);
+    if (status != kOK) return status;
+    status = readRegister(registers, apertureLength, stage, kRegScratchReg0, readback);
+    if (status != kOK) return status;
+    return *readback == original ? kOK : kScratchRestoreMismatch;
 }
 
 } // namespace cezanne

@@ -1,4 +1,5 @@
 """Build and run the hardware-core unit tests on the host (fakes only, no hardware)."""
+import re
 import shutil
 import subprocess
 import tempfile
@@ -50,6 +51,13 @@ class CoreTests(unittest.TestCase):
             "kDiscoveryBaseMismatch": ("return kDiscoveryBaseMismatch;", "(void)0;"),
             "kGfxIndexNotSe0Sh0": ("return kGfxIndexNotSe0Sh0;", "(void)0;"),
             "kGfxNotOn": ("!= kGfxOffStatusOn) return kGfxNotOn;", "!= kGfxOffStatusOn) (void)0;"),
+            "writeAllowed(kRegScratchReg0 + 4, 6)": ("&& offset == kRegScratchReg0;", "&& offset >= kRegScratchReg0;"),
+            "kCpNotHalted": ("return kCpNotHalted;", "(void)0;"),
+            "kRlcEnabled": ("if (check->rlcCntl != 0) return kRlcEnabled;", ""),
+            "kScratchUnstable": ("return check->original2 == check->original ? kOK : kScratchUnstable;",
+                                 "return kOK;"),
+            "kScratchRestoreMismatch": ("return *readback == original ? kOK : kScratchRestoreMismatch;",
+                                        "return kOK;"),
             "registerAllowed(kRegMp1C2PMsg90, 4)": (": stage >= 3 ? kStage3RegisterCount", ": stage >= 3 ? kStage5RegisterCount"),
             "registerAllowed(kRegGrbmGfxIndex, 2)": ("stage == 2 ? kStage2RegisterCount",
                                                      "stage == 2 ? kStage3RegisterCount"),
@@ -60,12 +68,20 @@ class CoreTests(unittest.TestCase):
                 self.assertNotEqual(run.returncode, 0)
                 self.assertIn(expected, run.stderr)
 
-    def test_core_has_no_write_path_or_runtime_dependencies(self):
+    def test_core_has_one_write_site_and_no_runtime_dependencies(self):
         for name in ("cezanne_core.h", "cezanne_core.cpp"):
             source = (CORE / name).read_text()
-            self.assertNotRegex(source, r"\bwrite\w*\s*\(", name)
             self.assertNotRegex(source, r"#include\s*<(?!stdint\.h>)", name)
             self.assertNotIn("volatile", source, name)
+        source = (CORE / "cezanne_core.cpp").read_text()
+        # The only call of the write callback, inside writeRegister, after the allowlist.
+        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 1)
+        body = re.search(r"static Status writeRegister\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("if (!writeAllowed(offset, stage)) return kRegisterNotAllowed;", body)
+        self.assertLess(body.index("writeAllowed"), body.index("write32"))
+        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 2)  # pattern and restore
+        allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("return stage >= kScratchStage && offset == kRegScratchReg0;", allow)
 
 
 if __name__ == "__main__":

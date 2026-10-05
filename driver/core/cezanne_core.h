@@ -2,9 +2,10 @@
 // IP discovery table.
 //
 // Freestanding C++ shared by the kext and the host unit tests: it uses no
-// IOKit, libc or allocation. The adapter supplies read callbacks. There is
-// deliberately no write path: every stage the core implements so far only
-// reads, and adding a write is a reviewed stage change (docs/test-boot.md).
+// IOKit, libc or allocation. The adapter supplies read callbacks and, for the
+// stage 6 scratch test only, one write callback. The write allowlist holds
+// exactly one register, SCRATCH_REG0; widening it is a reviewed stage change
+// (docs/test-boot.md).
 //
 // Register offsets are byte offsets into the MMIO register BAR (BAR5). Linux
 // v6.12 selects BAR5 for CHIP_BONAIRE and later in amdgpu_device_init and,
@@ -25,7 +26,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 5;
+const uint32_t kMaxStage = 6;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -133,6 +134,36 @@ const uint32_t kGfxGatedRegisters[] = {
 const uint32_t kGfxGatedRegisterCount = sizeof(kGfxGatedRegisters) / sizeof(kGfxGatedRegisters[0]);
 const uint32_t kGfxOffStatusMask = 0x6, kGfxOffStatusShift = 1, kGfxOffStatusOn = 2;
 
+// Stage 6: the first reviewed write. SCRATCH_REG0 (GC dword 0x2040, base index
+// 1, gc_9_0_offset.h) has no hardware function; Linux v6.12
+// gfx_v9_0_ring_test_ring writes 0xCAFEDEAD to it from the CPU.
+const uint32_t kRegScratchReg0 = (0xA000 + 0x2040) * 4;
+const uint32_t kScratchPattern = 0xCAFEDEAD;
+// The adapter maps only this 4 KiB page of BAR5 writable.
+const uint32_t kScratchPageOffset = kRegScratchReg0 & ~0xFFFu;
+const uint32_t kScratchPageSize = 0x1000;
+const uint32_t kStage6Registers[] = {kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset, kRegGrbmStatus,
+                                     kRegGrbmGfxIndex, kRegCcShaderArrayConfig, kRegUserShaderArrayConfig,
+                                     kRegCcRbBackendDisable, kRegUserRbBackendDisable, kRegGbAddrConfig,
+                                     kRegSmuioGfxMiscCntl, kRegMp1C2PMsg66, kRegMp1C2PMsg82,
+                                     kRegMp1C2PMsg90, kRegMp0C2PMsg35, kRegMp0C2PMsg81,
+                                     kRegRlcCgttMgcgOverride, kRegRlcCgcgCglsCtrl,
+                                     kRegRlcCgcgCglsCtrl3d, kRegRlcMemSlpCntl, kRegCpMemSlpCntl,
+                                     kRegRlcPgCntl, kRegGrbmStatus2, kRegGrbmStatusSe0,
+                                     kRegCpBusyStat, kRegCpCpfStatus, kRegCpMeCntl, kRegCpMecCntl,
+                                     kRegRlcCntl, kRegRlcStat, kRegCpPfpInstrPntr, kRegCpMeInstrPntr,
+                                     kRegCpMec1InstrPntr, kRegSdma0ClkCtrl, kRegSdma0PowerCntl,
+                                     kRegSdma0F32Cntl, kRegSdma0StatusReg, kRegSdma0GfxRbCntl,
+                                     kRegHdpMemPowerLs, kRegAthubMiscCntl, kRegAtcL2MiscCg,
+                                     kRegDagb0CntlMisc2, kRegMmhubFbLocationBase, kRegMmhubFbLocationTop,
+                                     kRegMmhubVmL2Cntl, kRegMmhubVmContext0Cntl, kRegMmhubMxL1TlbCntl,
+                                     kRegIhRbCntl, kRegScratchReg0};
+const uint32_t kStage6RegisterCount = sizeof(kStage6Registers) / sizeof(kStage6Registers[0]);
+// Preconditions (gc_9_0_sh_mask.h): every CP engine halted, GUI idle.
+const uint32_t kCpMeHalts = 0x15000000u;  // ME_HALT | PFP_HALT | CE_HALT
+const uint32_t kCpMecHalts = 0x50000000u; // MEC_ME1_HALT | MEC_ME2_HALT
+const uint32_t kGrbmGuiActive = 0x80000000u;
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -179,6 +210,15 @@ enum Status : uint32_t {
     kGfxIndexNotSe0Sh0,
     // Stage 5.
     kGfxNotOn,
+    // Stage 6.
+    kCpNotHalted,
+    kRlcEnabled,
+    kGfxBusy,
+    kScratchUnstable,
+    kRegisterWriteFailed,
+    kScratchReadbackMismatch,
+    kScratchRestoreMismatch,
+    kScratchOutOfOrder,
 };
 
 const char *statusName(Status status);
@@ -229,19 +269,54 @@ Status readAllowedRegister(const RegisterReader &registers, uint64_t apertureLen
 
 bool gfxGated(uint32_t offset);
 
+// Writes one 32-bit register at a byte offset into BAR5; pause waits about
+// 1 ms. Only the stage 6 scratch test uses it.
+struct RegisterWriter {
+    bool (*write32)(void *context, uint32_t offset, uint32_t value);
+    void (*pause)(void *context);
+    void *context;
+};
+
+// The write allowlist: SCRATCH_REG0 from stage 6 on, nothing else.
+bool writeAllowed(uint32_t offset, uint32_t stage);
+
+struct ScratchCheck {
+    uint32_t gfxMisc, cpMeCntl, cpMecCntl, rlcCntl, grbmStatus;
+    uint32_t original, original2; // read twice, ~1 ms apart
+};
+
+// Reads the preconditions (GFX on, every CP engine halted, RLC off, GUI idle)
+// and SCRATCH_REG0 twice; kScratchUnstable if the two reads differ. No write.
+Status checkScratch(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                    uint32_t stage, ScratchCheck *check);
+
+// Re-runs checkScratch, requires the same original value, then writes
+// kScratchPattern and reads it back (kScratchReadbackMismatch otherwise).
+Status writeScratchPattern(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                           uint32_t stage, uint32_t original, uint32_t *readback);
+
+// Writes the original value back and reads it back (kScratchRestoreMismatch).
+Status restoreScratch(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, uint32_t original, uint32_t *readback);
+
 // The diagnostic interface's read (stage 4 and later): readAllowedRegister,
 // but a GFX-gated register is read only after SMUIO_GFX_MISC_CNTL reports GFX
 // on (kGfxNotOn otherwise), as Linux requires before its GC IP dump.
 Status readDiagnosticRegister(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
                               uint32_t offset, uint32_t *value);
 
-// Stage 4 diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 1;
+// Diagnostic interface (IOUserClient selectors and their scalars).
+const uint32_t kDiagnosticVersion = 2;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
-    kDiagnosticSelectorCount = 2,
+    // Stage 6 scratch test, accepted only in this order per connection.
+    kDiagnosticScratchCheck = 2,   // out: Status, GFX misc, CP_ME, CP_MEC, RLC, GRBM, original
+    kDiagnosticScratchWrite = 3,   // out: Status, read-back
+    kDiagnosticScratchRestore = 4, // out: Status, read-back
+    kDiagnosticSelectorCount = 5,
 };
+const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
 
 struct BootState {

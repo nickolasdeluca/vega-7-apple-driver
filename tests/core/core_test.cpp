@@ -61,20 +61,27 @@ struct FakeRegisters {
     uint32_t userShader = 0;
     uint32_t ccRb = 0, userRb = 0;
     uint32_t gfxMisc = 0x4; // PWR_GFXOFF_STATUS 2: GFX on
+    uint32_t cpMe = 0x15000000u, cpMec = 0x50000000u, rlc = 0, grbm = 0x00003028u; // boot 7 values
+    uint32_t scratch = 0;
+    bool scratchWritable = true;
     bool fail = false;
-    uint32_t order[16];
+    uint32_t order[32];
     int reads = 0;
 
     static bool read32(void *context, uint32_t offset, uint32_t *value)
     {
         FakeRegisters *self = static_cast<FakeRegisters *>(context);
-        if (self->reads < 16) self->order[self->reads] = offset;
+        if (self->reads < 32) self->order[self->reads] = offset;
         self->reads++;
         if (self->fail) return false;
         *value = offset == kRegC2PMsg33        ? self->c2pmsg33
                  : offset == kRegConfigMemsize ? self->memsize
                  : offset == kRegMcVmFbOffset  ? self->fbOffset
-                 : offset == kRegGrbmStatus    ? 0x00003028u
+                 : offset == kRegGrbmStatus    ? self->grbm
+                 : offset == kRegCpMeCntl      ? self->cpMe
+                 : offset == kRegCpMecCntl     ? self->cpMec
+                 : offset == kRegRlcCntl       ? self->rlc
+                 : offset == kRegScratchReg0   ? self->scratch
                  : offset == kRegGrbmGfxIndex  ? self->gfxIndex
                  : offset == kRegCcShaderArrayConfig   ? self->ccShader
                  : offset == kRegUserShaderArrayConfig ? self->userShader
@@ -233,7 +240,7 @@ static void testAllowlist()
     CHECK(!registerAllowed(0, 2) && !registerAllowed(4, 2) && !registerAllowed(kRegConfigMemsize + 4, 2));
     CHECK(kRegC2PMsg33 == 0x58184 && kRegConfigMemsize == 0x378c && kRegMcVmFbOffset == 0xa5ac);
     CHECK(std::strcmp(statusName(kNotInD0), "not-in-d0") == 0);
-    for (uint32_t s = kOK; s <= kGfxNotOn; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
+    for (uint32_t s = kOK; s <= kScratchOutOfOrder; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
     CHECK(std::strcmp(statusName(static_cast<Status>(999)), "unknown") == 0);
 }
 
@@ -582,6 +589,136 @@ static void testStage5()
     }
 }
 
+// Records writes into a FakeRegisters; pause can simulate another writer.
+struct FakeWriter {
+    FakeRegisters *registers;
+    bool fail = false;
+    uint32_t pauseWrites = 0; // non-zero: value something else writes during the pause
+    uint32_t offsets[8], values[8];
+    int writes = 0;
+
+    explicit FakeWriter(FakeRegisters *r) : registers(r) {}
+    static bool write32(void *context, uint32_t offset, uint32_t value)
+    {
+        FakeWriter *self = static_cast<FakeWriter *>(context);
+        if (self->writes < 8) {
+            self->offsets[self->writes] = offset;
+            self->values[self->writes] = value;
+        }
+        self->writes++;
+        if (self->fail) return false;
+        if (offset == kRegScratchReg0 && self->registers->scratchWritable) self->registers->scratch = value;
+        return true;
+    }
+    static void pause(void *context)
+    {
+        FakeWriter *self = static_cast<FakeWriter *>(context);
+        if (self->pauseWrites != 0) self->registers->scratch = self->pauseWrites;
+    }
+    RegisterWriter writer() { return RegisterWriter{write32, pause, this}; }
+};
+
+static Status checkWith(uint32_t FakeRegisters::*field, uint32_t value)
+{
+    FakeRegisters r;
+    r.*field = value;
+    FakeWriter w(&r);
+    ScratchCheck c;
+    return checkScratch(r.reader(), 0x80000, w.writer(), 6, &c);
+}
+
+static void testScratch()
+{
+    CHECK(checkWith(&FakeRegisters::cpMe, 0x14000000u) == kCpNotHalted);
+    CHECK(checkWith(&FakeRegisters::rlc, 0x1) == kRlcEnabled);
+    CHECK(kRegScratchReg0 == 0x30100 && kScratchPageOffset == 0x30000 && kScratchPattern == 0xCAFEDEADu);
+    CHECK(writeAllowed(kRegScratchReg0, 6) && !writeAllowed(kRegScratchReg0, 5));
+    for (uint32_t i = 0; i < kStage6RegisterCount; i++) {
+        if (kStage6Registers[i] != kRegScratchReg0) CHECK(!writeAllowed(kStage6Registers[i], 6));
+    }
+    CHECK(!writeAllowed(kRegScratchReg0 + 4, 6) && !writeAllowed(kRegGrbmGfxIndex, 6));
+    for (uint32_t i = 0; i < kStage5RegisterCount; i++) CHECK(kStage6Registers[i] == kStage5Registers[i]);
+    CHECK(registerAllowed(kRegScratchReg0, 6) && !registerAllowed(kRegScratchReg0, 5));
+
+    {
+        FakeRegisters r;
+        r.scratch = 0x12345678u;
+        FakeWriter w(&r);
+        ScratchCheck c;
+        CHECK(checkScratch(r.reader(), 0x80000, w.writer(), 6, &c) == kOK);
+        CHECK(c.original == 0x12345678u && c.original2 == 0x12345678u && w.writes == 0);
+        CHECK(r.order[0] == kRegSmuioGfxMiscCntl);
+        uint32_t readback = 0;
+        CHECK(writeScratchPattern(r.reader(), 0x80000, w.writer(), 6, c.original, &readback) == kOK);
+        CHECK(readback == kScratchPattern && w.writes == 1 && w.offsets[0] == kRegScratchReg0 &&
+              w.values[0] == kScratchPattern);
+        CHECK(restoreScratch(r.reader(), 0x80000, w.writer(), 6, c.original, &readback) == kOK);
+        CHECK(readback == 0x12345678u && r.scratch == 0x12345678u && w.writes == 2 && w.values[1] == 0x12345678u);
+    }
+    // Every failed precondition stops before any write.
+    struct Case {
+        uint32_t FakeRegisters::*field;
+        uint32_t value;
+        Status expected;
+    } cases[] = {
+        {&FakeRegisters::gfxMisc, 0x0, kGfxNotOn},
+        {&FakeRegisters::cpMe, 0x14000000u, kCpNotHalted},
+        {&FakeRegisters::cpMe, 0x11000000u, kCpNotHalted},
+        {&FakeRegisters::cpMec, 0x40000000u, kCpNotHalted},
+        {&FakeRegisters::rlc, 0x1, kRlcEnabled},
+        {&FakeRegisters::grbm, 0x80003028u, kGfxBusy},
+    };
+    for (const Case &k : cases) {
+        FakeRegisters r;
+        r.*(k.field) = k.value;
+        FakeWriter w(&r);
+        ScratchCheck c;
+        CHECK(checkScratch(r.reader(), 0x80000, w.writer(), 6, &c) == k.expected);
+        uint32_t readback = 1;
+        CHECK(writeScratchPattern(r.reader(), 0x80000, w.writer(), 6, 0, &readback) == k.expected);
+        CHECK(w.writes == 0 && readback == 0);
+    }
+    {
+        FakeRegisters r;
+        FakeWriter w(&r);
+        w.pauseWrites = 0x55; // something else writes it between the two reads
+        ScratchCheck c;
+        CHECK(checkScratch(r.reader(), 0x80000, w.writer(), 6, &c) == kScratchUnstable);
+        uint32_t readback = 0;
+        CHECK(writeScratchPattern(r.reader(), 0x80000, w.writer(), 6, 0, &readback) == kScratchUnstable);
+        CHECK(w.writes == 0);
+    }
+    {
+        FakeRegisters r;
+        r.scratch = 7;
+        FakeWriter w(&r);
+        uint32_t readback = 0;
+        CHECK(writeScratchPattern(r.reader(), 0x80000, w.writer(), 6, 0, &readback) == kScratchUnstable);
+        CHECK(w.writes == 0); // original changed since the check
+        CHECK(writeScratchPattern(r.reader(), 0x80000, w.writer(), 5, 7, &readback) == kRegisterNotAllowed);
+        CHECK(restoreScratch(r.reader(), 0x80000, w.writer(), 5, 7, &readback) == kRegisterNotAllowed);
+        CHECK(w.writes == 0);
+    }
+    {
+        FakeRegisters r;
+        r.scratchWritable = false; // writes are ignored
+        FakeWriter w(&r);
+        uint32_t readback = 0;
+        CHECK(writeScratchPattern(r.reader(), 0x80000, w.writer(), 6, 0, &readback) == kScratchReadbackMismatch);
+        CHECK(readback == 0 && w.writes == 1);
+        r.scratch = 9; // restore cannot take effect either
+        CHECK(restoreScratch(r.reader(), 0x80000, w.writer(), 6, 0, &readback) == kScratchRestoreMismatch);
+    }
+    {
+        FakeRegisters r;
+        FakeWriter w(&r);
+        w.fail = true;
+        uint32_t readback = 0;
+        CHECK(writeScratchPattern(r.reader(), 0x80000, w.writer(), 6, 0, &readback) == kRegisterWriteFailed);
+        CHECK(restoreScratch(r.reader(), 0x80000, w.writer(), 6, 0, &readback) == kRegisterWriteFailed);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -595,6 +732,7 @@ int main()
     testDiscovery();
     testGfxConfig();
     testStage5();
+    testScratch();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }
