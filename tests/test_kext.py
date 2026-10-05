@@ -35,7 +35,9 @@ DIRECT_CALLS = {"___stack_chk_fail", "__ZN11OSMetaClassC2EPKcPKS_j", "__ZN11OSMe
                 "__ZN11IOPCIDevice20extendedConfigRead32Ey", "__ZN11IOMemoryMap18getPhysicalAddressEv",
                 "__ZN14IODeviceMemory9withRangeEyy", "__ZN12IOUserClient18clientHasPrivilegeEPvPKc",
                 "__ZN12IOUserClientC2EPK11OSMetaClass", "__ZN12IOUserClientD2Ev", "_IOLockAlloc", "_IOLockFree",
-                "_IOLockLock", "_IOLockUnlock", "_IODelay"}
+                "_IOLockLock", "_IOLockUnlock", "_IODelay",
+                # Zeroing the driver's own 148-byte metrics buffer (stage 9).
+                "___bzero"}
 OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU", "__ZN20CezanneGPUUserClient")
 
 
@@ -48,7 +50,7 @@ def strip_comments(source):
 # non-const volatile pointers that carry it.
 SCRATCH_MAP = "pageMemory->map(kIOMapInhibitCache)"
 SCRATCH_STORE = "page->base[(offset - page->pageOffset) / 4] = value;"
-ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize")
+ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize", "length")
 ALLOWED_VOLATILE = 2
 
 
@@ -128,9 +130,17 @@ void f(IOPCIDevice *p, Aperture *a) {
                                     ("cezanne::kScratchPageOffset", "scratchRestoreOperation"),
                                     ("cezanne::kScratchPageOffset", "scratchWriteOperation"),
                                     ("cezanne::kSmuPageOffset", "gfxOffOperation"),
+                                    ("cezanne::kSmuPageOffset", "metricsTransferOperation"),
                                     ("cezanne::kSmuPageOffset", "smuQueryOperation")])
-        self.assertEqual(re.findall(r"accessDevice\(0, (\w+)", source),
-                         ["readOperation", "scratchCheckOperation", "smuCheckOperation"])
+        self.assertEqual(sorted(re.findall(r"accessDevice\(0, (\w+)", source)),
+                         ["metricsCheckOperation", "metricsReadOperation", "readOperation", "scratchCheckOperation",
+                          "smuCheckOperation"])
+        # Carveout memory: only the metrics page's range, read-only, at the
+        # check size or one page.
+        self.assertEqual(re.findall(r"IODeviceMemory::withRange\(cezanne::(\w+), length\)", source), ["kMetricsPhysical"])
+        self.assertEqual(sorted(re.findall(r"withMetricsMemory\(cezanne::(\w+),", source)),
+                         ["kMetricsCheckSize", "kPageSize"])
+        self.assertIn("memory->map(kIOMapReadOnly | kIOMapInhibitCache)", source)
         self.assertIn("writablePage != 0 && writablePage != cezanne::kScratchPageOffset && "
                       "writablePage != cezanne::kSmuPageOffset", source)
         page = re.search(r"IODeviceMemory::withRange\(\(state\.bar5 & ~0xFull\) \+ writablePage, cezanne::kPageSize\)",
@@ -153,7 +163,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 8;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 9;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
