@@ -88,10 +88,11 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 2;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 3;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
+        self.assertRegex(header, r"kStage3Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset, kRegGrbmStatus,")
 
 
 @unittest.skipUnless(sys.platform == "darwin" and shutil.which("xcrun"), "macOS SDK required")

@@ -11,6 +11,9 @@
 //   Stage 2: also read GC MC_VM_FB_OFFSET, derive the carveout's physical
 //            address, check it overlaps none of the device's BARs, map only
 //            the 10 KiB IP discovery binary read-only, copy and validate it.
+//   Stage 3: also read seven GC configuration registers and derive the
+//            active CU and render-backend masks for SE 0 / SH 0, without
+//            writing GRBM_GFX_INDEX to select them.
 //            Nothing is written to configuration space, registers or memory,
 //            and every mapping and the provider are released before start()
 //            returns.
@@ -49,7 +52,9 @@ private:
     void publish(const char *key, UInt64 value, UInt32 bits);
     void publishRegistryIdentity(IOService *provider);
     cezanne::Status runDevice(IOPCIDevice *pci);
-    cezanne::Status runStage2(IOPCIDevice *pci, Aperture *aperture, const cezanne::BootState &boot);
+    cezanne::Status runStage2(IOPCIDevice *pci, Aperture *aperture, const cezanne::BootState &boot,
+                              cezanne::Discovery *discovery);
+    cezanne::Status runStage3(Aperture *aperture, const cezanne::Discovery &discovery);
     cezanne::Status copyDiscovery(UInt64 physical);
 };
 
@@ -175,8 +180,11 @@ cezanne::Status CezanneGPU::copyDiscovery(UInt64 physical)
     return status;
 }
 
-cezanne::Status CezanneGPU::runStage2(IOPCIDevice *pci, Aperture *aperture, const cezanne::BootState &boot)
+cezanne::Status CezanneGPU::runStage2(IOPCIDevice *pci, Aperture *aperture, const cezanne::BootState &boot,
+                                      cezanne::Discovery *out)
 {
+    cezanne::Discovery &discovery = *out;
+    discovery = cezanne::Discovery();
     cezanne::Carveout carveout;
     cezanne::RegisterReader registers = {registerRead, aperture};
     cezanne::Status status = cezanne::readCarveout(registers, aperture->length, boot, &carveout);
@@ -205,7 +213,6 @@ cezanne::Status CezanneGPU::runStage2(IOPCIDevice *pci, Aperture *aperture, cons
         IOLog(LOG_PREFIX "discovery mapping failed\n");
         return status;
     }
-    cezanne::Discovery discovery;
     status = cezanne::parseDiscovery(reinterpret_cast<const uint8_t *>(table_), sizeof(table_), &discovery);
     publish("discovery signature", table_[0], 32);
     // Publish the bytes only once the signature and checksum prove they are
@@ -225,9 +232,42 @@ cezanne::Status CezanneGPU::runStage2(IOPCIDevice *pci, Aperture *aperture, cons
     if (discovery.mp0Found) {
         publish("discovery MP0 base 0", discovery.mp0Base0, 32);
     }
+    if (discovery.gcInfoFound) {
+        publish("discovery GC info version", (UInt32(discovery.gcInfoMajor) << 16) | discovery.gcInfoMinor, 32);
+        publish("discovery GC SE count", discovery.gcNumSe, 32);
+        publish("discovery GC CUs per SH", discovery.gcCuPerSh, 32);
+        publish("discovery GC SHs per SE", discovery.gcShPerSe, 32);
+        publish("discovery GC RBs per SE", discovery.gcRbPerSe, 32);
+    }
     IOLog(LOG_PREFIX "discovery %s: v%u.%u, %u IPs, GC %u.%u.%u\n", cezanne::statusName(status),
           discovery.versionMajor, discovery.versionMinor, discovery.numIps, discovery.gcMajor, discovery.gcMinor,
           discovery.gcRevision);
+    return status;
+}
+
+cezanne::Status CezanneGPU::runStage3(Aperture *aperture, const cezanne::Discovery &discovery)
+{
+    cezanne::GfxConfig gfx;
+    cezanne::RegisterReader registers = {registerRead, aperture};
+    cezanne::Status status = cezanne::readGfxConfig(registers, aperture->length, discovery, &gfx);
+    if (status == cezanne::kOK || status == cezanne::kGcInfoUnavailable || status == cezanne::kGfxIndexNotSe0Sh0 ||
+        status == cezanne::kDeviceNotResponding) {
+        publish("GRBM_STATUS", gfx.grbmStatus, 32);
+        publish("GRBM_GFX_INDEX", gfx.grbmGfxIndex, 32);
+        publish("CC_GC_SHADER_ARRAY_CONFIG", gfx.ccShaderArrayConfig, 32);
+        publish("GC_USER_SHADER_ARRAY_CONFIG", gfx.userShaderArrayConfig, 32);
+        publish("CC_RB_BACKEND_DISABLE", gfx.ccRbBackendDisable, 32);
+        publish("GC_USER_RB_BACKEND_DISABLE", gfx.userRbBackendDisable, 32);
+        publish("GB_ADDR_CONFIG", gfx.gbAddrConfig, 32);
+    }
+    if (status == cezanne::kOK) {
+        publish("active CU mask", gfx.cuActiveMask, 32);
+        publish("active CU count", gfx.cuActiveCount, 32);
+        publish("active RB mask", gfx.rbActiveMask, 32);
+        publish("active RB count", gfx.rbActiveCount, 32);
+    }
+    IOLog(LOG_PREFIX "gfx %s: %u CUs (mask 0x%x), %u RBs, GRBM_STATUS 0x%08x\n", cezanne::statusName(status),
+          gfx.cuActiveCount, gfx.cuActiveMask, gfx.rbActiveCount, gfx.grbmStatus);
     return status;
 }
 
@@ -270,9 +310,16 @@ cezanne::Status CezanneGPU::runDevice(IOPCIDevice *pci)
             publish("RCC_CONFIG_MEMSIZE", boot.configMemsize, 32);
         }
         if (status == cezanne::kOK && stage_ >= 2) {
-            cezanne::Status stage2 = runStage2(pci, &aperture, boot);
+            cezanne::Discovery discovery;
+            cezanne::Status stage2 = runStage2(pci, &aperture, boot, &discovery);
             setProperty("CezanneGPU stage 2 result", cezanne::statusName(stage2));
             IOLog(LOG_PREFIX "stage 2 result: %s\n", cezanne::statusName(stage2));
+            // Stage 3 trusts the GC bases only after the discovery cross-check.
+            if (stage2 == cezanne::kOK && stage_ >= 3) {
+                cezanne::Status stage3 = runStage3(&aperture, discovery);
+                setProperty("CezanneGPU stage 3 result", cezanne::statusName(stage3));
+                IOLog(LOG_PREFIX "stage 3 result: %s\n", cezanne::statusName(stage3));
+            }
         }
     }
     map->release();
