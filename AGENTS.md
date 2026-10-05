@@ -24,13 +24,20 @@ after this host works.
 
 The current milestone is read-only discovery: capture the working baseline,
 map hardware blocks, and investigate macOS graphics and Metal contracts.
-Driver loading and GPU takeover are deferred until experimental booting is
-explicitly available.
+Experimental booting is available only through the USB test EFI in
+[docs/test-boot.md](docs/test-boot.md), at the stage that document authorizes.
 
 ## Host constraint
 
-- Perform no GPU register writes, PCI configuration writes, driver installation,
-  driver loading/unloading, boot changes, or GPU takeover on the working host.
+- In the known-good boot, perform no GPU register writes, PCI configuration
+  writes, driver installation, driver loading/unloading, boot changes, or GPU
+  takeover.
+- Driver code runs only when the user boots the USB test EFI, injected by that
+  EFI's OpenCore config, and only at the authorized stage in
+  [docs/test-boot.md](docs/test-boot.md) (currently stage 0, passive). Advancing
+  a stage needs a reviewed update to that document and the user's approval.
+  Never modify the internal EFI partition, install driver code on the macOS
+  volume, or load it with `kmutil`. The user performs disk, EFI and reboot steps.
 - Use read-only OS queries. Tools may write reports and build artifacts inside
   the repository or a requested output directory, but must not mutate graphics
   or system configuration. Do not use privileged probes to bypass restrictions.
@@ -71,7 +78,8 @@ explicitly available.
   give the next experiments and measurable success criteria.
 - Do not claim hardware functionality based on documentation or fixtures.
   Record the OS build, device/revision, commands, results, and limitations for
-  each host experiment. No driver experiment is authorized by this milestone.
+  each host experiment. Driver experiments are limited to the staged USB test
+  boot.
 - Future stages: PCI ownership/diagnostics; firmware, mappings, interrupts and
   verified DMA copy/fence; one connector/mode test pattern; known shader with
   correct results; own Metal discovery/rendering/surfaces/presentation; desktop
