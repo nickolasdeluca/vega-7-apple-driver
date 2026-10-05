@@ -8,7 +8,8 @@ discovery table from the carveout without writes. Stage 3 read the GC
 configuration: 7 of 8 CUs and both RBs active. Stage 4's root-only, read-only
 diagnostic interface re-read every register from the running system. Stage 5
 read 38 power, clock-gating, engine and memory-hub registers through it. No
-later stage is authorized.
+later stage is authorized; the first write is
+[proposed](#proposed-stage-6-first-reviewed-write) for review.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -452,6 +453,102 @@ is a data port, FIFO or counter that clears on read (`HDP_EDC_CNT` and indexed
 `*_DATA` registers were deliberately left out). A read that hangs would freeze
 the machine with that register's name on screen; power off and boot the
 known-good EFI. Nothing is written.
+
+### Proposed stage 6: first reviewed write
+
+**Status: proposal for the user's review. Not authorized, not implemented,
+not built.**
+
+The purpose is to prove a register write works and is reversible, with
+nothing in the GPU depending on the result, before any write that changes
+GPU behavior.
+
+**The register.** `SCRATCH_REG0` (GC): dword `0x2040`, base index 1
+(`gc_9_0_offset.h`), so BAR5 byte `0x30100` (`0xA000` + `0x2040`, times 4).
+It is a scratch register with no hardware function.
+
+**Why it is safe:**
+
+- Linux v6.12 writes it from the CPU: `gfx_v9_0_ring_test_ring` does
+  `WREG32(scratch, 0xCAFEDEAD)`, then has the CP overwrite it to prove the ring
+  works. Its only other use, `gfx_v9_0_init_rlcg_reg_access_ctrl`, is the
+  indirect register path for SR-IOV virtual functions, which this host is not.
+- Nothing can be reading it. Stage 5 showed the CP's graphics and compute
+  engines halted with no microcode ever run, the RLC disabled, and no rings
+  enabled; the stage 6 code re-checks that before writing.
+- It is restored. The original value is written back and read back, so the
+  register ends as the firmware left it. A cold boot resets the GPU in any
+  case.
+
+**What the stage 6 code would do.** It runs only when `cezanne-diag
+--scratch-test` asks for it, never at boot. The boot does exactly what stage 5
+does. One new diagnostic selector would:
+
+1. Take the same lock and re-run the per-read checks: identity, D0, memory
+   decoding and BAR5.
+2. Check the preconditions with reads, stopping with a named status if any
+   fails:
+   - `PWR_GFXOFF_STATUS` is 2 (GFX on);
+   - `CP_ME_CNTL` has `ME_HALT`, `PFP_HALT` and `CE_HALT` set;
+   - `CP_MEC_CNTL` has `MEC_ME1_HALT` and `MEC_ME2_HALT` set;
+   - `RLC_CNTL` is 0;
+   - `GRBM_STATUS` `GUI_ACTIVE` is clear.
+3. Read `SCRATCH_REG0` twice about 1 ms apart and stop if the values differ,
+   since that would mean something else writes it.
+4. Write `0xCAFEDEAD` (Linux's value) and read it back.
+5. Write the original value back and read it back.
+6. Return the original value, both read-backs and a status.
+
+**How the write path is confined:**
+
+- The core gains one write callback and a write allowlist containing only
+  `SCRATCH_REG0`. The scratch test is the only caller, and the values written
+  are limited to `0xCAFEDEAD` and the value read in step 3.
+- The adapter maps only the 4 KiB page holding `SCRATCH_REG0` writable
+  (`IODeviceMemory::withRange` at BAR5 + `0x30000`, uncached). Every read
+  still uses the read-only BAR5 mapping.
+  - That page also holds other GC registers, including `GRBM_GFX_INDEX` at
+    `0x30800`. Only the allowlist and the tests keep the code off them.
+  - The writable mapping is released before the call returns.
+- `tests/test_core.py` and `tests/test_kext.py` replace their "no write path"
+  checks with "exactly one write site, to the allowlisted offset". Weakened
+  copies must fail:
+  - a widened allowlist;
+  - a missing precondition;
+  - a missing restore.
+- Interface: still root-only and stage-gated (stage 6). `cezanne-diag` runs
+  the test only with the explicit `--scratch-test` flag, prints each step
+  before doing it, and flushes.
+
+**Expected result:**
+
+- **Original value:** most likely 0, though this is not predicted; whatever it
+  is, it must be stable across both reads.
+- **First read-back:** `0xCAFEDEAD`.
+- **Second read-back:** equals the original.
+- **All other diagnostics** read the same as boot 7.
+
+**Outcomes and responses:**
+
+- **Read-back differs from what was written:** the register is not writable
+  from the host in this state. Record it; it is a finding, not a reason to
+  retry or try another register.
+- **The original value changes between reads:** a consumer exists. The test
+  stops without writing; record it and re-review.
+- **A hang or panic** (the last line on screen names the step): power off,
+  unplug the drive, and cold-boot the known-good EFI. GPU state is reset by
+  the power cycle. Record it as rule 6 requires.
+- **After the test,** `cezanne-diag` must read all 48 registers with the boot 7
+  values. Then shut down completely before returning to the known-good boot.
+
+**What it does not do:**
+
+- It writes no register that controls hardware.
+- It does not select SE/SH, program golden settings, or send SMU or PSP
+  messages.
+- It does not enable an engine or touch the memory hub.
+
+Each of those is a later stage needing its own review.
 
 Stage 4 risks: it adds a kernel entry point. It is limited to root and to the
 reads stages 1–3 already made, but a defect in the user client could panic

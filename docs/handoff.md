@@ -133,16 +133,15 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: propose the first reviewed write
+## Next task: user review of the first-write proposal
 
 Stages 0–5 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-Stage 5 recorded the state the firmware leaves: every engine halted and idle,
-no CP or RLC microcode running, GPU VM context 0 and the MMHUB L2 off, nearly
-all gating off, GFX on, the SMU idle with an OK last response, and the PSP
-secure OS already running (Linux then skips loading it). Write the first-write
-proposal from this state as a test-boot.md section for the user's review:
-which register, why it is safe, how to verify it and how to recover. Nothing
-is built or booted until the user approves it.
+The first write is proposed in
+[test-boot.md](test-boot.md#proposed-stage-6-first-reviewed-write): a
+reversible write of `SCRATCH_REG0` (`0xCAFEDEAD`, then the original value),
+run only on request through `cezanne-diag --scratch-test`, behind read-checked
+preconditions. It is not authorized; implement it only after the user
+approves that section, and update rule 4 when they do.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
