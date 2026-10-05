@@ -60,17 +60,28 @@ and MP0 bases match `renoir_ip_offset.h`. Binary v1.1, 1124 bytes; IP table v2,
 one die, 41 entries. The raw capture is kept in ignored
 `out/test-efi/boot-4-stage2/`. Versions of the blocks named above:
 
-| Block | Measured | Matches the dispatch above |
+Each version was checked against the handler Linux v6.12 selects for it
+(`amdgpu_discovery.c` `amdgpu_discovery_set_*_ip_blocks` and
+`amdgpu_discovery_set_ip_blocks`, `gmc_v9_0.c`); Linux maps each hardware ID to
+its IP slot through `hw_id_map`:
+
+| Block (slot) | Measured | Linux v6.12 selects |
 | --- | --- | --- |
-| GC | 9.3.0, bases `0x2000`, `0xA000`, `0x2402C00` | Yes |
-| SDMA0 | 4.1.2, one instance | Yes |
-| MP1 (SMU) | 12.0.1 | Yes |
+| GC | 9.3.0, bases `0x2000`, `0xA000`, `0x2402C00` | `vega10_common`, `gmc_v9_0`, `gfx_v9_0` |
+| SDMA0 | 4.1.2, one instance | `sdma_v4_0` |
 | MP0 (PSP) | 12.0.1 | `psp_v12_0` |
-| DMU (display) | 2.1.0 | Yes (DCN 2.1) |
-| UVD (VCN) | 2.2.0 | Yes |
-| MMHUB / ATHUB | 1.5.0 / 1.5.0 | To check against the GMC handlers |
-| NBIF / HDP / OSSSYS | 2.5.0 / 4.1.2 / 4.3.0 | To check against `soc15.c` |
-| UMC | 7.6.0, two instances | — |
+| MP1 (SMU) | 12.0.1 | `smu_v12_0` |
+| DMU (`DCE_HWIP`) | 2.1.0 | `dm_ip_block` (DCN 2.1) |
+| UVD (VCN) | 2.2.0 | `vcn_v2_0` and `jpeg_v2_0` |
+| OSSSYS (IH) | 4.3.0 | `vega10_ih` |
+| NBIF (`NBIO_HWIP`) | 2.5.0 | `nbio_v7_0` funcs |
+| HDP | 4.1.2 | `hdp_v4_0` funcs |
+| MMHUB | 1.5.0 | `mmhub_v1_0` funcs (the `default` case); Renoir fault client IDs |
+| ATHUB | 1.5.0 | `athub_v1_0` (clock gating only) |
+| UMC | 7.6.0, two instances | Not checked |
+
+Every measured version has a supported Linux handler, and they are the
+handlers this manifest already planned around.
 
 The GC info table (v2.0) reports 1 shader engine, 1 shader array, 8 CUs per
 array (8 CUs before any fuse harvesting; the per-CU enable mask is a register
