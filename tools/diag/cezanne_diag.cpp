@@ -1,8 +1,9 @@
-// cezanne-diag: reads CezanneGPU's allowlisted registers through the stage 4
-// diagnostic interface. The driver re-checks the device and maps the register
-// BAR read-only for every read; this tool cannot request a write.
+// cezanne-diag: reads CezanneGPU's allowlisted registers through the
+// diagnostic interface (stage 4 on). The driver re-checks the device and maps
+// the register BAR read-only for every read. The only write it can request is
+// the stage 6 scratch test, run only with --scratch-test.
 //
-// Usage: sudo cezanne-diag [--repeat N] [--interval MS]
+// Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -22,8 +23,8 @@ struct Named {
     uint32_t offset;
 };
 
-// Every register the driver allows at stage 5, in its list order; a stage 4
-// driver allows the first kStage3RegisterCount.
+// Every register the driver allows at stage 6, in its list order; earlier
+// stages allow a prefix.
 const Named kRegisters[] = {
     {"MP0_SMN_C2PMSG_33", kRegC2PMsg33},
     {"RCC_CONFIG_MEMSIZE", kRegConfigMemsize},
@@ -74,13 +75,17 @@ const Named kRegisters[] = {
     {"VM_CONTEXT0_CNTL_MMHUB", kRegMmhubVmContext0Cntl},
     {"MC_VM_MX_L1_TLB_CNTL_MMHUB", kRegMmhubMxL1TlbCntl},
     {"IH_RB_CNTL", kRegIhRbCntl},
+    // Stage 6.
+    {"SCRATCH_REG0", kRegScratchReg0},
 };
-static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage5RegisterCount, "one name per register");
+static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage6RegisterCount, "one name per register");
 
 void usage(FILE *out)
 {
-    std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS]\n"
-                      "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n");
+    std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test]\n"
+                      "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
+                      "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
+                      "then restores its original value.\n");
 }
 
 bool parseCount(const char *text, unsigned long max, unsigned long *value)
@@ -93,12 +98,67 @@ bool parseCount(const char *text, unsigned long max, unsigned long *value)
     return true;
 }
 
+// Each step is printed and flushed before it is sent, so a hang leaves the
+// step on screen.
+void step(const char *text)
+{
+    std::printf("%s ... ", text);
+    std::fflush(stdout);
+}
+
+bool call(io_connect_t connection, uint32_t selector, uint64_t *output, uint32_t count)
+{
+    uint32_t outputCount = count;
+    kern_return_t result = IOConnectCallScalarMethod(connection, selector, nullptr, 0, output, &outputCount);
+    if (result != KERN_SUCCESS || outputCount != count) {
+        std::printf("call failed 0x%08x\n", result);
+        return false;
+    }
+    return true;
+}
+
+// The stage 6 scratch test: check, write, restore. Returns true if every
+// step returned ok. The driver restores the register if this exits early.
+bool scratchTest(io_connect_t connection)
+{
+    uint64_t check[7] = {};
+    step("scratch 1/3 check: GFX on, CP halted, RLC off, GUI idle; read SCRATCH_REG0 twice");
+    if (!call(connection, kDiagnosticScratchCheck, check, 7)) return false;
+    std::printf("%s\n", statusName(static_cast<Status>(check[0])));
+    std::printf("  SMUIO_GFX_MISC_CNTL 0x%08llx  CP_ME_CNTL 0x%08llx  CP_MEC_CNTL 0x%08llx\n"
+                "  RLC_CNTL 0x%08llx  GRBM_STATUS 0x%08llx  SCRATCH_REG0 original 0x%08llx\n",
+                static_cast<unsigned long long>(check[1]), static_cast<unsigned long long>(check[2]),
+                static_cast<unsigned long long>(check[3]), static_cast<unsigned long long>(check[4]),
+                static_cast<unsigned long long>(check[5]), static_cast<unsigned long long>(check[6]));
+    if (check[0] != kOK) return false;
+
+    uint64_t written[2] = {};
+    std::printf("scratch 2/3 write: SCRATCH_REG0 <- 0x%08x ... ", kScratchPattern);
+    std::fflush(stdout);
+    if (!call(connection, kDiagnosticScratchWrite, written, 2)) return false;
+    std::printf("%s, read back 0x%08llx\n", statusName(static_cast<Status>(written[0])),
+                static_cast<unsigned long long>(written[1]));
+
+    uint64_t restored[2] = {};
+    std::printf("scratch 3/3 restore: SCRATCH_REG0 <- 0x%08llx ... ", static_cast<unsigned long long>(check[6]));
+    std::fflush(stdout);
+    if (!call(connection, kDiagnosticScratchRestore, restored, 2)) return false;
+    std::printf("%s, read back 0x%08llx\n", statusName(static_cast<Status>(restored[0])),
+                static_cast<unsigned long long>(restored[1]));
+    return written[0] == kOK && restored[0] == kOK;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
+    bool scratch = false;
     for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "--scratch-test") == 0) {
+            scratch = true;
+            continue;
+        }
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             usage(stdout);
             return 0;
@@ -143,8 +203,18 @@ int main(int argc, char **argv)
     std::printf("CezanneGPU diagnostics v%llu, driver stage %llu\n", static_cast<unsigned long long>(info[0]),
                 static_cast<unsigned long long>(info[1]));
 
-    const uint32_t count = info[1] >= 5 ? kStage5RegisterCount : kStage3RegisterCount;
+    const uint32_t count = info[1] >= 6   ? kStage6RegisterCount
+                           : info[1] == 5 ? kStage5RegisterCount
+                                          : kStage3RegisterCount;
     int failures = 0;
+    if (scratch) {
+        if (info[1] < kScratchStage) {
+            std::fprintf(stderr, "cezanne-diag: --scratch-test needs driver stage %u\n", kScratchStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!scratchTest(connection)) failures++;
+    }
     for (unsigned long pass = 0; pass < repeat; pass++) {
         if (pass > 0) usleep(static_cast<useconds_t>(interval * 1000));
         if (repeat > 1) std::printf("-- pass %lu\n", pass + 1);

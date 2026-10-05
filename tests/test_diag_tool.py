@@ -12,16 +12,24 @@ DIAG = ROOT / "tools" / "diag"
 
 
 class DiagSourceTests(unittest.TestCase):
-    def test_tool_calls_only_the_two_read_selectors(self):
+    def test_tool_calls_only_known_selectors(self):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         calls = re.findall(r"IOConnect\w+\s*\(\s*connection\s*,\s*(\w+)", source)
-        self.assertEqual(sorted(set(calls)), ["kDiagnosticGetInfo", "kDiagnosticReadRegister"])
+        self.assertEqual(sorted(set(calls)), ["kDiagnosticGetInfo", "kDiagnosticReadRegister", "selector"])
+        helper = re.findall(r"\bcall\(connection, (\w+)", source)
+        self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore"])
         self.assertNotRegex(source, r"IOConnect(MapMemory|SetNotificationPort|CallAsync|CallStructMethod)")
 
-    def test_tool_names_every_stage_5_register_in_order(self):
+    def test_scratch_test_runs_only_on_request(self):
+        source = (DIAG / "cezanne_diag.cpp").read_text()
+        self.assertEqual(len(re.findall(r"\bscratchTest\(connection\)", source)), 1)
+        self.assertRegex(source, r"if \(scratch\) \{[^}]*info\[1\] < kScratchStage")
+        self.assertIn('std::strcmp(argv[i], "--scratch-test") == 0', source)
+
+    def test_tool_names_every_stage_6_register_in_order(self):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
-        listed = re.search(r"kStage5Registers\[\] = \{([^}]*)\}", header).group(1)
+        listed = re.search(r"kStage6Registers\[\] = \{([^}]*)\}", header).group(1)
         expected = [name.strip() for name in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
 
