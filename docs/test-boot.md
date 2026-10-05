@@ -1,11 +1,9 @@
 # USB test boot
 
-Status, 2026-10-05: stage 0 booted to the desktop from USB on the second
-attempt and the driver attached (see [Test boot log](#test-boot-log)); the
-`attached at stage 0` kernel line is still to be read with `dmesg`. The first
-attempt stalled in OpenCore file logging, which the test EFI no longer does.
-The stage 1 test EFI is rebuilt under ignored `out/test-efi/usb-stage1/` and
-not yet booted.
+Status, 2026-10-05: **stage 0 succeeded** on the second USB boot (see
+[Test boot log](#test-boot-log)); the first attempt stalled in OpenCore file
+logging, which the test EFI no longer does. The stage 1 test EFI is rebuilt
+under ignored `out/test-efi/usb-stage1/` and not yet booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -269,7 +267,7 @@ sysctl kern.bootargs                               # must contain cezanne-stage=
 kmutil showloaded --list-only | grep -i -E 'cezanne|nootedred|radeon'
 ioreg -r -c CezanneGPU -l -w0
 /usr/bin/log show --last boot --predicate 'eventMessage CONTAINS "CezanneGPU:"'
-sudo dmesg | grep 'CezanneGPU:'                    # kernel buffer, if the log query is empty
+sudo dmesg | grep 'CezanneGPU:'                    # kernel buffer; wraps within minutes
 ```
 
 Use `/usr/bin/log`: in zsh, a bare `log` is a shell builtin.
@@ -280,7 +278,12 @@ Stage 0 succeeds when:
 - `ioreg` shows a `CezanneGPU` instance under the Cezanne PCI device with
   `CezanneGPU stage` 0 and `CezanneGPU registry vendor-id` `0x1002`,
   `device-id` `0x1638` and `revision-id` `0xc9`.
-- The log shows the `attached at stage 0` line.
+- The `CezanneGPU` entry is `registered`. `start()` calls `registerService()`
+  only after logging `attached at stage N`, so this proves `start()` completed
+  even when that line is unavailable: the driver's `IOLog` lines do not reach
+  the unified log, and the kernel buffer is 128 KiB despite `msgbuf=1048576`
+  and had wrapped within about 195 s of boot 2. The `ioreg` properties are the
+  record; read `dmesg` within the first minute to catch the lines.
 
 It also answers two unknowns: what the display does without NootedRed, and
 whether the 26.0-targeted kext loads.
@@ -357,8 +360,12 @@ logging; kept as `out/test-efi/superseded-filelog-usb-stage0/`).
 - Display without NootedRed: 1920×1080 on the firmware framebuffer, 7 MB
   reported, no acceleration ("No Kext Loaded").
 - The unified log has IOPCIFamily's `child CezanneGPU … published` and
-  kernelmanagerd's load notification, but not the driver's `IOLog` lines;
-  read those with `sudo dmesg`.
+  kernelmanagerd's load notification, but not the driver's `IOLog` lines.
+  `sudo dmesg` held 131071 bytes starting at 195 s, so they had been
+  overwritten. `CezanneGPU` is `registered`, so `start()` completed.
+- IOPCIFamily logged the GPU at enumeration with command `0x0006` (memory
+  decoding and bus mastering already on).
+- Result: stage 0 succeeded.
 
 ## Unknowns and limits
 
