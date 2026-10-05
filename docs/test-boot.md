@@ -11,9 +11,9 @@ read 38 power, clock-gating, engine and memory-hub registers through it.
 Stage 6, the first reviewed write, wrote `0xCAFEDEAD` to `SCRATCH_REG0`,
 read it back, and restored the original value. Stage 7 sent the first SMU
 messages: driver-interface version 14, SMU firmware 64.74.0. One stage 7 boot
-attempt reset before reaching macOS, cause unknown. No later stage is
-authorized; disallowing GFXOFF is
-[proposed](#proposed-stage-8-disallow-gfxoff) for review.
+attempt reset before reaching macOS, cause unknown. Stage 8 (send
+`DisallowGfxOff` on request) is authorized and built under ignored
+`out/test-efi/usb-stage8/`; it has not been booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -61,6 +61,9 @@ off restores the known-good boot. This is the experimental environment
    - **Stage 7** (proposed and approved by the user on 2026-10-05): stage 6
      plus the first SMU messages, `GetDriverIfVersion` and `GetSmuVersion`, run
      only on request, described [below](#stage-7-first-smu-query).
+   - **Stage 8** (proposed and approved by the user on 2026-10-05): stage 7
+     plus `DisallowGfxOff`, sent only on request, described
+     [below](#stage-8-disallow-gfxoff).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -772,10 +775,11 @@ is printed and flushed before it is sent:
 - It writes no other register.
 - The `SCRATCH_REG0` test is unchanged.
 
-### Proposed stage 8: disallow GFXOFF
+### Stage 8: disallow GFXOFF
 
-**Status: proposal for the user's review. Not authorized, not implemented,
-not built.**
+**Status: approved by the user on 2026-10-05, implemented and built; not yet
+booted.** The proposal below is kept as approved. An implementation section
+follows it.
 
 **Purpose.** GFXOFF lets the SMU power the graphics block down while it is
 idle. Every later step that programs the GC (golden settings, RLC, CP
@@ -850,6 +854,29 @@ step is printed and flushed first:
   anything. It is unexplained and unrelated to the boot path stage 8 changes,
   but note the screen if it recurs.
 
+**Implementation (as built):**
+
+- **Core:**
+  - `writeAllowed` adds `C2PMSG_66` ← `0x8` from stage 8; `0x7` and every
+    other message stay refused.
+  - The stage 7 send-and-poll code is now `sendSmuMessage`, shared by
+    `sendSmuQuery` (`0x2`/`0x3`) and `disallowGfxOff`. It reads no answer
+    unless asked, matching Linux's `read_arg` of `NULL`.
+  - `disallowGfxOff` polls `PWR_GFXOFF_STATUS` for up to 500 pauses of 1 ms
+    (`gfxoff-timeout`), and only after an OK response.
+- **Adapter:** selector `kDiagnosticGfxOffDisallow`, accepted only after a
+  passing `kDiagnosticSmuCheck` by the same connection, with the SMU page
+  writable during it. Diagnostics version 4.
+- **Tool:** `cezanne-diag --gfxoff-disallow` runs the check, then the message,
+  printing each step first, and reports the response and the GFXOFF status.
+- **Tests:**
+  - `0x8` is allowed only from stage 8, `0x7` is refused, and the queries
+    cannot send `0x8`.
+  - GFX turning on after a delay, never turning on (timeout), a `0xFD` reply
+    with no confirmation poll, and a busy mailbox.
+  - Four more weakened cores must fail: widened message values, `0x7`
+    allowed, a missing timeout, a missing status check.
+
 **What it does not do:**
 
 - It does not allow GFXOFF.
@@ -874,7 +901,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7; do
+for stage in 0 1 2 3 4 5 6 7 8; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -981,6 +1008,18 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 8 succeeds when:
+
+- the stage 7 conditions hold with `CezanneGPU stage` 8;
+- `sudo cezanne-diag --gfxoff-disallow` reports `ok` for the check and the
+  message, with response `0x01` and `PWR_GFXOFF_STATUS` 2;
+- the register dump matches boot 9, with the mailbox holding `0x8`, `0`
+  and `0x1`;
+- the machine stays as before: fans, temperatures, desktop.
+
+A `smu-response-not-ok` (for example `0xFD`) or `gfxoff-timeout` is a finding
+to record; do not retry or send `AllowGfxOff`.
 
 Stage 7 succeeds when:
 
