@@ -133,23 +133,19 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: choose the next reviewed step
+## Next task: user review of the SMU metrics table proposal
 
 Stages 0–8 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
 
-- **SMU:** driver-interface 14, firmware 64.74.0. It accepted
-  `DisallowGfxOff`, and GFX stays on.
-- **Open finding:** one stage 7 boot attempt reset before macOS logged
-  anything.
-- **Observation:** test boots run hot at boot and login, because the desktop
-  is composited on the CPU.
-
-Each further write or SMU message needs a proposal in test-boot.md and the
-user's approval. The next candidates:
-
-- the SMU metrics table, which gives clocks and temperatures but needs
-  GPU-addressable memory for the SMU to write into;
-- the Renoir golden settings, starting with `GB_ADDR_CONFIG`.
+- **SMU:** driver-interface 14, firmware 64.74.0. `DisallowGfxOff` was
+  accepted.
+- **Open finding:** one stage 7 boot attempt reset early.
+- **Proposed next**, in
+  [test-boot.md](test-boot.md#proposed-stage-9-smu-metrics-table): have the
+  SMU write its 148-byte metrics table into one fixed, checked carveout page
+  (GPU `0xF440000000`, CPU `0x600000000`), read through a read-only mapping.
+  It runs on request through `cezanne-diag --smu-metrics`.
+- **Not authorized.** Implement it only after the user approves that section.
 
 ## Offline task while waiting: Metal shader frontend boundary
 

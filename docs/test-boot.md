@@ -12,7 +12,9 @@ Stage 6, the first reviewed write, wrote `0xCAFEDEAD` to `SCRATCH_REG0`,
 read it back, and restored the original value. Stage 7 sent the first SMU
 messages: driver-interface version 14, SMU firmware 64.74.0. One stage 7 boot
 attempt reset before reaching macOS, cause unknown. Stage 8 sent
-`DisallowGfxOff`: response OK, GFX stayed on. No later stage is authorized.
+`DisallowGfxOff`: response OK, GFX stayed on. No later stage is authorized;
+reading the SMU metrics table is
+[proposed](#proposed-stage-9-smu-metrics-table) for review.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -882,6 +884,162 @@ step is printed and flushed first:
 - It sends no clock, power-gating or table message.
 - It writes no GC register.
 - The scratch test and the version queries are unchanged.
+
+### Proposed stage 9: SMU metrics table
+
+**Status: proposal for the user's review. Not authorized, not implemented,
+not built.**
+
+**Purpose.** Read live clocks, activity, voltages, currents, power and
+temperatures from the SMU. On Renoir these exist only in the SMU's metrics
+table, not in registers. Every later step can then be judged by measurement:
+heat, clocks, throttling. This is also the first time the GPU side (the SMU)
+**writes into memory**.
+
+**Linux v6.12:**
+
+- **Table and ID.** `SmuMetrics_t` (`smu12_driver_if.h`, 148 bytes). It holds:
+  - 18 `ClockFrequency` entries, plus average GFX, SoC, VCN and fabric clocks
+    and GFX and UVD activity;
+  - VDD and SoC voltage, current and power, fan PWM and socket power;
+  - per-core frequency, power and temperature for 8 cores, and L3 frequency
+    and temperature;
+  - GFX and SoC temperature, throttler status, STAPM limits, APU power, and
+    TDC/EDC values.
+
+  The table ID is `TABLE_SMU_METRICS` = 7. `renoir_ppt.c` places it in a
+  `PAGE_SIZE`-aligned VRAM buffer (`AMDGPU_GEM_DOMAIN_VRAM`).
+- **Setting the address.** `smu_v12_0_set_driver_table_location` sends
+  `SetDriverDramAddrHigh` (`0x1A`) and `SetDriverDramAddrLow` (`0x1B`) with
+  the buffer's GPU (MC) address. Linux does this once at hardware setup
+  (`amdgpu_smu.c` `smu_set_driver_table_location`).
+- **Reading the table.** `smu_cmn_update_table(..., drv2smu = false)` sends
+  `TransferTableSmu2Dram` (`0x1C`) with argument `table_id | (0 << 16)` = 7.
+  It then invalidates HDP and copies the buffer.
+- **Where VRAM is.** For this APU, VRAM is the carveout. GPU address
+  `0xF400000000` + *offset* (MMHUB `MC_VM_FB_LOCATION_BASE` `0xf400`, stage
+  5) is CPU physical `0x5C0000000` + *offset* (`MC_VM_FB_OFFSET` `0x5c0`,
+  stage 2). That is how `gmc_v9_0_mc_init` sets `aper_base` for APUs.
+
+**Where the table goes.** There is no VRAM allocator yet, so stage 9 uses one
+fixed 4 KiB page in the middle of the carveout: offset `0x40000000` (1 GiB),
+GPU address `0xF440000000`, CPU physical `0x600000000`.
+
+- It is far from the regions known to be in use:
+  - the boot framebuffer at the start of VRAM (`IONDRVFramebuffer`, about
+    8 MB);
+  - the discovery binary in the top 64 KiB;
+  - the firmware-reserved and PSP regions, which Linux places near the top.
+- **Not proven unused.** Linux would find this out from the VBIOS
+  firmware-usage table, which this driver does not read. The checks below
+  look for any sign that the page is in use, and stop if they find one.
+
+**What the stage 9 code would do.** It runs on request through `cezanne-diag
+--smu-metrics`, never at boot, with the boot unchanged from stage 8. Each step
+is printed and flushed first:
+
+1. **Check:**
+   - per-read device checks; the mailbox is idle;
+   - `MC_VM_FB_LOCATION_BASE` reads `0xf400` and `MC_VM_FB_OFFSET` reads
+     `0x5c0`, otherwise the fixed addresses would be wrong;
+   - the GPU and CPU addresses fall inside the carveout and outside every
+     BAR, the boot framebuffer and the discovery binary;
+   - the 64 KiB around the page reads all zero, twice, 1 ms apart, through a
+     read-only uncached mapping (`table-region-in-use` otherwise).
+
+   It keeps a copy of the page.
+2. **Set the address:** `SetDriverDramAddrHigh` (`0xF4`), then
+   `SetDriverDramAddrLow` (`0x40000000`), each with the stage 7 send, poll and
+   stop-on-non-OK.
+3. **Transfer:** `TransferTableSmu2Dram` (argument 7).
+4. **Read and verify:**
+   - read the page through the read-only uncached mapping;
+   - require that bytes 148–4095 are unchanged and bytes 0–147 are not all
+     zero (`table-not-written` or `table-overflow` otherwise);
+   - copy the 148 bytes out.
+5. **Show:** decoded values, including clocks in MHz, temperatures in °C,
+   power in mW/W, and throttler bits.
+
+**Differences from Linux:**
+
+- **The address.** Linux takes it from its VRAM allocator; stage 9 uses a
+  fixed, checked page.
+- **HDP.** Linux invalidates HDP before copying. HDP is the host data path for
+  CPU access through the BAR. Stage 9 reads the carveout directly by physical
+  address, uncached, not through BAR0, so HDP is not involved and no HDP
+  register is written.
+- **Repeating.** Linux sets the address once per boot. Stage 9 sends both
+  address messages on every `--smu-metrics` run, so each run stands alone.
+  The values are the same each time.
+
+**Confinement:**
+
+- **The allowlist** grows by exact values, from stage 9:
+  - `C2PMSG_66` ← `0x1A`, `0x1B`, `0x1C`;
+  - `C2PMSG_82` ← `0xF4`, `0x40000000` or `7`, each only with its own message.
+    The core pairs the argument with the message before writing.
+
+  `TransferTableDram2Smu` (`0x1D`) and every other table and message stay
+  refused.
+- **No CPU writes to memory.** The CPU never writes the table page. Its only
+  mapping is read-only (`IODeviceMemory::withRange` at `0x600000000`, 4 KiB,
+  `kIOMapReadOnly | kIOMapInhibitCache`), plus one read-only 64 KiB mapping
+  for the check.
+- **Register writes** stay limited to the SMU mailbox page, with the same
+  per-connection ordering as stages 7 and 8.
+- **Tests:**
+  - each message and argument pair, and refusal of `0x1D` and other tables;
+  - the address arithmetic and the inside-carveout and outside-BAR checks;
+  - a non-zero region, an unchanged page and writes past 148 bytes;
+  - decoding, against a synthetic table.
+
+  Weakened cores must fail: unpaired arguments, a missing in-use check, a
+  missing overflow check.
+
+**Expected result:**
+
+- **The region:** all zero before.
+- **The messages:** responses `0x01`.
+- **The table:** bytes 0–147 change, the rest of the page stays zero.
+- **The values:** plausible readings, for example:
+  - `GfxTemperature` and `SocTemperature` near the "Hot" readings;
+  - eight `CoreFrequency` entries in the CPU's range, for the 5600GT's six
+    cores plus two absent;
+  - `AverageGfxActivity` near 0.
+- **Afterwards:** the mailbox holds `0x1C`/`7`/`0x1`, and the machine behaves
+  as before.
+
+**Risks and responses:**
+
+- **Memory corruption (the main risk).** If the address translation were
+  wrong, the SMU would write 148 bytes somewhere else in physical memory,
+  possibly into macOS's memory, which could crash it or corrupt data.
+  - Mitigations:
+    - the translation is the one Linux uses for APUs, from two registers
+      measured in every boot;
+    - the target lies inside the reserved carveout, which macOS does not
+      use;
+    - the write is only 148 bytes;
+    - step 4 confirms the bytes landed exactly where expected.
+  - If step 4 reports `table-not-written`, assume they landed elsewhere: save
+    nothing, power off at once and boot the known-good EFI.
+  - **Make a Time Machine backup before this boot.**
+- **The page is in use after all.** The zero check makes this unlikely, but
+  the SMU's 148 bytes would overwrite whatever was there, inside the carveout.
+  The GPU and display are not running, so the likely effect is none or a
+  visual glitch. A power-off clears it.
+- **A non-OK response or a timeout.** Record it and stop. Do not retry with a
+  different address.
+- **Persistence.** The SMU keeps the table address until power-off. Nothing in
+  the test boot uses it; a full power-off resets it before the known-good
+  boot, where NootedRed sets its own.
+
+**What it does not do:**
+
+- It sends no table to the SMU (`Dram2Smu`) and no clock, power or watermark
+  message.
+- It does not allocate VRAM, set up GART or touch display memory.
+- It writes no GC or HDP register.
 
 Stage 4 risks: it adds a kernel entry point. It is limited to root and to the
 reads stages 1–3 already made, but a defect in the user client could panic
