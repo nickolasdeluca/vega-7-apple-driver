@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-05: **stages 0 to 6 succeeded** (see
+Status, 2026-10-05: **stages 0 to 7 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -9,9 +9,10 @@ configuration: 7 of 8 CUs and both RBs active. Stage 4's root-only, read-only
 diagnostic interface re-read every register from the running system. Stage 5
 read 38 power, clock-gating, engine and memory-hub registers through it.
 Stage 6, the first reviewed write, wrote `0xCAFEDEAD` to `SCRATCH_REG0`,
-read it back, and restored the original value. Stage 7, the first SMU
-messages (the two version queries), is authorized and built under ignored
-`out/test-efi/usb-stage7/`; it has not been booted.
+read it back, and restored the original value. Stage 7 sent the first SMU
+messages: driver-interface version 14, SMU firmware 64.74.0. One stage 7 boot
+attempt reset before reaching macOS, cause unknown. No later stage is
+authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -610,7 +611,7 @@ Each of those is a later stage needing its own review.
 ### Stage 7: first SMU query
 
 **Status: approved by the user on 2026-10-05 ("go straight to stage 7"),
-implemented and built; not yet booted.** The proposal below is kept as
+implemented, and run successfully in boot 9.** The proposal below is kept as
 approved. An implementation section follows it.
 
 **Purpose.** This is the first conversation with the SMU (MP1 12.0.1). The
@@ -1161,6 +1162,47 @@ EFI verified unchanged against the stage 2 manifest before it).
 - Captures (`diag.txt`, `ioreg.plist`) are in ignored
   `out/test-efi/boot-8-stage6/`.
 - Result: stage 6 succeeded.
+
+**Boot 9, 2026-10-05, stage 7** (`out/test-efi/usb-stage7/`; cold boot after
+a software shutdown of the stage 6 session at 15:34).
+
+- **First attempt: failed.** Reported by the user: the boot failed and the PC
+  rebooted by itself. The second attempt (kernel up 15:35:43) reached the
+  desktop.
+  - The first attempt left no macOS evidence: no kernel log between the
+    15:34:31 logout and the 15:35:43 boot, no panic report, and `DumpPanic`
+    processed 0 files.
+  - `Previous shutdown cause` was 5, the clean shutdown of the stage 6
+    session.
+  - So the reset most likely happened before macOS logging starts: in the
+    firmware, OpenCore or early kernel. That is before the driver runs.
+  - Stage 7's boot-time code path does the same as stage 6's; SMU messages
+    are sent only on request.
+  - **Cause unknown and not reproduced.** It is not attributed to the driver,
+    but that is not excluded. Earlier USB boots also had firmware-level
+    hiccups (boot 1).
+  - If it recurs, note the last screen (firmware logo, OpenCore picker, or
+    verbose text) and photograph it.
+- **Second attempt:** `kern.bootargs` ends `cezanne-stage=7`; stages 1–3
+  `ok`; diagnostics v3.
+- `sudo cezanne-diag --smu-query`:
+
+  | Step | Result |
+  | --- | --- |
+  | 1 check | `ok`: `C2PMSG_66` `0`, `C2PMSG_82` `0`, `C2PMSG_90` `0x1` (idle) |
+  | 2 `GetDriverIfVersion` | `ok`, response `0x01`, answer `0x0000000e` = **14**, equal to `SMU12_DRIVER_IF_VERSION` |
+  | 3 `GetSmuVersion` | `ok`, response `0x01`, answer `0x00404a00` = **SMU firmware 64.74.0** (program 0) |
+
+- The register dump that followed matched boot 8 except, as expected, the
+  mailbox holding the last exchange (`C2PMSG_66` `0x2`, `C2PMSG_82`
+  `0x00404a00`, `C2PMSG_90` `0x1`) and the PSP counter.
+- The SMU answered within the poll limit and the session stayed up long enough
+  to collect these results. The user did not report the fans or desktop
+  behaving abnormally; this is not separately confirmed.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-9-stage7/`.
+- Result: stage 7 succeeded on the second attempt; the first attempt's reset
+  is an open finding.
 
 ## Unknowns and limits
 

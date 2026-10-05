@@ -133,14 +133,14 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 7 USB test boot
+## Next task: choose the next reviewed step
 
-Stages 0–6 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-Stage 7, the first SMU messages (`GetDriverIfVersion`, `GetSmuVersion`), was
-approved and is built under `out/test-efi/usb-stage7/`. It runs only with
-`sudo cezanne-diag --smu-query`. Follow
-[test-boot.md](test-boot.md#stage-7-first-smu-query) and record both answers,
-the following register dump, and whether the machine stays stable.
+Stages 0–7 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
+Stage 7 sent the first SMU messages: driver-interface version 14 (as Linux
+v6.12 expects) and SMU firmware 64.74.0. Open finding: one stage 7 boot
+attempt reset before macOS logged anything, cause unknown. Watch for it
+recurring before attributing anything to the driver. Further writes or SMU
+messages each need a proposal in test-boot.md and the user's approval.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
