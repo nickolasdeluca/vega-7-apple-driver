@@ -15,11 +15,13 @@ class DiagSourceTests(unittest.TestCase):
     def test_tool_calls_only_known_selectors(self):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         calls = re.findall(r"IOConnect\w+\s*\(\s*connection\s*,\s*(\w+)", source)
-        self.assertEqual(sorted(set(calls)), ["kDiagnosticGetInfo", "kDiagnosticReadRegister", "selector"])
+        self.assertEqual(sorted(set(calls)),
+                         ["kDiagnosticGetInfo", "kDiagnosticMetricsRead", "kDiagnosticReadRegister", "selector"])
         helper = re.findall(r"\bcall\(connection, (\w+)", source)
         self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore",
                                   "kDiagnosticSmuCheck", "kDiagnosticSmuQuery", "kDiagnosticSmuCheck",
-                                  "kDiagnosticGfxOffDisallow"])
+                                  "kDiagnosticGfxOffDisallow", "kDiagnosticMetricsCheck",
+                                  "kDiagnosticMetricsTransfer"])
         # The only messages the tool can ask for are the two version queries.
         self.assertEqual(re.findall(r'\{"smu \d/3 query: \w+ \(0x\d\)", (\w+)\}', source),
                          ["kSmuMsgGetDriverIfVersion", "kSmuMsgGetSmuVersion"])
@@ -32,6 +34,8 @@ class DiagSourceTests(unittest.TestCase):
         self.assertIn('std::strcmp(argv[i], "--smu-query") == 0', source)
         self.assertEqual(len(re.findall(r"\bgfxOffDisallow\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(gfxoff\) \{[^}]*info\[1\] < kGfxOffStage")
+        self.assertEqual(len(re.findall(r"\bsmuMetrics\(connection\)", source)), 1)
+        self.assertRegex(source, r"if \(metrics\) \{[^}]*info\[1\] < kMetricsStage")
         self.assertEqual(len(re.findall(r"\bscratchTest\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(scratch\) \{[^}]*info\[1\] < kScratchStage")
         self.assertIn('std::strcmp(argv[i], "--scratch-test") == 0', source)

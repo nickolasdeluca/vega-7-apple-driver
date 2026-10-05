@@ -2,9 +2,11 @@
 // diagnostic interface (stage 4 on). The driver re-checks the device and maps
 // the register BAR read-only for every read. The only writes it can request
 // are the stage 6 scratch test (--scratch-test), the stage 7 SMU version
-// queries (--smu-query) and the stage 8 DisallowGfxOff (--gfxoff-disallow).
+// queries (--smu-query), the stage 8 DisallowGfxOff (--gfxoff-disallow) and
+// the stage 9 metrics-table transfer (--smu-metrics).
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
+//                          [--smu-metrics]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -84,12 +86,14 @@ static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage6RegisterCount
 void usage(FILE *out)
 {
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
-                      "                         [--gfxoff-disallow]\n"
+                      "                         [--gfxoff-disallow] [--smu-metrics]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
                       "--smu-query first asks the SMU for its driver-interface and firmware versions.\n"
-                      "--gfxoff-disallow first sends DisallowGfxOff and waits for GFX to report on.\n");
+                      "--gfxoff-disallow first sends DisallowGfxOff and waits for GFX to report on.\n"
+                      "--smu-metrics first has the SMU write its metrics table to the checked carveout page\n"
+                      "and prints it.\n");
 }
 
 bool parseCount(const char *text, unsigned long max, unsigned long *value)
@@ -209,12 +213,85 @@ bool gfxOffDisallow(io_connect_t connection)
     return out[0] == kOK;
 }
 
+// smu12_driver_if.h CLOCK_IDs_e order.
+const char *const kClockNames[18] = {"SMNCLK", "SOCCLK", "MP0CLK", "MP1CLK", "MP2CLK", "VCLK",
+                                     "LCLK",   "DCLK",   "ACLK",   "ISPCLK", "SHUBCLK", "DISPCLK",
+                                     "DPPCLK", "DPREFCLK", "DCFCLK", "FCLK", "UMCCLK", "GFXCLK"};
+
+double centi(uint16_t value)
+{
+    return value / 100.0;
+}
+
+void printMetrics(const SmuMetrics &m)
+{
+    const uint16_t *w = m.words;
+    std::printf("  clocks (MHz):");
+    for (uint32_t i = 0; i < 18; i++) std::printf("%s %s %u", i % 6 == 0 ? "\n   " : "", kClockNames[i], w[kMetricsClockFrequency + i]);
+    std::printf("\n  average MHz: GFX %u  SOC %u  VCLK %u  FCLK %u\n", w[kMetricsAverageGfxclk],
+                w[kMetricsAverageSocclk], w[kMetricsAverageVclk], w[kMetricsAverageFclk]);
+    std::printf("  activity: GFX %.2f %%  UVD %.2f %%\n", centi(w[kMetricsAverageGfxActivity]),
+                centi(w[kMetricsAverageUvdActivity]));
+    std::printf("  VDD %u mV %u mA %u mW   SOC %u mV %u mA %u mW\n", w[kMetricsVoltage], w[kMetricsCurrent],
+                w[kMetricsPower], w[kMetricsVoltage + 1], w[kMetricsCurrent + 1], w[kMetricsPower + 1]);
+    std::printf("  socket power %u W  APU power %u W  fan PWM %u (milli)\n", w[kMetricsCurrentSocketPower],
+                w[kMetricsApuPower], w[kMetricsFanPwm]);
+    std::printf("  cores (MHz / mW / C):");
+    for (uint32_t i = 0; i < 8; i++)
+        std::printf("%s %u/%u/%.2f", i % 4 == 0 ? "\n   " : "", w[kMetricsCoreFrequency + i], w[kMetricsCorePower + i],
+                    centi(w[kMetricsCoreTemperature + i]));
+    std::printf("\n  L3: %u MHz %.2f C, %u MHz %.2f C\n", w[kMetricsL3Frequency], centi(w[kMetricsL3Temperature]),
+                w[kMetricsL3Frequency + 1], centi(w[kMetricsL3Temperature + 1]));
+    std::printf("  GFX %.2f C  SOC %.2f C  throttler 0x%04x\n", centi(w[kMetricsGfxTemperature]),
+                centi(w[kMetricsSocTemperature]), w[kMetricsThrottlerStatus]);
+    std::printf("  STAPM limit %u W (original %u W)  TDC VDD %u SOC %u mA  EDC VDD %u SOC %u mA\n",
+                w[kMetricsStapmCurrentLimit], w[kMetricsStapmOriginalLimit], w[kMetricsVddTdc], w[kMetricsSocTdc],
+                w[kMetricsVddEdc], w[kMetricsSocEdc]);
+}
+
+// The stage 9 metrics table: check the page, have the SMU write it, read it.
+bool smuMetrics(io_connect_t connection)
+{
+    uint64_t check[5] = {};
+    step("metrics 1/3 check: mailbox idle, FB registers, carveout page and 64 KiB all zero");
+    if (!call(connection, kDiagnosticMetricsCheck, check, 5)) return false;
+    std::printf("%s\n  MC_VM_FB_LOCATION_BASE 0x%llx  MC_VM_FB_OFFSET 0x%llx  GPU 0x%llx  physical 0x%llx\n",
+                statusName(static_cast<Status>(check[0])), static_cast<unsigned long long>(check[1]),
+                static_cast<unsigned long long>(check[2]), static_cast<unsigned long long>(check[3]),
+                static_cast<unsigned long long>(check[4]));
+    if (check[0] != kOK) return false;
+
+    uint64_t transfer[4] = {};
+    step("metrics 2/3 transfer: SetDriverDramAddrHigh, SetDriverDramAddrLow, TransferTableSmu2Dram");
+    if (!call(connection, kDiagnosticMetricsTransfer, transfer, 4)) return false;
+    std::printf("%s, responses 0x%02llx 0x%02llx 0x%02llx\n", statusName(static_cast<Status>(transfer[0])),
+                static_cast<unsigned long long>(transfer[1]), static_cast<unsigned long long>(transfer[2]),
+                static_cast<unsigned long long>(transfer[3]));
+    if (transfer[0] != kOK) return false;
+
+    step("metrics 3/3 read: the page through a read-only mapping; only the 148 table bytes may change");
+    uint64_t status = 0;
+    uint32_t statusCount = 1;
+    SmuMetrics metrics = {};
+    size_t size = sizeof(metrics);
+    kern_return_t result = IOConnectCallMethod(connection, kDiagnosticMetricsRead, nullptr, 0, nullptr, 0, &status,
+                                               &statusCount, &metrics, &size);
+    if (result != KERN_SUCCESS || statusCount != 1 || size != sizeof(metrics)) {
+        std::printf("call failed 0x%08x\n", result);
+        return false;
+    }
+    std::printf("%s\n", statusName(static_cast<Status>(status)));
+    if (status != kOK) return false;
+    printMetrics(metrics);
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
-    bool scratch = false, smu = false, gfxoff = false;
+    bool scratch = false, smu = false, gfxoff = false, metrics = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -226,6 +303,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--gfxoff-disallow") == 0) {
             gfxoff = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--smu-metrics") == 0) {
+            metrics = true;
             continue;
         }
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -299,6 +380,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!gfxOffDisallow(connection)) failures++;
+    }
+    if (metrics) {
+        if (info[1] < kMetricsStage) {
+            std::fprintf(stderr, "cezanne-diag: --smu-metrics needs driver stage %u\n", kMetricsStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!smuMetrics(connection)) failures++;
     }
     for (unsigned long pass = 0; pass < repeat; pass++) {
         if (pass > 0) usleep(static_cast<useconds_t>(interval * 1000));
