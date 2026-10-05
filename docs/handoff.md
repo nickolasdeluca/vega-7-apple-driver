@@ -138,9 +138,9 @@ binaries are observation references and remain excluded from the finished stack.
 Stages 0–3 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
 The measured IP inventory, GC layout (7 of 8 CUs, 2 RBs) and `GB_ADDR_CONFIG`
 are in the [target manifest](cezanne-target-manifest.md#measured-ip-inventory-stage-2-test-boot-2026-10-05)
-and the boot log. Open question: `GB_ADDR_CONFIG` `0x24000011` differs from
-Linux's Renoir golden `0x24000042`; establish which value Linux's derived
-configuration uses before relying on either. No later stage is authorized; a
+and the boot log. `GB_ADDR_CONFIG` is resolved there: Linux derives
+`0x26010042` (4 pipes) and programs `0x24000042`, ignoring the firmware's
+`0x24000011` pipe fields. No later stage is authorized; a
 PCI-ownership diagnostic interface and the first reviewed register write are
 candidates, each needing a test-boot.md update and the user's approval.
 

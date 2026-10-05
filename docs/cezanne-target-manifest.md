@@ -91,6 +91,31 @@ The stage 3 boot read the fuse registers: CU 3 is fused off, leaving 7 active
 CUs (mask `0xf7`), and both RBs are active. `GB_ADDR_CONFIG` read
 `0x24000011`; see the [stage 3 boot](test-boot.md#test-boot-log).
 
+#### GB_ADDR_CONFIG
+
+The firmware leaves `GB_ADDR_CONFIG` at `0x24000011` (2 pipes, 1 KiB pipe
+interleave, 1 compressed fragment, 2 RBs per SE). Linux v6.12 replaces the
+pipe, interleave and fragment fields; it keeps from the hardware only the bits
+outside mask `0xf3e777ff` (`0x0c188800`: RBs per SE, shader engines and two
+bank bits), which here is `0x04000000`:
+
+- Configuration: `gfx_v9_0_gpu_early_init`, GC 9.3.0 case, computes
+  `(read & ~0xf3e777ff) | 0x22010042` = **`0x26010042`** and derives
+  `gb_addr_config_fields` from it: 4 pipes, 256-byte pipe interleave, 2
+  compressed fragments, 2 RBs per SE.
+- Hardware: `gfx_v9_0_init_golden_registers` applies only
+  `golden_settings_gc_9_1_rn` for GC 9.3.0, whose entry `GB_ADDR_CONFIG`
+  `0xf3e777ff`/`0x24000042` makes the register **`0x24000042`**
+  (`soc15_program_register_sequence`: `(read & ~and) | (or & and)`;
+  `GB_ADDR_CONFIG_READ` likewise).
+
+Both agree on pipes, interleave, fragments and RBs. They differ only in
+`SHADER_ENGINE_TILE_SIZE` and `MULTI_GPU_TILE_SIZE` (the configuration value
+has 1 and 2; the register 0 and 0). A driver for this host should use
+`0x26010042` for surface layout. Programming `0x24000042` is a register write
+that belongs to a later, reviewed stage; the firmware value must not be used
+for layout.
+
 ## Conditional firmware inventory
 
 `amdgpu_ucode_ip_version_decode` maps GC 9.3.0 and SDMA 4.1.2 to their Green

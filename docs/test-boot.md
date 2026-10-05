@@ -586,10 +586,9 @@ EFI verified unchanged against the stage 2 manifest before it).
 
 - `GB_ADDR_CONFIG` differs from Linux's Renoir golden value `0x24000042` in
   `NUM_PIPES` (1 vs 2), `PIPE_INTERLEAVE_SIZE` (2 vs 0) and
-  `MAX_COMPRESSED_FRAGS` (0 vs 1). Linux reads the register in
-  `gfx_v9_0_gpu_early_init` and writes the golden settings later in hardware
-  init; which value its derived configuration ends up using on this host is
-  not established.
+  `MAX_COMPRESSED_FRAGS` (0 vs 1). Linux v6.12 does not use the firmware's
+  pipe, interleave or fragment fields, as traced offline afterwards (see the
+  [target manifest](cezanne-target-manifest.md#gb_addr_config)).
 - The `ioreg -a` capture is in ignored `out/test-efi/boot-5-stage3/`.
 - Result: stage 3 succeeded.
 
