@@ -133,20 +133,18 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 9 USB test boot (revised check)
+## Next task: choose the next reviewed step
 
-Stages 0–8 succeeded.
+Stages 0–9 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
 
-- **Boot 11.** Stage 9's first boot stopped safely: the "all zero" test is
-  wrong for stale DRAM.
-- **Boot 12.** The SysReport dump showed the VBIOS reserves no carveout
-  memory.
-- **The revised check.** It requires the region to stay unchanged over about
-  1 s and compares the page after the transfer with a snapshot. It is approved
-  and built under `out/test-efi/usb-stage9/`.
-- **Next.** Follow [test-boot.md](test-boot.md#stage-9-smu-metrics-table) and
-  the [revision](test-boot.md#revision-stage-9-free-page-check). Back up first
-  and power off at once on `table-not-written` or `table-overflow`.
+- **The metrics table.** Stage 9 had the SMU write its 148-byte metrics table
+  to a checked carveout page, giving live clocks, power and temperatures:
+  GFX idle at 400 MHz and about 44 °C, CPU at 4.65 GHz all-core.
+- **What it proves.** The GPU-address-to-physical translation for the
+  carveout is correct; it is the first GPU-side write to memory.
+- **Open finding.** One stage 7 boot attempt reset early.
+- **Approval.** Further steps each need a proposal in test-boot.md and the
+  user's approval.
 
 ## Offline task while waiting: Metal shader frontend boundary
 

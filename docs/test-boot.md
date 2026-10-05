@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-05: **stages 0 to 8 succeeded** (see
+Status, 2026-10-05: **stages 0 to 9 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -16,10 +16,9 @@ attempt reset before reaching macOS, cause unknown. Stage 8 sent
 table) stopped at its own check: the chosen carveout region is not all zero,
 so no SMU message was sent. Its check needs a better criterion before
 another attempt. The [SysReport dump boot](#sysreport-dump-boot) gave the
-VBIOS: the firmware reserves no carveout memory. The
-[revised stage 9 check](#revision-stage-9-free-page-check) (stable over 1 s,
-compared with a snapshot) is approved and built under ignored
-`out/test-efi/usb-stage9/`; it has not been booted.
+VBIOS: the firmware reserves no carveout memory. With the
+[revised check](#revision-stage-9-free-page-check), stage 9 read the SMU
+metrics table in boot 13. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -418,8 +417,8 @@ user copied them to ignored `out/test-efi/sysreport/`.
 
 ### Revision: stage 9 free-page check
 
-**Status: approved by the user on 2026-10-05, implemented and built; not yet
-booted.**
+**Status: approved by the user on 2026-10-05, implemented, and run
+successfully in boot 13.**
 It replaces stage 9 step 1's "all zero" test, which boot 11 showed is wrong
 for stale DRAM.
 
@@ -1761,6 +1760,48 @@ kernel up 16:06:52).
   `out/test-efi/boot-11-stage9/`.
 - Result: **stopped safely before any write**. Stage 9 needs a revised,
   reviewed check before another attempt.
+
+**Boot 13, 2026-10-05, stage 9 with the revised check**
+(`out/test-efi/usb-stage9/`; cold boot, kernel up 16:27:19).
+
+- `kern.bootargs` ends `cezanne-stage=9`; stages 1–3 `ok`.
+- `sudo cezanne-diag --smu-metrics`, written 16:28:17:
+  1. **Check:** `ok`. FB location base `0xf400`, FB offset `0x5c0`, GPU
+     `0xf440000000`, physical `0x600000000`; the 64 KiB was unchanged over
+     about 1 s.
+  2. **Transfer:** `ok`. `SetDriverDramAddrHigh`, `SetDriverDramAddrLow` and
+     `TransferTableSmu2Dram` each answered `0x01`.
+  3. **Read:** `ok`. The 148 table bytes changed and bytes 148–4095 were
+     identical to the snapshot.
+- **First GPU-side write to memory.** The SMU wrote exactly where the
+  address translation predicted, and nowhere else on the page.
+- **Decoded metrics** (taken about 1 minute after boot, CPU still busy):
+
+  | Reading | Value |
+  | --- | --- |
+  | GFX clock (current / average) | 400 / 400 MHz |
+  | GFX activity | 0.00 % (graphics engine idle) |
+  | GFX / SoC temperature | 43.75 / 43.00 °C |
+  | Other clocks | SOCCLK 400, FCLK 1333, DCFCLK 400, DISPCLK 200, DPPCLK 200, DPREFCLK 600, VCLK/DCLK 400, LCLK 400, MP0/MP1/MP2 300/400/100, SHUBCLK 200, ACLK 200, ISPCLK 0, UMCCLK 6 (unit unclear) |
+  | CPU cores (MHz / mW / °C) | six active at 4650 MHz, 4.2–8.8 W, 55.5–67.5 °C; cores 2 and 4 report 0 MHz / 0 mW (the 5600GT's 6 of 8 cores) at about 44.5 °C |
+  | L3 | 4650 MHz, 48.0 °C (second L3 slot 0) |
+  | VDD (CPU) | 1287 mV, 25.7 A, 33.1 W |
+  | VDD SoC | 849 mV, 2.06 A, 1.75 W |
+  | Socket / APU power | 37 W / 34 W |
+  | Fan PWM | 50 980 milli (about 51 %) |
+  | STAPM limit | 87 W (original 88 W) |
+  | Throttler status | `0x0800`: bit 11 `EDC_CPU` (CPU current limit), consistent with all-core boost under load |
+  | TDC VDD / SoC | 23 325 / 2 137 mA |
+  | EDC VDD / SoC | 18 465 / 9 796 mA |
+
+  - The CPU at 4.65 GHz on all six cores, at 1.29 V and 33 W, confirms the
+    boot-time load seen in boot 10.
+  - The GPU is idle at its minimum clock, around 44 °C.
+- The register dump matched boot 10 except the mailbox (`C2PMSG_66`
+  `0x1c`, `C2PMSG_82` `0x7`, `C2PMSG_90` `0x1`) and the PSP counter.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-13-stage9/`.
+- Result: stage 9 succeeded.
 
 ## Unknowns and limits
 
