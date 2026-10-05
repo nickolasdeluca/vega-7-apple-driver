@@ -133,14 +133,15 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: choose the next reviewed step
+## Next task: user review of the disallow-GFXOFF proposal
 
-Stages 0–7 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-Stage 7 sent the first SMU messages: driver-interface version 14 (as Linux
-v6.12 expects) and SMU firmware 64.74.0. Open finding: one stage 7 boot
-attempt reset before macOS logged anything, cause unknown. Watch for it
-recurring before attributing anything to the driver. Further writes or SMU
-messages each need a proposal in test-boot.md and the user's approval.
+Stages 0–7 succeeded (see the [test boot log](test-boot.md#test-boot-log));
+the SMU reports driver-interface 14 and firmware 64.74.0. Open finding: one
+stage 7 boot attempt reset before macOS logged anything. Proposed next, in
+[test-boot.md](test-boot.md#proposed-stage-8-disallow-gfxoff):
+`DisallowGfxOff` (`0x8`) on request through `cezanne-diag --gfxoff-disallow`,
+confirming GFX stays on. It is not authorized; implement it only after the
+user approves that section.
 
 ## Offline task while waiting: Metal shader frontend boundary
 

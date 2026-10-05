@@ -12,7 +12,8 @@ Stage 6, the first reviewed write, wrote `0xCAFEDEAD` to `SCRATCH_REG0`,
 read it back, and restored the original value. Stage 7 sent the first SMU
 messages: driver-interface version 14, SMU firmware 64.74.0. One stage 7 boot
 attempt reset before reaching macOS, cause unknown. No later stage is
-authorized.
+authorized; disallowing GFXOFF is
+[proposed](#proposed-stage-8-disallow-gfxoff) for review.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -771,6 +772,91 @@ is printed and flushed before it is sent:
 - It writes no other register.
 - The `SCRATCH_REG0` test is unchanged.
 
+### Proposed stage 8: disallow GFXOFF
+
+**Status: proposal for the user's review. Not authorized, not implemented,
+not built.**
+
+**Purpose.** GFXOFF lets the SMU power the graphics block down while it is
+idle. Every later step that programs the GC (golden settings, RLC, CP
+microcode, rings) needs GFX to stay on. Linux makes sure of this by sending
+`DisallowGfxOff`, for example before its GC IP dump. Stage 8 sends that
+message once and confirms GFX stays on. It also proves the SMU path for a
+message that sets a policy, not just a query.
+
+**Linux v6.12:**
+
+- **The message.** `renoir_ppt.c` maps `DisallowGfxOff` to
+  `PPSMC_MSG_DisableGfxOff` = `0x8` (`smu_v12_0_ppsmc.h`), parameter 0.
+  `smu_v12_0_gfx_off_control(smu, false)` sends it, then polls
+  `SMUIO_GFX_MISC_CNTL` `PWR_GFXOFF_STATUS` until it is 2 (GFX on), for at
+  most 500 ms.
+- **Initial state.** `amdgpu_device_init` sets `gfx_off_req_count = 1`: Linux
+  treats GFXOFF as disallowed at start and sends no message at init. It allows
+  GFXOFF later (`AllowGfxOff`, `0x7`), and sends `DisallowGfxOff` only to undo
+  that.
+
+**What we have measured.** `PWR_GFXOFF_STATUS` was 2 (not in GFXOFF) in boots
+7, 8 and 9, with GFX idle for minutes, so nothing has allowed GFXOFF. Sending
+`DisallowGfxOff` therefore confirms the state the firmware is already in; it
+is not expected to change behaviour. **This differs from Linux:** Linux never
+sends this message from the initial state.
+
+**What the stage 8 code would do.** It runs on request through `cezanne-diag
+--gfxoff-disallow`, never at boot, with the boot unchanged from stage 7. Each
+step is printed and flushed first:
+
+1. **Check:** read the mailbox (stop with `smu-busy` unless `C2PMSG_90` is
+   non-zero) and `PWR_GFXOFF_STATUS`.
+2. **Send:** `DisableGfxOff` (`0x8`, argument 0), with the same writes, 2 s
+   poll and stop-on-non-OK as the stage 7 queries.
+3. **Confirm:** poll `PWR_GFXOFF_STATUS` until it is 2, for at most 500 ms
+   (`gfxoff-timeout` otherwise), as Linux does.
+4. **Dump:** the usual register dump.
+
+**Confinement:**
+
+- **The allowlist.** It grows by exactly one value, from stage 8: `C2PMSG_66` ←
+  `0x8`. The other mailbox writes stay as in stage 7, and `AllowGfxOff`
+  (`0x7`) and every other message stay refused.
+- **One writable page.** The same SMU mailbox page as stage 7, and the same
+  per-connection ordering.
+- **Tests.** `0x8` is allowed only from stage 8, and `0x7` and every other
+  message are refused. The tests also cover the status poll, its timeout and
+  each error response. Weakened cores must fail: `0x7` allowed, a missing
+  confirmation poll, a missing timeout.
+
+**Expected result:**
+
+- **Check:** idle mailbox, and status 2.
+- **Send:** response `0x01`.
+- **Confirm:** status 2 at once.
+- **Dump:** matches boot 9, with the mailbox holding `0x8`/`0`/`0x1`.
+- **Afterwards:** the machine stays as before: fans, temperatures, desktop.
+
+**Risks and responses:**
+
+- **A policy message.** Unlike stage 7, this message sets SMU state. It is the
+  state already measured and the one Linux assumes at start, so no change is
+  expected. A full power-off resets it in any case.
+- **A non-OK response.** `0xFD` (bad prerequisites) is plausible if the
+  firmware has not enabled the GFXOFF feature. That would be a finding: do
+  not retry, and do not try `AllowGfxOff`.
+- **A status other than 2 afterwards, or a timeout.** Unexpected; record it and
+  stop. GC register reads were already gated on status 2 since stage 5.
+- **Instability.** A hang, unusual fan behaviour or temperature changes: power
+  off completely, unplug the drive and boot the known-good EFI.
+- **The stage 7 reset.** One stage 7 boot attempt reset before macOS logged
+  anything. It is unexplained and unrelated to the boot path stage 8 changes,
+  but note the screen if it recurs.
+
+**What it does not do:**
+
+- It does not allow GFXOFF.
+- It sends no clock, power-gating or table message.
+- It writes no GC register.
+- The scratch test and the version queries are unchanged.
+
 Stage 4 risks: it adds a kernel entry point. It is limited to root and to the
 reads stages 1–3 already made, but a defect in the user client could panic
 the kernel. Reads happen while the system runs, still with no graphics
@@ -1196,9 +1282,10 @@ a software shutdown of the stage 6 session at 15:34).
 - The register dump that followed matched boot 8 except, as expected, the
   mailbox holding the last exchange (`C2PMSG_66` `0x2`, `C2PMSG_82`
   `0x00404a00`, `C2PMSG_90` `0x1`) and the PSP counter.
-- The SMU answered within the poll limit and the session stayed up long enough
-  to collect these results. The user did not report the fans or desktop
-  behaving abnormally; this is not separately confirmed.
+- The SMU answered within the poll limit. The user confirmed the fans behaved
+  normally afterwards. Their temperature monitor ("Hot") showed temperatures
+  well below usual, consistent with nothing driving the GPU in a test boot
+  (no NootedRed, graphics engine never started).
 - Captures (`diag.txt`, `ioreg.plist`) are in ignored
   `out/test-efi/boot-9-stage7/`.
 - Result: stage 7 succeeded on the second attempt; the first attempt's reset
