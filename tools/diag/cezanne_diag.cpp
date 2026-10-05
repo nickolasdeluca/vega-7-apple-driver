@@ -1,9 +1,10 @@
 // cezanne-diag: reads CezanneGPU's allowlisted registers through the
 // diagnostic interface (stage 4 on). The driver re-checks the device and maps
-// the register BAR read-only for every read. The only write it can request is
-// the stage 6 scratch test, run only with --scratch-test.
+// the register BAR read-only for every read. The only writes it can request
+// are the stage 6 scratch test (--scratch-test) and the stage 7 SMU version
+// queries (--smu-query).
 //
-// Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test]
+// Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -82,10 +83,11 @@ static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage6RegisterCount
 
 void usage(FILE *out)
 {
-    std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test]\n"
+    std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
-                      "then restores its original value.\n");
+                      "then restores its original value.\n"
+                      "--smu-query first asks the SMU for its driver-interface and firmware versions.\n");
 }
 
 bool parseCount(const char *text, unsigned long max, unsigned long *value)
@@ -106,10 +108,11 @@ void step(const char *text)
     std::fflush(stdout);
 }
 
-bool call(io_connect_t connection, uint32_t selector, uint64_t *output, uint32_t count)
+bool call(io_connect_t connection, uint32_t selector, uint64_t *output, uint32_t count, const uint64_t *input = nullptr,
+          uint32_t inputCount = 0)
 {
     uint32_t outputCount = count;
-    kern_return_t result = IOConnectCallScalarMethod(connection, selector, nullptr, 0, output, &outputCount);
+    kern_return_t result = IOConnectCallScalarMethod(connection, selector, input, inputCount, output, &outputCount);
     if (result != KERN_SUCCESS || outputCount != count) {
         std::printf("call failed 0x%08x\n", result);
         return false;
@@ -148,15 +151,54 @@ bool scratchTest(io_connect_t connection)
     return written[0] == kOK && restored[0] == kOK;
 }
 
+// The stage 7 SMU queries: check the mailbox is idle, then the two version
+// queries Linux sends first. Stops at the first status other than ok.
+bool smuQuery(io_connect_t connection)
+{
+    uint64_t check[4] = {};
+    step("smu 1/3 check: MP1 mailbox idle (C2PMSG_90 non-zero)");
+    if (!call(connection, kDiagnosticSmuCheck, check, 4)) return false;
+    std::printf("%s\n  C2PMSG_66 0x%08llx  C2PMSG_82 0x%08llx  C2PMSG_90 0x%08llx\n",
+                statusName(static_cast<Status>(check[0])), static_cast<unsigned long long>(check[1]),
+                static_cast<unsigned long long>(check[2]), static_cast<unsigned long long>(check[3]));
+    if (check[0] != kOK) return false;
+
+    const struct {
+        const char *text;
+        uint64_t message;
+    } queries[] = {
+        {"smu 2/3 query: GetDriverIfVersion (0x3)", kSmuMsgGetDriverIfVersion},
+        {"smu 3/3 query: GetSmuVersion (0x2)", kSmuMsgGetSmuVersion},
+    };
+    for (const auto &query : queries) {
+        uint64_t out[3] = {};
+        step(query.text);
+        if (!call(connection, kDiagnosticSmuQuery, out, 3, &query.message, 1)) return false;
+        std::printf("%s, response 0x%02llx, answer 0x%08llx\n", statusName(static_cast<Status>(out[0])),
+                    static_cast<unsigned long long>(out[1]), static_cast<unsigned long long>(out[2]));
+        if (out[0] != kOK) return false;
+        if (query.message == kSmuMsgGetSmuVersion) {
+            uint32_t v = static_cast<uint32_t>(out[2]);
+            std::printf("  SMU firmware %u.%u.%u.%u (program.major.minor.debug)\n", v >> 24, (v >> 16) & 0xff,
+                        (v >> 8) & 0xff, v & 0xff);
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
-    bool scratch = false;
+    bool scratch = false, smu = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--smu-query") == 0) {
+            smu = true;
             continue;
         }
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -214,6 +256,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!scratchTest(connection)) failures++;
+    }
+    if (smu) {
+        if (info[1] < kSmuStage) {
+            std::fprintf(stderr, "cezanne-diag: --smu-query needs driver stage %u\n", kSmuStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!smuQuery(connection)) failures++;
     }
     for (unsigned long pass = 0; pass < repeat; pass++) {
         if (pass > 0) usleep(static_cast<useconds_t>(interval * 1000));
