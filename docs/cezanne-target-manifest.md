@@ -51,10 +51,31 @@ families, not necessarily hardware version numbers.
 | Display / DCE_HWIP | DCE_HWIP 2.1.0 is a supported display-dispatch case; study DCN2.1 resource code | Display version, pipe count, board connector routing, timing and bandwidth |
 | VCN / JPEG | UVD_HWIP 2.2.0 firmware prefix distinguishes Renoir/Green Sardine | Version and media requirements; deferred beyond initial display/compute goals |
 
-No raw discovery table is available from the permitted host evidence. Obtaining
-one through BAR mapping, indexed registers or an owner change is outside this
-milestone. A future experimental boot must validate identity, discovery bounds,
-checksum, instance layout and register bases before accepting this inventory.
+### Measured IP inventory (stage 2 test boot, 2026-10-05)
+
+The stage 2 driver read the host's IP discovery binary from the carveout
+without any GPU write ([test-boot.md](test-boot.md#stage-2-write-free-discovery-table-read)).
+It passed the binary and IP-table signature and checksum checks, and its GC
+and MP0 bases match `renoir_ip_offset.h`. Binary v1.1, 1124 bytes; IP table v2,
+one die, 41 entries. The raw capture is kept in ignored
+`out/test-efi/boot-4-stage2/`. Versions of the blocks named above:
+
+| Block | Measured | Matches the dispatch above |
+| --- | --- | --- |
+| GC | 9.3.0, bases `0x2000`, `0xA000`, `0x2402C00` | Yes |
+| SDMA0 | 4.1.2, one instance | Yes |
+| MP1 (SMU) | 12.0.1 | Yes |
+| MP0 (PSP) | 12.0.1 | `psp_v12_0` |
+| DMU (display) | 2.1.0 | Yes (DCN 2.1) |
+| UVD (VCN) | 2.2.0 | Yes |
+| MMHUB / ATHUB | 1.5.0 / 1.5.0 | To check against the GMC handlers |
+| NBIF / HDP / OSSSYS | 2.5.0 / 4.1.2 / 4.3.0 | To check against `soc15.c` |
+| UMC | 7.6.0, two instances | — |
+
+The GC info table (v2.0) reports 1 shader engine, 1 shader array, 8 CUs per
+array (8 CUs before any fuse harvesting; the per-CU enable mask is a register
+read, not in the table), 2 RBs, 4 TCCs, wave size 64, 10 waves per SIMD and
+64 KiB LDS. The harvest table lists ISP, XGBE and hardware ID 99 instance 0.
 
 ## Conditional firmware inventory
 
@@ -86,9 +107,9 @@ This study downloaded no firmware. The later
 [provenance study](firmware-provenance.md) pins linux-firmware `20260916` and
 records the license, size, SHA-256 and documented header/feature versions and
 payload bounds for each candidate. It adds `green_sardine_dmcub.bin`, which display
-selects only through a hardware-revision rule. Signature acceptance and the host's
-actual IP versions remain **unavailable**; do not fill them from file headers or
-source filenames. Hash validation and host-side header checks
+selects only through a hardware-revision rule. Signature acceptance remains
+**unavailable**; the host's IP versions are now measured (above), never taken
+from file headers or source filenames. Hash validation and host-side header checks
 do not substitute for security-processor acceptance of signed images.
 
 Before acquisition/use, record an exact AMD firmware source revision and license
@@ -120,8 +141,8 @@ material, not incorporated driver code. Review per-file licensing before reuse.
 | Next experiment | Scope | Success criterion |
 | --- | --- | --- |
 | Firmware provenance/header specification | Done: [provenance study](firmware-provenance.md) | Exact release/license for each image, bounded parser and required/optional decisions recorded |
-| Compiler target mapping | Done: [shader target study](shader-target.md) | `gfx90c` selected (XNACK any, no SRAM ECC, wave64; `gfx9-generic` fallback); emitted ISA, descriptor and metadata recorded for one kernel. Host GC version still unmeasured |
-| Target IP validation | Deferred to experimental boot | Checked discovery/IP identity and instance counts agree with selected handlers; unsupported versions stop initialization |
+| Compiler target mapping | Done: [shader target study](shader-target.md) | `gfx90c` selected (XNACK any, no SRAM ECC, wave64; `gfx9-generic` fallback); emitted ISA, descriptor and metadata recorded for one kernel. Host GC 9.3.0 measured at stage 2 |
+| Target IP validation | Discovery read done (stage 2); handler checks pending | Checked discovery/IP identity and instance counts agree with selected handlers; unsupported versions stop initialization |
 | Firmware and copy/fence | Deferred to own PCI ownership and recovery | Signed image acceptance, bounded rejection behavior, guarded byte-for-byte DMA copy and reliable fence/interrupt completion |
 
 The loader feasibility investigation remains the earlier priority; see

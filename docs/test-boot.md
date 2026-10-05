@@ -1,11 +1,11 @@
 # USB test boot
 
-Status, 2026-10-05: **stage 0 and stage 1 succeeded** (see
+Status, 2026-10-05: **stages 0, 1 and 2 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
-logging, which the test EFI no longer does. Stage 2 (write-free discovery
-table read) is authorized and built under ignored `out/test-efi/usb-stage2/`;
-it has not been booted.
+logging, which the test EFI no longer does. Stage 2 read and validated the IP
+discovery table from the carveout without writes. No later stage is
+authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -486,6 +486,32 @@ logging; kept as `out/test-efi/superseded-filelog-usb-stage0/`).
   the driver's `IOLog` lines may never reach the kernel buffer; not
   investigated. The registry is the record.
 - Result: stage 1 succeeded.
+
+**Boot 4, 2026-10-05, stage 2** (`out/test-efi/usb-stage2/`; cold boot; internal
+EFI verified unchanged against the stage 2 manifest before it).
+
+- Desktop reached; `kern.bootargs` ends `cezanne-stage=2`; driver loaded.
+- `CezanneGPU stage 1 result` `ok` (values as boot 3); `CezanneGPU stage 2
+  result` `ok`.
+
+  | Property | Value |
+  | --- | --- |
+  | `MC_VM_FB_OFFSET` | `0x5c0` |
+  | `carveout base` | `0x5c0000000` (2 GiB, ending at `0x640000000`, where BAR0 begins) |
+  | `discovery address` | `0x63fff0000` |
+  | `discovery signature` | `0x28211407` |
+  | `discovery version` / `table version` | 1.1 / 2 |
+  | `discovery IP count` | 41 |
+  | `discovery GC version` | 9.3.0 |
+  | `discovery GC base 0` / `1` | `0x2000` / `0xa000` |
+  | `discovery MP0 base 0` | `0x16000` |
+
+- The CPU can read the TMR region holding the table; no machine check. The
+  base cross-check confirms `0xa5ac` is `MC_VM_FB_OFFSET`.
+- `ioreg -a` capture and the extracted 1124-byte binary are in ignored
+  `out/test-efi/boot-4-stage2/`. The decoded inventory is in the
+  [target manifest](cezanne-target-manifest.md#measured-ip-inventory-stage-2-test-boot-2026-10-05).
+- Result: stage 2 succeeded.
 
 ## Unknowns and limits
 

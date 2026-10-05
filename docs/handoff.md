@@ -133,22 +133,17 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 2 USB test boot
+## Next task: choose the next driver stage
 
-Stages 0 and 1 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-Stage 2, a write-free read of the IP discovery table from the carveout, is
-authorized and built under `out/test-efi/usb-stage2/`. Follow
-[test-boot.md](test-boot.md): the user replaces the USB `EFI` folder, checks
-it with `test_efi.py verify --side test`, and cold-boots it. Save the
-`CezanneGPU` registry entry with `ioreg -a` into an ignored directory and
-record the boot. Afterwards confirm the internal EFI with
-`verify --side known_good`.
-
-A valid table replaces the unmeasured IP versions in the
-[target manifest](cezanne-target-manifest.md). If the CPU cannot read the table
-(TMR protection), the remaining route is the `MM_INDEX`/`MM_DATA` path, which
-writes an index register and needs its own reviewed stage. A PCI-ownership
-diagnostic interface is the other unauthorized candidate.
+Stages 0–2 succeeded (see the [test boot log](test-boot.md#test-boot-log)). The
+host's IP inventory is measured and recorded in the
+[target manifest](cezanne-target-manifest.md#measured-ip-inventory-stage-2-test-boot-2026-10-05):
+GC 9.3.0, SDMA 4.1.2, MP1 12.0.1, DCN 2.1.0, VCN 2.2.0. Check the remaining
+versions (MMHUB/ATHUB 1.5.0, NBIF 2.5.0, HDP 4.1.2, OSSSYS 4.3.0) against the
+handlers Linux v6.12 selects. No later stage is authorized; candidates need a
+reviewed test-boot.md update and the user's approval: reading the enabled-CU
+mask and other GC configuration registers, and a PCI-ownership diagnostic
+interface.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
