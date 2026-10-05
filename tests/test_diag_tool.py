@@ -18,7 +18,8 @@ class DiagSourceTests(unittest.TestCase):
         self.assertEqual(sorted(set(calls)), ["kDiagnosticGetInfo", "kDiagnosticReadRegister", "selector"])
         helper = re.findall(r"\bcall\(connection, (\w+)", source)
         self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore",
-                                  "kDiagnosticSmuCheck", "kDiagnosticSmuQuery"])
+                                  "kDiagnosticSmuCheck", "kDiagnosticSmuQuery", "kDiagnosticSmuCheck",
+                                  "kDiagnosticGfxOffDisallow"])
         # The only messages the tool can ask for are the two version queries.
         self.assertEqual(re.findall(r'\{"smu \d/3 query: \w+ \(0x\d\)", (\w+)\}', source),
                          ["kSmuMsgGetDriverIfVersion", "kSmuMsgGetSmuVersion"])
@@ -29,6 +30,8 @@ class DiagSourceTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"\bsmuQuery\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(smu\) \{[^}]*info\[1\] < kSmuStage")
         self.assertIn('std::strcmp(argv[i], "--smu-query") == 0', source)
+        self.assertEqual(len(re.findall(r"\bgfxOffDisallow\(connection\)", source)), 1)
+        self.assertRegex(source, r"if \(gfxoff\) \{[^}]*info\[1\] < kGfxOffStage")
         self.assertEqual(len(re.findall(r"\bscratchTest\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(scratch\) \{[^}]*info\[1\] < kScratchStage")
         self.assertIn('std::strcmp(argv[i], "--scratch-test") == 0', source)
