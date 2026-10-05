@@ -54,6 +54,8 @@ enum Status : uint32_t {
     kRegisterNotAllowed,
     kRegisterReadFailed,
     kDeviceNotResponding,
+    // The adapter could not open its provider, so no device access was tried.
+    kProviderOpenFailed,
 };
 
 const char *statusName(Status status);

@@ -30,6 +30,7 @@ const char *statusName(Status status)
     case kRegisterNotAllowed: return "register-not-allowed";
     case kRegisterReadFailed: return "register-read-failed";
     case kDeviceNotResponding: return "device-not-responding";
+    case kProviderOpenFailed: return "provider-open-failed";
     }
     return "unknown";
 }

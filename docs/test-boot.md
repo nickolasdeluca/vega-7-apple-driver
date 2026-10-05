@@ -1,10 +1,11 @@
 # USB test boot
 
-Status, 2026-10-05: the first stage 0 boot did not reach the OpenCore picker
-(see [Test boot log](#test-boot-log)); OpenCore file logging to the USB 2.0
-stick was the cause. The stage 0 and stage 1 test EFIs were rebuilt without
-file logging under ignored `out/test-efi/usb-stage0/` and
-`out/test-efi/usb-stage1/`; the rebuilt stage 0 EFI has not been booted yet.
+Status, 2026-10-05: stage 0 booted to the desktop from USB on the second
+attempt and the driver attached (see [Test boot log](#test-boot-log)); the
+`attached at stage 0` kernel line is still to be read with `dmesg`. The first
+attempt stalled in OpenCore file logging, which the test EFI no longer does.
+The stage 1 test EFI is rebuilt under ignored `out/test-efi/usb-stage1/` and
+not yet booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -340,15 +341,33 @@ logging; kept as `out/test-efi/superseded-filelog-usb-stage0/`).
   stops before the picker again, a build with file logging is the diagnostic,
   preferably on a faster USB 3 stick and with several minutes' wait.
 
+**Boot 2, 2026-10-05, stage 0** (manifest built after the file-logging fix;
+`out/test-efi/usb-stage0/`).
+
+- Partition 2 reached the OpenCore picker and macOS booted to the desktop.
+- `kern.bootargs`: `-v keepsyms=1 debug=0x100 msgbuf=1048576 cezanne-stage=0`.
+- Loaded: `org.cezanne-driver.gpu` 0.1.0 and Lilu; no NootedRed or Radeon kext.
+- `ioreg`: `CezanneGPU` under `VGA@0` (bridge `GP17@8,1`) with `CezanneGPU
+  stage` 0 and registry vendor `0x1002`, device `0x1638`, revision `0xc9`,
+  subsystem `0x1002:0x1636`, class `0x030000`.
+- Also attached to `VGA@0`: Apple's `AMDSupport` and the boot framebuffer
+  `.Display_boot` (`IONDRVFramebuffer`). Either may hold the PCI device open;
+  stage 1 now records that as `provider-open-failed` instead of the misleading
+  `config-read-failed`, and reads nothing in that case.
+- Display without NootedRed: 1920×1080 on the firmware framebuffer, 7 MB
+  reported, no acceleration ("No Kext Loaded").
+- The unified log has IOPCIFamily's `child CezanneGPU … published` and
+  kernelmanagerd's load notification, but not the driver's `IOLog` lines;
+  read those with `sudo dmesg`.
+
 ## Unknowns and limits
 
 - The firmware lists both partitions `eraseDisk … GPT` creates. Partition 1 is
   the empty EFI system partition and fails; partition 2 (`CZTEST`) starts
   OpenCore.
-- Untested: whether the OpenCore picker appears from USB without file logging,
-  the display state without NootedRed, the kext's acceptance, where the driver's
-  `IOLog` lines appear in the unified log, and the device's power and decoding
-  state when no driver has initialized it.
+- Untested: whether the provider can be opened beside the boot framebuffer
+  and AMDSupport, and the device's power and decoding state when no driver has
+  initialized it.
 - The preparation checks prove the configs and files differ only as intended
   and that OpenCore's validator accepts them; they do not prove the boot works.
 - The known-good copy was taken from a read-write mount the user created; no

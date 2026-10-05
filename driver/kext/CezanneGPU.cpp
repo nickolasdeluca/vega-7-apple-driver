@@ -196,11 +196,13 @@ bool CezanneGPU::start(IOService *provider)
     publishRegistryIdentity(provider);
     if (stage_ >= 1) {
         IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
-        cezanne::Status status = cezanne::kConfigReadFailed;
+        cezanne::Status status = cezanne::kProviderOpenFailed;
         if (pci != nullptr && pci->open(this)) {
             status = runStage1(pci);
             pci->close(this);
         } else {
+            // Another client (the boot framebuffer or AMDSupport also attach
+            // to this device) may hold it open; record that, read nothing.
             IOLog(LOG_PREFIX "could not open the PCI device\n");
         }
         // A failed check is a result to record, not a reason to unload.

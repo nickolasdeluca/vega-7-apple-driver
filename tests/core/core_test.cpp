@@ -214,7 +214,7 @@ static void testAllowlist()
     CHECK(!registerAllowed(0) && !registerAllowed(4) && !registerAllowed(kRegConfigMemsize + 4));
     CHECK(kRegC2PMsg33 == 0x58184 && kRegConfigMemsize == 0x378c);
     CHECK(std::strcmp(statusName(kNotInD0), "not-in-d0") == 0);
-    for (uint32_t s = kOK; s <= kDeviceNotResponding; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
+    for (uint32_t s = kOK; s <= kProviderOpenFailed; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
     CHECK(std::strcmp(statusName(static_cast<Status>(999)), "unknown") == 0);
 }
 
