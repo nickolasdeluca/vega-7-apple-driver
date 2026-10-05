@@ -3,7 +3,9 @@
 Status, 2026-10-05: **stage 0 and stage 1 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
-logging, which the test EFI no longer does. No later stage is authorized.
+logging, which the test EFI no longer does. Stage 2 (write-free discovery
+table read) is authorized and built under ignored `out/test-efi/usb-stage2/`;
+it has not been booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -31,6 +33,10 @@ off restores the known-good boot. This is the experimental environment
    - **Stage 1** (authorized by the user on 2026-10-05): read-only device
      access, described [below](#stage-1-read-only-device-access). Boot it only
      after stage 0 has met its success criteria.
+   - **Stage 2** (authorized by the user on 2026-10-05): stage 1 plus one more
+     register read and a read-only mapping of the IP discovery binary in the
+     carveout, described [below](#stage-2-write-free-discovery-table-read).
+     Still no register, configuration or memory write.
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -189,6 +195,79 @@ machine during boot; power it off and boot the known-good EFI. Linux performs
 these same reads early in every boot of this chip family, before its discovery
 code writes a register, which is why they were chosen.
 
+### Stage 2: write-free discovery table read
+
+On an APU the "VRAM" is a carveout of system RAM. Linux v6.12
+`gmc_v9_0_mc_init` treats it as directly addressable on x86-64: for APUs it
+sets the aperture base to `gfxhub_v1_0_get_mc_fb_offset`, which is
+`MC_VM_FB_OFFSET << 24`. Linux only reads that register; the firmware sets it.
+So the discovery binary can be read from system memory instead of through the
+`MM_INDEX`/`MM_DATA` write that Linux uses at discovery time (Linux reads it
+before the aperture is set up). Stage 2 runs only after stage 1 returned `ok`,
+in the same `start()`:
+
+1. Reads one more register through the same read-only BAR5 mapping:
+
+   | Register | BAR5 byte offset | Source |
+   | --- | --- | --- |
+   | `MC_VM_FB_OFFSET` (GC) | `0xa5ac`: GC segment 0 base `0x2000` + dword `0x96b` | `renoir_ip_offset.h` `GC_BASE`, `gc_9_0_offset.h`; field mask `0x00FFFFFF` (`gc_9_0_sh_mask.h`) |
+
+   The same header's `MP0_BASE` segment 0 (`0x16000`) locates the stage 1
+   register `MP0_SMN_C2PMSG_33` (`0x16061`), which read as expected.
+2. Derives the carveout base (`MC_VM_FB_OFFSET << 24`), its size
+   (`RCC_CONFIG_MEMSIZE << 20`) and the table address, `base + size - 64 KiB`
+   (`DISCOVERY_TMR_OFFSET`, `amdgpu_discovery.h`). It stops on all ones,
+   reserved bits, zero, a carveout under 64 KiB or one ending above 2^48.
+3. Parses the device's `assigned-addresses` registry property and stops if the
+   carveout overlaps any of its memory BARs.
+4. Maps exactly the 10 KiB table (`DISCOVERY_TMR_SIZE`) with
+   `IODeviceMemory::withRange` **read-only and uncached**, copies it with
+   32-bit loads, and releases the mapping.
+5. Validates the copy as `amdgpu_discovery_init` does: binary signature
+   `0x28211407`, the byte-sum binary checksum, the IP discovery table signature
+   `IPDS` and its checksum. It walks every die's IP list with bounds checks and
+   records GC and MP0 instance 0. Their bases must match `renoir_ip_offset.h`
+   (GC `0x2000`/`0xA000`, MP0 `0x16000`), which confirms after the fact that
+   step 1 read the right register.
+6. Publishes `CezanneGPU MC_VM_FB_OFFSET`, `carveout base`, `discovery
+   address`, `discovery signature`, the versions, base addresses and IP count,
+   and `CezanneGPU stage 2 result`. The raw binary is published as `CezanneGPU
+   discovery binary` only after the signature and checksum pass, so arbitrary
+   memory is never exposed in the registry.
+
+Guards, each tested offline: the stage 2 register is refused at stage 1
+(`registerAllowed(offset, stage)`); the core tests cover the carveout
+arithmetic, every refusal, the `assigned-addresses` parser, BAR overlap, and a
+synthetic discovery binary with corrupted signatures, checksums, sizes, die
+ids, bases and 64-bit tables. Four more weakened cores (stage gating, BAR
+overlap, table checksum, base cross-check) must fail the suite.
+`tests/test_kext.py` now also requires every `->map(` to carry
+`kIOMapReadOnly` and every `withRange` to use `kDiscoveryTmrSize`, and allows
+`IODeviceMemory::withRange` as the one new direct call.
+
+Expected stage 2 values: `MC_VM_FB_OFFSET` non-zero with the carveout outside
+BAR0 (`0x640000000` at stage 1), BAR2 and BAR5; discovery binary signature
+`0x28211407`; GC version 9.3.x (`gfx90c`); GC bases `0x2000`/`0xA000`; MP0
+base `0x16000`. The kernel reported 24 GiB (`mem_actual 0x600000000`) and
+22 GiB usable (`sane_size 0x580000000`) at stage 1, so a carveout at
+`0x580000000` (`MC_VM_FB_OFFSET` `0x580`) is plausible, not predicted.
+
+Stage 2 risks:
+
+- **TMR protection.** The table lives in a trusted memory region the PSP may
+  protect from CPU access. Linux v6.12 reads this region with the CPU only in
+  `amdgpu_discovery_read_binary_from_sysmem` (other APUs, via ACPI), and on
+  Renoir reaches it through the GPU at discovery time. A protected read may
+  return all ones or zeros (reported as `discovery-signature`) or, at worst,
+  raise a machine check, which panics; power off and boot the known-good EFI.
+- **Wrong register.** If `0xa5ac` is not `MC_VM_FB_OFFSET` on this chip, the
+  derived address points elsewhere. Reads of system RAM have no side effects;
+  the BAR overlap check refuses the device's own ranges; non-RAM physical
+  addresses outside those are not excluded. The base cross-check reports the
+  error afterwards.
+- Nothing is written, so a failure ends that boot's experiment without
+  changing GPU state.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -200,7 +279,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1; do
+for stage in 0 1 2; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -211,7 +290,7 @@ done
 the tree under `usb-stageN.rejected-<UTC time>`, never under the name the next
 steps copy. Each `manifest.json` records the stage, the boot arguments, the
 SHA-256 of every file in both trees, the removed bundles and the `ocvalidate`
-output. The two test EFIs differ only in the `cezanne-stage` value. They
+output. The test EFIs differ only in the `cezanne-stage` value. They
 contain the host's SMBIOS serials; keep them in ignored `out/`.
 
 ## Prepare the USB drive
@@ -297,6 +376,20 @@ Stage 1 succeeds when:
 - `CezanneGPU MP0_SMN_C2PMSG_33` and `CezanneGPU RCC_CONFIG_MEMSIZE` are
   recorded. Compare them with the expected values above; a mismatch is a
   finding to investigate, not a reason to retry with writes.
+
+Stage 2 succeeds when:
+
+- The stage 1 conditions hold with `CezanneGPU stage` 2.
+- `CezanneGPU stage 2 result` is `ok` and `CezanneGPU discovery binary` is
+  published; save it with
+  `ioreg -r -c CezanneGPU -a > out/test-efi/boot-N-stage2/ioreg.plist`
+  (ignored; it is a raw capture).
+- `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
+  the bases are recorded and compared with the expected values above.
+
+Any other stage 2 result is an observation that ends the experiment; a
+`discovery-signature` with `discovery signature` `0xffffffff` or `0` points to
+TMR protection. Do not retry with the `MM_INDEX` path without a new stage.
 
 Any other stage 1 result (for example `not-in-d0` or `memory-decode-disabled`)
 is a valid observation of the device's state and ends that boot's experiment.

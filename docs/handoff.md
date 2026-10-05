@@ -133,23 +133,22 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 0, then stage 1, USB test boots
+## Next task: stage 2 USB test boot
 
-Waits for the user's USB drive. Follow [test-boot.md](test-boot.md): the user
-erases the drive and performs every disk, EFI and reboot step. Copy
-`out/test-efi/usb-stage0/` first. Before copying, rebuild the test EFIs if the
-known-good EFI, the driver or the tool changed, and check the copy with
-`test_efi.py verify --side test`. Record each boot as the document lists. Only
-after stage 0 meets its criteria, replace the USB `EFI` folder with
-`usb-stage1/` and run stage 1. Afterwards confirm the internal EFI with
+Stages 0 and 1 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
+Stage 2, a write-free read of the IP discovery table from the carveout, is
+authorized and built under `out/test-efi/usb-stage2/`. Follow
+[test-boot.md](test-boot.md): the user replaces the USB `EFI` folder, checks
+it with `test_efi.py verify --side test`, and cold-boots it. Save the
+`CezanneGPU` registry entry with `ioreg -a` into an ignored directory and
+record the boot. Afterwards confirm the internal EFI with
 `verify --side known_good`.
 
-The next driver stage is not authorized. Candidates, each needing a reviewed
-update to test-boot.md and the user's approval: reading the IP discovery
-table (requires the `MM_INDEX` index-register write), which would replace the
-unmeasured IP versions in the [target manifest](cezanne-target-manifest.md),
-and a PCI-ownership diagnostic interface. Use stage 1's recorded values to
-decide.
+A valid table replaces the unmeasured IP versions in the
+[target manifest](cezanne-target-manifest.md). If the CPU cannot read the table
+(TMR protection), the remaining route is the `MM_INDEX`/`MM_DATA` path, which
+writes an index register and needs its own reviewed stage. A PCI-ownership
+diagnostic interface is the other unauthorized candidate.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
