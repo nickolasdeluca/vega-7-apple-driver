@@ -138,9 +138,8 @@ binaries are observation references and remain excluded from the finished stack.
 Stages 0–2 succeeded (see the [test boot log](test-boot.md#test-boot-log)). The
 host's IP inventory is measured and recorded in the
 [target manifest](cezanne-target-manifest.md#measured-ip-inventory-stage-2-test-boot-2026-10-05):
-GC 9.3.0, SDMA 4.1.2, MP1 12.0.1, DCN 2.1.0, VCN 2.2.0. Check the remaining
-versions (MMHUB/ATHUB 1.5.0, NBIF 2.5.0, HDP 4.1.2, OSSSYS 4.3.0) against the
-handlers Linux v6.12 selects. No later stage is authorized; candidates need a
+GC 9.3.0, SDMA 4.1.2, MP1 12.0.1, DCN 2.1.0, VCN 2.2.0, and every measured
+version maps to a supported Linux v6.12 handler (UMC not checked). No later stage is authorized; candidates need a
 reviewed test-boot.md update and the user's approval: reading the enabled-CU
 mask and other GC configuration registers, and a PCI-ownership diagnostic
 interface.
