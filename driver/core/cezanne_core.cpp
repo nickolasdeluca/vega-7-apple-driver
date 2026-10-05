@@ -42,6 +42,7 @@ const char *statusName(Status status)
     case kDiscoveryBaseMismatch: return "discovery-base-mismatch";
     case kGcInfoUnavailable: return "gc-info-unavailable";
     case kGfxIndexNotSe0Sh0: return "gfx-index-not-se0-sh0";
+    case kGfxNotOn: return "gfx-not-on";
     }
     return "unknown";
 }
@@ -118,10 +119,14 @@ Status checkAperture(const PciState &state, uint64_t physical, uint64_t length)
 bool registerAllowed(uint32_t offset, uint32_t stage)
 {
     // Each stage's list extends the previous one (checked by the tests), so a
-    // prefix of the stage 3 list is the list for any stage.
-    uint32_t count = stage >= 3 ? kStage3RegisterCount : stage == 2 ? kStage2RegisterCount : stage == 1 ? kStage1RegisterCount : 0;
+    // prefix of the stage 5 list is the list for any stage.
+    uint32_t count = stage >= 5   ? kStage5RegisterCount
+                     : stage >= 3 ? kStage3RegisterCount
+                     : stage == 2 ? kStage2RegisterCount
+                     : stage == 1 ? kStage1RegisterCount
+                                  : 0;
     for (uint32_t i = 0; i < count; i++) {
-        if (kStage3Registers[i] == offset) return true;
+        if (kStage5Registers[i] == offset) return true;
     }
     return false;
 }
@@ -137,6 +142,28 @@ static Status readRegister(const RegisterReader &registers, uint64_t length, uin
 Status readAllowedRegister(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
                            uint32_t offset, uint32_t *value)
 {
+    return readRegister(registers, apertureLength, stage, offset, value);
+}
+
+bool gfxGated(uint32_t offset)
+{
+    for (uint32_t i = 0; i < kGfxGatedRegisterCount; i++) {
+        if (kGfxGatedRegisters[i] == offset) return true;
+    }
+    return false;
+}
+
+Status readDiagnosticRegister(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                              uint32_t offset, uint32_t *value)
+{
+    *value = 0;
+    if (!registerAllowed(offset, stage)) return kRegisterNotAllowed;
+    if (gfxGated(offset)) {
+        uint32_t misc = 0;
+        Status status = readRegister(registers, apertureLength, stage, kRegSmuioGfxMiscCntl, &misc);
+        if (status != kOK) return status;
+        if (((misc & kGfxOffStatusMask) >> kGfxOffStatusShift) != kGfxOffStatusOn) return kGfxNotOn;
+    }
     return readRegister(registers, apertureLength, stage, offset, value);
 }
 

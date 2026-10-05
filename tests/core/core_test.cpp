@@ -60,6 +60,7 @@ struct FakeRegisters {
     uint32_t ccShader = 0x00800000u;    // CU 7 fused off
     uint32_t userShader = 0;
     uint32_t ccRb = 0, userRb = 0;
+    uint32_t gfxMisc = 0x4; // PWR_GFXOFF_STATUS 2: GFX on
     bool fail = false;
     uint32_t order[16];
     int reads = 0;
@@ -80,6 +81,7 @@ struct FakeRegisters {
                  : offset == kRegCcRbBackendDisable    ? self->ccRb
                  : offset == kRegUserRbBackendDisable  ? self->userRb
                  : offset == kRegGbAddrConfig          ? 0x24000042u
+                 : offset == kRegSmuioGfxMiscCntl      ? self->gfxMisc
                                                        : 0xDEADBEEF;
         return true;
     }
@@ -231,7 +233,7 @@ static void testAllowlist()
     CHECK(!registerAllowed(0, 2) && !registerAllowed(4, 2) && !registerAllowed(kRegConfigMemsize + 4, 2));
     CHECK(kRegC2PMsg33 == 0x58184 && kRegConfigMemsize == 0x378c && kRegMcVmFbOffset == 0xa5ac);
     CHECK(std::strcmp(statusName(kNotInD0), "not-in-d0") == 0);
-    for (uint32_t s = kOK; s <= kGfxIndexNotSe0Sh0; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
+    for (uint32_t s = kOK; s <= kGfxNotOn; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
     CHECK(std::strcmp(statusName(static_cast<Status>(999)), "unknown") == 0);
 }
 
@@ -541,6 +543,45 @@ static void testGfxConfig()
     CHECK(kRegGrbmGfxIndex == 0x30800 && kRegCcShaderArrayConfig == 0x89bc && kRegGbAddrConfig == 0x98f8);
 }
 
+static void testStage5()
+{
+    // Byte offsets: measured base + dword from the v6.12 headers, times 4.
+    CHECK(kRegSmuioGfxMiscCntl == 0x5a320 && kRegMp1C2PMsg90 == 0x58a68 && kRegMp0C2PMsg81 == 0x58244);
+    CHECK(kRegRlcCgcgCglsCtrl == 0x3b124 && kRegCpMeCntl == 0x86d8 && kRegSdma0F32Cntl == 0x4a28);
+    CHECK(kRegMmhubFbLocationBase == 0x6a0b0 && kRegIhRbCntl == 0x4480 && kRegAthubMiscCntl == 0x30a8);
+    for (uint32_t i = 0; i < kStage3RegisterCount; i++) CHECK(kStage5Registers[i] == kStage3Registers[i]);
+    for (uint32_t i = 0; i < kStage5RegisterCount; i++) {
+        CHECK(kStage5Registers[i] % 4 == 0 && kStage5Registers[i] + 4 <= 0x80000); // inside BAR5
+        for (uint32_t j = i + 1; j < kStage5RegisterCount; j++) CHECK(kStage5Registers[i] != kStage5Registers[j]);
+    }
+    for (uint32_t i = 0; i < kGfxGatedRegisterCount; i++) CHECK(registerAllowed(kGfxGatedRegisters[i], 5));
+    CHECK(!registerAllowed(kRegMp1C2PMsg90, 4) && registerAllowed(kRegMp1C2PMsg90, 5));
+    CHECK(gfxGated(kRegCpMeCntl) && !gfxGated(kRegSdma0F32Cntl) && !gfxGated(kRegGrbmStatus));
+
+    uint32_t value = 0;
+    {
+        FakeRegisters r;
+        r.gfxMisc = 0x4;
+        CHECK(readDiagnosticRegister(r.reader(), 0x80000, 5, kRegCpMeCntl, &value) == kOK);
+        CHECK(r.reads == 2 && r.order[0] == kRegSmuioGfxMiscCntl && r.order[1] == kRegCpMeCntl);
+    }
+    const uint32_t notOn[] = {0x0, 0x2, 0x6};
+    for (uint32_t misc : notOn) {
+        FakeRegisters r;
+        r.gfxMisc = misc;
+        CHECK(readDiagnosticRegister(r.reader(), 0x80000, 5, kRegCpMeCntl, &value) == kGfxNotOn);
+        CHECK(r.reads == 1 && value == 0);
+    }
+    {
+        FakeRegisters r;
+        r.gfxMisc = 0;
+        CHECK(readDiagnosticRegister(r.reader(), 0x80000, 5, kRegSdma0F32Cntl, &value) == kOK);
+        CHECK(r.reads == 1); // not gated: SMUIO not consulted
+        CHECK(readDiagnosticRegister(r.reader(), 0x80000, 4, kRegSdma0F32Cntl, &value) == kRegisterNotAllowed);
+        CHECK(readDiagnosticRegister(r.reader(), 0x80000, 4, kRegGbAddrConfig, &value) == kOK);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -553,6 +594,7 @@ int main()
     testDeviceRanges();
     testDiscovery();
     testGfxConfig();
+    testStage5();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }
