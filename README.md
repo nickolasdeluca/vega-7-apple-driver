@@ -77,7 +77,8 @@ disks, NVRAM or EFI partitions. Follow [the test boot procedure](docs/test-boot.
 experiments run only from that USB EFI. `tools/diag/build.sh` builds
 `cezanne-diag`, which re-reads the driver's allowlisted registers through its
 root-only diagnostic interface during a stage 4 or later test boot;
-`--scratch-test` runs the stage 6 reversible write test.
+`--scratch-test` runs the stage 6 reversible write test and `--smu-query` the
+stage 7 SMU version queries.
 
 ## Verify
 

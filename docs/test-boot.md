@@ -9,9 +9,9 @@ configuration: 7 of 8 CUs and both RBs active. Stage 4's root-only, read-only
 diagnostic interface re-read every register from the running system. Stage 5
 read 38 power, clock-gating, engine and memory-hub registers through it.
 Stage 6, the first reviewed write, wrote `0xCAFEDEAD` to `SCRATCH_REG0`,
-read it back, and restored the original value. No later stage is authorized;
-the first SMU message is [proposed](#proposed-stage-7-first-smu-query) for
-review.
+read it back, and restored the original value. Stage 7, the first SMU
+messages (the two version queries), is authorized and built under ignored
+`out/test-efi/usb-stage7/`; it has not been booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -56,6 +56,9 @@ off restores the known-good boot. This is the experimental environment
    - **Stage 6** (proposed and approved by the user on 2026-10-05): stage 5
      plus the first register write, a reversible `SCRATCH_REG0` test run only
      on request, described [below](#stage-6-first-reviewed-write).
+   - **Stage 7** (proposed and approved by the user on 2026-10-05): stage 6
+     plus the first SMU messages, `GetDriverIfVersion` and `GetSmuVersion`, run
+     only on request, described [below](#stage-7-first-smu-query).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -604,10 +607,11 @@ does. One new diagnostic selector would:
 
 Each of those is a later stage needing its own review.
 
-### Proposed stage 7: first SMU query
+### Stage 7: first SMU query
 
-**Status: proposal for the user's review. Not authorized, not implemented,
-not built.**
+**Status: approved by the user on 2026-10-05 ("go straight to stage 7"),
+implemented and built; not yet booted.** The proposal below is kept as
+approved. An implementation section follows it.
 
 **Purpose.** This is the first conversation with the SMU (MP1 12.0.1). The
 SMU is the power firmware that every later step depends on: clocks, power
@@ -722,6 +726,43 @@ is printed and flushed before it is sent:
 - **Mailbox contention.** If something else uses the mailbox, the busy check
   or an unexpected response shows it. Stop and re-review.
 
+**Implementation (as built):**
+
+- **Core:**
+  - `writeAllowed(offset, value, stage)` now checks values. It allows
+    `SCRATCH_REG0` from stage 6 and, from stage 7, `C2PMSG_90` ← 0,
+    `C2PMSG_82` ← 0 and `C2PMSG_66` ← `0x2`/`0x3`. Nothing else in the mailbox
+    page passes, including the PSP registers.
+  - `checkSmu` reads `C2PMSG_66`/`82`/`90` and returns `smu-busy` if `_90` is 0.
+  - `sendSmuQuery` does the following in order:
+    - re-checks that the mailbox is idle;
+    - writes response, argument, then message;
+    - polls the response with up to 2000 pauses of 1 ms (`smu-timeout`);
+    - reads the answer only after `0x1` (`smu-response-not-ok` otherwise).
+  - `writeRegister` is still the only call of `write32`, now reached from five
+    call sites.
+- **Adapter:**
+  - `accessDevice` takes the page to map writable: none, the scratch page, or
+    the SMU page (BAR5 + `0x58000`). It refuses any other page.
+  - `registerWrite` repeats the value allowlist and the page bounds before its
+    single store.
+  - The driver accepts a query (`kDiagnosticSmuQuery`, message `0x2` or `0x3`
+    only) only after a passing `kDiagnosticSmuCheck` by the same connection.
+    Any failure ends the sequence (`smu-out-of-order` until a new check).
+- **Tool:** `cezanne-diag --smu-query` runs the check, then
+  `GetDriverIfVersion`, then `GetSmuVersion`, printing and flushing each step
+  first. It decodes the firmware version as `program.major.minor.debug`.
+- **Tests:**
+  - The value allowlist: every other message index and value, every other
+    offset in the mailbox page, and refusal before stage 7.
+  - Write order; a slow, a silent and a busy SMU; each error response with no
+    answer read; a failed write.
+  - Seven more weakened cores must fail: widened scratch offset, widened
+    message values, widened zero values, widened page, busy check, timeout,
+    response check.
+  - `tests/test_kext.py` pins which operations get which writable page.
+    `tests/test_diag_tool.py` pins the two message constants the tool can send.
+
 **What it does not do:**
 
 - It sends no message that sets clocks, power, GFXOFF or tables.
@@ -746,7 +787,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6; do
+for stage in 0 1 2 3 4 5 6 7; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -853,6 +894,19 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 7 succeeds when:
+
+- the stage 6 conditions hold with `CezanneGPU stage` 7;
+- `sudo cezanne-diag --smu-query` reports `ok` for the check and both
+  queries, each with response `0x01`;
+- the driver-interface and firmware versions are recorded;
+- the register dump that follows matches boot 8, with the mailbox now holding
+  the last exchange (`C2PMSG_66` `0x2`, `_82` the version, `_90` `0x1`);
+- the machine stays stable afterwards: desktop responsive, fans normal.
+
+Any other status is a finding to record; do not retry or send another message.
+Save the output with `tee` in an ignored directory.
 
 Stage 6 succeeds when the stage 5 conditions hold with `CezanneGPU stage` 6
 and `sudo cezanne-diag --scratch-test` reports `ok` for all three steps:

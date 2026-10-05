@@ -133,14 +133,14 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: user review of the first SMU query proposal
+## Next task: stage 7 USB test boot
 
 Stages 0–6 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-The first SMU message is proposed in
-[test-boot.md](test-boot.md#proposed-stage-7-first-smu-query): the two queries
-Linux sends first on Renoir (`GetDriverIfVersion`, `GetSmuVersion`), on request
-through `cezanne-diag --smu-query`. It is not authorized; implement it only
-after the user approves that section, and update rule 4 when they do.
+Stage 7, the first SMU messages (`GetDriverIfVersion`, `GetSmuVersion`), was
+approved and is built under `out/test-efi/usb-stage7/`. It runs only with
+`sudo cezanne-diag --smu-query`. Follow
+[test-boot.md](test-boot.md#stage-7-first-smu-query) and record both answers,
+the following register dump, and whether the machine stays stable.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
