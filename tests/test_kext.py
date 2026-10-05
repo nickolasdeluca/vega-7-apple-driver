@@ -76,7 +76,7 @@ class KextSourceTests(unittest.TestCase):
         self.assertLess(gate.index("clientHasPrivilege"), gate.index("OSTypeAlloc"))
         self.assertLess(gate.index("kDiagnosticStage"), gate.index("OSTypeAlloc"))
         # Reads go through the allowlist with the driver's own stage.
-        self.assertIn("readAllowedRegister(registers, aperture.length, stage_, offset, value)", source)
+        self.assertIn("readDiagnosticRegister(registers, aperture.length, stage_, offset, value)", source)
         self.assertNotIn("IOConnectMapMemory", source)
         self.assertNotIn("clientMemoryForType", source)
 
@@ -112,7 +112,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 4;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 5;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")

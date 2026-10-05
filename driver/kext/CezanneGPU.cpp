@@ -18,6 +18,9 @@
 //            IOUserClient that re-reads any stage 3 register on request. Each
 //            read re-checks D0, decoding and BAR5, maps BAR5 read-only, reads
 //            one allowlisted register and releases the mapping.
+//   Stage 5: the diagnostic interface also reads 38 power, clock-gating,
+//            engine and memory-hub state registers (never at boot); GC ones
+//            only while SMUIO reports GFX on.
 //            Nothing is written to configuration space, registers or memory,
 //            and every mapping and the provider are released before start()
 //            returns.
@@ -417,7 +420,7 @@ cezanne::Status CezanneGPU::diagnosticRead(uint32_t offset, uint32_t *value)
                 status = cezanne::checkAperture(state, map->getPhysicalAddress(), aperture.length);
                 if (status == cezanne::kOK) {
                     cezanne::RegisterReader registers = {registerRead, &aperture};
-                    status = cezanne::readAllowedRegister(registers, aperture.length, stage_, offset, value);
+                    status = cezanne::readDiagnosticRegister(registers, aperture.length, stage_, offset, value);
                 }
                 map->release();
             }
