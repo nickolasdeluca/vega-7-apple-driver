@@ -958,25 +958,42 @@ static void testMetrics()
         CHECK(checkMetricsTarget(r.reader(), 0x80000, 9, clash, 1, &t) == kMetricsTargetInvalid);
     }
 
-    // The zero check.
+    // The stability check: stale non-zero data passes, a change fails.
+    static uint32_t snapshot[kMetricsCheckSize / 4];
     {
         FakeRegisters r;
         FakeWriter w(&r);
         FakeMemory m;
-        CHECK(checkRegionUnused(m.reader(), kMetricsCheckSize, w.writer()) == kOK);
-        m.words[kMetricsCheckSize / 4 - 1] = 1; // the last word of the region
-        CHECK(checkRegionUnused(m.reader(), kMetricsCheckSize, w.writer()) == kTableRegionInUse);
-        m.words[kMetricsCheckSize / 4 - 1] = 0;
+        for (uint32_t i = 0; i < kMetricsCheckSize / 4; i++) m.words[i] = 0x9E3779B9u * i; // stale data
+        CHECK(checkRegionStable(m.reader(), kMetricsCheckSize, w.writer(), 3, snapshot) == kOK);
+        CHECK(snapshot[1] == 0x9E3779B9u && snapshot[kMetricsCheckSize / 4 - 1] == m.words[kMetricsCheckSize / 4 - 1]);
         m.fail = true;
-        CHECK(checkRegionUnused(m.reader(), kMetricsCheckSize, w.writer()) == kRegisterReadFailed);
+        CHECK(checkRegionStable(m.reader(), kMetricsCheckSize, w.writer(), 3, snapshot) == kRegisterReadFailed);
+    }
+    {
+        // Something writes the last word of the region during the wait.
+        struct ChangingMemory {
+            FakeMemory memory;
+            int pauses = 0;
+            static void pause(void *context)
+            {
+                ChangingMemory *self = static_cast<ChangingMemory *>(context);
+                if (++self->pauses == 2) self->memory.words[kMetricsCheckSize / 4 - 1] ^= 1;
+            }
+        } changing;
+        RegisterWriter writer = {nullptr, ChangingMemory::pause, &changing};
+        CHECK(checkRegionStable(changing.memory.reader(), kMetricsCheckSize, writer, 3, snapshot) == kTableRegionInUse);
+        CHECK(changing.pauses == 3);
     }
 
     // The three messages, the SMU's write and the verification.
     {
         FakeRegisters r;
         FakeMemory m;
+        for (uint32_t i = 0; i < kMetricsCheckSize / 4; i++) m.words[i] = 0x5A5A0000u + i; // stale data
         r.memory = &m;
         FakeWriter w(&r);
+        CHECK(checkRegionStable(m.reader(), kMetricsCheckSize, w.writer(), 1, snapshot) == kOK);
         uint32_t responses[3];
         CHECK(requestMetrics(r.reader(), 0x80000, w.writer(), 9, responses) == kOK);
         CHECK(responses[0] == 1 && responses[1] == 1 && responses[2] == 1 && w.writes == 9);
@@ -984,7 +1001,7 @@ static void testMetrics()
         CHECK(w.values[4] == 0x40000000u && w.values[5] == kSmuMsgSetDriverDramAddrLow);
         CHECK(w.values[7] == kTableSmuMetrics && w.values[8] == kSmuMsgTransferTableSmu2Dram);
         SmuMetrics metrics;
-        CHECK(verifyMetricsPage(m.reader(), &metrics) == kOK);
+        CHECK(verifyMetricsPage(m.reader(), snapshot, &metrics) == kOK);
         CHECK(metrics.words[0] == 0 && metrics.words[1] == 1 && metrics.words[kMetricsGfxTemperature] == 60 &&
               metrics.words[kMetricsWordCount - 1] == 73);
         CHECK(requestMetrics(r.reader(), 0x80000, w.writer(), 8, responses) == kRegisterNotAllowed);
@@ -995,19 +1012,22 @@ static void testMetrics()
         r.memory = &m;
         r.tableOverflows = true;
         FakeWriter w(&r);
+        CHECK(checkRegionStable(m.reader(), kMetricsCheckSize, w.writer(), 1, snapshot) == kOK);
         uint32_t responses[3];
         CHECK(requestMetrics(r.reader(), 0x80000, w.writer(), 9, responses) == kOK);
         SmuMetrics metrics;
-        CHECK(verifyMetricsPage(m.reader(), &metrics) == kTableOverflow);
+        CHECK(verifyMetricsPage(m.reader(), snapshot, &metrics) == kTableOverflow);
     }
     {
         FakeRegisters r;
-        FakeMemory m; // the SMU writes nothing
+        FakeMemory m; // the SMU writes nothing over stale data
+        for (uint32_t i = 0; i < kMetricsCheckSize / 4; i++) m.words[i] = 0x12340000u + i;
         FakeWriter w(&r);
+        CHECK(checkRegionStable(m.reader(), kMetricsCheckSize, w.writer(), 1, snapshot) == kOK);
         uint32_t responses[3];
         CHECK(requestMetrics(r.reader(), 0x80000, w.writer(), 9, responses) == kOK);
         SmuMetrics metrics;
-        CHECK(verifyMetricsPage(m.reader(), &metrics) == kTableNotWritten);
+        CHECK(verifyMetricsPage(m.reader(), snapshot, &metrics) == kTableNotWritten);
     }
     {
         FakeRegisters r;

@@ -60,8 +60,10 @@ class CoreTests(unittest.TestCase):
             "!smuArgumentAllowed(kSmuMsgSetDriverDramAddrLow, 0xF4, 9)": (
                 "case kSmuMsgSetDriverDramAddrLow: return stage >= kMetricsStage && argument == uint32_t(kMetricsGpuAddress);",
                 "case kSmuMsgSetDriverDramAddrLow: return stage >= kMetricsStage;"),
-            "kTableRegionInUse": ("if (value != 0) return kTableRegionInUse;", ""),
-            "kTableOverflow": ("if (value != 0) return kTableOverflow;", ""),
+            "kTableRegionInUse": ("if (value != snapshot[offset / 4]) return kTableRegionInUse;", ""),
+            "kTableOverflow": ("if (value != snapshot[offset / 4]) return kTableOverflow;", ""),
+            "changing.pauses == 3": ("for (uint32_t i = 0; i < pauses; i++) writer.pause(writer.context);",
+                                     "if (pauses > 0) writer.pause(writer.context);"),
             "kGfxOffTimeout": ("if (i == kGfxOffConfirmPauses) return kGfxOffTimeout;",
                                "if (i == kGfxOffConfirmPauses) return kOK;"),
             "misc == 0x4": ("        if (((*gfxMisc & kGfxOffStatusMask) >> kGfxOffStatusShift) == kGfxOffStatusOn) return kOK;\n        if (i == kGfxOffConfirmPauses)",

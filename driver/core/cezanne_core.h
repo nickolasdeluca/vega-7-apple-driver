@@ -206,8 +206,12 @@ const uint32_t kExpectedFbOffset = 0x5c0;        // GC, stage 2
 const uint64_t kMetricsCarveoutOffset = 0x40000000ull;
 const uint64_t kMetricsGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kMetricsCarveoutOffset;
 const uint64_t kMetricsPhysical = (uint64_t(kExpectedFbOffset) << 24) + kMetricsCarveoutOffset;
-// The page and the 60 KiB after it must read all zero before use.
+// The page and the 60 KiB after it must read the same twice, about 1 s
+// apart (kMetricsStablePauses pauses), before use. Unused carveout DRAM holds
+// stale data, so content is not tested (boot 11); the VBIOS reserves no
+// carveout memory for firmware (boot 12).
 const uint32_t kMetricsCheckSize = 0x10000;
+const uint32_t kMetricsStablePauses = 1000;
 // Carveout regions the page must avoid: the boot framebuffer and other
 // low allocations, and the firmware, PSP and discovery regions at the top.
 const uint64_t kCarveoutLowReserve = 64ull << 20;
@@ -541,8 +545,10 @@ struct MemoryReader {
     void *context;
 };
 
-// The region must read all zero twice, a pause apart (kTableRegionInUse).
-Status checkRegionUnused(const MemoryReader &memory, uint32_t length, const RegisterWriter &writer);
+// Reads the region into snapshot (length / 4 words), waits pauses pauses, and
+// requires a second read to match word for word (kTableRegionInUse).
+Status checkRegionStable(const MemoryReader &memory, uint32_t length, const RegisterWriter &writer,
+                         uint32_t pauses, uint32_t *snapshot);
 
 // Sends SetDriverDramAddrHigh, SetDriverDramAddrLow and TransferTableSmu2Dram
 // in that order with the stage 7 send-and-poll; stops at the first failure.
@@ -553,10 +559,10 @@ struct SmuMetrics {
     uint16_t words[kMetricsWordCount];
 };
 
-// Checks a page read after the transfer against the zero page read before:
-// bytes kMetricsSize.. must still be zero (kTableOverflow), and the table
-// bytes must not all be zero (kTableNotWritten). Decodes the table.
-Status verifyMetricsPage(const MemoryReader &page, SmuMetrics *metrics);
+// Checks a page read after the transfer against the snapshot taken before it:
+// bytes kMetricsSize.. must be unchanged (kTableOverflow), and the table bytes
+// must differ somewhere (kTableNotWritten). Decodes the table.
+Status verifyMetricsPage(const MemoryReader &page, const uint32_t *snapshot, SmuMetrics *metrics);
 
 } // namespace cezanne
 

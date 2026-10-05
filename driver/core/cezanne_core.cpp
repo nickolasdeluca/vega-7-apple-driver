@@ -618,15 +618,17 @@ Status checkMetricsTarget(const RegisterReader &registers, uint64_t apertureLeng
     return kOK;
 }
 
-Status checkRegionUnused(const MemoryReader &memory, uint32_t length, const RegisterWriter &writer)
+Status checkRegionStable(const MemoryReader &memory, uint32_t length, const RegisterWriter &writer,
+                         uint32_t pauses, uint32_t *snapshot)
 {
-    for (int pass = 0; pass < 2; pass++) {
-        if (pass == 1) writer.pause(writer.context);
-        for (uint32_t offset = 0; offset < length; offset += 4) {
-            uint32_t value = 0;
-            if (!memory.read32(memory.context, offset, &value)) return kRegisterReadFailed;
-            if (value != 0) return kTableRegionInUse;
-        }
+    for (uint32_t offset = 0; offset < length; offset += 4) {
+        if (!memory.read32(memory.context, offset, &snapshot[offset / 4])) return kRegisterReadFailed;
+    }
+    for (uint32_t i = 0; i < pauses; i++) writer.pause(writer.context);
+    for (uint32_t offset = 0; offset < length; offset += 4) {
+        uint32_t value = 0;
+        if (!memory.read32(memory.context, offset, &value)) return kRegisterReadFailed;
+        if (value != snapshot[offset / 4]) return kTableRegionInUse;
     }
     return kOK;
 }
@@ -651,20 +653,20 @@ Status requestMetrics(const RegisterReader &registers, uint64_t apertureLength, 
     return kOK;
 }
 
-Status verifyMetricsPage(const MemoryReader &page, SmuMetrics *metrics)
+Status verifyMetricsPage(const MemoryReader &page, const uint32_t *snapshot, SmuMetrics *metrics)
 {
     *metrics = SmuMetrics();
-    // Everything after the table must still be zero, as checked before.
+    // Everything after the table must be as it was before the transfer.
     for (uint32_t offset = kMetricsSize; offset < kPageSize; offset += 4) {
         uint32_t value = 0;
         if (!page.read32(page.context, offset, &value)) return kRegisterReadFailed;
-        if (value != 0) return kTableOverflow;
+        if (value != snapshot[offset / 4]) return kTableOverflow;
     }
     bool written = false;
     for (uint32_t offset = 0; offset < kMetricsSize; offset += 4) {
         uint32_t value = 0;
         if (!page.read32(page.context, offset, &value)) return kRegisterReadFailed;
-        written = written || value != 0;
+        written = written || value != snapshot[offset / 4];
         metrics->words[offset / 2] = static_cast<uint16_t>(value);
         metrics->words[offset / 2 + 1] = static_cast<uint16_t>(value >> 16);
     }
