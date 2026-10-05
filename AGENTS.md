@@ -35,8 +35,9 @@ Experimental booting is available only through the USB test EFI in
 - Driver code runs only when the user boots the USB test EFI, injected by that
   EFI's OpenCore config, and only at the authorized stage in
   [docs/test-boot.md](docs/test-boot.md) (currently stage 0, passive;
-  stage 1, read-only device access; and stage 2, a write-free read of the IP
-  discovery table from the carveout). Advancing
+  stage 1, read-only device access; stage 2, a write-free read of the IP
+  discovery table from the carveout; and stage 3, read-only GC configuration
+  registers). Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS
   volume, or load it with `kmutil`. The user performs disk, EFI and reboot steps.

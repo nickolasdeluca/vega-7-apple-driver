@@ -4,8 +4,9 @@ Status, 2026-10-05: **stages 0, 1 and 2 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
-discovery table from the carveout without writes. No later stage is
-authorized.
+discovery table from the carveout without writes. Stage 3 (read-only GC
+configuration registers) is authorized and built under ignored
+`out/test-efi/usb-stage3/`; it has not been booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -37,6 +38,9 @@ off restores the known-good boot. This is the experimental environment
      register read and a read-only mapping of the IP discovery binary in the
      carveout, described [below](#stage-2-write-free-discovery-table-read).
      Still no register, configuration or memory write.
+   - **Stage 3** (authorized by the user on 2026-10-05): stage 2 plus seven
+     read-only GC configuration registers, described
+     [below](#stage-3-read-only-gc-configuration). Still no write of any kind.
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -268,6 +272,52 @@ Stage 2 risks:
 - Nothing is written, so a failure ends that boot's experiment without
   changing GPU state.
 
+### Stage 3: read-only GC configuration
+
+Runs only after stage 2 returned `ok`, because that cross-check confirmed the
+GC base addresses these registers use. Through the same read-only BAR5
+mapping, in this order:
+
+| Register | BAR5 byte offset | Linux v6.12 use |
+| --- | --- | --- |
+| `GRBM_STATUS` | `0x8010` (`0x2000` + `0x0004`) | Status; bit 31 `GUI_ACTIVE` |
+| `GRBM_GFX_INDEX` | `0x30800` (`0xA000` + `0x2200`) | Selects the SE/SH/instance per-instance registers read from |
+| `CC_GC_SHADER_ARRAY_CONFIG` | `0x89bc` (`0x2000` + `0x026f`) | `gfx_v9_0_get_cu_active_bitmap`: fused-off CUs, bits 31:16 |
+| `GC_USER_SHADER_ARRAY_CONFIG` | `0x89c0` (`0x2000` + `0x0270`) | Same function: driver-disabled CUs, bits 31:16 |
+| `CC_RB_BACKEND_DISABLE` | `0x98f4` (`0x2000` + `0x063d`) | `gfx_v9_0_get_rb_active_bitmap`, bits 23:16 |
+| `GC_USER_RB_BACKEND_DISABLE` | `0x9b7c` (`0x2000` + `0x06df`) | Same function |
+| `GB_ADDR_CONFIG` | `0x98f8` (`0x2000` + `0x063e`) | `gfx_v9_0_gpu_early_init` reads it for GC 9.3.0 before the golden-register writes |
+
+Offsets and fields are from `gc_9_0_offset.h` and `gc_9_0_sh_mask.h`. The
+driver computes the masks as Linux does: active CUs are
+`~(CC | USER) >> 16` limited to the GC info table's CUs per SH (8); active RBs
+are `~(CC | USER) >> 16` limited to RBs per SE / SHs per SE (2).
+
+**Difference from Linux:** Linux writes `GRBM_GFX_INDEX` to select SE 0 / SH
+0 before reading the CU and RB registers. Stage 3 does not write it. It reads
+the current index and publishes the masks only if its `SE_INDEX` (23:16) and
+`SH_INDEX` (15:8) are already 0 and the GC info table reports one SE with one
+SH, as stage 2 measured; otherwise the result is `gfx-index-not-se0-sh0` or
+`gc-info-unavailable` and only the raw values are published. The
+`*_BROADCAST_WRITES` bits affect writes only.
+
+Guards, each tested offline: the stage 3 registers are refused at stages 1 and
+2; each stage's register list is a prefix of the next; the core tests cover the
+masks, user-disabled CUs and RBs, a non-zero index, an unexpected SE count,
+and a short mapping. Two more weakened cores (index check, stage 2/3 gating)
+must fail the suite.
+
+Expected stage 3 values: the CPU is a Ryzen 5 5600GT, specified with 7 GPU
+CUs, so `active CU count` 7 with one bit clear in the 8-bit mask;
+`active RB count` 2; `GUI_ACTIVE` clear (nothing has started the graphics
+engine); `GB_ADDR_CONFIG` near Linux's Renoir golden value `0x24000042` under
+mask `0xf3e777ff` (an expectation, not a requirement).
+
+Stage 3 risks: these are configuration and status registers Linux reads
+without side effects, in the same register window as stages 1 and 2. A hang
+would freeze the boot; power off and boot the known-good EFI. Nothing is
+written.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -279,7 +329,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2; do
+for stage in 0 1 2 3; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -386,6 +436,12 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 3 succeeds when the stage 2 conditions hold with `CezanneGPU stage` 3,
+`CezanneGPU stage 3 result` is `ok`, and the seven raw registers, `active CU
+mask`/`count` and `active RB mask`/`count` are recorded and compared with the
+expected values above. `gfx-index-not-se0-sh0` is an observation, not a
+reason to write the index.
 
 Any other stage 2 result is an observation that ends the experiment; a
 `discovery-signature` with `discovery signature` `0xffffffff` or `0` points to
