@@ -133,16 +133,14 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: choose the next reviewed write
+## Next task: user review of the first SMU query proposal
 
 Stages 0–6 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-Stage 6 proved the reviewed write path with a reversible `SCRATCH_REG0` test
-(written, read back, restored; GPU state unchanged). Any further write needs
-its own proposal in test-boot.md and the user's approval. Candidates, in
-rising order of effect: selecting SE/SH through `GRBM_GFX_INDEX` as Linux does
-before its CU reads; programming the Renoir golden `GB_ADDR_CONFIG`; and the
-first SMU message (for example a read-style query), which starts the
-power-firmware path that clocks and firmware loading depend on.
+The first SMU message is proposed in
+[test-boot.md](test-boot.md#proposed-stage-7-first-smu-query): the two queries
+Linux sends first on Renoir (`GetDriverIfVersion`, `GetSmuVersion`), on request
+through `cezanne-diag --smu-query`. It is not authorized; implement it only
+after the user approves that section, and update rule 4 when they do.
 
 ## Offline task while waiting: Metal shader frontend boundary
 

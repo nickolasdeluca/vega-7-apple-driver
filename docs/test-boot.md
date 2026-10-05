@@ -9,7 +9,9 @@ configuration: 7 of 8 CUs and both RBs active. Stage 4's root-only, read-only
 diagnostic interface re-read every register from the running system. Stage 5
 read 38 power, clock-gating, engine and memory-hub registers through it.
 Stage 6, the first reviewed write, wrote `0xCAFEDEAD` to `SCRATCH_REG0`,
-read it back, and restored the original value. No later stage is authorized.
+read it back, and restored the original value. No later stage is authorized;
+the first SMU message is [proposed](#proposed-stage-7-first-smu-query) for
+review.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -601,6 +603,129 @@ does. One new diagnostic selector would:
 - It does not enable an engine or touch the memory hub.
 
 Each of those is a later stage needing its own review.
+
+### Proposed stage 7: first SMU query
+
+**Status: proposal for the user's review. Not authorized, not implemented,
+not built.**
+
+**Purpose.** This is the first conversation with the SMU (MP1 12.0.1). The
+SMU is the power firmware that every later step depends on: clocks, power
+gating, GFXOFF control and the metrics table. Stage 7 asks it two questions
+whose answers change nothing: its firmware version and its driver-interface
+version.
+
+**What Linux does first.** On Renoir, `smu_v12_0_check_fw_version`
+(`renoir_ppt.c` `.check_fw_version`) calls `smu_cmn_get_smc_version`. That
+sends exactly these two messages, before any message that changes state:
+
+| Message | Index (`smu_v12_0_ppsmc.h`) | Parameter | Answer |
+| --- | --- | --- | --- |
+| `PPSMC_MSG_GetDriverIfVersion` | `0x3` | 0 | Driver-interface version, read from the argument register |
+| `PPSMC_MSG_GetSmuVersion` | `0x2` | 0 | Firmware version `program.major.minor.debug`, one byte each |
+
+The mailbox protocol (`smu_cmn.c`: `smu_cmn_send_smc_msg_with_param`,
+`__smu_cmn_send_msg`, `__smu_cmn_poll_stat`, `smu_cmn_read_arg`), using the
+registers stage 5 already reads:
+
+1. Poll `MP1_SMN_C2PMSG_90` (response) until non-zero, so no message is in
+   flight.
+2. Write `C2PMSG_90` ← 0, then `C2PMSG_82` (argument) ← parameter, then
+   `C2PMSG_66` (message) ← index.
+3. Poll `C2PMSG_90` until non-zero; Linux allows up to 2 s
+   (`usec_timeout` × 20).
+4. Read the answer from `C2PMSG_82`.
+
+Response `0x1` is OK. The others are `0xFF` failed, `0xFE` unknown command,
+`0xFD` bad prerequisites and `0xFC` busy (`PPSMC_Result_*`).
+
+**Why it is safe enough:**
+
+- **Queries only.** Both messages only return values. They are the first
+  messages Linux sends, and its later state-changing messages depend on
+  them, not the other way round.
+- **Mailbox idle.** Stage 5 read message 0, argument 0 and response `0x1` in
+  boots 7 and 8, so no message was pending and the last one succeeded.
+  Nothing else in the test boot drives this mailbox: NootedRed is not loaded.
+  This is the graphics driver's MP1 mailbox, distinct from the SMN/RSMU
+  mailbox CPU tools use. The test EFI's `SMCProcessorAMD.kext` is believed to
+  read MSRs only; this is **not verified**, and step 1 detects a busy
+  mailbox.
+- **No restore needed.** These registers carry messages. Linux leaves them
+  holding the last exchange, and so would stage 7.
+
+**What the stage 7 code would do.** It runs on request through `cezanne-diag
+--smu-query`, never at boot, with the boot unchanged from stage 6. Each step
+is printed and flushed before it is sent:
+
+1. **Check:** run the per-read device checks, then read `C2PMSG_66`, `_82`
+   and `_90`. Stop with `smu-busy` unless `_90` is non-zero.
+2. **Query `GetDriverIfVersion`:** the three writes, poll `_90` with a 2 s
+   limit, read `_82`. Stop on any response other than `0x1`, or on timeout
+   (`smu-timeout`).
+3. **Query `GetSmuVersion`:** the same.
+4. **Show the result:** the answers and responses, followed by the usual
+   register dump.
+
+**How the write path is confined** (as in stage 6):
+
+- **A value-level allowlist.** The core's write allowlist would grow from
+  `SCRATCH_REG0` to exactly these writes, from stage 7 on:
+  - `C2PMSG_90` ← `0`;
+  - `C2PMSG_82` ← `0`;
+  - `C2PMSG_66` ← `0x2` or `0x3`.
+
+  Any other register or value is refused.
+- **One writable page.** The adapter maps only the 4 KiB page holding the
+  three registers writable (BAR5 + `0x58000`), only during a query.
+  - That page also holds PSP mailbox registers (`MP0_SMN_C2PMSG_33`/`35`/`81`
+    and the PSP ring registers). Only the allowlist keeps the code off them.
+    That makes the per-value allowlist and its tests the main guard.
+- **Ordering.** As in stage 6, the driver accepts the steps only in order,
+  per connection.
+- **Tests.**
+  - Every refused register and value.
+  - Write order: response clear, argument, message.
+  - The busy precondition, timeout and each error response.
+  - That the version is read only after an OK response.
+  - Weakened cores must fail: a widened register list, a widened value list,
+    a missing busy check, a missing timeout.
+
+**Expected result:**
+
+- **Both responses:** `0x1`.
+- **`GetDriverIfVersion`:** about 14 (`SMU12_DRIVER_IF_VERSION` in v6.12).
+  A different value is not an error: Linux treats a mismatch as non-critical.
+- **`GetSmuVersion`:** a plausible version with program, major and minor
+  bytes. There is no exact prediction.
+- **Afterwards:**
+  - `C2PMSG_66` reads `0x2`, the last message sent;
+  - `C2PMSG_90` reads `0x1`;
+  - `C2PMSG_82` holds the version;
+  - every other register matches boot 8, apart from the PSP counter.
+
+**Risks and responses:**
+
+- **The SMU manages the whole SoC.** On an APU, MP1 controls CPU and GPU power
+  together. A wedged SMU could affect more than graphics: clocks, fans or a
+  hang. This is the largest risk of any stage so far.
+  - Mitigations: these are the queries Linux sends first on every boot of this
+    chip family; the busy check; the 2 s timeout; and stopping on the first
+    non-OK response.
+  - Recovery: power off completely (a full cold boot resets the SMU), unplug
+    the drive and boot the known-good EFI. Record it as rule 6 requires.
+- **A non-OK response** (`0xFE`, `0xFD`, `0xFC`, `0xFF`) or a timeout is a
+  finding. Record it, and do not retry or send another message without a new
+  review.
+- **Mailbox contention.** If something else uses the mailbox, the busy check
+  or an unexpected response shows it. Stop and re-review.
+
+**What it does not do:**
+
+- It sends no message that sets clocks, power, GFXOFF or tables.
+- It does not use the PSP or touch the SMN or RSMU mailbox.
+- It writes no other register.
+- The `SCRATCH_REG0` test is unchanged.
 
 Stage 4 risks: it adds a kernel entry point. It is limited to root and to the
 reads stages 1–3 already made, but a defect in the user client could panic
