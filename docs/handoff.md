@@ -133,15 +133,16 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 5 USB test boot
+## Next task: propose the first reviewed write
 
-Stages 0–4 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-Stage 5 adds 38 read-only power, clock-gating, engine and memory-hub registers
-to the diagnostic interface to prepare the first reviewed write; it is
-authorized and built under `out/test-efi/usb-stage5/`. Follow
-[test-boot.md](test-boot.md#stage-5-power-clock-and-engine-state), run
-`sudo out/diag/cezanne-diag --repeat 3 | tee …` and record the values. Then
-write the first-write proposal from them; the write itself is not authorized.
+Stages 0–5 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
+Stage 5 recorded the state the firmware leaves: every engine halted and idle,
+no CP or RLC microcode running, GPU VM context 0 and the MMHUB L2 off, nearly
+all gating off, GFX on, the SMU idle with an OK last response, and the PSP
+secure OS already running (Linux then skips loading it). Write the first-write
+proposal from this state as a test-boot.md section for the user's review:
+which register, why it is safe, how to verify it and how to recover. Nothing
+is built or booted until the user approves it.
 
 ## Offline task while waiting: Metal shader frontend boundary
 

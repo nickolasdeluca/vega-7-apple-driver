@@ -1,14 +1,14 @@
 # USB test boot
 
-Status, 2026-10-05: **stages 0 to 4 succeeded** (see
+Status, 2026-10-05: **stages 0 to 5 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
 discovery table from the carveout without writes. Stage 3 read the GC
 configuration: 7 of 8 CUs and both RBs active. Stage 4's root-only, read-only
 diagnostic interface re-read every register from the running system. Stage 5
-(38 more read-only registers through the diagnostic interface) is authorized
-and built under ignored `out/test-efi/usb-stage5/`; it has not been booted.
+read 38 power, clock-gating, engine and memory-hub registers through it. No
+later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -758,6 +758,44 @@ EFI verified unchanged against the stage 2 manifest before it).
 - Captures (`ioreg.plist`, `diag.txt`) are in ignored
   `out/test-efi/boot-6-stage4/`.
 - Result: stage 4 succeeded.
+
+**Boot 7, 2026-10-05, stage 5** (`out/test-efi/usb-stage5/`; cold boot).
+
+- Desktop reached; `kern.bootargs` ends `cezanne-stage=5`; stages 1–3 `ok`,
+  diagnostics `true`.
+- `sudo cezanne-diag --repeat 3`: all 48 registers `ok` in every pass, no hang.
+  The stage 1–3 registers matched boot 6. Only `MP0_SMN_C2PMSG_81` changed
+  between passes (`0x0016b545`, `0x0016b5fb`, `0x0016b6b0`, about 1 s apart).
+- Decoded with the v6.12 `*_sh_mask.h` fields (fields not listed are 0):
+
+  | Area | Register: value | Reading |
+  | --- | --- | --- |
+  | GFX power | `SMUIO_GFX_MISC_CNTL` `0x00000005` | `PWR_GFXOFF_STATUS` 2: GFX on, not in GFXOFF |
+  | SMU mailbox | `MP1_SMN_C2PMSG_66`/`82`/`90` `0`/`0`/`0x1` | No message pending; the last response was 1 (OK) |
+  | PSP | `MP0_SMN_C2PMSG_81` non-zero, increasing | Secure OS sign of life: `psp_v12_0` skips loading the system driver and secure OS when it is non-zero |
+  | PSP | `MP0_SMN_C2PMSG_35` `0xffffffff` | Bit 31 (bootloader ready) set; the all-ones value is unexplained |
+  | GFX clock gating | `RLC_CGTT_MGCG_OVERRIDE` `0xffffffff`; `RLC_CGCG_CGLS_CTRL`(`_3D`) `0x0001003c` | Every MGCG override set; `CGCG_EN`, `CGLS_EN` 0: no GFX clock gating |
+  | GFX memory light sleep | `RLC_MEM_SLP_CNTL`, `CP_MEM_SLP_CNTL` `0x00020200` | `*_MEM_LS_EN` 0: off (delays only) |
+  | GFX power gating | `RLC_PG_CNTL` `0` | Off |
+  | Command processor | `CP_ME_CNTL` `0x15000000`; `CP_MEC_CNTL` `0x50000000` | `ME_HALT`, `PFP_HALT`, `CE_HALT`, `MEC_ME1_HALT`, `MEC_ME2_HALT`: all halted |
+  | RLC | `RLC_CNTL` `0`, `RLC_STAT` `0`; `CP_*_INSTR_PNTR` `0` | RLC not enabled; no CP microcode has run |
+  | GRBM | `GRBM_STATUS2` `0x8`, `GRBM_STATUS_SE0` `0x6`, `CP_BUSY_STAT` `0`, `CP_CPF_STATUS` `0` | Idle |
+  | SDMA0 | `SDMA0_F32_CNTL` `0x1`; `SDMA0_GFX_RB_CNTL` `0x00040000`; `SDMA0_STATUS_REG` `0x46dee557` | `HALT` 1, `RB_ENABLE` 0; every idle bit set |
+  | SDMA0 gating | `SDMA0_CLK_CTRL` `0xff000100`; `SDMA0_POWER_CNTL` `0x40000050` | All `SOFT_OVERRIDE` bits set (no MGCG); `MEM_POWER_LS_EN` 0 |
+  | HDP | `HDP_MEM_POWER_LS` `0x45504550` | `LS_ENABLE` 0 |
+  | ATHUB | `ATHUB_MISC_CNTL` `0x200c0200` | `CG_ENABLE` 1, `CG_MEM_LS_ENABLE` 1: the only gating the firmware enabled |
+  | MMHUB gating | `ATC_L2_MISC_CG` `0`; `DAGB0_CNTL_MISC2` `0x8888811f` | ATC L2 gating off; DAGB request/return clock gating disabled |
+  | MMHUB FB | `MC_VM_FB_LOCATION_BASE`/`TOP` `0xf400`/`0xf47f` | GPU addresses `0xF400000000`–`0xF47FFFFFFF`: the 2 GiB carveout |
+  | MMHUB VM | `VM_L2_CNTL` `0x00080602`; `VM_CONTEXT0_CNTL` `0x007ffe80`; `MC_VM_MX_L1_TLB_CNTL` `0x00002501` | `ENABLE_L2_CACHE` 0, `ENABLE_CONTEXT` 0; `ENABLE_L1_TLB` 1, `ATC_EN` 1 |
+  | IH | `IH_RB_CNTL` `0x40610000` | `RB_ENABLE` 0: no interrupt ring |
+
+- Summary: the firmware leaves every engine halted and idle, no microcode
+  running in the CP or RLC, GPU VM context 0 and the MMHUB L2 off, almost all
+  clock and power gating off, GFX powered on, the SMU idle with an OK last
+  response, and the PSP secure OS already running.
+- Captures (`ioreg.plist`, `diag.txt`) are in ignored
+  `out/test-efi/boot-7-stage5/`.
+- Result: stage 5 succeeded.
 
 ## Unknowns and limits
 
