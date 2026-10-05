@@ -1,12 +1,11 @@
 # USB test boot
 
-Status, 2026-10-05: **stages 0, 1 and 2 succeeded** (see
+Status, 2026-10-05: **stages 0 to 3 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
-discovery table from the carveout without writes. Stage 3 (read-only GC
-configuration registers) is authorized and built under ignored
-`out/test-efi/usb-stage3/`; it has not been booted.
+discovery table from the carveout without writes. Stage 3 read the GC
+configuration: 7 of 8 CUs and both RBs active. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -568,6 +567,31 @@ EFI verified unchanged against the stage 2 manifest before it).
   `out/test-efi/boot-4-stage2/`. The decoded inventory is in the
   [target manifest](cezanne-target-manifest.md#measured-ip-inventory-stage-2-test-boot-2026-10-05).
 - Result: stage 2 succeeded.
+
+**Boot 5, 2026-10-05, stage 3** (`out/test-efi/usb-stage3/`; cold boot).
+
+- Desktop reached; `kern.bootargs` ends `cezanne-stage=3`; driver loaded.
+  Stage 1, 2 and 3 results all `ok`; stage 1 and 2 values as boots 3 and 4.
+
+  | Register / derived | Value | Meaning |
+  | --- | --- | --- |
+  | `GRBM_STATUS` | `0x00003028` | `GUI_ACTIVE` clear: graphics idle |
+  | `GRBM_GFX_INDEX` | `0x00000000` | SE 0 / SH 0 / instance 0, no broadcast bits |
+  | `CC_GC_SHADER_ARRAY_CONFIG` | `0xff080000` | `INACTIVE_CUS` `0xff08`: CU 3 fused off; bits 8–15 beyond the 8 CUs |
+  | `GC_USER_SHADER_ARRAY_CONFIG` | `0x00000000` | None disabled by software |
+  | `CC_RB_BACKEND_DISABLE` / `GC_USER_RB_BACKEND_DISABLE` | `0` / `0` | No RB disabled |
+  | `GB_ADDR_CONFIG` | `0x24000011` | `NUM_PIPES` 1, `PIPE_INTERLEAVE_SIZE` 2, `MAX_COMPRESSED_FRAGS` 0, `NUM_RB_PER_SE` 1, `ROW_SIZE` 2 |
+  | `active CU mask` / `count` | `0xf7` / 7 | Matches the 5600GT's 7 CUs |
+  | `active RB mask` / `count` | `0x3` / 2 | Matches the GC info table |
+
+- `GB_ADDR_CONFIG` differs from Linux's Renoir golden value `0x24000042` in
+  `NUM_PIPES` (1 vs 2), `PIPE_INTERLEAVE_SIZE` (2 vs 0) and
+  `MAX_COMPRESSED_FRAGS` (0 vs 1). Linux reads the register in
+  `gfx_v9_0_gpu_early_init` and writes the golden settings later in hardware
+  init; which value its derived configuration ends up using on this host is
+  not established.
+- The `ioreg -a` capture is in ignored `out/test-efi/boot-5-stage3/`.
+- Result: stage 3 succeeded.
 
 ## Unknowns and limits
 

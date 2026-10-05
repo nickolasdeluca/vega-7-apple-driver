@@ -133,17 +133,16 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 3 USB test boot
+## Next task: choose the next driver stage
 
-Stages 0–2 succeeded (see the [test boot log](test-boot.md#test-boot-log)) and
-the measured IP inventory is in the
-[target manifest](cezanne-target-manifest.md#measured-ip-inventory-stage-2-test-boot-2026-10-05);
-every measured version maps to a supported Linux v6.12 handler (UMC not
-checked). Stage 3, read-only GC configuration registers (active CU and RB
-masks), is authorized and built under `out/test-efi/usb-stage3/`. Follow
-[test-boot.md](test-boot.md) as for stage 2 and save the `ioreg -a` capture
-in an ignored directory. A PCI-ownership diagnostic interface remains an
-unauthorized candidate.
+Stages 0–3 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
+The measured IP inventory, GC layout (7 of 8 CUs, 2 RBs) and `GB_ADDR_CONFIG`
+are in the [target manifest](cezanne-target-manifest.md#measured-ip-inventory-stage-2-test-boot-2026-10-05)
+and the boot log. Open question: `GB_ADDR_CONFIG` `0x24000011` differs from
+Linux's Renoir golden `0x24000042`; establish which value Linux's derived
+configuration uses before relying on either. No later stage is authorized; a
+PCI-ownership diagnostic interface and the first reviewed register write are
+candidates, each needing a test-boot.md update and the user's approval.
 
 ## Offline task while waiting: Metal shader frontend boundary
 

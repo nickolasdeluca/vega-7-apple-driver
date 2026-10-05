@@ -87,6 +87,9 @@ The GC info table (v2.0) reports 1 shader engine, 1 shader array, 8 CUs per
 array (8 CUs before any fuse harvesting; the per-CU enable mask is a register
 read, not in the table), 2 RBs, 4 TCCs, wave size 64, 10 waves per SIMD and
 64 KiB LDS. The harvest table lists ISP, XGBE and hardware ID 99 instance 0.
+The stage 3 boot read the fuse registers: CU 3 is fused off, leaving 7 active
+CUs (mask `0xf7`), and both RBs are active. `GB_ADDR_CONFIG` read
+`0x24000011`; see the [stage 3 boot](test-boot.md#test-boot-log).
 
 ## Conditional firmware inventory
 
