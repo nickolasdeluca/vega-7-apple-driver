@@ -6,8 +6,9 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current research checkpoint: USB test boot prepared, 2026-10-05, on branch
-`cezanne-discovery`, extending `1cd61ee`. This handoff is committed
+Current research checkpoint: family queue reply production traced and USB test
+boot prepared, 2026-10-05, on branch `cezanne-discovery`, extending `aa1c1a1`.
+This handoff is committed
 with the continuation; check Git history for its commit rather than assuming a
 recorded hash is HEAD.
 The project remains in **discovery and specification**. A USB test EFI and a
@@ -46,8 +47,9 @@ Completed work:
   their object captures and local transport-failure cleanup:
   [block ownership](ioaccel-block-ownership.md). These provide an ownership graph
   for inspected normal/error paths. Exactly one kernel delivery per distinct
-  copy would balance the normal path, but actual message production, callback
-  cardinality and reset/reuse remain unverified.
+  copy would balance the normal path. The subsequent family study below maps
+  static send attempts; delivery, callback cardinality and reset/reuse remain
+  unverified.
 - Completion predicates, reset state, synchronous-debug semaphore prerequisite
   and pooled/unpooled storage cleanup:
   [buffer reuse](ioaccel-buffer-reuse.md). The bounded Metal code scan validates
@@ -65,7 +67,7 @@ Completed work:
   [async replies](xnu-async-replies.md). Offline layout/field fixtures distinguish
   registration count from reply count, padding from argument data and Mach port
   ownership from retained blocks/queues. Send success does not establish delivery;
-  actual private reply production remains open.
+  installed generic-helper equivalence and runtime delivery remain open.
 - Installed IOKit dispatch-queue callout, dispatcher, async wrappers and generated
   `io_connect_async_method` stub compared with pinned source/IDL:
   [installed dispatch](iokit-async-dispatch.md). All compared offsets, limits,
@@ -75,6 +77,16 @@ Completed work:
   registration leaves reference slot 0 unwritten and treats a zero wake port as
   a fatal assertion. The dispatcher enforces no argument minimum or maximum; the
   producer must supply the consumer's seven words.
+
+- Installed IOAcceleratorFamily2 queue registration, reply producers and
+  cancellation/teardown paths: [family replies](ioaccel-family-replies.md).
+  Read-only inspection of the original kernel-collection files establishes
+  seven argument words with callback result zero, a normal scheduling send and
+  deferred completion object, and two immediate sends on per-entry error paths.
+  Block fences retain the registration owner, whose destructor releases the
+  async reference. Cancellation detaches the submitter without clearing the
+  block/port or sending a reply. These are static base-family paths; vendor
+  overrides, kernel validation, delivery and hardware completion remain open.
 
 - Green Sardine firmware candidates pinned to linux-firmware `20260916`
   (`ab23307…`), verified over kernel.org downloads and GitLab mirror blob IDs,
@@ -146,39 +158,22 @@ an independent backend would still lack, or an explicit list of what blocks the
 question. Readable intermediate output does not establish that Metal would
 accept an independent backend.
 
-## Parked task: trace IOAcceleratorFamily2 queue reply production
+## Completed parked task: family queue reply production
 
-Continue read-only graphics-contract work before driver bring-up:
+Completed 2026-10-05: [the family reply study](ioaccel-family-replies.md) records
+the requested producer/consumer map, argument count and fields, per-entry send
+attempts, registration storage/release, and error/cancellation/teardown paths.
+An offline LLVM utility reads the original fileset entry without extracting or
+rewriting a collection. The original `out/ioaccel-family-replies/` captures remain
+preserved; new evidence and a fresh documented reproduction are listed below.
+No kernel debugger, private calls, callbacks, messages or GPU work were used.
 
-1. Read the [installed dispatch comparison](iokit-async-dispatch.md) and the
-   [async-reply study](xnu-async-replies.md); reuse the saved consumer, producer
-   and dispatch evidence. Use a new ignored output directory.
-2. Locate `com.apple.iokit.IOAcceleratorFamily2` inside the world-readable kernel
-   collections with read-only file inspection tools. Its bundle on disk holds
-   metadata only. Record tool versions, failures and symbol availability; stripped
-   symbols are unavailable, not absent code. Use no tool mode that builds, loads,
-   installs or rewrites collections or extensions.
-3. Map the command queue's async-reference storage and `sendAsyncResult64`-family
-   send sites. For each, record the argument count, the words written at the
-   consumer's offsets 0/16/32/48, sends per submitted entry and the
-   error/cancellation/teardown paths. Also map `releaseAsyncReference64` sites.
-   Compare with the generic sender, the observed consumer and the gates. No kernel
-   debugging, messages, callbacks, connections or GPU work.
-
-Status 2026-10-02: parked by the user before any instructions were read; another
-agent may resume it. Partial ignored evidence is in `out/ioaccel-family-replies/`:
-tool versions (cctools-1040, Apple LLVM 21.0.0) and `otool -h`/`-l` captures of
-both kernel collections. The family is the fileset entry
-`com.apple.iokit.IOAcceleratorFamily2` in `SystemKernelExtensions.kc`, not the
-boot collection. No tool for reading a single entry's instructions had been
-settled on; confirm the approach with the user before continuing.
-
-Success means an attributed static map from family send sites to consumer
-expectations, or a documented limit if the fileset or symbols are unavailable.
-It does not establish runtime delivery, ordering, cancellation, drain or GPU
-completion. Installed mapping reclamation, vendor/indirect alias access,
-cross-thread reuse, kernel MIG server validation, libdispatch receive handling
-and complete commit dispatch remain separate open interfaces.
+Further queue-contract studies should examine the installed generic helper and
+kernel MIG validation/error cleanup, vendor overrides and reference-word
+initialization. Runtime delivery, ordering, cancellation drain, GPU completion,
+installed mapping reclamation, vendor/indirect alias access, cross-thread reuse,
+libdispatch receive handling and complete commit dispatch remain separate open
+interfaces. The USB and offline frontend tasks above retain their scope.
 
 Parallel areas of future investigation, when relevant: primary vendor admission
 contracts and the PSP/ASD/TA service questions in the firmware study. Keep those separate from a focused lifecycle batch. Driver
@@ -205,6 +200,8 @@ Saved evidence on this workspace is ignored and contains sensitive/raw details:
 | `out/xnu-async-replies/` | OS/kernel/SDK queries, offline layout build and bounded fixture checks, supplementary source reads, preserved lookup/web failures and verification index |
 | `out/xnu-async-sources/`, `out/xnu-async-reproduced/` | Initial and final pinned source collection; final collector captured 28 downloads and verified 24 source/header/license files |
 | `out/iokit-async-dispatch/` | OS/kernel/SDK queries, probe build, IOKit symbol lookups, readable and normalized disassembly, layout build, IDL routine IDs, checker and mutation results, preserved inspection-code failures, kernel-collection availability and verification index |
+| `out/ioaccel-family-replies-20261005/` | Read-only collection inspection, family/kernel symbols, instructions, normalized calls, metadata/digests, synthetic fixtures, independent byte/linkage/schema checks, preserved failures and verification index |
+| `out/ioaccel-family-replies-reproduced-20261005/` | Fresh reader build and documented captures, identical symbol/instruction/normalized outputs, four fixture cases and eight independent check groups |
 | `out/firmware-provenance/` | Pinned firmware, `WHENCE`, license, Linux v6.12 sources, GitLab partial clone, artifact index, parser output, tool mutation check, test run and preserved failures; firmware is never tracked |
 | `out/firmware-provenance-reproduced/` | Fresh run of the documented download, blob verification and parser commands |
 | `out/shader-target/` | Verified LLVM 20.1.7 archive, attestation and unpacked toolchain, pinned LLVM/Linux/Mesa sources, compile outputs, checker and mutation results, preserved failures |
@@ -224,6 +221,16 @@ public enumeration may initialize the existing stack internally; that is not
 manual private invocation or independent-driver proof.
 
 ## Verification record and commands
+
+The family-reply study independently compared 4,705 symbol entries and all
+357,364 text bytes with the original collection. Its eight check groups cover
+branch-stub linkage and selected schema/ownership instructions. Four controlled
+fixture cases passed, including missing-entry/truncated-header rejection. The
+documented reader/scripts reproduced identical captures and normalized outputs
+in a fresh directory. The initial repository test capture passed all 26 tests;
+the final capture passed all 42, including the separately added test-boot tests. No installed
+family code was invoked. Tool/build/checker failures and denied sysctls remain
+preserved; details and runtime limits are in [the study](ioaccel-family-replies.md).
 
 The USB test boot preparation ran the probe build and test-EFI tests (16 new),
 built the real test EFI with `ocvalidate` exit 0, and confirmed the internal EFI

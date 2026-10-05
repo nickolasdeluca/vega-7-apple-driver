@@ -107,4 +107,5 @@ kext is built, never loaded); they are skipped elsewhere. Host observations requ
 - [Generic XNU mapping and user-client teardown](docs/xnu-mapping-lifecycle.md)
 - [Generic async replies and wake-port ownership](docs/xnu-async-replies.md)
 - [Installed IOKit async dispatch and wrappers](docs/iokit-async-dispatch.md)
+- [IOAcceleratorFamily2 queue reply production](docs/ioaccel-family-replies.md)
 - [Milestones and discovery decisions](docs/discovery-plan.md)

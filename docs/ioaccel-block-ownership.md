@@ -15,6 +15,11 @@ payload consumption and asynchronous notification-port cancellation.
 
 ## Evidence and scope
 
+The later [family reply study](ioaccel-family-replies.md) connects these two
+opaque block values to static scheduling/completion send attempts and fence-port
+ownership. Runtime acceptance, delivery count and block cleanup on loss remain
+unverified.
+
 Host reconfirmed on 2026-10-02: macOS 26.4.1 build 25E253, x86_64, reported
 Ryzen 5 5600GT, PCI `1002:1638:c9`. SDK headers are from 26.5. The unchanged
 public metadata child was rebuilt with `-g -O0 -Wall -Wextra -Werror`, then stopped

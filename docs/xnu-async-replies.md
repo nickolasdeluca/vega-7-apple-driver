@@ -12,6 +12,10 @@ clients, queues, mappings or GPU requests were created or sent.
 
 ## Evidence and provenance
 
+The later [family reply study](ioaccel-family-replies.md) maps installed static
+producers to this schema and identifies the registration owner's release site.
+It leaves installed generic-helper equivalence and runtime delivery unverified.
+
 Primary sources read on 2026-10-02:
 
 | Source | Revision and locations |

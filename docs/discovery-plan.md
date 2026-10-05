@@ -113,9 +113,11 @@ then traces generic message packing, port ownership, send limits and dispatch
 arity. Its offline layout/field fixtures are not live reply evidence. The
 [installed dispatch comparison](iokit-async-dispatch.md) finds the IOKit receive
 path, wrappers and generated client stub consistent with that source and IDL.
-It adds client-only count checks and a shared output-count hazard. Static
-inspection of IOAcceleratorFamily2 reply production is the next focused read-only
-task. Separate future
+It adds client-only count checks and a shared output-count hazard. The
+[family reply study](ioaccel-family-replies.md) now maps installed static
+registration storage, seven-word producers, per-entry send attempts and
+cancellation/teardown ownership. Runtime delivery and GPU completion remain
+unverified. Separate future
 studies include primary vendor
 admission-contract evidence and the Metal shader frontend boundary. Kernel validation, negotiation,
 complete ownership/ordering and actual independent bundle admission remain open.

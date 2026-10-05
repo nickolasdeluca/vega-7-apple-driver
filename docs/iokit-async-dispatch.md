@@ -19,6 +19,10 @@ initialize the existing stack internally; that is not manual private invocation.
 
 ## Experiment record
 
+The later [family reply study](ioaccel-family-replies.md) closes the static
+producer-layout question for the inspected base-family paths. It does not
+establish live message validity, delivery or hardware completion.
+
 Read-only investigation on 2026-10-02:
 
 | Item | Observation |
