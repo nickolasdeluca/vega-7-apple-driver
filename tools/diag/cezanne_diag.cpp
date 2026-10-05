@@ -253,7 +253,7 @@ void printMetrics(const SmuMetrics &m)
 bool smuMetrics(io_connect_t connection)
 {
     uint64_t check[5] = {};
-    step("metrics 1/3 check: mailbox idle, FB registers, carveout page and 64 KiB all zero");
+    step("metrics 1/3 check: mailbox idle, FB registers, carveout bounds, 64 KiB unchanged over ~1 s");
     if (!call(connection, kDiagnosticMetricsCheck, check, 5)) return false;
     std::printf("%s\n  MC_VM_FB_LOCATION_BASE 0x%llx  MC_VM_FB_OFFSET 0x%llx  GPU 0x%llx  physical 0x%llx\n",
                 statusName(static_cast<Status>(check[0])), static_cast<unsigned long long>(check[1]),
@@ -269,7 +269,7 @@ bool smuMetrics(io_connect_t connection)
                 static_cast<unsigned long long>(transfer[3]));
     if (transfer[0] != kOK) return false;
 
-    step("metrics 3/3 read: the page through a read-only mapping; only the 148 table bytes may change");
+    step("metrics 3/3 read: the page through a read-only mapping; only the 148 table bytes may differ from before");
     uint64_t status = 0;
     uint32_t statusCount = 1;
     SmuMetrics metrics = {};
