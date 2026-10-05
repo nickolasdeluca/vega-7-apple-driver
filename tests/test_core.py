@@ -57,12 +57,18 @@ class CoreTests(unittest.TestCase):
                                                           "return value < 0x40 ||"),
             "!writeAllowed(kRegMp1C2PMsg66, 0x7, 8)": ("(stage >= kGfxOffStage && value == kSmuMsgDisableGfxOff)",
                                                        "(stage >= kGfxOffStage && value >= 0x7 && value <= 0x8)"),
+            "!smuArgumentAllowed(kSmuMsgSetDriverDramAddrLow, 0xF4, 9)": (
+                "case kSmuMsgSetDriverDramAddrLow: return stage >= kMetricsStage && argument == uint32_t(kMetricsGpuAddress);",
+                "case kSmuMsgSetDriverDramAddrLow: return stage >= kMetricsStage;"),
+            "kTableRegionInUse": ("if (value != 0) return kTableRegionInUse;", ""),
+            "kTableOverflow": ("if (value != 0) return kTableOverflow;", ""),
             "kGfxOffTimeout": ("if (i == kGfxOffConfirmPauses) return kGfxOffTimeout;",
                                "if (i == kGfxOffConfirmPauses) return kOK;"),
             "misc == 0x4": ("        if (((*gfxMisc & kGfxOffStatusMask) >> kGfxOffStatusShift) == kGfxOffStatusOn) return kOK;\n        if (i == kGfxOffConfirmPauses)",
                             "        return kOK;\n        if (i == kGfxOffConfirmPauses)"),
             "writeAllowed(kRegMp1C2PMsg90, 1, 7)": ("return value == 0;", "return true;"),
-            "writeAllowed(offset, 0, 7)": ("    return false;\n}\n\n// The only write site", "    return offset >= kSmuPageOffset;\n}\n\n// The only write site"),
+            "writeAllowed(offset, 0, 7)": ("    return false;\n}\n\nbool smuArgumentAllowed",
+                                           "    return offset >= kSmuPageOffset;\n}\n\nbool smuArgumentAllowed"),
             "kSmuBusy": ("return mailbox->response == 0 ? kSmuBusy : kOK;", "return kOK;"),
             "kSmuTimeout": ("if (i == kSmuPollPauses) return kSmuTimeout;", "if (i == kSmuPollPauses) break;"),
             "kSmuResponseNotOk": ("if (*response != kSmuResponseOk) return kSmuResponseNotOk;", ""),
@@ -96,11 +102,13 @@ class CoreTests(unittest.TestCase):
         # Scratch pattern and restore; SMU response, argument and message.
         self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 5)
         allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
-        self.assertEqual(allow.count("return"), 5)
+        self.assertEqual(allow.count("return"), 6)
         self.assertIn("if (stage >= kScratchStage && offset == kRegScratchReg0) return true;", allow)
-        self.assertIn("if (offset == kRegMp1C2PMsg90 || offset == kRegMp1C2PMsg82) return value == 0;", allow)
-        self.assertIn("return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion ||\n"
-                      "               (stage >= kGfxOffStage && value == kSmuMsgDisableGfxOff);", allow)
+        self.assertIn("if (offset == kRegMp1C2PMsg90) return value == 0;", allow)
+        # Every SMU message is checked against its argument before any write.
+        send = re.search(r"static Status sendSmuMessage\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(send.index("smuArgumentAllowed(message, argument, stage)"), send.index("writeRegister"))
+        self.assertIn("(stage >= kGfxOffStage && value == kSmuMsgDisableGfxOff)", allow)
 
 
 if __name__ == "__main__":

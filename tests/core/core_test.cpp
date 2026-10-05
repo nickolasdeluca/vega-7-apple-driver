@@ -52,6 +52,21 @@ struct FakeConfig {
     ConfigReader reader() { return ConfigReader{read, this}; }
 };
 
+// A fake read-only memory region (the metrics check region).
+struct FakeMemory {
+    uint32_t words[kMetricsCheckSize / 4];
+    bool fail = false;
+    FakeMemory() { std::memset(words, 0, sizeof(words)); }
+    static bool read32(void *context, uint32_t offset, uint32_t *value)
+    {
+        FakeMemory *self = static_cast<FakeMemory *>(context);
+        if (self->fail || offset % 4 != 0 || offset >= kMetricsCheckSize) return false;
+        *value = self->words[offset / 4];
+        return true;
+    }
+    MemoryReader reader() { return MemoryReader{read32, this}; }
+};
+
 struct FakeRegisters {
     uint32_t c2pmsg33 = 0x80000000u;
     uint32_t memsize = 2048;
@@ -70,6 +85,10 @@ struct FakeRegisters {
     int smuDelay = 0;            // pauses before it answers; -1 never
     int smuPending = -1;         // pauses left for the current message
     int gfxOnDelay = 0;          // pauses after DisableGfxOff until GFX reads on; -1 never
+    uint32_t mmhubFbBase = 0xf400;
+    FakeMemory *memory = nullptr; // where TransferTableSmu2Dram writes, if set
+    bool tableOverflows = false;  // write past the 148 bytes too
+    uint32_t smuAddrHigh = 0, smuAddrLow = 0;
     int gfxOffPending = -1;
     bool fail = false;
     uint32_t order[32];
@@ -92,6 +111,7 @@ struct FakeRegisters {
                  : offset == kRegMp1C2PMsg66   ? self->smuMsg
                  : offset == kRegMp1C2PMsg82   ? self->smuArg
                  : offset == kRegMp1C2PMsg90   ? self->smuResp
+                 : offset == kRegMmhubFbLocationBase ? self->mmhubFbBase
                  : offset == kRegGrbmGfxIndex  ? self->gfxIndex
                  : offset == kRegCcShaderArrayConfig   ? self->ccShader
                  : offset == kRegUserShaderArrayConfig ? self->userShader
@@ -250,7 +270,7 @@ static void testAllowlist()
     CHECK(!registerAllowed(0, 2) && !registerAllowed(4, 2) && !registerAllowed(kRegConfigMemsize + 4, 2));
     CHECK(kRegC2PMsg33 == 0x58184 && kRegConfigMemsize == 0x378c && kRegMcVmFbOffset == 0xa5ac);
     CHECK(std::strcmp(statusName(kNotInD0), "not-in-d0") == 0);
-    for (uint32_t s = kOK; s <= kGfxOffTimeout; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
+    for (uint32_t s = kOK; s <= kMetricsOutOfOrder; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
     CHECK(std::strcmp(statusName(static_cast<Status>(999)), "unknown") == 0);
 }
 
@@ -604,14 +624,14 @@ struct FakeWriter {
     FakeRegisters *registers;
     bool fail = false;
     uint32_t pauseWrites = 0; // non-zero: value something else writes during the pause
-    uint32_t offsets[16], values[16];
+    uint32_t offsets[32], values[32];
     int writes = 0;
 
     explicit FakeWriter(FakeRegisters *r) : registers(r) {}
     static bool write32(void *context, uint32_t offset, uint32_t value)
     {
         FakeWriter *self = static_cast<FakeWriter *>(context);
-        if (self->writes < 16) {
+        if (self->writes < 32) {
             self->offsets[self->writes] = offset;
             self->values[self->writes] = value;
         }
@@ -631,9 +651,18 @@ struct FakeWriter {
     static void answer(FakeRegisters *r)
     {
         r->smuResp = r->smuReply;
-        if (r->smuReply == kSmuResponseOk && r->smuMsg != kSmuMsgDisableGfxOff)
+        if (r->smuReply == kSmuResponseOk &&
+            (r->smuMsg == kSmuMsgGetDriverIfVersion || r->smuMsg == kSmuMsgGetSmuVersion))
             r->smuArg = r->smuMsg == kSmuMsgGetDriverIfVersion ? 14 : 0x00403500u;
         if (r->smuReply == kSmuResponseOk && r->smuMsg == kSmuMsgDisableGfxOff) r->gfxOffPending = r->gfxOnDelay;
+        if (r->smuReply == kSmuResponseOk && r->smuMsg == kSmuMsgSetDriverDramAddrHigh) r->smuAddrHigh = r->smuArg;
+        if (r->smuReply == kSmuResponseOk && r->smuMsg == kSmuMsgSetDriverDramAddrLow) r->smuAddrLow = r->smuArg;
+        // The SMU writes the table only to the address it was given.
+        if (r->smuReply == kSmuResponseOk && r->smuMsg == kSmuMsgTransferTableSmu2Dram && r->memory != nullptr &&
+            ((uint64_t(r->smuAddrHigh) << 32) | r->smuAddrLow) == kMetricsGpuAddress) {
+            for (uint32_t i = 0; i < kMetricsSize / 4; i++) r->memory->words[i] = 0x00010000u * (2 * i + 1) + 2 * i;
+            if (r->tableOverflows) r->memory->words[kMetricsSize / 4] = 1;
+        }
         r->smuPending = -1;
     }
     static void pause(void *context)
@@ -877,6 +906,119 @@ static void testGfxOff()
     }
 }
 
+static void testMetrics()
+{
+    CHECK(kMetricsGpuAddress == 0xF440000000ull && kMetricsPhysical == 0x600000000ull);
+    CHECK(sizeof(SmuMetrics) == kMetricsSize && kMetricsWordCount * 2 == kMetricsSize);
+    // Message and argument pairs, from stage 9 only.
+    CHECK(smuArgumentAllowed(kSmuMsgSetDriverDramAddrHigh, 0xF4, 9) && smuArgumentAllowed(kSmuMsgSetDriverDramAddrLow, 0x40000000u, 9));
+    CHECK(smuArgumentAllowed(kSmuMsgTransferTableSmu2Dram, 7, 9) && !smuArgumentAllowed(kSmuMsgTransferTableSmu2Dram, 7, 8));
+    CHECK(!smuArgumentAllowed(kSmuMsgSetDriverDramAddrLow, 0xF4, 9) && !smuArgumentAllowed(kSmuMsgSetDriverDramAddrHigh, 0x40000000u, 9));
+    CHECK(!smuArgumentAllowed(kSmuMsgTransferTableSmu2Dram, 4, 9) && !smuArgumentAllowed(0x1D, 7, 9));
+    CHECK(!smuArgumentAllowed(kSmuMsgGetSmuVersion, 7, 9) && smuArgumentAllowed(kSmuMsgGetSmuVersion, 0, 9));
+    for (uint32_t table = 0; table < 8; table++) {
+        if (table != kTableSmuMetrics) CHECK(!smuArgumentAllowed(kSmuMsgTransferTableSmu2Dram, table, 9));
+    }
+    CHECK(writeAllowed(kRegMp1C2PMsg66, 0x1C, 9) && !writeAllowed(kRegMp1C2PMsg66, 0x1C, 8) &&
+          !writeAllowed(kRegMp1C2PMsg66, 0x1D, 9));
+    CHECK(writeAllowed(kRegMp1C2PMsg82, 0x40000000u, 9) && !writeAllowed(kRegMp1C2PMsg82, 0x40000000u, 8) &&
+          !writeAllowed(kRegMp1C2PMsg82, 0x40001000u, 9));
+
+    // The host's BARs, as at stage 1.
+    uint8_t data[80];
+    putCells(data, 0x83000010u, 0x640000000ull, 0x10000000ull);
+    putCells(data + 20, 0x83000018u, 0x650000000ull, 0x200000ull);
+    putCells(data + 40, 0x81000020u, 0xe000ull, 0x100ull);
+    putCells(data + 60, 0x82000024u, 0xfca00000ull, 0x80000ull);
+    Range ranges[8];
+    uint32_t count = 0;
+    CHECK(parseAssignedAddresses(data, sizeof(data), ranges, 8, &count) == kOK);
+    MetricsTarget t;
+    {
+        FakeRegisters r;
+        r.fbOffset = 0x5c0;
+        CHECK(checkMetricsTarget(r.reader(), 0x80000, 9, ranges, count, &t) == kOK);
+        CHECK(t.gpuAddress == 0xF440000000ull && t.physical == 0x600000000ull && t.configMemsize == 2048);
+        CHECK(checkMetricsTarget(r.reader(), 0x80000, 8, ranges, count, &t) == kRegisterNotAllowed);
+        CHECK(checkMetricsTarget(r.reader(), 0x80000, 9, ranges, 0, &t) == kMetricsTargetInvalid);
+        r.mmhubFbBase = 0xf401;
+        CHECK(checkMetricsTarget(r.reader(), 0x80000, 9, ranges, count, &t) == kMetricsAddressMismatch);
+    }
+    {
+        FakeRegisters r; // FB offset 0x580: not the measured value
+        CHECK(checkMetricsTarget(r.reader(), 0x80000, 9, ranges, count, &t) == kMetricsAddressMismatch);
+    }
+    {
+        FakeRegisters r;
+        r.fbOffset = 0x5c0;
+        r.memsize = 1024; // the page would fall in the high reserve
+        CHECK(checkMetricsTarget(r.reader(), 0x80000, 9, ranges, count, &t) == kMetricsTargetInvalid);
+        r.memsize = 2048;
+        Range clash[1] = {{0x600008000ull, 0x1000}}; // a device range inside the check region
+        CHECK(checkMetricsTarget(r.reader(), 0x80000, 9, clash, 1, &t) == kMetricsTargetInvalid);
+    }
+
+    // The zero check.
+    {
+        FakeRegisters r;
+        FakeWriter w(&r);
+        FakeMemory m;
+        CHECK(checkRegionUnused(m.reader(), kMetricsCheckSize, w.writer()) == kOK);
+        m.words[kMetricsCheckSize / 4 - 1] = 1; // the last word of the region
+        CHECK(checkRegionUnused(m.reader(), kMetricsCheckSize, w.writer()) == kTableRegionInUse);
+        m.words[kMetricsCheckSize / 4 - 1] = 0;
+        m.fail = true;
+        CHECK(checkRegionUnused(m.reader(), kMetricsCheckSize, w.writer()) == kRegisterReadFailed);
+    }
+
+    // The three messages, the SMU's write and the verification.
+    {
+        FakeRegisters r;
+        FakeMemory m;
+        r.memory = &m;
+        FakeWriter w(&r);
+        uint32_t responses[3];
+        CHECK(requestMetrics(r.reader(), 0x80000, w.writer(), 9, responses) == kOK);
+        CHECK(responses[0] == 1 && responses[1] == 1 && responses[2] == 1 && w.writes == 9);
+        CHECK(w.values[1] == 0xF4 && w.values[2] == kSmuMsgSetDriverDramAddrHigh);
+        CHECK(w.values[4] == 0x40000000u && w.values[5] == kSmuMsgSetDriverDramAddrLow);
+        CHECK(w.values[7] == kTableSmuMetrics && w.values[8] == kSmuMsgTransferTableSmu2Dram);
+        SmuMetrics metrics;
+        CHECK(verifyMetricsPage(m.reader(), &metrics) == kOK);
+        CHECK(metrics.words[0] == 0 && metrics.words[1] == 1 && metrics.words[kMetricsGfxTemperature] == 60 &&
+              metrics.words[kMetricsWordCount - 1] == 73);
+        CHECK(requestMetrics(r.reader(), 0x80000, w.writer(), 8, responses) == kRegisterNotAllowed);
+    }
+    {
+        FakeRegisters r;
+        FakeMemory m;
+        r.memory = &m;
+        r.tableOverflows = true;
+        FakeWriter w(&r);
+        uint32_t responses[3];
+        CHECK(requestMetrics(r.reader(), 0x80000, w.writer(), 9, responses) == kOK);
+        SmuMetrics metrics;
+        CHECK(verifyMetricsPage(m.reader(), &metrics) == kTableOverflow);
+    }
+    {
+        FakeRegisters r;
+        FakeMemory m; // the SMU writes nothing
+        FakeWriter w(&r);
+        uint32_t responses[3];
+        CHECK(requestMetrics(r.reader(), 0x80000, w.writer(), 9, responses) == kOK);
+        SmuMetrics metrics;
+        CHECK(verifyMetricsPage(m.reader(), &metrics) == kTableNotWritten);
+    }
+    {
+        FakeRegisters r;
+        r.smuReply = 0xFE;
+        FakeWriter w(&r);
+        uint32_t responses[3];
+        CHECK(requestMetrics(r.reader(), 0x80000, w.writer(), 9, responses) == kSmuResponseNotOk);
+        CHECK(responses[0] == 0xFE && responses[1] == 0 && w.writes == 3); // stops after the first message
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -893,6 +1035,7 @@ int main()
     testScratch();
     testSmu();
     testGfxOff();
+    testMetrics();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

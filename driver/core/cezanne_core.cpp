@@ -56,6 +56,12 @@ const char *statusName(Status status)
     case kSmuResponseNotOk: return "smu-response-not-ok";
     case kSmuOutOfOrder: return "smu-out-of-order";
     case kGfxOffTimeout: return "gfxoff-timeout";
+    case kMetricsAddressMismatch: return "metrics-address-mismatch";
+    case kMetricsTargetInvalid: return "metrics-target-invalid";
+    case kTableRegionInUse: return "table-region-in-use";
+    case kTableNotWritten: return "table-not-written";
+    case kTableOverflow: return "table-overflow";
+    case kMetricsOutOfOrder: return "metrics-out-of-order";
     }
     return "unknown";
 }
@@ -401,11 +407,31 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
 {
     if (stage >= kScratchStage && offset == kRegScratchReg0) return true;
     if (stage < kSmuStage) return false;
-    if (offset == kRegMp1C2PMsg90 || offset == kRegMp1C2PMsg82) return value == 0;
+    if (offset == kRegMp1C2PMsg90) return value == 0;
+    if (offset == kRegMp1C2PMsg82)
+        return value == 0 || (stage >= kMetricsStage && (value == uint32_t(kMetricsGpuAddress >> 32) ||
+                                                         value == uint32_t(kMetricsGpuAddress) ||
+                                                         value == kTableSmuMetrics));
     if (offset == kRegMp1C2PMsg66)
         return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion ||
-               (stage >= kGfxOffStage && value == kSmuMsgDisableGfxOff);
+               (stage >= kGfxOffStage && value == kSmuMsgDisableGfxOff) ||
+               (stage >= kMetricsStage && (value == kSmuMsgSetDriverDramAddrHigh ||
+                                           value == kSmuMsgSetDriverDramAddrLow ||
+                                           value == kSmuMsgTransferTableSmu2Dram));
     return false;
+}
+
+bool smuArgumentAllowed(uint32_t message, uint32_t argument, uint32_t stage)
+{
+    switch (message) {
+    case kSmuMsgGetSmuVersion:
+    case kSmuMsgGetDriverIfVersion: return stage >= kSmuStage && argument == 0;
+    case kSmuMsgDisableGfxOff: return stage >= kGfxOffStage && argument == 0;
+    case kSmuMsgSetDriverDramAddrHigh: return stage >= kMetricsStage && argument == uint32_t(kMetricsGpuAddress >> 32);
+    case kSmuMsgSetDriverDramAddrLow: return stage >= kMetricsStage && argument == uint32_t(kMetricsGpuAddress);
+    case kSmuMsgTransferTableSmu2Dram: return stage >= kMetricsStage && argument == kTableSmuMetrics;
+    default: return false;
+    }
 }
 
 // The only write site in the core.
@@ -492,17 +518,19 @@ Status checkSmu(const RegisterReader &registers, uint64_t apertureLength, uint32
     return mailbox->response == 0 ? kSmuBusy : kOK;
 }
 
-// smu_cmn_send_smc_msg_with_param for an argument of 0. The answer is read
-// only if requested and only after an OK response.
+// smu_cmn_send_smc_msg_with_param. The answer is read only if requested and
+// only after an OK response.
 static Status sendSmuMessage(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
-                             uint32_t stage, uint32_t message, uint32_t *response, uint32_t *answer)
+                             uint32_t stage, uint32_t message, uint32_t argument, uint32_t *response,
+                             uint32_t *answer)
 {
+    if (!smuArgumentAllowed(message, argument, stage)) return kRegisterNotAllowed;
     SmuMailbox mailbox;
     Status status = checkSmu(registers, apertureLength, stage, &mailbox);
     if (status != kOK) return status;
     // __smu_cmn_send_msg: response, argument, then message.
     status = writeRegister(writer, stage, kRegMp1C2PMsg90, 0);
-    if (status == kOK) status = writeRegister(writer, stage, kRegMp1C2PMsg82, 0);
+    if (status == kOK) status = writeRegister(writer, stage, kRegMp1C2PMsg82, argument);
     if (status == kOK) status = writeRegister(writer, stage, kRegMp1C2PMsg66, message);
     if (status != kOK) return status;
     // __smu_cmn_poll_stat.
@@ -526,7 +554,7 @@ Status sendSmuQuery(const RegisterReader &registers, uint64_t apertureLength, co
     *answer = 0;
     if (stage < kSmuStage || (message != kSmuMsgGetSmuVersion && message != kSmuMsgGetDriverIfVersion))
         return kRegisterNotAllowed;
-    return sendSmuMessage(registers, apertureLength, writer, stage, message, response, answer);
+    return sendSmuMessage(registers, apertureLength, writer, stage, message, 0, response, answer);
 }
 
 Status disallowGfxOff(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
@@ -535,7 +563,8 @@ Status disallowGfxOff(const RegisterReader &registers, uint64_t apertureLength, 
     *response = 0;
     *gfxMisc = 0;
     if (stage < kGfxOffStage) return kRegisterNotAllowed;
-    Status status = sendSmuMessage(registers, apertureLength, writer, stage, kSmuMsgDisableGfxOff, response, nullptr);
+    Status status =
+        sendSmuMessage(registers, apertureLength, writer, stage, kSmuMsgDisableGfxOff, 0, response, nullptr);
     if (status != kOK) return status;
     // smu_v12_0_gfx_off_control: wait for GFX to be on.
     for (uint32_t i = 0; i <= kGfxOffConfirmPauses; i++) {
@@ -546,6 +575,100 @@ Status disallowGfxOff(const RegisterReader &registers, uint64_t apertureLength, 
         writer.pause(writer.context);
     }
     return kGfxOffTimeout;
+}
+
+static bool overlaps(uint64_t base, uint64_t length, uint64_t otherBase, uint64_t otherLength)
+{
+    return base < otherBase + otherLength && otherBase < base + length;
+}
+
+Status checkMetricsTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                          const Range *ranges, uint32_t rangeCount, MetricsTarget *target)
+{
+    *target = MetricsTarget();
+    if (stage < kMetricsStage) return kRegisterNotAllowed;
+    const struct {
+        uint32_t offset;
+        uint32_t *value;
+    } reads[] = {
+        {kRegMmhubFbLocationBase, &target->fbLocationBase},
+        {kRegMcVmFbOffset, &target->fbOffset},
+        {kRegConfigMemsize, &target->configMemsize},
+    };
+    for (const auto &read : reads) {
+        Status status = readRegister(registers, apertureLength, stage, read.offset, read.value);
+        if (status != kOK) return status;
+    }
+    if (target->fbLocationBase != kExpectedFbLocationBase || target->fbOffset != kExpectedFbOffset)
+        return kMetricsAddressMismatch;
+    target->gpuAddress = (uint64_t(target->fbLocationBase) << 24) + kMetricsCarveoutOffset;
+    target->physical = (uint64_t(target->fbOffset) << 24) + kMetricsCarveoutOffset;
+    if (target->gpuAddress != kMetricsGpuAddress || target->physical != kMetricsPhysical) return kMetricsAddressMismatch;
+    // Inside the carveout, clear of its reserved low and high regions.
+    uint64_t carveoutSize = uint64_t(target->configMemsize) << 20;
+    if (target->configMemsize == 0xFFFFFFFFu || carveoutSize < kCarveoutLowReserve + kCarveoutHighReserve ||
+        kMetricsCarveoutOffset < kCarveoutLowReserve ||
+        kMetricsCarveoutOffset + kMetricsCheckSize > carveoutSize - kCarveoutHighReserve)
+        return kMetricsTargetInvalid;
+    if (rangeCount == 0) return kMetricsTargetInvalid;
+    for (uint32_t i = 0; i < rangeCount; i++) {
+        if (overlaps(target->physical, kMetricsCheckSize, ranges[i].base, ranges[i].length))
+            return kMetricsTargetInvalid;
+    }
+    return kOK;
+}
+
+Status checkRegionUnused(const MemoryReader &memory, uint32_t length, const RegisterWriter &writer)
+{
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) writer.pause(writer.context);
+        for (uint32_t offset = 0; offset < length; offset += 4) {
+            uint32_t value = 0;
+            if (!memory.read32(memory.context, offset, &value)) return kRegisterReadFailed;
+            if (value != 0) return kTableRegionInUse;
+        }
+    }
+    return kOK;
+}
+
+Status requestMetrics(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, uint32_t responses[3])
+{
+    responses[0] = responses[1] = responses[2] = 0;
+    if (stage < kMetricsStage) return kRegisterNotAllowed;
+    const struct {
+        uint32_t message, argument;
+    } messages[] = {
+        {kSmuMsgSetDriverDramAddrHigh, uint32_t(kMetricsGpuAddress >> 32)},
+        {kSmuMsgSetDriverDramAddrLow, uint32_t(kMetricsGpuAddress)},
+        {kSmuMsgTransferTableSmu2Dram, kTableSmuMetrics},
+    };
+    for (uint32_t i = 0; i < 3; i++) {
+        Status status = sendSmuMessage(registers, apertureLength, writer, stage, messages[i].message,
+                                       messages[i].argument, &responses[i], nullptr);
+        if (status != kOK) return status;
+    }
+    return kOK;
+}
+
+Status verifyMetricsPage(const MemoryReader &page, SmuMetrics *metrics)
+{
+    *metrics = SmuMetrics();
+    // Everything after the table must still be zero, as checked before.
+    for (uint32_t offset = kMetricsSize; offset < kPageSize; offset += 4) {
+        uint32_t value = 0;
+        if (!page.read32(page.context, offset, &value)) return kRegisterReadFailed;
+        if (value != 0) return kTableOverflow;
+    }
+    bool written = false;
+    for (uint32_t offset = 0; offset < kMetricsSize; offset += 4) {
+        uint32_t value = 0;
+        if (!page.read32(page.context, offset, &value)) return kRegisterReadFailed;
+        written = written || value != 0;
+        metrics->words[offset / 2] = static_cast<uint16_t>(value);
+        metrics->words[offset / 2 + 1] = static_cast<uint16_t>(value >> 16);
+    }
+    return written ? kOK : kTableNotWritten;
 }
 
 } // namespace cezanne

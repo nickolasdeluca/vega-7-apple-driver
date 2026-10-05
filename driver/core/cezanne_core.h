@@ -6,7 +6,8 @@
 // stage 6 scratch test and stage 7 SMU queries, one write callback. The write
 // allowlist names exact registers and values: SCRATCH_REG0 (stage 6) and the
 // three SMU mailbox writes of a version query (stage 7), plus the
-// DisableGfxOff message (stage 8). Widening it is a reviewed stage change
+// DisableGfxOff message (stage 8), plus the three metrics-table messages and
+// their arguments (stage 9). Widening it is a reviewed stage change
 // (docs/test-boot.md).
 //
 // Register offsets are byte offsets into the MMIO register BAR (BAR5). Linux
@@ -28,7 +29,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 8;
+const uint32_t kMaxStage = 9;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -186,6 +187,64 @@ const uint32_t kSmuMsgDisableGfxOff = 0x8;
 const uint32_t kGfxOffConfirmPauses = 500;
 const uint32_t kGfxOffStage = 8;
 
+// Stage 9: the SMU metrics table (smu12_driver_if.h SmuMetrics_t, table 7).
+// The SMU writes it to a GPU (MC) address set with SetDriverDramAddrHigh/Low
+// (smu_v12_0_set_driver_table_location) when asked by TransferTableSmu2Dram
+// with argument table_id | (0 << 16) (smu_cmn_update_table).
+const uint32_t kSmuMsgSetDriverDramAddrHigh = 0x1A;
+const uint32_t kSmuMsgSetDriverDramAddrLow = 0x1B;
+const uint32_t kSmuMsgTransferTableSmu2Dram = 0x1C;
+const uint32_t kTableSmuMetrics = 7;
+const uint32_t kMetricsSize = 148; // 74 uint16_t fields
+const uint32_t kMetricsStage = 9;
+// One fixed page 1 GiB into the carveout. For this APU, GPU address
+// (MC_VM_FB_LOCATION_BASE << 24) + offset is CPU physical
+// (MC_VM_FB_OFFSET << 24) + offset (gmc_v9_0_mc_init aper_base); both
+// registers are checked against these values before use.
+const uint32_t kExpectedFbLocationBase = 0xf400; // MMHUB, stage 5
+const uint32_t kExpectedFbOffset = 0x5c0;        // GC, stage 2
+const uint64_t kMetricsCarveoutOffset = 0x40000000ull;
+const uint64_t kMetricsGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kMetricsCarveoutOffset;
+const uint64_t kMetricsPhysical = (uint64_t(kExpectedFbOffset) << 24) + kMetricsCarveoutOffset;
+// The page and the 60 KiB after it must read all zero before use.
+const uint32_t kMetricsCheckSize = 0x10000;
+// Carveout regions the page must avoid: the boot framebuffer and other
+// low allocations, and the firmware, PSP and discovery regions at the top.
+const uint64_t kCarveoutLowReserve = 64ull << 20;
+const uint64_t kCarveoutHighReserve = 64ull << 20;
+// SmuMetrics_t field indices, in uint16_t words.
+enum MetricsWord : uint32_t {
+    kMetricsClockFrequency = 0, // [18], MHz, CLOCK_IDs_e order
+    kMetricsAverageGfxclk = 18,
+    kMetricsAverageSocclk = 19,
+    kMetricsAverageVclk = 20,
+    kMetricsAverageFclk = 21,
+    kMetricsAverageGfxActivity = 22, // centi-percent
+    kMetricsAverageUvdActivity = 23,
+    kMetricsVoltage = 24, // [2] mV: VDDCR_VDD, VDDCR_SOC
+    kMetricsCurrent = 26, // [2] mA
+    kMetricsPower = 28,   // [2] mW
+    kMetricsFanPwm = 30,
+    kMetricsCurrentSocketPower = 31, // W
+    kMetricsCoreFrequency = 32,      // [8] MHz
+    kMetricsCorePower = 40,          // [8] mW
+    kMetricsCoreTemperature = 48,    // [8] centi-degrees C
+    kMetricsL3Frequency = 56,        // [2]
+    kMetricsL3Temperature = 58,      // [2]
+    kMetricsGfxTemperature = 60,
+    kMetricsSocTemperature = 61,
+    kMetricsThrottlerStatus = 62,
+    kMetricsStapmOriginalLimit = 64,
+    kMetricsStapmCurrentLimit = 65,
+    kMetricsApuPower = 66,
+    kMetricsDgpuPower = 67,
+    kMetricsVddTdc = 68,
+    kMetricsSocTdc = 69,
+    kMetricsVddEdc = 70,
+    kMetricsSocEdc = 71,
+    kMetricsWordCount = 74,
+};
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -248,6 +307,13 @@ enum Status : uint32_t {
     kSmuOutOfOrder,
     // Stage 8.
     kGfxOffTimeout,
+    // Stage 9.
+    kMetricsAddressMismatch,
+    kMetricsTargetInvalid,
+    kTableRegionInUse,
+    kTableNotWritten,
+    kTableOverflow,
+    kMetricsOutOfOrder,
 };
 
 const char *statusName(Status status);
@@ -309,7 +375,11 @@ struct RegisterWriter {
 // The write allowlist, by register and value: SCRATCH_REG0 (any value; the
 // scratch test writes only the pattern and the value it read) from stage 6;
 // from stage 7, C2PMSG_90 <- 0, C2PMSG_82 <- 0 and C2PMSG_66 <- 0x2 or 0x3;
-// from stage 8 also C2PMSG_66 <- 0x8.
+// from stage 8 also C2PMSG_66 <- 0x8; from stage 9 also C2PMSG_66 <- 0x1A,
+// 0x1B, 0x1C and C2PMSG_82 <- the high and low halves of kMetricsGpuAddress
+// and kTableSmuMetrics. Pairs of message and argument are checked by
+// smuArgumentAllowed.
+bool smuArgumentAllowed(uint32_t message, uint32_t argument, uint32_t stage);
 bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage);
 
 struct ScratchCheck {
@@ -354,6 +424,7 @@ Status sendSmuQuery(const RegisterReader &registers, uint64_t apertureLength, co
 Status disallowGfxOff(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                       uint32_t stage, uint32_t *response, uint32_t *gfxMisc);
 
+
 // The diagnostic interface's read (stage 4 and later): readAllowedRegister,
 // but a GFX-gated register is read only after SMUIO_GFX_MISC_CNTL reports GFX
 // on (kGfxNotOn otherwise), as Linux requires before its GC IP dump.
@@ -361,7 +432,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 4;
+const uint32_t kDiagnosticVersion = 5;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -374,7 +445,11 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticSmuQuery = 6,       // in: message (0x2 or 0x3); out: Status, response, answer
     // Stage 8; also accepted only after a passing SMU check.
     kDiagnosticGfxOffDisallow = 7, // out: Status, response, SMUIO_GFX_MISC_CNTL
-    kDiagnosticSelectorCount = 8,
+    // Stage 9, accepted only in this order per connection.
+    kDiagnosticMetricsCheck = 8,    // out: Status, FB location base, FB offset, GPU address, physical
+    kDiagnosticMetricsTransfer = 9, // out: Status, responses to AddrHigh, AddrLow, Transfer
+    kDiagnosticMetricsRead = 10,    // out: Status; structure: the 148-byte table
+    kDiagnosticSelectorCount = 11,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -447,6 +522,41 @@ struct GfxConfig {
 // values are still filled in).
 Status readGfxConfig(const RegisterReader &registers, uint64_t apertureLength, const Discovery &discovery,
                      GfxConfig *config);
+
+struct MetricsTarget {
+    uint32_t fbLocationBase, fbOffset, configMemsize;
+    uint64_t gpuAddress, physical;
+};
+
+// Reads MMHUB MC_VM_FB_LOCATION_BASE, MC_VM_FB_OFFSET and RCC_CONFIG_MEMSIZE,
+// requires the expected values (kMetricsAddressMismatch), and checks the page
+// and its check region lie inside the carveout, outside the reserved low and
+// high regions and outside every device range (kMetricsTargetInvalid).
+Status checkMetricsTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                          const Range *ranges, uint32_t rangeCount, MetricsTarget *target);
+
+// Reads 32-bit words at byte offsets of a read-only memory mapping.
+struct MemoryReader {
+    bool (*read32)(void *context, uint32_t offset, uint32_t *value);
+    void *context;
+};
+
+// The region must read all zero twice, a pause apart (kTableRegionInUse).
+Status checkRegionUnused(const MemoryReader &memory, uint32_t length, const RegisterWriter &writer);
+
+// Sends SetDriverDramAddrHigh, SetDriverDramAddrLow and TransferTableSmu2Dram
+// in that order with the stage 7 send-and-poll; stops at the first failure.
+Status requestMetrics(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, uint32_t responses[3]);
+
+struct SmuMetrics {
+    uint16_t words[kMetricsWordCount];
+};
+
+// Checks a page read after the transfer against the zero page read before:
+// bytes kMetricsSize.. must still be zero (kTableOverflow), and the table
+// bytes must not all be zero (kTableNotWritten). Decodes the table.
+Status verifyMetricsPage(const MemoryReader &page, SmuMetrics *metrics);
 
 } // namespace cezanne
 
