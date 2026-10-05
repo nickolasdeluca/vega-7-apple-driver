@@ -15,7 +15,9 @@ attempt reset before reaching macOS, cause unknown. Stage 8 sent
 `DisallowGfxOff`: response OK, GFX stayed on. Stage 9 (the SMU metrics
 table) stopped at its own check: the chosen carveout region is not all zero,
 so no SMU message was sent. Its check needs a better criterion before
-another attempt.
+another attempt. To get the criterion Linux uses, a one-time
+[SysReport dump boot](#sysreport-dump-boot) is authorized and built under
+ignored `out/test-efi/usb-sysreport/`; it has not been booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -90,6 +92,7 @@ rejects the result unless the configurations differ in exactly these values:
 | `Kernel → Add` | includes NootedRed, SMCRadeonSensors | both removed; `CezanneGPU.kext` appended (`MinKernel` 25.0.0, x86_64) | NootedRed drives the iGPU through Apple's AMD kexts; SMCRadeonSensors reads GPU sensor registers itself. Nothing else may touch the GPU. |
 | `NVRAM → Add → 7C436110-…:boot-args` | `-NRedRBPlus` | `-v keepsyms=1 debug=0x100 msgbuf=1048576 cezanne-stage=N` | Verbose boot, symbolized panics, a halt on panic instead of a reboot, a larger kernel log buffer, and the driver's stage |
 | `Misc → Security → AllowSetDefault` | `true` | `false` | The test picker cannot store a new default boot entry in shared NVRAM |
+| `Misc → Debug → SysReport` (only with `--sysreport`) | `false` | `true` | One-time OpenCore DEBUG dump of ACPI tables (including `VFCT`, the VBIOS), SMBIOS and PCI information to `SysReport/` on the USB drive, for the [SysReport dump boot](#sysreport-dump-boot) |
 | `Misc → Debug → Target` | `67` (`0x43`) | `3` | Drops bit `0x40`, the `opencore-*.txt` log file. On the USB 2.0 stick each flush took about 0.7 s, and the first boot spent 51 s logging before the filesystem scan. On-screen logging (warnings and errors) stays. |
 
 Everything else is byte-identical: ACPI tables, quirks, kernel patches, device
@@ -345,6 +348,49 @@ Stage 3 risks: these are configuration and status registers Linux reads
 without side effects, in the same register window as stages 1 and 2. A hang
 would freeze the boot; power off and boot the known-good EFI. Nothing is
 written.
+
+### SysReport dump boot
+
+**Status:** approved by the user on 2026-10-05 and built, but not yet booted.
+This is a test-EFI configuration change, not a driver stage.
+
+**Purpose.** Stage 9 needs to know which carveout memory the firmware uses.
+Linux reads this from the VBIOS firmware-usage table
+(`vram_usagebyfirmware`); on APUs the VBIOS reaches the OS in the ACPI `VFCT`
+table. macOS 26 publishes neither in the registry (boot 11), so stage 9's
+check cannot use it yet.
+
+**What changes.**
+
+- `tools/test_efi.py build --sysreport` adds exactly one config change to
+  the stage 0 test EFI: `Misc → Debug → SysReport` `true`. The tool's
+  expected-change check includes it only when the flag is given. The
+  manifest records `"sysreport": true`.
+- The driver runs at stage 0 (passive): no device access in this boot.
+- OpenCore DEBUG writes `SysReport/` to the root of the USB drive once at boot.
+  - Expect a pause at the picker while it writes.
+  - It is a single dump, not per-line file logging, which stays off.
+
+**Steps.**
+
+1. Copy `out/test-efi/usb-sysreport/EFI` to the drive and run `verify` as
+   for any stage.
+2. Cold-boot it. Reaching the desktop is not required, since the dump happens
+   in OpenCore, but it shows the boot path is unchanged.
+3. Back on either EFI, copy the dump into ignored `out/` and remove it from
+   the drive. It contains SMBIOS serials.
+
+   ```sh
+   ditto /Volumes/CZTEST/SysReport out/test-efi/sysreport
+   rm -rf /Volumes/CZTEST/SysReport   # the USB copy only; check the path
+   ```
+4. Offline: extract the VBIOS from `VFCT`, then read its firmware-usage table
+   (`vram_usagebyfirmware`: start and size in KiB) as
+   `amdgpu_atomfirmware_allocate_fb_scratch` does. Revise stage 9's
+   free-page check from it for the user's review.
+
+**Return:** put the stage 9 EFI (or any other) back on the drive before the
+next driver test. The SysReport EFI is only for this dump.
 
 ### Stage 4: diagnostic interface
 

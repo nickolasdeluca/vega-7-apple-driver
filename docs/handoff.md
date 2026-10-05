@@ -133,21 +133,20 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: revise stage 9's free-page check
+## Next task: SysReport dump boot, then revise stage 9's check
 
 Stages 0–8 succeeded. Stage 9 stopped safely at its own check in boot 11:
-the chosen carveout page was not all zero, and no SMU message was sent (see
-the [test boot log](test-boot.md#test-boot-log)).
+"all zero" is the wrong test, because unused carveout DRAM holds stale data
+(see the [test boot log](test-boot.md#test-boot-log)).
 
-- **The flaw.** "All zero" is the wrong criterion: unused carveout DRAM holds
-  stale data.
-- **What Linux uses.** The VBIOS firmware-usage table.
-- **Where to get it.** It is not visible in macOS 26's registry. Candidates:
-  an OpenCore SysReport ACPI dump (a reviewed test-EFI config change), the
-  `VFCT` table via another route, or a read-only "describe the region" step
-  (content stability over time).
-- **Approval.** Each changes the approved stage 9 design and needs the user's
-  approval.
+- **What to boot.** The approved fix is to read the VBIOS firmware-usage table
+  as Linux does. Boot `out/test-efi/usb-sysreport/` once, following
+  [test-boot.md](test-boot.md#sysreport-dump-boot): stage 0, OpenCore
+  SysReport on.
+- **Saving the dump.** Copy `SysReport/` into ignored `out/` and delete it
+  from the drive.
+- **Then.** Extract the VBIOS from `VFCT`, read `vram_usagebyfirmware`, and
+  propose the revised stage 9 check.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
