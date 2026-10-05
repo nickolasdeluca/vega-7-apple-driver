@@ -38,7 +38,7 @@ def config():
         "ACPI": {"Add": []},
         "Kernel": {"Add": [entry("Lilu.kext"), entry("NootedRed.kext"), entry("SMCRadeonSensors.kext"),
                            entry("Other.kext")]},
-        "Misc": {"Boot": {"LauncherOption": "Disabled"}, "Debug": {"Target": 67},
+        "Misc": {"Boot": {"LauncherOption": "Disabled"}, "Debug": {"SysReport": False, "Target": 67},
                  "Security": {"AllowSetDefault": True}},
         "NVRAM": {"Add": {GUID: {"boot-args": "-NRedRBPlus", "csr-active-config": b"\0\0\0\0"}},
                   "Delete": {GUID: ["boot-args", "csr-active-config"]}},
@@ -83,9 +83,27 @@ class TestEfiTests(unittest.TestCase):
             code = self.tool.main(list(argv))
         return code, out.getvalue()
 
-    def build(self, stage="1"):
+    def build(self, stage="1", *extra):
         return self.run_tool("build", "--known-good", str(self.known), "--kext", str(self.driver),
-                             "--stage", stage, "--output", str(self.output))
+                             "--stage", stage, "--output", str(self.output), *extra)
+
+    def test_sysreport_enables_only_the_dump(self):
+        code, out = self.build("0", "--sysreport")
+        self.assertEqual(code, 0, out)
+        with (self.output / "EFI" / "OC" / "Config.plist").open("rb") as handle:
+            test = plistlib.load(handle)
+        self.assertIs(test["Misc"]["Debug"]["SysReport"], True)
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertTrue(manifest["sysreport"])
+        self.assertIn("Misc.Debug.SysReport", manifest["config_changes"])
+
+    def test_sysreport_is_off_unless_requested(self):
+        self.assertEqual(self.build("0")[0], 0)
+        with (self.output / "EFI" / "OC" / "Config.plist").open("rb") as handle:
+            self.assertIs(plistlib.load(handle)["Misc"]["Debug"]["SysReport"], False)
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertFalse(manifest["sysreport"])
+        self.assertNotIn("Misc.Debug.SysReport", manifest["config_changes"])
 
     def test_build_changes_only_the_intended_values_and_files(self):
         code, out = self.build()

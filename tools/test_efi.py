@@ -40,6 +40,11 @@ REMOVED_KEXTS = {
 # USB 2.0 stick every flush takes ~0.7 s: the first stage 0 boot took 51 s to
 # reach the filesystem scan, with a blank screen. On-screen logging stays.
 FILE_LOG_BIT = 0x40
+# --sysreport: OpenCore DEBUG's Misc.Debug.SysReport dumps ACPI tables (VFCT,
+# the VBIOS), SMBIOS and PCI information to SysReport/ on the boot volume once.
+# Used to read the VBIOS firmware-usage table; it contains SMBIOS serials, so
+# keep the dump in ignored out/.
+SYSREPORT_CHANGE = "Misc.Debug.SysReport"
 DRIVER_BUNDLE = "CezanneGPU.kext"
 DRIVER_ENTRY = {
     "Arch": "x86_64",
@@ -116,7 +121,11 @@ def boot_args(stage):
     return "%s cezanne-stage=%d" % (BASE_BOOT_ARGS, stage)
 
 
-def derive(config, kexts_dir, stage):
+def expected_changes(sysreport=False):
+    return EXPECTED_CHANGES | ({SYSREPORT_CHANGE} if sysreport else set())
+
+
+def derive(config, kexts_dir, stage, sysreport=False):
     """Return (test config, {removed bundle: bundle id}). Reads only kext Info.plists."""
     test = copy.deepcopy(config)
     args = boot_args(stage)
@@ -143,6 +152,11 @@ def derive(config, kexts_dir, stage):
         raise Rejected("known-good Misc.Debug.Target %r has no file logging to disable; review "
                        "FILE_LOG_BIT before building" % (target,))
     test["Misc"]["Debug"]["Target"] = target & ~FILE_LOG_BIT
+    if sysreport:
+        if config["Misc"]["Debug"].get("SysReport") is not False:
+            raise Rejected("known-good Misc.Debug.SysReport is %r, expected false"
+                           % (config["Misc"]["Debug"].get("SysReport"),))
+        test["Misc"]["Debug"]["SysReport"] = True
     return test, removed_ids
 
 
@@ -157,12 +171,13 @@ def differences(a, b, prefix=""):
     return [] if type(a) is type(b) and a == b else [prefix]
 
 
-def check_configs(known, test):
+def check_configs(known, test, sysreport=False):
     """Raise Rejected unless the test config differs from known-good only as intended."""
     changed = set(differences(known, test))
-    if changed != EXPECTED_CHANGES:
+    expected = expected_changes(sysreport)
+    if changed != expected:
         raise Rejected("unexpected config differences: extra %s, missing %s"
-                       % (sorted(changed - EXPECTED_CHANGES), sorted(EXPECTED_CHANGES - changed)))
+                       % (sorted(changed - expected), sorted(expected - changed)))
     expected_kexts = [e for e in known["Kernel"]["Add"] if e["BundlePath"] not in REMOVED_KEXTS]
     if test["Kernel"]["Add"] != expected_kexts + [DRIVER_ENTRY]:
         raise Rejected("Kernel.Add must be the known-good list minus %s plus the driver, in order"
@@ -216,7 +231,7 @@ def run_ocvalidate(tool, config):
     return result
 
 
-def build(known_efi, kext, output, stage, ocvalidate=None):
+def build(known_efi, kext, output, stage, ocvalidate=None, sysreport=False):
     known_efi, kext, output = Path(known_efi), Path(kext), Path(output)
     partial = output.with_name(output.name + ".partial")
     for path in (output, partial):
@@ -227,7 +242,7 @@ def build(known_efi, kext, output, stage, ocvalidate=None):
     config_path = find_config(known_efi)
     with config_path.open("rb") as handle:
         known = plistlib.load(handle)
-    test, removed_ids = derive(known, known_efi / "OC" / "Kexts", stage)
+    test, removed_ids = derive(known, known_efi / "OC" / "Kexts", stage, sysreport)
     config_rel = config_path.relative_to(known_efi).as_posix()
     skipped = sorted(p.relative_to(known_efi).as_posix() for p in config_path.parent.iterdir()
                      if p.is_file() and is_config_backup(p, config_path))
@@ -247,7 +262,7 @@ def build(known_efi, kext, output, stage, ocvalidate=None):
         with (efi / config_rel).open("rb") as handle:
             written = plistlib.load(handle)
         known_hashes, test_hashes = tree(known_efi), tree(efi)
-        check_configs(known, written)
+        check_configs(known, written, sysreport)
         check_tree(known_hashes, test_hashes, config_rel, skipped)
         check_bundles(efi, written)
         validation = run_ocvalidate(ocvalidate, efi / config_rel) if ocvalidate else None
@@ -263,7 +278,8 @@ def build(known_efi, kext, output, stage, ocvalidate=None):
         "stage": stage, "config": config_rel, "boot_args": boot_args(stage),
         "removed_kexts": {name: {"bundle_id": removed_ids[name], "reason": REMOVED_KEXTS[name]}
                           for name in REMOVED_KEXTS},
-        "skipped_config_backups": skipped, "config_changes": sorted(EXPECTED_CHANGES),
+        "skipped_config_backups": skipped, "config_changes": sorted(expected_changes(sysreport)),
+        "sysreport": sysreport,
         "ocvalidate": validation, "known_good_sha256": known_hashes, "test_sha256": test_hashes,
     }
     (partial / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
@@ -295,6 +311,8 @@ def main(argv=None):
     make.add_argument("--stage", required=True, type=int, help="driver stage the boot arguments select")
     make.add_argument("--output", required=True, help="new directory for the test EFI")
     make.add_argument("--ocvalidate", help="ocvalidate matching the OpenCore version")
+    make.add_argument("--sysreport", action="store_true",
+                      help="also enable OpenCore's one-time SysReport dump (ACPI tables, SMBIOS)")
     check = commands.add_parser("verify")
     check.add_argument("--manifest", required=True)
     check.add_argument("--side", required=True, choices=("test", "known_good"))
@@ -302,7 +320,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "build":
-            manifest = build(args.known_good, args.kext, args.output, args.stage, args.ocvalidate)
+            manifest = build(args.known_good, args.kext, args.output, args.stage, args.ocvalidate, args.sysreport)
             print(json.dumps({"output": args.output, "stage": manifest["stage"], "config_changes": manifest["config_changes"],
                               "removed_kexts": sorted(manifest["removed_kexts"]),
                               "ocvalidate_exit": (manifest["ocvalidate"] or {}).get("exit_code"),
