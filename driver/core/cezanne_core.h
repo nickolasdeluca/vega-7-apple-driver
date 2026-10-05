@@ -48,6 +48,7 @@ enum Status : uint32_t {
     kNotInD0,
     kMemoryDecodeDisabled,
     kBarNotMemory32,
+    kApertureUnavailable,
     kBarMismatch,
     kApertureTooSmall,
     kRegisterNotAllowed,

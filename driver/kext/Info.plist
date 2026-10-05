@@ -5,13 +5,13 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>CezanneProbe</string>
+	<string>CezanneGPU</string>
 	<key>CFBundleIdentifier</key>
-	<string>org.cezanne-driver.probe</string>
+	<string>org.cezanne-driver.gpu</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>CezanneProbe</string>
+	<string>CezanneGPU</string>
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
@@ -20,12 +20,12 @@
 	<string>0.1.0</string>
 	<key>IOKitPersonalities</key>
 	<dict>
-		<key>CezanneProbe</key>
+		<key>CezanneGPU</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>org.cezanne-driver.probe</string>
+			<string>org.cezanne-driver.gpu</string>
 			<key>IOClass</key>
-			<string>CezanneProbe</string>
+			<string>CezanneGPU</string>
 			<key>IOPCIMatch</key>
 			<string>0x16381002</string>
 			<key>IOProviderClass</key>

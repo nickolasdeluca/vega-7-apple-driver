@@ -24,6 +24,7 @@ const char *statusName(Status status)
     case kNotInD0: return "not-in-d0";
     case kMemoryDecodeDisabled: return "memory-decode-disabled";
     case kBarNotMemory32: return "bar5-not-32-bit-memory";
+    case kApertureUnavailable: return "bar5-mapping-unavailable";
     case kBarMismatch: return "bar5-mapping-mismatch";
     case kApertureTooSmall: return "aperture-too-small";
     case kRegisterNotAllowed: return "register-not-allowed";
