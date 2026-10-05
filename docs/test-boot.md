@@ -629,7 +629,9 @@ The mailbox protocol (`smu_cmn.c`: `smu_cmn_send_smc_msg_with_param`,
 registers stage 5 already reads:
 
 1. Poll `MP1_SMN_C2PMSG_90` (response) until non-zero, so no message is in
-   flight.
+   flight. Linux skips this poll for its very first message after init
+   (`SMU_FW_INIT`). Stage 7 requires it anyway, since stage 5 showed `0x1`
+   there.
 2. Write `C2PMSG_90` ← 0, then `C2PMSG_82` (argument) ← parameter, then
    `C2PMSG_66` (message) ← index.
 3. Poll `C2PMSG_90` until non-zero; Linux allows up to 2 s
