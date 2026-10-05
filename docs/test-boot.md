@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-05: **stages 0 to 7 succeeded** (see
+Status, 2026-10-05: **stages 0 to 8 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -11,9 +11,8 @@ read 38 power, clock-gating, engine and memory-hub registers through it.
 Stage 6, the first reviewed write, wrote `0xCAFEDEAD` to `SCRATCH_REG0`,
 read it back, and restored the original value. Stage 7 sent the first SMU
 messages: driver-interface version 14, SMU firmware 64.74.0. One stage 7 boot
-attempt reset before reaching macOS, cause unknown. Stage 8 (send
-`DisallowGfxOff` on request) is authorized and built under ignored
-`out/test-efi/usb-stage8/`; it has not been booted.
+attempt reset before reaching macOS, cause unknown. Stage 8 sent
+`DisallowGfxOff`: response OK, GFX stayed on. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -777,9 +776,9 @@ is printed and flushed before it is sent:
 
 ### Stage 8: disallow GFXOFF
 
-**Status: approved by the user on 2026-10-05, implemented and built; not yet
-booted.** The proposal below is kept as approved. An implementation section
-follows it.
+**Status: approved by the user on 2026-10-05, implemented, and run
+successfully in boot 10.** The proposal below is kept as approved. An
+implementation section follows it.
 
 **Purpose.** GFXOFF lets the SMU power the graphics block down while it is
 idle. Every later step that programs the GC (golden settings, RLC, CP
@@ -1329,6 +1328,39 @@ a software shutdown of the stage 6 session at 15:34).
   `out/test-efi/boot-9-stage7/`.
 - Result: stage 7 succeeded on the second attempt; the first attempt's reset
   is an open finding.
+
+**Boot 10, 2026-10-05, stage 8** (`out/test-efi/usb-stage8/`; cold boot;
+booted on the first attempt).
+
+- Kernel up 15:48:30; `kern.bootargs` ends `cezanne-stage=8`; stages 1–3
+  `ok`; diagnostics v4.
+- `sudo cezanne-diag --gfxoff-disallow`, written 15:49:46:
+
+  | Step | Result |
+  | --- | --- |
+  | 1 check | `ok`: `C2PMSG_66` `0`, `C2PMSG_82` `0`, `C2PMSG_90` `0x1` (idle) |
+  | 2 `DisallowGfxOff` (`0x8`) | `ok`, response `0x01`; `SMUIO_GFX_MISC_CNTL` `0x5`, `PWR_GFXOFF_STATUS` 2 on the first read |
+
+- The register dump matched boot 9 except the mailbox (`C2PMSG_66` `0x8`,
+  `C2PMSG_82` `0`, `C2PMSG_90` `0x1`) and the PSP counter. GFXOFF status was
+  2 before and after, so as predicted the message confirmed the existing
+  state.
+- **Temperature.** The user saw the CPU temperature rise sharply during boot,
+  to the 70s °C on reaching the desktop, then fall to about 45 °C (user's
+  "Hot" monitor).
+  - The rise began before the message: the kernel started at 15:48:30, and the
+    message went out at 15:49:46, after the desktop appeared.
+  - At 15:51 the load average was 15.9 / 13.2 / 5.9 (1/5/15 min) and
+    `WindowServer` used about 85 % CPU. Without a graphics driver, the
+    desktop is composited on the CPU, which explains heavy CPU use at boot and
+    login.
+  - The heat is therefore attributed to boot load and software compositing,
+    not to `DisallowGfxOff`; the message did not change GFX state. Not
+    measured: whether earlier test boots peaked the same way (they were not
+    watched during boot).
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-10-stage8/`.
+- Result: stage 8 succeeded.
 
 ## Unknowns and limits
 

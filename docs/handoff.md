@@ -133,15 +133,23 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 8 USB test boot
+## Next task: choose the next reviewed step
 
-Stages 0–7 succeeded (see the [test boot log](test-boot.md#test-boot-log));
-the SMU reports driver-interface 14 and firmware 64.74.0. Open finding: one
-stage 7 boot attempt reset before macOS logged anything. Stage 8,
-`DisallowGfxOff` on request through `cezanne-diag --gfxoff-disallow`, was
-approved and is built under `out/test-efi/usb-stage8/`. Follow
-[test-boot.md](test-boot.md#stage-8-disallow-gfxoff) and record the response,
-the GFXOFF status and the machine's behaviour.
+Stages 0–8 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
+
+- **SMU:** driver-interface 14, firmware 64.74.0. It accepted
+  `DisallowGfxOff`, and GFX stays on.
+- **Open finding:** one stage 7 boot attempt reset before macOS logged
+  anything.
+- **Observation:** test boots run hot at boot and login, because the desktop
+  is composited on the CPU.
+
+Each further write or SMU message needs a proposal in test-boot.md and the
+user's approval. The next candidates:
+
+- the SMU metrics table, which gives clocks and temperatures but needs
+  GPU-addressable memory for the SMU to write into;
+- the Renoir golden settings, starting with `GB_ADDR_CONFIG`.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
