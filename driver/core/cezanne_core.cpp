@@ -51,6 +51,10 @@ const char *statusName(Status status)
     case kScratchReadbackMismatch: return "scratch-readback-mismatch";
     case kScratchRestoreMismatch: return "scratch-restore-mismatch";
     case kScratchOutOfOrder: return "scratch-out-of-order";
+    case kSmuBusy: return "smu-busy";
+    case kSmuTimeout: return "smu-timeout";
+    case kSmuResponseNotOk: return "smu-response-not-ok";
+    case kSmuOutOfOrder: return "smu-out-of-order";
     }
     return "unknown";
 }
@@ -392,15 +396,19 @@ Status readGfxConfig(const RegisterReader &registers, uint64_t apertureLength, c
     return kOK;
 }
 
-bool writeAllowed(uint32_t offset, uint32_t stage)
+bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
 {
-    return stage >= kScratchStage && offset == kRegScratchReg0;
+    if (stage >= kScratchStage && offset == kRegScratchReg0) return true;
+    if (stage < kSmuStage) return false;
+    if (offset == kRegMp1C2PMsg90 || offset == kRegMp1C2PMsg82) return value == 0;
+    if (offset == kRegMp1C2PMsg66) return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion;
+    return false;
 }
 
 // The only write site in the core.
 static Status writeRegister(const RegisterWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
 {
-    if (!writeAllowed(offset, stage)) return kRegisterNotAllowed;
+    if (!writeAllowed(offset, value, stage)) return kRegisterNotAllowed;
     return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
 }
 
@@ -408,7 +416,7 @@ Status checkScratch(const RegisterReader &registers, uint64_t apertureLength, co
                     uint32_t stage, ScratchCheck *check)
 {
     *check = ScratchCheck();
-    if (!writeAllowed(kRegScratchReg0, stage)) return kRegisterNotAllowed;
+    if (!writeAllowed(kRegScratchReg0, kScratchPattern, stage)) return kRegisterNotAllowed;
     Status status = readRegister(registers, apertureLength, stage, kRegSmuioGfxMiscCntl, &check->gfxMisc);
     if (status != kOK) return status;
     if (((check->gfxMisc & kGfxOffStatusMask) >> kGfxOffStatusShift) != kGfxOffStatusOn) return kGfxNotOn;
@@ -460,6 +468,53 @@ Status restoreScratch(const RegisterReader &registers, uint64_t apertureLength, 
     status = readRegister(registers, apertureLength, stage, kRegScratchReg0, readback);
     if (status != kOK) return status;
     return *readback == original ? kOK : kScratchRestoreMismatch;
+}
+
+Status checkSmu(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, SmuMailbox *mailbox)
+{
+    *mailbox = SmuMailbox();
+    if (stage < kSmuStage) return kRegisterNotAllowed;
+    const struct {
+        uint32_t offset;
+        uint32_t *value;
+    } reads[] = {
+        {kRegMp1C2PMsg66, &mailbox->message},
+        {kRegMp1C2PMsg82, &mailbox->argument},
+        {kRegMp1C2PMsg90, &mailbox->response},
+    };
+    for (const auto &read : reads) {
+        Status status = readRegister(registers, apertureLength, stage, read.offset, read.value);
+        if (status != kOK) return status;
+    }
+    return mailbox->response == 0 ? kSmuBusy : kOK;
+}
+
+Status sendSmuQuery(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                    uint32_t stage, uint32_t message, uint32_t *response, uint32_t *answer)
+{
+    *response = 0;
+    *answer = 0;
+    if (stage < kSmuStage || (message != kSmuMsgGetSmuVersion && message != kSmuMsgGetDriverIfVersion))
+        return kRegisterNotAllowed;
+    SmuMailbox mailbox;
+    Status status = checkSmu(registers, apertureLength, stage, &mailbox);
+    if (status != kOK) return status;
+    // __smu_cmn_send_msg: response, argument, then message.
+    status = writeRegister(writer, stage, kRegMp1C2PMsg90, 0);
+    if (status == kOK) status = writeRegister(writer, stage, kRegMp1C2PMsg82, 0);
+    if (status == kOK) status = writeRegister(writer, stage, kRegMp1C2PMsg66, message);
+    if (status != kOK) return status;
+    // __smu_cmn_poll_stat.
+    for (uint32_t i = 0; i <= kSmuPollPauses; i++) {
+        status = readRegister(registers, apertureLength, stage, kRegMp1C2PMsg90, response);
+        if (status != kOK) return status;
+        if (*response != 0) break;
+        if (i == kSmuPollPauses) return kSmuTimeout;
+        writer.pause(writer.context);
+    }
+    if (*response != kSmuResponseOk) return kSmuResponseNotOk;
+    // smu_cmn_read_arg.
+    return readRegister(registers, apertureLength, stage, kRegMp1C2PMsg82, answer);
 }
 
 } // namespace cezanne

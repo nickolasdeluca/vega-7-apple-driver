@@ -64,6 +64,11 @@ struct FakeRegisters {
     uint32_t cpMe = 0x15000000u, cpMec = 0x50000000u, rlc = 0, grbm = 0x00003028u; // boot 7 values
     uint32_t scratch = 0;
     bool scratchWritable = true;
+    // A fake SMU mailbox (boot 7 idle state) and its behaviour.
+    uint32_t smuMsg = 0, smuArg = 0, smuResp = 1;
+    uint32_t smuReply = 1;       // response it gives
+    int smuDelay = 0;            // pauses before it answers; -1 never
+    int smuPending = -1;         // pauses left for the current message
     bool fail = false;
     uint32_t order[32];
     int reads = 0;
@@ -82,6 +87,9 @@ struct FakeRegisters {
                  : offset == kRegCpMecCntl     ? self->cpMec
                  : offset == kRegRlcCntl       ? self->rlc
                  : offset == kRegScratchReg0   ? self->scratch
+                 : offset == kRegMp1C2PMsg66   ? self->smuMsg
+                 : offset == kRegMp1C2PMsg82   ? self->smuArg
+                 : offset == kRegMp1C2PMsg90   ? self->smuResp
                  : offset == kRegGrbmGfxIndex  ? self->gfxIndex
                  : offset == kRegCcShaderArrayConfig   ? self->ccShader
                  : offset == kRegUserShaderArrayConfig ? self->userShader
@@ -240,7 +248,7 @@ static void testAllowlist()
     CHECK(!registerAllowed(0, 2) && !registerAllowed(4, 2) && !registerAllowed(kRegConfigMemsize + 4, 2));
     CHECK(kRegC2PMsg33 == 0x58184 && kRegConfigMemsize == 0x378c && kRegMcVmFbOffset == 0xa5ac);
     CHECK(std::strcmp(statusName(kNotInD0), "not-in-d0") == 0);
-    for (uint32_t s = kOK; s <= kScratchOutOfOrder; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
+    for (uint32_t s = kOK; s <= kSmuOutOfOrder; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
     CHECK(std::strcmp(statusName(static_cast<Status>(999)), "unknown") == 0);
 }
 
@@ -594,26 +602,42 @@ struct FakeWriter {
     FakeRegisters *registers;
     bool fail = false;
     uint32_t pauseWrites = 0; // non-zero: value something else writes during the pause
-    uint32_t offsets[8], values[8];
+    uint32_t offsets[16], values[16];
     int writes = 0;
 
     explicit FakeWriter(FakeRegisters *r) : registers(r) {}
     static bool write32(void *context, uint32_t offset, uint32_t value)
     {
         FakeWriter *self = static_cast<FakeWriter *>(context);
-        if (self->writes < 8) {
+        if (self->writes < 16) {
             self->offsets[self->writes] = offset;
             self->values[self->writes] = value;
         }
         self->writes++;
         if (self->fail) return false;
-        if (offset == kRegScratchReg0 && self->registers->scratchWritable) self->registers->scratch = value;
+        FakeRegisters *r = self->registers;
+        if (offset == kRegScratchReg0 && r->scratchWritable) r->scratch = value;
+        if (offset == kRegMp1C2PMsg90) r->smuResp = value;
+        if (offset == kRegMp1C2PMsg82) r->smuArg = value;
+        if (offset == kRegMp1C2PMsg66) {
+            r->smuMsg = value;
+            r->smuPending = r->smuDelay;
+            if (r->smuPending == 0) answer(r);
+        }
         return true;
+    }
+    static void answer(FakeRegisters *r)
+    {
+        r->smuResp = r->smuReply;
+        if (r->smuReply == kSmuResponseOk) r->smuArg = r->smuMsg == kSmuMsgGetDriverIfVersion ? 14 : 0x00403500u;
+        r->smuPending = -1;
     }
     static void pause(void *context)
     {
         FakeWriter *self = static_cast<FakeWriter *>(context);
         if (self->pauseWrites != 0) self->registers->scratch = self->pauseWrites;
+        FakeRegisters *r = self->registers;
+        if (r->smuPending > 0 && --r->smuPending == 0) answer(r);
     }
     RegisterWriter writer() { return RegisterWriter{write32, pause, this}; }
 };
@@ -632,11 +656,11 @@ static void testScratch()
     CHECK(checkWith(&FakeRegisters::cpMe, 0x14000000u) == kCpNotHalted);
     CHECK(checkWith(&FakeRegisters::rlc, 0x1) == kRlcEnabled);
     CHECK(kRegScratchReg0 == 0x30100 && kScratchPageOffset == 0x30000 && kScratchPattern == 0xCAFEDEADu);
-    CHECK(writeAllowed(kRegScratchReg0, 6) && !writeAllowed(kRegScratchReg0, 5));
+    CHECK(writeAllowed(kRegScratchReg0, kScratchPattern, 6) && !writeAllowed(kRegScratchReg0, kScratchPattern, 5));
     for (uint32_t i = 0; i < kStage6RegisterCount; i++) {
-        if (kStage6Registers[i] != kRegScratchReg0) CHECK(!writeAllowed(kStage6Registers[i], 6));
+        if (kStage6Registers[i] != kRegScratchReg0) CHECK(!writeAllowed(kStage6Registers[i], 0, 6));
     }
-    CHECK(!writeAllowed(kRegScratchReg0 + 4, 6) && !writeAllowed(kRegGrbmGfxIndex, 6));
+    CHECK(!writeAllowed(kRegScratchReg0 + 4, 0, 6) && !writeAllowed(kRegGrbmGfxIndex, 0, 6));
     for (uint32_t i = 0; i < kStage5RegisterCount; i++) CHECK(kStage6Registers[i] == kStage5Registers[i]);
     CHECK(registerAllowed(kRegScratchReg0, 6) && !registerAllowed(kRegScratchReg0, 5));
 
@@ -719,6 +743,87 @@ static void testScratch()
     }
 }
 
+static void testSmu()
+{
+    CHECK(kRegMp1C2PMsg66 == 0x58a08 && kSmuPageOffset == 0x58000);
+    CHECK((kRegMp1C2PMsg82 & ~0xFFFu) == kSmuPageOffset && (kRegMp1C2PMsg90 & ~0xFFFu) == kSmuPageOffset);
+    // The value-level allowlist, at stage 7 and not before.
+    CHECK(writeAllowed(kRegMp1C2PMsg90, 0, 7) && writeAllowed(kRegMp1C2PMsg82, 0, 7));
+    CHECK(writeAllowed(kRegMp1C2PMsg66, 2, 7) && writeAllowed(kRegMp1C2PMsg66, 3, 7));
+    CHECK(!writeAllowed(kRegMp1C2PMsg66, 2, 6) && !writeAllowed(kRegMp1C2PMsg90, 0, 6));
+    CHECK(!writeAllowed(kRegMp1C2PMsg90, 1, 7) && !writeAllowed(kRegMp1C2PMsg82, 1, 7));
+    for (uint32_t message = 0; message < 0x40; message++) {
+        if (message != 2 && message != 3) CHECK(!writeAllowed(kRegMp1C2PMsg66, message, 7));
+    }
+    CHECK(!writeAllowed(kRegMp0C2PMsg81, 0, 7) && !writeAllowed(kRegC2PMsg33, 0, 7) && !writeAllowed(kRegMp0C2PMsg35, 0, 7));
+    for (uint32_t offset = kSmuPageOffset; offset < kSmuPageOffset + kPageSize; offset += 4) {
+        if (offset != kRegMp1C2PMsg66 && offset != kRegMp1C2PMsg82 && offset != kRegMp1C2PMsg90)
+            CHECK(!writeAllowed(offset, 0, 7));
+    }
+
+    uint32_t response = 0, answer = 0;
+    {
+        FakeRegisters r;
+        FakeWriter w(&r);
+        SmuMailbox m;
+        CHECK(checkSmu(r.reader(), 0x80000, 7, &m) == kOK && m.response == 1 && w.writes == 0);
+        CHECK(sendSmuQuery(r.reader(), 0x80000, w.writer(), 7, kSmuMsgGetDriverIfVersion, &response, &answer) == kOK);
+        CHECK(response == kSmuResponseOk && answer == 14);
+        // __smu_cmn_send_msg order: response, argument, message.
+        CHECK(w.writes == 3 && w.offsets[0] == kRegMp1C2PMsg90 && w.values[0] == 0 && w.offsets[1] == kRegMp1C2PMsg82 &&
+              w.values[1] == 0 && w.offsets[2] == kRegMp1C2PMsg66 && w.values[2] == kSmuMsgGetDriverIfVersion);
+        CHECK(sendSmuQuery(r.reader(), 0x80000, w.writer(), 7, kSmuMsgGetSmuVersion, &response, &answer) == kOK);
+        CHECK(answer == 0x00403500u && w.writes == 6 && r.smuMsg == kSmuMsgGetSmuVersion);
+    }
+    {
+        FakeRegisters r;
+        r.smuDelay = 5; // answers after a few pauses
+        FakeWriter w(&r);
+        CHECK(sendSmuQuery(r.reader(), 0x80000, w.writer(), 7, kSmuMsgGetSmuVersion, &response, &answer) == kOK);
+        CHECK(answer == 0x00403500u);
+    }
+    {
+        FakeRegisters r;
+        r.smuResp = 0; // a message is in flight
+        FakeWriter w(&r);
+        SmuMailbox m;
+        CHECK(checkSmu(r.reader(), 0x80000, 7, &m) == kSmuBusy);
+        CHECK(sendSmuQuery(r.reader(), 0x80000, w.writer(), 7, kSmuMsgGetSmuVersion, &response, &answer) == kSmuBusy);
+        CHECK(w.writes == 0);
+    }
+    {
+        FakeRegisters r;
+        r.smuDelay = -1; // never answers
+        FakeWriter w(&r);
+        CHECK(sendSmuQuery(r.reader(), 0x80000, w.writer(), 7, kSmuMsgGetSmuVersion, &response, &answer) == kSmuTimeout);
+        CHECK(response == 0 && answer == 0 && w.writes == 3);
+    }
+    const uint32_t errors[] = {0xFF, 0xFE, 0xFD, 0xFC, 0xFB};
+    for (uint32_t error : errors) {
+        FakeRegisters r;
+        r.smuReply = error;
+        r.smuArg = 0x77;
+        FakeWriter w(&r);
+        CHECK(sendSmuQuery(r.reader(), 0x80000, w.writer(), 7, kSmuMsgGetSmuVersion, &response, &answer) ==
+              kSmuResponseNotOk);
+        CHECK(response == error && answer == 0); // no answer read after a failure
+    }
+    {
+        FakeRegisters r;
+        FakeWriter w(&r);
+        CHECK(sendSmuQuery(r.reader(), 0x80000, w.writer(), 6, kSmuMsgGetSmuVersion, &response, &answer) ==
+              kRegisterNotAllowed);
+        CHECK(sendSmuQuery(r.reader(), 0x80000, w.writer(), 7, 0x4, &response, &answer) == kRegisterNotAllowed);
+        SmuMailbox m;
+        CHECK(checkSmu(r.reader(), 0x80000, 6, &m) == kRegisterNotAllowed);
+        CHECK(w.writes == 0);
+        w.fail = true;
+        CHECK(sendSmuQuery(r.reader(), 0x80000, w.writer(), 7, kSmuMsgGetSmuVersion, &response, &answer) ==
+              kRegisterWriteFailed);
+        CHECK(w.writes == 1); // stops at the first failed write
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -733,6 +838,7 @@ int main()
     testGfxConfig();
     testStage5();
     testScratch();
+    testSmu();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

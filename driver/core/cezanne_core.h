@@ -3,9 +3,10 @@
 //
 // Freestanding C++ shared by the kext and the host unit tests: it uses no
 // IOKit, libc or allocation. The adapter supplies read callbacks and, for the
-// stage 6 scratch test only, one write callback. The write allowlist holds
-// exactly one register, SCRATCH_REG0; widening it is a reviewed stage change
-// (docs/test-boot.md).
+// stage 6 scratch test and stage 7 SMU queries, one write callback. The write
+// allowlist names exact registers and values: SCRATCH_REG0 (stage 6) and the
+// three SMU mailbox writes of a version query (stage 7). Widening it is a
+// reviewed stage change (docs/test-boot.md).
 //
 // Register offsets are byte offsets into the MMIO register BAR (BAR5). Linux
 // v6.12 selects BAR5 for CHIP_BONAIRE and later in amdgpu_device_init and,
@@ -26,7 +27,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 6;
+const uint32_t kMaxStage = 7;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -141,7 +142,7 @@ const uint32_t kRegScratchReg0 = (0xA000 + 0x2040) * 4;
 const uint32_t kScratchPattern = 0xCAFEDEAD;
 // The adapter maps only this 4 KiB page of BAR5 writable.
 const uint32_t kScratchPageOffset = kRegScratchReg0 & ~0xFFFu;
-const uint32_t kScratchPageSize = 0x1000;
+const uint32_t kScratchPageSize = 0x1000; // == kPageSize
 const uint32_t kStage6Registers[] = {kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset, kRegGrbmStatus,
                                      kRegGrbmGfxIndex, kRegCcShaderArrayConfig, kRegUserShaderArrayConfig,
                                      kRegCcRbBackendDisable, kRegUserRbBackendDisable, kRegGbAddrConfig,
@@ -163,6 +164,20 @@ const uint32_t kStage6RegisterCount = sizeof(kStage6Registers) / sizeof(kStage6R
 const uint32_t kCpMeHalts = 0x15000000u;  // ME_HALT | PFP_HALT | CE_HALT
 const uint32_t kCpMecHalts = 0x50000000u; // MEC_ME1_HALT | MEC_ME2_HALT
 const uint32_t kGrbmGuiActive = 0x80000000u;
+
+// Stage 7: the first SMU messages, the two queries Linux v6.12 sends first on
+// Renoir (smu_v12_0_check_fw_version -> smu_cmn_get_smc_version), through
+// the MP1 mailbox stage 5 reads (renoir_ppt: msg C2PMSG_66, argument
+// C2PMSG_82, response C2PMSG_90). Indices: smu_v12_0_ppsmc.h.
+const uint32_t kSmuMsgGetSmuVersion = 0x2;
+const uint32_t kSmuMsgGetDriverIfVersion = 0x3;
+const uint32_t kSmuResponseOk = 0x1; // PPSMC_Result_OK
+// smu_cmn's poll limit is usec_timeout * 20 = 2 s; polled in 1 ms pauses.
+const uint32_t kSmuPollPauses = 2000;
+// The adapter maps only this 4 KiB page of BAR5 writable for a query.
+const uint32_t kSmuPageOffset = kRegMp1C2PMsg66 & ~0xFFFu;
+const uint32_t kPageSize = 0x1000;
+const uint32_t kSmuStage = 7;
 
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
@@ -219,6 +234,11 @@ enum Status : uint32_t {
     kScratchReadbackMismatch,
     kScratchRestoreMismatch,
     kScratchOutOfOrder,
+    // Stage 7.
+    kSmuBusy,
+    kSmuTimeout,
+    kSmuResponseNotOk,
+    kSmuOutOfOrder,
 };
 
 const char *statusName(Status status);
@@ -277,8 +297,10 @@ struct RegisterWriter {
     void *context;
 };
 
-// The write allowlist: SCRATCH_REG0 from stage 6 on, nothing else.
-bool writeAllowed(uint32_t offset, uint32_t stage);
+// The write allowlist, by register and value: SCRATCH_REG0 (any value; the
+// scratch test writes only the pattern and the value it read) from stage 6;
+// from stage 7, C2PMSG_90 <- 0, C2PMSG_82 <- 0 and C2PMSG_66 <- 0x2 or 0x3.
+bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage);
 
 struct ScratchCheck {
     uint32_t gfxMisc, cpMeCntl, cpMecCntl, rlcCntl, grbmStatus;
@@ -299,6 +321,22 @@ Status writeScratchPattern(const RegisterReader &registers, uint64_t apertureLen
 Status restoreScratch(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                       uint32_t stage, uint32_t original, uint32_t *readback);
 
+struct SmuMailbox {
+    uint32_t message, argument, response; // C2PMSG_66, _82, _90
+};
+
+// Reads the mailbox; kSmuBusy if the response register is 0 (a message is in
+// flight). No write.
+Status checkSmu(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, SmuMailbox *mailbox);
+
+// Sends one version query (kSmuMsgGetSmuVersion or kSmuMsgGetDriverIfVersion,
+// argument 0) as smu_cmn does: requires an idle mailbox, writes response <- 0,
+// argument <- 0, message <- index, polls the response (kSmuTimeout after
+// kSmuPollPauses), and reads the answer only after an OK response
+// (kSmuResponseNotOk otherwise).
+Status sendSmuQuery(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                    uint32_t stage, uint32_t message, uint32_t *response, uint32_t *answer);
+
 // The diagnostic interface's read (stage 4 and later): readAllowedRegister,
 // but a GFX-gated register is read only after SMUIO_GFX_MISC_CNTL reports GFX
 // on (kGfxNotOn otherwise), as Linux requires before its GC IP dump.
@@ -306,7 +344,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 2;
+const uint32_t kDiagnosticVersion = 3;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -314,7 +352,10 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticScratchCheck = 2,   // out: Status, GFX misc, CP_ME, CP_MEC, RLC, GRBM, original
     kDiagnosticScratchWrite = 3,   // out: Status, read-back
     kDiagnosticScratchRestore = 4, // out: Status, read-back
-    kDiagnosticSelectorCount = 5,
+    // Stage 7 SMU queries; a query is accepted only after a passing check.
+    kDiagnosticSmuCheck = 5,       // out: Status, message, argument, response
+    kDiagnosticSmuQuery = 6,       // in: message (0x2 or 0x3); out: Status, response, answer
+    kDiagnosticSelectorCount = 7,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface

@@ -51,7 +51,15 @@ class CoreTests(unittest.TestCase):
             "kDiscoveryBaseMismatch": ("return kDiscoveryBaseMismatch;", "(void)0;"),
             "kGfxIndexNotSe0Sh0": ("return kGfxIndexNotSe0Sh0;", "(void)0;"),
             "kGfxNotOn": ("!= kGfxOffStatusOn) return kGfxNotOn;", "!= kGfxOffStatusOn) (void)0;"),
-            "writeAllowed(kRegScratchReg0 + 4, 6)": ("&& offset == kRegScratchReg0;", "&& offset >= kRegScratchReg0;"),
+            "writeAllowed(kRegScratchReg0 + 4, 0, 6)": ("&& offset == kRegScratchReg0) return true;",
+                                                        "&& offset >= kRegScratchReg0) return true;"),
+            "writeAllowed(kRegMp1C2PMsg66, message, 7)": ("return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion;",
+                                                          "return value < 0x40;"),
+            "writeAllowed(kRegMp1C2PMsg90, 1, 7)": ("return value == 0;", "return true;"),
+            "writeAllowed(offset, 0, 7)": ("    return false;\n}\n\n// The only write site", "    return offset >= kSmuPageOffset;\n}\n\n// The only write site"),
+            "kSmuBusy": ("return mailbox->response == 0 ? kSmuBusy : kOK;", "return kOK;"),
+            "kSmuTimeout": ("if (i == kSmuPollPauses) return kSmuTimeout;", "if (i == kSmuPollPauses) break;"),
+            "kSmuResponseNotOk": ("if (*response != kSmuResponseOk) return kSmuResponseNotOk;", ""),
             "kCpNotHalted": ("return kCpNotHalted;", "(void)0;"),
             "kRlcEnabled": ("if (check->rlcCntl != 0) return kRlcEnabled;", ""),
             "kScratchUnstable": ("return check->original2 == check->original ? kOK : kScratchUnstable;",
@@ -77,11 +85,15 @@ class CoreTests(unittest.TestCase):
         # The only call of the write callback, inside writeRegister, after the allowlist.
         self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 1)
         body = re.search(r"static Status writeRegister\(.*?\n}\n", source, re.S).group(0)
-        self.assertIn("if (!writeAllowed(offset, stage)) return kRegisterNotAllowed;", body)
+        self.assertIn("if (!writeAllowed(offset, value, stage)) return kRegisterNotAllowed;", body)
         self.assertLess(body.index("writeAllowed"), body.index("write32"))
-        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 2)  # pattern and restore
+        # Scratch pattern and restore; SMU response, argument and message.
+        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 5)
         allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
-        self.assertIn("return stage >= kScratchStage && offset == kRegScratchReg0;", allow)
+        self.assertEqual(allow.count("return"), 5)
+        self.assertIn("if (stage >= kScratchStage && offset == kRegScratchReg0) return true;", allow)
+        self.assertIn("if (offset == kRegMp1C2PMsg90 || offset == kRegMp1C2PMsg82) return value == 0;", allow)
+        self.assertIn("return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion;", allow)
 
 
 if __name__ == "__main__":
