@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import plistlib
+import re
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -65,8 +66,8 @@ class TestEfiTests(unittest.TestCase):
         (self.known / "OC" / "._Lilu.kext").write_bytes(b"appledouble")
         self.write_config(config())
         (self.known / "OC" / "Config.plist.bak-old").write_bytes(b"backup")
-        kext(self.root / "probe", "CezanneProbe.kext", "org.cezanne-driver.probe")
-        self.probe = self.root / "probe" / "CezanneProbe.kext"
+        kext(self.root / "driver", "CezanneGPU.kext", "org.cezanne-driver.gpu")
+        self.driver = self.root / "driver" / "CezanneGPU.kext"
         self.output = self.root / "usb"
 
     def tearDown(self):
@@ -81,9 +82,9 @@ class TestEfiTests(unittest.TestCase):
             code = self.tool.main(list(argv))
         return code, out.getvalue()
 
-    def build(self):
-        return self.run_tool("build", "--known-good", str(self.known), "--kext", str(self.probe),
-                             "--output", str(self.output))
+    def build(self, stage="1"):
+        return self.run_tool("build", "--known-good", str(self.known), "--kext", str(self.driver),
+                             "--stage", stage, "--output", str(self.output))
 
     def test_build_changes_only_the_intended_values_and_files(self):
         code, out = self.build()
@@ -91,8 +92,9 @@ class TestEfiTests(unittest.TestCase):
         with (self.output / "EFI" / "OC" / "Config.plist").open("rb") as handle:
             test = plistlib.load(handle)
         names = [e["BundlePath"] for e in test["Kernel"]["Add"]]
-        self.assertEqual(names, ["Lilu.kext", "Other.kext", "CezanneProbe.kext"])
-        self.assertEqual(test["NVRAM"]["Add"][GUID]["boot-args"], self.tool.TEST_BOOT_ARGS)
+        self.assertEqual(names, ["Lilu.kext", "Other.kext", "CezanneGPU.kext"])
+        self.assertEqual(test["NVRAM"]["Add"][GUID]["boot-args"],
+                         "-v keepsyms=1 debug=0x100 msgbuf=1048576 cezanne-stage=1")
         self.assertFalse(test["Misc"]["Security"]["AllowSetDefault"])
         self.assertEqual(test["PlatformInfo"], config()["PlatformInfo"])
         self.assertFalse((self.output / "EFI" / "OC" / "Kexts" / "NootedRed.kext").exists())
@@ -102,6 +104,22 @@ class TestEfiTests(unittest.TestCase):
         self.assertEqual(manifest["skipped_config_backups"], ["OC/Config.plist.bak-old"])
         self.assertEqual(manifest["removed_kexts"]["NootedRed.kext"]["bundle_id"], "org.ChefKiss.NootedRed")
         self.assertIsNone(manifest["ocvalidate"])
+        self.assertEqual(manifest["stage"], 1)
+
+    def test_stage_selects_boot_argument_and_unauthorized_stages_are_rejected(self):
+        self.assertEqual(self.build("0")[0], 0)
+        with (self.output / "EFI" / "OC" / "Config.plist").open("rb") as handle:
+            self.assertTrue(plistlib.load(handle)["NVRAM"]["Add"][GUID]["boot-args"].endswith(" cezanne-stage=0"))
+        self.output = self.root / "usb2"
+        code, out = self.build("2")
+        self.assertEqual(code, 2)
+        self.assertIn("stage 2 is not authorized", json.loads(out)["rejected"])
+        self.assertFalse(self.output.exists())
+
+    def test_authorized_stages_do_not_exceed_the_driver(self):
+        header = (MODULE_PATH.parents[1] / "driver" / "core" / "cezanne_core.h").read_text()
+        max_stage = int(re.search(r"const uint32_t kMaxStage = (\d+);", header).group(1))
+        self.assertEqual(max(self.tool.AUTHORIZED_STAGES), max_stage)
 
     def test_build_refuses_existing_output(self):
         self.output.mkdir()
@@ -153,7 +171,7 @@ class TestEfiTests(unittest.TestCase):
 
     def test_check_configs_rejects_any_other_change(self):
         known = config()
-        test, _ = self.tool.derive(known, self.known / "OC" / "Kexts")
+        test, _ = self.tool.derive(known, self.known / "OC" / "Kexts", 1)
         self.tool.check_configs(known, test)
         test["PlatformInfo"]["Generic"]["SystemSerialNumber"] = "OTHER"
         with self.assertRaisesRegex(self.tool.Rejected, "PlatformInfo.Generic.SystemSerialNumber"):

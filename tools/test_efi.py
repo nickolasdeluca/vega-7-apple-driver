@@ -5,7 +5,7 @@ Python 3.9+, standard library only. Reads the known-good tree and writes a new
 output directory; it never mounts, writes or erases disks, NVRAM or EFI
 partitions. See docs/test-boot.md for the procedure and the boot rules.
 
-build:  test_efi.py build --known-good EFI --kext CezanneProbe.kext --output DIR
+build:  test_efi.py build --known-good EFI --kext CezanneGPU.kext --stage N --output DIR
         [--ocvalidate PATH]. Writes DIR/EFI and DIR/manifest.json. The tree is
         assembled in DIR.partial and renamed only after every check passes.
 verify: test_efi.py verify --manifest DIR/manifest.json --side test|known_good EFI
@@ -26,19 +26,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 APPLE_BOOT_GUID = "7C436110-AB2A-4BBB-A880-FE41995C9F82"
-TEST_BOOT_ARGS = "-v keepsyms=1 debug=0x100 msgbuf=1048576 -cezanne-probe"
-# Kexts that claim or read the Cezanne GPU; none may run beside the probe.
+# Verbose boot, symbolized panics, halt on panic, a larger kernel log, and the
+# driver's stage selector. Without cezanne-stage the driver declines to attach.
+BASE_BOOT_ARGS = "-v keepsyms=1 debug=0x100 msgbuf=1048576"
+# Stages docs/test-boot.md authorizes; must not exceed the driver's kMaxStage.
+AUTHORIZED_STAGES = (0, 1)
+# Kexts that claim or read the Cezanne GPU; none may run beside the driver.
 REMOVED_KEXTS = {
     "NootedRed.kext": "drives the Cezanne iGPU through Apple's AMD kexts",
     "SMCRadeonSensors.kext": "reads AMD GPU sensor registers itself",
 }
-PROBE_BUNDLE = "CezanneProbe.kext"
-PROBE_ENTRY = {
+DRIVER_BUNDLE = "CezanneGPU.kext"
+DRIVER_ENTRY = {
     "Arch": "x86_64",
-    "BundlePath": PROBE_BUNDLE,
-    "Comment": "Cezanne passive probe (test EFI only)",
+    "BundlePath": DRIVER_BUNDLE,
+    "Comment": "Cezanne driver (test EFI only)",
     "Enabled": True,
-    "ExecutablePath": "Contents/MacOS/CezanneProbe",
+    "ExecutablePath": "Contents/MacOS/CezanneGPU",
     "MaxKernel": "",
     "MinKernel": "25.0.0",
     "PlistPath": "Contents/Info.plist",
@@ -101,9 +105,17 @@ def dependents(kexts_dir, removed_ids, kept):
     return found
 
 
-def derive(config, kexts_dir):
+def boot_args(stage):
+    if stage not in AUTHORIZED_STAGES:
+        raise Rejected("stage %r is not authorized; docs/test-boot.md authorizes %s"
+                       % (stage, list(AUTHORIZED_STAGES)))
+    return "%s cezanne-stage=%d" % (BASE_BOOT_ARGS, stage)
+
+
+def derive(config, kexts_dir, stage):
     """Return (test config, {removed bundle: bundle id}). Reads only kext Info.plists."""
     test = copy.deepcopy(config)
+    args = boot_args(stage)
     if config["Misc"]["Boot"].get("LauncherOption") != "Disabled":
         raise Rejected("Misc.Boot.LauncherOption must be Disabled: the test EFI must not "
                        "register itself as a firmware boot option")
@@ -112,15 +124,15 @@ def derive(config, kexts_dir):
     missing = sorted(set(REMOVED_KEXTS) - set(names))
     if missing:
         raise Rejected("known-good config lacks %s; review REMOVED_KEXTS before building" % missing)
-    if PROBE_BUNDLE in names:
-        raise Rejected("known-good config already lists %s" % PROBE_BUNDLE)
+    if DRIVER_BUNDLE in names:
+        raise Rejected("known-good config already lists %s" % DRIVER_BUNDLE)
     removed_ids = {name: bundle_id(kexts_dir / name)[0] for name in REMOVED_KEXTS}
     kept = [e for e in entries if e["BundlePath"] not in REMOVED_KEXTS]
     blocked = dependents(kexts_dir, set(removed_ids.values()), [e for e in kept if e.get("Enabled")])
     if blocked:
         raise Rejected("kept kexts depend on removed ones: %s" % blocked)
-    test["Kernel"]["Add"] = kept + [dict(PROBE_ENTRY)]
-    test["NVRAM"]["Add"].setdefault(APPLE_BOOT_GUID, {})["boot-args"] = TEST_BOOT_ARGS
+    test["Kernel"]["Add"] = kept + [dict(DRIVER_ENTRY)]
+    test["NVRAM"]["Add"].setdefault(APPLE_BOOT_GUID, {})["boot-args"] = args
     test["Misc"]["Security"]["AllowSetDefault"] = False
     return test, removed_ids
 
@@ -143,8 +155,8 @@ def check_configs(known, test):
         raise Rejected("unexpected config differences: extra %s, missing %s"
                        % (sorted(changed - EXPECTED_CHANGES), sorted(EXPECTED_CHANGES - changed)))
     expected_kexts = [e for e in known["Kernel"]["Add"] if e["BundlePath"] not in REMOVED_KEXTS]
-    if test["Kernel"]["Add"] != expected_kexts + [PROBE_ENTRY]:
-        raise Rejected("Kernel.Add must be the known-good list minus %s plus the probe, in order"
+    if test["Kernel"]["Add"] != expected_kexts + [DRIVER_ENTRY]:
+        raise Rejected("Kernel.Add must be the known-good list minus %s plus the driver, in order"
                        % sorted(REMOVED_KEXTS))
     # Each boot must overwrite every NVRAM value the other one sets differently.
     for guid, values in test["NVRAM"]["Add"].items():
@@ -160,10 +172,10 @@ def check_configs(known, test):
 
 
 def check_tree(known_hashes, test_hashes, config_rel, skipped):
-    """Raise Rejected unless files differ only by config, removed kexts and the probe."""
+    """Raise Rejected unless files differ only by config, removed kexts and the driver."""
     removed = {p for p in known_hashes for k in REMOVED_KEXTS if p.startswith("OC/Kexts/%s/" % k)}
-    probe = {p for p in test_hashes if p.startswith("OC/Kexts/%s/" % PROBE_BUNDLE)}
-    want = (set(known_hashes) - removed - set(skipped)) | probe
+    driver = {p for p in test_hashes if p.startswith("OC/Kexts/%s/" % DRIVER_BUNDLE)}
+    want = (set(known_hashes) - removed - set(skipped)) | driver
     if set(test_hashes) != want:
         raise Rejected("test tree files: extra %s, missing %s" % (sorted(set(test_hashes) - want),
                                                                  sorted(want - set(test_hashes))))
@@ -171,8 +183,8 @@ def check_tree(known_hashes, test_hashes, config_rel, skipped):
                      if p != config_rel and known_hashes[p] != test_hashes[p])
     if changed:
         raise Rejected("copied files differ from known-good: %s" % changed)
-    if not probe:
-        raise Rejected("probe kext missing from test tree")
+    if not driver:
+        raise Rejected("driver kext missing from test tree")
 
 
 def check_bundles(efi, config):
@@ -195,7 +207,7 @@ def run_ocvalidate(tool, config):
     return result
 
 
-def build(known_efi, kext, output, ocvalidate=None):
+def build(known_efi, kext, output, stage, ocvalidate=None):
     known_efi, kext, output = Path(known_efi), Path(kext), Path(output)
     partial = output.with_name(output.name + ".partial")
     for path in (output, partial):
@@ -206,7 +218,7 @@ def build(known_efi, kext, output, ocvalidate=None):
     config_path = find_config(known_efi)
     with config_path.open("rb") as handle:
         known = plistlib.load(handle)
-    test, removed_ids = derive(known, known_efi / "OC" / "Kexts")
+    test, removed_ids = derive(known, known_efi / "OC" / "Kexts", stage)
     config_rel = config_path.relative_to(known_efi).as_posix()
     skipped = sorted(p.relative_to(known_efi).as_posix() for p in config_path.parent.iterdir()
                      if p.is_file() and is_config_backup(p, config_path))
@@ -220,7 +232,7 @@ def build(known_efi, kext, output, ocvalidate=None):
     efi = partial / "EFI"
     try:
         shutil.copytree(known_efi, efi, ignore=skip)
-        shutil.copytree(kext, efi / "OC" / "Kexts" / PROBE_BUNDLE, ignore=lambda d, n: [x for x in n if ignored(x)])
+        shutil.copytree(kext, efi / "OC" / "Kexts" / DRIVER_BUNDLE, ignore=lambda d, n: [x for x in n if ignored(x)])
         with (efi / config_rel).open("wb") as handle:
             plistlib.dump(test, handle, sort_keys=False)
         with (efi / config_rel).open("rb") as handle:
@@ -238,8 +250,8 @@ def build(known_efi, kext, output, ocvalidate=None):
         raise Rejected("%s (tree kept at %s)" % (error, kept)) from None
     manifest = {
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "known_good": str(known_efi.resolve()), "probe_kext": str(kext.resolve()),
-        "config": config_rel, "boot_args": TEST_BOOT_ARGS,
+        "known_good": str(known_efi.resolve()), "driver_kext": str(kext.resolve()),
+        "stage": stage, "config": config_rel, "boot_args": boot_args(stage),
         "removed_kexts": {name: {"bundle_id": removed_ids[name], "reason": REMOVED_KEXTS[name]}
                           for name in REMOVED_KEXTS},
         "skipped_config_backups": skipped, "config_changes": sorted(EXPECTED_CHANGES),
@@ -270,7 +282,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     make = commands.add_parser("build")
     make.add_argument("--known-good", required=True, help="copy of the known-good EFI folder")
-    make.add_argument("--kext", required=True, help="built CezanneProbe.kext")
+    make.add_argument("--kext", required=True, help="built CezanneGPU.kext")
+    make.add_argument("--stage", required=True, type=int, help="driver stage the boot arguments select")
     make.add_argument("--output", required=True, help="new directory for the test EFI")
     make.add_argument("--ocvalidate", help="ocvalidate matching the OpenCore version")
     check = commands.add_parser("verify")
@@ -280,8 +293,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "build":
-            manifest = build(args.known_good, args.kext, args.output, args.ocvalidate)
-            print(json.dumps({"output": args.output, "config_changes": manifest["config_changes"],
+            manifest = build(args.known_good, args.kext, args.output, args.stage, args.ocvalidate)
+            print(json.dumps({"output": args.output, "stage": manifest["stage"], "config_changes": manifest["config_changes"],
                               "removed_kexts": sorted(manifest["removed_kexts"]),
                               "ocvalidate_exit": (manifest["ocvalidate"] or {}).get("exit_code"),
                               "test_files": len(manifest["test_sha256"])}, indent=1))
