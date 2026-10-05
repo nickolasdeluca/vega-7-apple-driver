@@ -32,7 +32,9 @@
 //            Linux does first, writing only the allowlisted mailbox values.
 //            Only the 4 KiB BAR5 page holding the mailbox is mapped writable,
 //            and only during a query.
-//            Apart from the stage 6 and 7 tests, nothing is written to
+//   Stage 8: on request, after the same mailbox check, send DisallowGfxOff
+//            and wait for SMUIO to report GFX on, as Linux does.
+//            Apart from the stage 6 to 8 tests, nothing is written to
 //            configuration space, registers or memory, and every mapping and
 //            the provider are released before start() returns.
 //
@@ -93,6 +95,7 @@ public:
     void scratchAbandon(const void *owner);
     cezanne::Status smuCheck(const void *owner, cezanne::SmuMailbox *mailbox);
     cezanne::Status smuQuery(const void *owner, uint32_t message, uint32_t *response, uint32_t *answer);
+    cezanne::Status gfxOffDisallow(const void *owner, uint32_t *response, uint32_t *gfxMisc);
 
 private:
     enum ScratchState { kScratchIdle, kScratchChecked, kScratchWritten };
@@ -642,6 +645,13 @@ static cezanne::Status smuQueryOperation(UInt32 stage, const cezanne::RegisterRe
     return cezanne::sendSmuQuery(registers, length, *writer, stage, smu->message, smu->response, smu->answer);
 }
 
+static cezanne::Status gfxOffOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                       const cezanne::RegisterWriter *writer, void *argument)
+{
+    SmuArgument *smu = static_cast<SmuArgument *>(argument);
+    return cezanne::disallowGfxOff(registers, length, *writer, stage, smu->response, smu->answer);
+}
+
 cezanne::Status CezanneGPU::smuCheck(const void *owner, cezanne::SmuMailbox *mailbox)
 {
     *mailbox = cezanne::SmuMailbox();
@@ -671,6 +681,27 @@ cezanne::Status CezanneGPU::smuQuery(const void *owner, uint32_t message, uint32
         smuChecked_ = status == cezanne::kOK;
         IOLog(LOG_PREFIX "SMU query 0x%x: %s, response 0x%x, answer 0x%08x\n", message, cezanne::statusName(status),
               *response, *answer);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::gfxOffDisallow(const void *owner, uint32_t *response, uint32_t *gfxMisc)
+{
+    *response = 0;
+    *gfxMisc = 0;
+    if (stage_ < cezanne::kGfxOffStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kSmuOutOfOrder;
+    // Like a query: only after a passing check by the same connection.
+    if (smuChecked_ && smuOwner_ == owner) {
+        SmuArgument smu = {cezanne::kSmuMsgDisableGfxOff, response, gfxMisc, nullptr};
+        status = accessDevice(cezanne::kSmuPageOffset, gfxOffOperation, &smu);
+        smuChecked_ = status == cezanne::kOK;
+        IOLog(LOG_PREFIX "DisallowGfxOff: %s, response 0x%x, SMUIO_GFX_MISC_CNTL 0x%08x\n",
+              cezanne::statusName(status), *response, *gfxMisc);
     }
     IOLockUnlock(lock_);
     return status;
@@ -718,6 +749,7 @@ private:
     static IOReturn scratchRestore(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn smuCheck(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn smuQuery(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn gfxOffDisallow(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPUUserClient, IOUserClient)
@@ -813,6 +845,16 @@ IOReturn CezanneGPUUserClient::smuQuery(OSObject *target, void *, IOExternalMeth
     return kIOReturnSuccess;
 }
 
+IOReturn CezanneGPUUserClient::gfxOffDisallow(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t response = 0, gfxMisc = 0;
+    arguments->scalarOutput[0] = self->gpu_->gfxOffDisallow(self, &response, &gfxMisc);
+    arguments->scalarOutput[1] = response;
+    arguments->scalarOutput[2] = gfxMisc;
+    return kIOReturnSuccess;
+}
+
 IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                               IOExternalMethodDispatch *, OSObject *, void *reference)
 {
@@ -825,6 +867,7 @@ IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMetho
         {scratchRestore, 0, 0, 2, 0}, // kDiagnosticScratchRestore
         {smuCheck, 0, 0, 4, 0},       // kDiagnosticSmuCheck
         {smuQuery, 1, 0, 3, 0},       // kDiagnosticSmuQuery
+        {gfxOffDisallow, 0, 0, 3, 0}, // kDiagnosticGfxOffDisallow
     };
     if (selector >= cezanne::kDiagnosticSelectorCount) {
         return kIOReturnUnsupported;

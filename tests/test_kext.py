@@ -127,6 +127,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertEqual(writable, [("cezanne::kScratchPageOffset", "scratchRestoreOperation"),
                                     ("cezanne::kScratchPageOffset", "scratchRestoreOperation"),
                                     ("cezanne::kScratchPageOffset", "scratchWriteOperation"),
+                                    ("cezanne::kSmuPageOffset", "gfxOffOperation"),
                                     ("cezanne::kSmuPageOffset", "smuQueryOperation")])
         self.assertEqual(re.findall(r"accessDevice\(0, (\w+)", source),
                          ["readOperation", "scratchCheckOperation", "smuCheckOperation"])
@@ -136,7 +137,7 @@ void f(IOPCIDevice *p, Aperture *a) {
                          source)
         self.assertIsNotNone(page)
         # An SMU query needs a passing check by the same connection.
-        self.assertIn("if (smuChecked_ && smuOwner_ == owner) {", source)
+        self.assertEqual(source.count("if (smuChecked_ && smuOwner_ == owner) {"), 2)  # query and GFXOFF
         # A connection closed mid-test restores the register.
         self.assertRegex(source, r"clientClose\(\)\s*\{\s*gpu_->scratchAbandon\(this\);")
 
@@ -152,7 +153,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 7;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 8;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
