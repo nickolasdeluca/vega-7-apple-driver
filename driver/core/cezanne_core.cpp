@@ -134,6 +134,12 @@ static Status readRegister(const RegisterReader &registers, uint64_t length, uin
     return registers.read32(registers.context, offset, value) ? kOK : kRegisterReadFailed;
 }
 
+Status readAllowedRegister(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                           uint32_t offset, uint32_t *value)
+{
+    return readRegister(registers, apertureLength, stage, offset, value);
+}
+
 Status readBootState(const RegisterReader &registers, uint64_t apertureLength, BootState *state)
 {
     *state = BootState();

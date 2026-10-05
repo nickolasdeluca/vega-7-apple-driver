@@ -25,7 +25,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 3;
+const uint32_t kMaxStage = 4;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -148,8 +148,22 @@ Status checkPciState(const PciState &state);
 Status checkAperture(const PciState &state, uint64_t physical, uint64_t length);
 
 // Whether a stage may read a register: stage 1 its two, stage 2 also
-// FB_OFFSET, stage 3 also the GC configuration registers.
+// FB_OFFSET, stage 3 and later also the GC configuration registers.
 bool registerAllowed(uint32_t offset, uint32_t stage);
+
+// Reads one register a stage allows, refusing unaligned offsets and offsets
+// beyond the mapping. Used by the stage 4 diagnostic interface.
+Status readAllowedRegister(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                           uint32_t offset, uint32_t *value);
+
+// Stage 4 diagnostic interface (IOUserClient selectors and their scalars).
+const uint32_t kDiagnosticVersion = 1;
+enum DiagnosticSelector : uint32_t {
+    kDiagnosticGetInfo = 0,       // out: version, stage
+    kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
+    kDiagnosticSelectorCount = 2,
+};
+const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
 
 struct BootState {
     uint32_t c2pmsg33;

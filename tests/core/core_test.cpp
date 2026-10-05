@@ -526,6 +526,16 @@ static void testGfxConfig()
         CHECK(readGfxConfig(r.reader(), 0x30000, d, &g) == kRegisterNotAllowed); // GRBM_GFX_INDEX beyond
     }
     CHECK(!registerAllowed(kRegGrbmGfxIndex, 2) && registerAllowed(kRegGrbmGfxIndex, 3));
+    CHECK(registerAllowed(kRegGrbmGfxIndex, 4) && !registerAllowed(kRegGrbmGfxIndex + 4, 4));
+    {
+        FakeRegisters r;
+        uint32_t value = 1;
+        CHECK(readAllowedRegister(r.reader(), 0x80000, 4, kRegGbAddrConfig, &value) == kOK && value == 0x24000042u);
+        CHECK(readAllowedRegister(r.reader(), 0x80000, 4, kRegGbAddrConfig + 2, &value) == kRegisterNotAllowed);
+        CHECK(readAllowedRegister(r.reader(), 0x80000, 2, kRegGbAddrConfig, &value) == kRegisterNotAllowed);
+        CHECK(readAllowedRegister(r.reader(), 0x80000, 4, 0x8014, &value) == kRegisterNotAllowed && value == 0);
+        CHECK(r.reads == 1);
+    }
     for (uint32_t i = 0; i < kStage2RegisterCount; i++) CHECK(kStage3Registers[i] == kStage2Registers[i]);
     for (uint32_t i = 0; i < kStage1RegisterCount; i++) CHECK(kStage2Registers[i] == kStage1Registers[i]);
     CHECK(kRegGrbmGfxIndex == 0x30800 && kRegCcShaderArrayConfig == 0x89bc && kRegGbAddrConfig == 0x98f8);
