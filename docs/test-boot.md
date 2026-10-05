@@ -1,9 +1,9 @@
 # USB test boot
 
-Status, 2026-10-05: **stage 0 succeeded** on the second USB boot (see
-[Test boot log](#test-boot-log)); the first attempt stalled in OpenCore file
-logging, which the test EFI no longer does. The stage 1 test EFI is rebuilt
-under ignored `out/test-efi/usb-stage1/` and not yet booted.
+Status, 2026-10-05: **stage 0 and stage 1 succeeded** (see
+[Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
+the expected values. The first stage 0 attempt stalled in OpenCore file
+logging, which the test EFI no longer does. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -367,14 +367,40 @@ logging; kept as `out/test-efi/superseded-filelog-usb-stage0/`).
   decoding and bus mastering already on).
 - Result: stage 0 succeeded.
 
+**Boot 3, 2026-10-05, stage 1** (`out/test-efi/usb-stage1/`, kext with
+`provider-open-failed`; cold boot after a full shutdown).
+
+- Booted to the desktop; `kern.bootargs` ends `cezanne-stage=1`;
+  `org.cezanne-driver.gpu` 0.1.0 loaded, no NootedRed.
+- `ioreg` (`ioreg` prints 32-bit values with bit 31 set sign-extended; low
+  32 bits shown):
+
+  | Property | Value |
+  | --- | --- |
+  | `CezanneGPU stage 1 result` | `ok` |
+  | `config command` | `0x0006` (memory decoding, bus master) |
+  | `config status` | `0x0010` (capability list) |
+  | `config pmcsr` | `0x0000` (D0) |
+  | `config bar5` | `0xfca00000` |
+  | `bar5 length` | `0x80000` (512 KiB) |
+  | `MP0_SMN_C2PMSG_33` | `0x80000000` (IFWI ready) |
+  | `RCC_CONFIG_MEMSIZE` | `0x800` (2048 MiB) |
+
+- All match the expected values: the read-only BAR5 mapping works with
+  AMDSupport and the boot framebuffer attached, and the firmware leaves the
+  device in D0 with decoding on.
+- `sudo dmesg | grep 'CezanneGPU:'` was empty about a minute after login, so
+  the driver's `IOLog` lines may never reach the kernel buffer; not
+  investigated. The registry is the record.
+- Result: stage 1 succeeded.
+
 ## Unknowns and limits
 
 - The firmware lists both partitions `eraseDisk … GPT` creates. Partition 1 is
   the empty EFI system partition and fails; partition 2 (`CZTEST`) starts
   OpenCore.
-- Untested: whether the provider can be opened beside the boot framebuffer
-  and AMDSupport, and the device's power and decoding state when no driver has
-  initialized it.
+- Where the driver's `IOLog` output goes on macOS 26 is unknown: it reached
+  neither the unified log nor, a minute after login, `dmesg`.
 - The preparation checks prove the configs and files differ only as intended
   and that OpenCore's validator accepts them; they do not prove the boot works.
 - The known-good copy was taken from a read-write mount the user created; no
