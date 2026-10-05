@@ -1,13 +1,13 @@
 # USB test boot
 
-Status, 2026-10-05: **stages 0 to 3 succeeded** (see
+Status, 2026-10-05: **stages 0 to 4 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
 discovery table from the carveout without writes. Stage 3 read the GC
-configuration: 7 of 8 CUs and both RBs active. Stage 4 (a root-only, read-only
-diagnostic interface) is authorized and built under ignored
-`out/test-efi/usb-stage4/`; it has not been booted.
+configuration: 7 of 8 CUs and both RBs active. Stage 4's root-only, read-only
+diagnostic interface re-read every register from the running system. No later
+stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -643,6 +643,20 @@ EFI verified unchanged against the stage 2 manifest before it).
   [target manifest](cezanne-target-manifest.md#gb_addr_config)).
 - The `ioreg -a` capture is in ignored `out/test-efi/boot-5-stage3/`.
 - Result: stage 3 succeeded.
+
+**Boot 6, 2026-10-05, stage 4** (`out/test-efi/usb-stage4/`; cold boot).
+
+- Desktop reached; `kern.bootargs` ends `cezanne-stage=4`. Stage 1, 2 and 3
+  results `ok` with the boot 5 values; `CezanneGPU diagnostics` `true`.
+- `cezanne-diag` without `sudo`: refused with `0xe00002c1`
+  (`kIOReturnNotPrivileged`).
+- `sudo cezanne-diag --repeat 3` (1 s apart): every register read `ok` in
+  every pass, with values identical to the boot-time ones, including
+  `GRBM_STATUS` `0x00003028` (idle) each time. No user client remained in
+  the registry afterwards.
+- Captures (`ioreg.plist`, `diag.txt`) are in ignored
+  `out/test-efi/boot-6-stage4/`.
+- Result: stage 4 succeeded.
 
 ## Unknowns and limits
 
