@@ -35,7 +35,7 @@ DIRECT_CALLS = {"___stack_chk_fail", "__ZN11OSMetaClassC2EPKcPKS_j", "__ZN11OSMe
                 "__ZN11IOPCIDevice20extendedConfigRead32Ey", "__ZN11IOMemoryMap18getPhysicalAddressEv",
                 "__ZN14IODeviceMemory9withRangeEyy", "__ZN12IOUserClient18clientHasPrivilegeEPvPKc",
                 "__ZN12IOUserClientC2EPK11OSMetaClass", "__ZN12IOUserClientD2Ev", "_IOLockAlloc", "_IOLockFree",
-                "_IOLockLock", "_IOLockUnlock"}
+                "_IOLockLock", "_IOLockUnlock", "_IODelay"}
 OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU", "__ZN20CezanneGPUUserClient")
 
 
@@ -43,18 +43,31 @@ def strip_comments(source):
     return re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.S)
 
 
+# The stage 6 scratch test's write path, and the only writable constructs allowed:
+# one writable map of the scratch page, one store (in registerWrite), and the
+# two non-const volatile pointers that carry it.
+SCRATCH_MAP = "pageMemory->map(kIOMapInhibitCache)"
+SCRATCH_STORE = "page->base[(offset - cezanne::kScratchPageOffset) / 4] = value;"
+ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kScratchPageSize")
+ALLOWED_VOLATILE = 2
+
+
 def hardware_calls(source):
-    """Forbidden names used in code, unguarded register mappings and register-pointer stores."""
+    """Forbidden names used in code, and writable constructs beyond the scratch test's."""
     code = strip_comments(source)
     found = [name for name in FORBIDDEN if re.search(r"\b%s" % name, code)]
-    maps = re.findall(r"(?:mapDeviceMemoryWithRegister|->map)\s*\(([^;]*)\)\s*;", code)
-    found += ["writable mapping" for args in maps if "kIOMapReadOnly" not in args]
-    # Physical ranges are created only for the discovery binary's fixed size.
+    maps = re.findall(r"((?:mapDeviceMemoryWithRegister|->map)\s*\(([^;]*)\))\s*;", code)
+    writable = [call for call, args in maps if "kIOMapReadOnly" not in args]
+    found += ["writable mapping" for call in writable if call.split("=")[-1].strip() != SCRATCH_MAP]
+    if len([call for call in writable if call.strip().endswith(SCRATCH_MAP)]) > 1:
+        found.append("writable mapping")
+    # Physical ranges: the discovery binary and the scratch page, at fixed sizes.
     ranges = re.findall(r"\bwithRange\s*\(([^;]*)\)\s*;", code)
-    found += ["unbounded range" for args in ranges if not args.strip().endswith("cezanne::kDiscoveryTmrSize")]
-    if re.search(r"\bvolatile\b", code) and re.search(r"(?<!const )volatile", code):
+    found += ["unbounded range" for args in ranges if not args.strip().endswith(ALLOWED_RANGE_SIZES)]
+    if len(re.findall(r"(?<!const )\bvolatile\b", code)) > ALLOWED_VOLATILE:
         found.append("non-const volatile")
-    if re.search(r"->base\s*\[[^\]]*\]\s*=[^=]", code):
+    stores = re.findall(r"\w+->base\s*\[[^\]]*\]\s*=[^=][^;]*;", code)
+    if [store for store in stores if store != SCRATCH_STORE] or len(stores) > 1:
         found.append("register store")
     return found
 
@@ -76,7 +89,8 @@ class KextSourceTests(unittest.TestCase):
         self.assertLess(gate.index("clientHasPrivilege"), gate.index("OSTypeAlloc"))
         self.assertLess(gate.index("kDiagnosticStage"), gate.index("OSTypeAlloc"))
         # Reads go through the allowlist with the driver's own stage.
-        self.assertIn("readDiagnosticRegister(registers, aperture.length, stage_, offset, value)", source)
+        self.assertIn("readDiagnosticRegister(registers, length, stage, read->offset, read->value)", source)
+        self.assertIn("status = operation(stage_, registers, aperture.length, &writer, argument);", source)
         self.assertNotIn("IOConnectMapMemory", source)
         self.assertNotIn("clientMemoryForType", source)
 
@@ -100,6 +114,23 @@ void f(IOPCIDevice *p, Aperture *a) {
                          ["configWrite", "writable mapping", "writable mapping", "unbounded range",
                           "non-const volatile", "register store"])
 
+    def test_scratch_write_path_is_confined(self):
+        source = strip_comments((KEXT / "CezanneGPU.cpp").read_text())
+        self.assertEqual(source.count(SCRATCH_MAP), 1)
+        self.assertEqual(source.count(SCRATCH_STORE), 1)
+        write = re.search(r"static bool registerWrite\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn(SCRATCH_STORE, write)
+        self.assertLess(write.index("writeAllowed(offset, cezanne::kScratchStage)"), write.index(SCRATCH_STORE))
+        # Writable access is requested only by the scratch write and restore steps.
+        writable = sorted(re.findall(r"accessDevice\(true, (\w+)", source))
+        self.assertEqual(writable, ["scratchRestoreOperation", "scratchRestoreOperation", "scratchWriteOperation"])
+        self.assertEqual(re.findall(r"accessDevice\(false, (\w+)", source), ["readOperation", "scratchCheckOperation"])
+        page = re.search(r"IODeviceMemory::withRange\(\(state\.bar5 & ~0xFull\) \+ cezanne::kScratchPageOffset,"
+                         r"\s*cezanne::kScratchPageSize\)", source)
+        self.assertIsNotNone(page)
+        # A connection closed mid-test restores the register.
+        self.assertRegex(source, r"clientClose\(\)\s*\{\s*gpu_->scratchAbandon\(this\);")
+
     def test_stage_interlock_and_identity_are_declared(self):
         info = plistlib.loads((KEXT / "Info.plist").read_bytes())
         personality = info["IOKitPersonalities"]["CezanneGPU"]
@@ -112,7 +143,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 5;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 6;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
