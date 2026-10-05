@@ -5,8 +5,9 @@
 // IOKit, libc or allocation. The adapter supplies read callbacks and, for the
 // stage 6 scratch test and stage 7 SMU queries, one write callback. The write
 // allowlist names exact registers and values: SCRATCH_REG0 (stage 6) and the
-// three SMU mailbox writes of a version query (stage 7). Widening it is a
-// reviewed stage change (docs/test-boot.md).
+// three SMU mailbox writes of a version query (stage 7), plus the
+// DisableGfxOff message (stage 8). Widening it is a reviewed stage change
+// (docs/test-boot.md).
 //
 // Register offsets are byte offsets into the MMIO register BAR (BAR5). Linux
 // v6.12 selects BAR5 for CHIP_BONAIRE and later in amdgpu_device_init and,
@@ -27,7 +28,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 7;
+const uint32_t kMaxStage = 8;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -178,6 +179,12 @@ const uint32_t kSmuPollPauses = 2000;
 const uint32_t kSmuPageOffset = kRegMp1C2PMsg66 & ~0xFFFu;
 const uint32_t kPageSize = 0x1000;
 const uint32_t kSmuStage = 7;
+// Stage 8: DisallowGfxOff, as smu_v12_0_gfx_off_control(smu, false) sends it
+// (renoir_ppt maps it to PPSMC_MSG_DisableGfxOff), then waits up to 500 ms
+// for PWR_GFXOFF_STATUS 2. AllowGfxOff (0x7) stays refused.
+const uint32_t kSmuMsgDisableGfxOff = 0x8;
+const uint32_t kGfxOffConfirmPauses = 500;
+const uint32_t kGfxOffStage = 8;
 
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
@@ -239,6 +246,8 @@ enum Status : uint32_t {
     kSmuTimeout,
     kSmuResponseNotOk,
     kSmuOutOfOrder,
+    // Stage 8.
+    kGfxOffTimeout,
 };
 
 const char *statusName(Status status);
@@ -299,7 +308,8 @@ struct RegisterWriter {
 
 // The write allowlist, by register and value: SCRATCH_REG0 (any value; the
 // scratch test writes only the pattern and the value it read) from stage 6;
-// from stage 7, C2PMSG_90 <- 0, C2PMSG_82 <- 0 and C2PMSG_66 <- 0x2 or 0x3.
+// from stage 7, C2PMSG_90 <- 0, C2PMSG_82 <- 0 and C2PMSG_66 <- 0x2 or 0x3;
+// from stage 8 also C2PMSG_66 <- 0x8.
 bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage);
 
 struct ScratchCheck {
@@ -337,6 +347,13 @@ Status checkSmu(const RegisterReader &registers, uint64_t apertureLength, uint32
 Status sendSmuQuery(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                     uint32_t stage, uint32_t message, uint32_t *response, uint32_t *answer);
 
+// Sends DisableGfxOff the same way (no answer is read, as Linux passes no
+// read_arg), then polls PWR_GFXOFF_STATUS until 2 (GFX on), at most
+// kGfxOffConfirmPauses pauses (kGfxOffTimeout). gfxMisc is the last
+// SMUIO_GFX_MISC_CNTL value read.
+Status disallowGfxOff(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, uint32_t *response, uint32_t *gfxMisc);
+
 // The diagnostic interface's read (stage 4 and later): readAllowedRegister,
 // but a GFX-gated register is read only after SMUIO_GFX_MISC_CNTL reports GFX
 // on (kGfxNotOn otherwise), as Linux requires before its GC IP dump.
@@ -344,7 +361,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 3;
+const uint32_t kDiagnosticVersion = 4;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -355,7 +372,9 @@ enum DiagnosticSelector : uint32_t {
     // Stage 7 SMU queries; a query is accepted only after a passing check.
     kDiagnosticSmuCheck = 5,       // out: Status, message, argument, response
     kDiagnosticSmuQuery = 6,       // in: message (0x2 or 0x3); out: Status, response, answer
-    kDiagnosticSelectorCount = 7,
+    // Stage 8; also accepted only after a passing SMU check.
+    kDiagnosticGfxOffDisallow = 7, // out: Status, response, SMUIO_GFX_MISC_CNTL
+    kDiagnosticSelectorCount = 8,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface

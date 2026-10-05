@@ -69,6 +69,8 @@ struct FakeRegisters {
     uint32_t smuReply = 1;       // response it gives
     int smuDelay = 0;            // pauses before it answers; -1 never
     int smuPending = -1;         // pauses left for the current message
+    int gfxOnDelay = 0;          // pauses after DisableGfxOff until GFX reads on; -1 never
+    int gfxOffPending = -1;
     bool fail = false;
     uint32_t order[32];
     int reads = 0;
@@ -248,7 +250,7 @@ static void testAllowlist()
     CHECK(!registerAllowed(0, 2) && !registerAllowed(4, 2) && !registerAllowed(kRegConfigMemsize + 4, 2));
     CHECK(kRegC2PMsg33 == 0x58184 && kRegConfigMemsize == 0x378c && kRegMcVmFbOffset == 0xa5ac);
     CHECK(std::strcmp(statusName(kNotInD0), "not-in-d0") == 0);
-    for (uint32_t s = kOK; s <= kSmuOutOfOrder; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
+    for (uint32_t s = kOK; s <= kGfxOffTimeout; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
     CHECK(std::strcmp(statusName(static_cast<Status>(999)), "unknown") == 0);
 }
 
@@ -629,7 +631,9 @@ struct FakeWriter {
     static void answer(FakeRegisters *r)
     {
         r->smuResp = r->smuReply;
-        if (r->smuReply == kSmuResponseOk) r->smuArg = r->smuMsg == kSmuMsgGetDriverIfVersion ? 14 : 0x00403500u;
+        if (r->smuReply == kSmuResponseOk && r->smuMsg != kSmuMsgDisableGfxOff)
+            r->smuArg = r->smuMsg == kSmuMsgGetDriverIfVersion ? 14 : 0x00403500u;
+        if (r->smuReply == kSmuResponseOk && r->smuMsg == kSmuMsgDisableGfxOff) r->gfxOffPending = r->gfxOnDelay;
         r->smuPending = -1;
     }
     static void pause(void *context)
@@ -638,6 +642,7 @@ struct FakeWriter {
         if (self->pauseWrites != 0) self->registers->scratch = self->pauseWrites;
         FakeRegisters *r = self->registers;
         if (r->smuPending > 0 && --r->smuPending == 0) answer(r);
+        if (r->gfxOffPending > 0 && --r->gfxOffPending == 0) r->gfxMisc = 0x4;
     }
     RegisterWriter writer() { return RegisterWriter{write32, pause, this}; }
 };
@@ -754,7 +759,9 @@ static void testSmu()
     CHECK(!writeAllowed(kRegMp1C2PMsg90, 1, 7) && !writeAllowed(kRegMp1C2PMsg82, 1, 7));
     for (uint32_t message = 0; message < 0x40; message++) {
         if (message != 2 && message != 3) CHECK(!writeAllowed(kRegMp1C2PMsg66, message, 7));
+        if (message != 2 && message != 3 && message != 8) CHECK(!writeAllowed(kRegMp1C2PMsg66, message, 8));
     }
+    CHECK(writeAllowed(kRegMp1C2PMsg66, kSmuMsgDisableGfxOff, 8) && !writeAllowed(kRegMp1C2PMsg66, 0x7, 8));
     CHECK(!writeAllowed(kRegMp0C2PMsg81, 0, 7) && !writeAllowed(kRegC2PMsg33, 0, 7) && !writeAllowed(kRegMp0C2PMsg35, 0, 7));
     for (uint32_t offset = kSmuPageOffset; offset < kSmuPageOffset + kPageSize; offset += 4) {
         if (offset != kRegMp1C2PMsg66 && offset != kRegMp1C2PMsg82 && offset != kRegMp1C2PMsg90)
@@ -824,6 +831,52 @@ static void testSmu()
     }
 }
 
+static void testGfxOff()
+{
+    uint32_t response = 0, misc = 0;
+    {
+        FakeRegisters r;
+        FakeWriter w(&r);
+        CHECK(disallowGfxOff(r.reader(), 0x80000, w.writer(), 8, &response, &misc) == kOK);
+        CHECK(response == kSmuResponseOk && ((misc & kGfxOffStatusMask) >> kGfxOffStatusShift) == kGfxOffStatusOn);
+        CHECK(w.writes == 3 && w.offsets[2] == kRegMp1C2PMsg66 && w.values[2] == kSmuMsgDisableGfxOff);
+        CHECK(r.smuArg == 0); // no answer is produced or read
+    }
+    {
+        FakeRegisters r;
+        r.gfxMisc = 0x0; // in GFXOFF; turns on 3 pauses after the message
+        r.gfxOnDelay = 3;
+        FakeWriter w(&r);
+        CHECK(disallowGfxOff(r.reader(), 0x80000, w.writer(), 8, &response, &misc) == kOK && misc == 0x4);
+    }
+    {
+        FakeRegisters r;
+        r.gfxMisc = 0x0;
+        r.gfxOnDelay = -1; // never reports GFX on
+        FakeWriter w(&r);
+        CHECK(disallowGfxOff(r.reader(), 0x80000, w.writer(), 8, &response, &misc) == kGfxOffTimeout);
+        CHECK(response == kSmuResponseOk);
+    }
+    {
+        FakeRegisters r;
+        r.smuReply = 0xFD;
+        FakeWriter w(&r);
+        CHECK(disallowGfxOff(r.reader(), 0x80000, w.writer(), 8, &response, &misc) == kSmuResponseNotOk);
+        CHECK(response == 0xFD && misc == 0); // no confirmation poll after a failure
+    }
+    {
+        FakeRegisters r;
+        r.smuResp = 0;
+        FakeWriter w(&r);
+        CHECK(disallowGfxOff(r.reader(), 0x80000, w.writer(), 8, &response, &misc) == kSmuBusy && w.writes == 0);
+        CHECK(disallowGfxOff(r.reader(), 0x80000, w.writer(), 7, &response, &misc) == kRegisterNotAllowed);
+        uint32_t answer = 0;
+        CHECK(sendSmuQuery(r.reader(), 0x80000, w.writer(), 8, kSmuMsgDisableGfxOff, &response, &answer) ==
+              kRegisterNotAllowed);
+        CHECK(w.writes == 0);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -839,6 +892,7 @@ int main()
     testStage5();
     testScratch();
     testSmu();
+    testGfxOff();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

@@ -53,8 +53,14 @@ class CoreTests(unittest.TestCase):
             "kGfxNotOn": ("!= kGfxOffStatusOn) return kGfxNotOn;", "!= kGfxOffStatusOn) (void)0;"),
             "writeAllowed(kRegScratchReg0 + 4, 0, 6)": ("&& offset == kRegScratchReg0) return true;",
                                                         "&& offset >= kRegScratchReg0) return true;"),
-            "writeAllowed(kRegMp1C2PMsg66, message, 7)": ("return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion;",
-                                                          "return value < 0x40;"),
+            "writeAllowed(kRegMp1C2PMsg66, message, 7)": ("return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion ||",
+                                                          "return value < 0x40 ||"),
+            "!writeAllowed(kRegMp1C2PMsg66, 0x7, 8)": ("(stage >= kGfxOffStage && value == kSmuMsgDisableGfxOff)",
+                                                       "(stage >= kGfxOffStage && value >= 0x7 && value <= 0x8)"),
+            "kGfxOffTimeout": ("if (i == kGfxOffConfirmPauses) return kGfxOffTimeout;",
+                               "if (i == kGfxOffConfirmPauses) return kOK;"),
+            "misc == 0x4": ("        if (((*gfxMisc & kGfxOffStatusMask) >> kGfxOffStatusShift) == kGfxOffStatusOn) return kOK;\n        if (i == kGfxOffConfirmPauses)",
+                            "        return kOK;\n        if (i == kGfxOffConfirmPauses)"),
             "writeAllowed(kRegMp1C2PMsg90, 1, 7)": ("return value == 0;", "return true;"),
             "writeAllowed(offset, 0, 7)": ("    return false;\n}\n\n// The only write site", "    return offset >= kSmuPageOffset;\n}\n\n// The only write site"),
             "kSmuBusy": ("return mailbox->response == 0 ? kSmuBusy : kOK;", "return kOK;"),
@@ -93,7 +99,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(allow.count("return"), 5)
         self.assertIn("if (stage >= kScratchStage && offset == kRegScratchReg0) return true;", allow)
         self.assertIn("if (offset == kRegMp1C2PMsg90 || offset == kRegMp1C2PMsg82) return value == 0;", allow)
-        self.assertIn("return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion;", allow)
+        self.assertIn("return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion ||\n"
+                      "               (stage >= kGfxOffStage && value == kSmuMsgDisableGfxOff);", allow)
 
 
 if __name__ == "__main__":

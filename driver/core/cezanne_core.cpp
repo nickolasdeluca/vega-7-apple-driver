@@ -55,6 +55,7 @@ const char *statusName(Status status)
     case kSmuTimeout: return "smu-timeout";
     case kSmuResponseNotOk: return "smu-response-not-ok";
     case kSmuOutOfOrder: return "smu-out-of-order";
+    case kGfxOffTimeout: return "gfxoff-timeout";
     }
     return "unknown";
 }
@@ -401,7 +402,9 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (stage >= kScratchStage && offset == kRegScratchReg0) return true;
     if (stage < kSmuStage) return false;
     if (offset == kRegMp1C2PMsg90 || offset == kRegMp1C2PMsg82) return value == 0;
-    if (offset == kRegMp1C2PMsg66) return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion;
+    if (offset == kRegMp1C2PMsg66)
+        return value == kSmuMsgGetSmuVersion || value == kSmuMsgGetDriverIfVersion ||
+               (stage >= kGfxOffStage && value == kSmuMsgDisableGfxOff);
     return false;
 }
 
@@ -489,13 +492,11 @@ Status checkSmu(const RegisterReader &registers, uint64_t apertureLength, uint32
     return mailbox->response == 0 ? kSmuBusy : kOK;
 }
 
-Status sendSmuQuery(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
-                    uint32_t stage, uint32_t message, uint32_t *response, uint32_t *answer)
+// smu_cmn_send_smc_msg_with_param for an argument of 0. The answer is read
+// only if requested and only after an OK response.
+static Status sendSmuMessage(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                             uint32_t stage, uint32_t message, uint32_t *response, uint32_t *answer)
 {
-    *response = 0;
-    *answer = 0;
-    if (stage < kSmuStage || (message != kSmuMsgGetSmuVersion && message != kSmuMsgGetDriverIfVersion))
-        return kRegisterNotAllowed;
     SmuMailbox mailbox;
     Status status = checkSmu(registers, apertureLength, stage, &mailbox);
     if (status != kOK) return status;
@@ -513,8 +514,38 @@ Status sendSmuQuery(const RegisterReader &registers, uint64_t apertureLength, co
         writer.pause(writer.context);
     }
     if (*response != kSmuResponseOk) return kSmuResponseNotOk;
+    if (answer == nullptr) return kOK;
     // smu_cmn_read_arg.
     return readRegister(registers, apertureLength, stage, kRegMp1C2PMsg82, answer);
+}
+
+Status sendSmuQuery(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                    uint32_t stage, uint32_t message, uint32_t *response, uint32_t *answer)
+{
+    *response = 0;
+    *answer = 0;
+    if (stage < kSmuStage || (message != kSmuMsgGetSmuVersion && message != kSmuMsgGetDriverIfVersion))
+        return kRegisterNotAllowed;
+    return sendSmuMessage(registers, apertureLength, writer, stage, message, response, answer);
+}
+
+Status disallowGfxOff(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, uint32_t *response, uint32_t *gfxMisc)
+{
+    *response = 0;
+    *gfxMisc = 0;
+    if (stage < kGfxOffStage) return kRegisterNotAllowed;
+    Status status = sendSmuMessage(registers, apertureLength, writer, stage, kSmuMsgDisableGfxOff, response, nullptr);
+    if (status != kOK) return status;
+    // smu_v12_0_gfx_off_control: wait for GFX to be on.
+    for (uint32_t i = 0; i <= kGfxOffConfirmPauses; i++) {
+        status = readRegister(registers, apertureLength, stage, kRegSmuioGfxMiscCntl, gfxMisc);
+        if (status != kOK) return status;
+        if (((*gfxMisc & kGfxOffStatusMask) >> kGfxOffStatusShift) == kGfxOffStatusOn) return kOK;
+        if (i == kGfxOffConfirmPauses) return kGfxOffTimeout;
+        writer.pause(writer.context);
+    }
+    return kGfxOffTimeout;
 }
 
 } // namespace cezanne
