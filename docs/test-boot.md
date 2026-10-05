@@ -5,7 +5,9 @@ Status, 2026-10-05: **stages 0 to 3 succeeded** (see
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
 discovery table from the carveout without writes. Stage 3 read the GC
-configuration: 7 of 8 CUs and both RBs active. No later stage is authorized.
+configuration: 7 of 8 CUs and both RBs active. Stage 4 (a root-only, read-only
+diagnostic interface) is authorized and built under ignored
+`out/test-efi/usb-stage4/`; it has not been booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -40,6 +42,9 @@ off restores the known-good boot. This is the experimental environment
    - **Stage 3** (authorized by the user on 2026-10-05): stage 2 plus seven
      read-only GC configuration registers, described
      [below](#stage-3-read-only-gc-configuration). Still no write of any kind.
+   - **Stage 4** (authorized by the user on 2026-10-05): stage 3 plus a
+     root-only diagnostic interface that re-reads stage 3 registers on
+     request, described [below](#stage-4-diagnostic-interface). Still no write.
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -317,6 +322,47 @@ without side effects, in the same register window as stages 1 and 2. A hang
 would freeze the boot; power off and boot the known-good EFI. Nothing is
 written.
 
+### Stage 4: diagnostic interface
+
+Stage 4 runs stages 1–3 at boot unchanged. If stage 3 returned `ok`, the
+driver also accepts connections from `cezanne-diag` (`tools/diag/`), so the
+same registers can be read again from the running system without a reboot,
+for example to watch `GRBM_STATUS` over time. It does not add any register.
+
+- **Who can connect:** `newUserClient` refuses unless the driver runs at stage
+  4 or later, stage 3 succeeded (`CezanneGPU diagnostics` is `true`), the
+  connection type is 0, and the caller is root (`clientHasPrivilege`,
+  `kIOClientPrivilegeAdministrator`). These checks run before a client is
+  created.
+- **What it can do:** two selectors with fixed scalar counts, which
+  `IOUserClient::externalMethod` enforces. `kDiagnosticGetInfo` returns the
+  interface version and stage. `kDiagnosticReadRegister` takes a byte offset
+  and returns a status and a value. No memory mapping, notification port,
+  structure argument or asynchronous call is offered.
+- **Each read:** under a lock, the driver opens the PCI device, re-reads and
+  re-checks configuration space (identity, D0, memory decoding, BAR5), maps
+  BAR5 read-only and uncached, checks the mapping, reads the one register if
+  the stage allows it (otherwise `register-not-allowed`), releases the mapping
+  and closes the device. A changed device state is reported, not corrected.
+- **Guards, tested offline:** the core rejects unlisted, unaligned and
+  out-of-range offsets; `tests/test_kext.py` checks that the privilege and
+  stage checks precede client creation, that reads use the allowlist with the
+  driver's own stage, and the binary's direct calls (now also
+  `clientHasPrivilege`, the `IOUserClient` constructor and destructor, and
+  `IOLock`). `tests/test_diag_tool.py` builds the tool, checks it calls only the
+  two selectors, names every stage 3 register in order, and reports a missing
+  driver.
+
+Expected stage 4 values: the boot-time results as in boot 5, `CezanneGPU
+diagnostics` `true`, and `sudo cezanne-diag` reading the same values (with
+`GRBM_STATUS` possibly varying).
+
+Stage 4 risks: it adds a kernel entry point. It is limited to root and to the
+reads stages 1–3 already made, but a defect in the user client could panic
+the kernel. Reads happen while the system runs, still with no graphics
+driver; the per-read checks stop on a device that left D0 or stopped decoding.
+Do not sleep the machine.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -328,7 +374,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3; do
+for stage in 0 1 2 3 4; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -435,6 +481,12 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 4 succeeds when the stage 3 conditions hold with `CezanneGPU stage` 4,
+`CezanneGPU diagnostics` is `true`, and `sudo cezanne-diag --repeat 3` (built
+with `tools/diag/build.sh out/diag`) prints all ten registers with no error
+status. Also check that the tool without `sudo` is refused. Record its output
+in an ignored directory.
 
 Stage 3 succeeds when the stage 2 conditions hold with `CezanneGPU stage` 3,
 `CezanneGPU stage 3 result` is `ok`, and the seven raw registers, `active CU

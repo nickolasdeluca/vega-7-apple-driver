@@ -74,7 +74,9 @@ read. Keep firmware under ignored `out/`; see
 build --stage N` derives a USB test EFI for an authorized stage from a copy of
 the known-good OpenCore EFI, rejecting any change beyond the intended ones. Neither writes to
 disks, NVRAM or EFI partitions. Follow [the test boot procedure](docs/test-boot.md);
-experiments run only from that USB EFI.
+experiments run only from that USB EFI. `tools/diag/build.sh` builds
+`cezanne-diag`, which re-reads the driver's allowlisted registers through its
+root-only, read-only diagnostic interface during a stage 4 test boot.
 
 ## Verify
 
