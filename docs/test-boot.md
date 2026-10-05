@@ -7,9 +7,10 @@ logging, which the test EFI no longer does. Stage 2 read and validated the IP
 discovery table from the carveout without writes. Stage 3 read the GC
 configuration: 7 of 8 CUs and both RBs active. Stage 4's root-only, read-only
 diagnostic interface re-read every register from the running system. Stage 5
-read 38 power, clock-gating, engine and memory-hub registers through it. No
-later stage is authorized; the first write is
-[proposed](#proposed-stage-6-first-reviewed-write) for review.
+read 38 power, clock-gating, engine and memory-hub registers through it.
+Stage 6, the first reviewed write (a reversible `SCRATCH_REG0` test), is
+authorized and built under ignored `out/test-efi/usb-stage6/`; it has not been
+booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -51,6 +52,9 @@ off restores the known-good boot. This is the experimental environment
      read-only power, clock-gating, engine and memory-hub registers, read only
      through the diagnostic interface, described
      [below](#stage-5-power-clock-and-engine-state). Still no write.
+   - **Stage 6** (proposed and approved by the user on 2026-10-05): stage 5
+     plus the first register write, a reversible `SCRATCH_REG0` test run only
+     on request, described [below](#stage-6-first-reviewed-write).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -454,10 +458,11 @@ is a data port, FIFO or counter that clears on read (`HDP_EDC_CNT` and indexed
 the machine with that register's name on screen; power off and boot the
 known-good EFI. Nothing is written.
 
-### Proposed stage 6: first reviewed write
+### Stage 6: first reviewed write
 
-**Status: proposal for the user's review. Not authorized, not implemented,
-not built.**
+**Status: approved by the user on 2026-10-05, implemented and built; not yet
+booted.** The proposal below is kept as approved. The implementation section
+after it records one refinement: the test runs as three ordered calls.
 
 The purpose is to prove a register write works and is reversible, with
 nothing in the GPU depending on the result, before any write that changes
@@ -541,6 +546,54 @@ does. One new diagnostic selector would:
 - **After the test,** `cezanne-diag` must read all 48 registers with the boot 7
   values. Then shut down completely before returning to the known-good boot.
 
+**Implementation (as built):**
+
+- **Core** (`driver/core/`):
+  - `writeAllowed(offset, stage)` is true only for `SCRATCH_REG0` at stage 6
+    or later.
+  - `writeRegister` is the only call of the `RegisterWriter::write32`
+    callback, and it checks that allowlist first.
+  - `checkScratch` covers steps 2 and 3 and writes nothing.
+  - `writeScratchPattern` re-runs `checkScratch`, requires the same original
+    value, then writes `0xCAFEDEAD` and reads it back.
+  - `restoreScratch` writes the original value back and reads it back.
+  - New statuses: `cp-not-halted`, `rlc-enabled`, `gfx-busy`,
+    `scratch-unstable`, `register-write-failed`, `scratch-readback-mismatch`,
+    `scratch-restore-mismatch` and `scratch-out-of-order`.
+- **Three ordered calls (refinement):** a single driver call cannot report
+  steps, so the test is three selectors, each printed and flushed by the tool
+  before it is sent:
+  - `kDiagnosticScratchCheck` (steps 1–3);
+  - `kDiagnosticScratchWrite` (step 4);
+  - `kDiagnosticScratchRestore` (step 5).
+
+  The driver accepts them only in that order and only from the connection
+  that ran the check. A write is refused (`scratch-out-of-order`) unless it
+  follows a passing check. If a connection closes after the write without
+  restoring, the driver restores the original value itself and records
+  `CezanneGPU scratch abandoned restore`.
+- **Adapter** (`driver/kext/`):
+  - Every diagnostic operation runs through `accessDevice`, which does the
+    per-read checks and maps BAR5 read-only.
+  - Only the write and restore steps also map the scratch page writable:
+    `IODeviceMemory::withRange` at BAR5 + `0x30000`, 4 KiB, mapped
+    `kIOMapInhibitCache`.
+  - `registerWrite` refuses any offset outside the allowlist or the page
+    before storing. The 1 ms pause uses `IODelay`.
+- **Tests:**
+  - `tests/test_core.py` allows exactly one `write32` call, after the
+    allowlist. It also requires five more weakened cores to fail: widened
+    allowlist, CP-halt check, RLC check, stability check and restore check.
+  - The core tests cover each precondition stopping before any write, a value
+    changed between reads, a stale original, refusal at stage 5, ignored
+    writes, failed writes and a failed restore.
+  - `tests/test_kext.py` allows exactly one writable map, one register store
+    and two non-const `volatile` pointers. Writable access may be requested
+    only by the write and restore steps, and closing the connection must
+    restore.
+  - `tests/test_diag_tool.py` checks that the scratch selectors run only
+    under `--scratch-test` and only with a stage 6 driver.
+
 **What it does not do:**
 
 - It writes no register that controls hardware.
@@ -567,7 +620,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5; do
+for stage in 0 1 2 3 4 5 6; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -674,6 +727,18 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 6 succeeds when the stage 5 conditions hold with `CezanneGPU stage` 6
+and `sudo cezanne-diag --scratch-test` reports `ok` for all three steps:
+
+- the check, with a stable original value;
+- the write, reading back `0xcafedead`;
+- the restore, reading back the original value.
+
+The register dump that follows must match boot 7, with `SCRATCH_REG0` equal to
+the original value. A `*-mismatch`, `scratch-unstable` or failed precondition
+is a finding to record, not a reason to retry. Save the output with `tee` in
+an ignored directory.
 
 Stage 5 succeeds when the stage 4 conditions hold with `CezanneGPU stage` 5
 and `sudo cezanne-diag --repeat 3` prints all 48 registers. Statuses other

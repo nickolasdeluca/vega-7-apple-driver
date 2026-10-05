@@ -133,15 +133,14 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: user review of the first-write proposal
+## Next task: stage 6 USB test boot
 
 Stages 0–5 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-The first write is proposed in
-[test-boot.md](test-boot.md#proposed-stage-6-first-reviewed-write): a
-reversible write of `SCRATCH_REG0` (`0xCAFEDEAD`, then the original value),
-run only on request through `cezanne-diag --scratch-test`, behind read-checked
-preconditions. It is not authorized; implement it only after the user
-approves that section, and update rule 4 when they do.
+Stage 6, the first reviewed write, was approved and is built under
+`out/test-efi/usb-stage6/`. It is a reversible `SCRATCH_REG0` test, run only
+with `sudo cezanne-diag --scratch-test`. Follow
+[test-boot.md](test-boot.md#stage-6-first-reviewed-write) and record the
+three steps and the following register dump.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
