@@ -31,6 +31,15 @@ const char *statusName(Status status)
     case kRegisterReadFailed: return "register-read-failed";
     case kDeviceNotResponding: return "device-not-responding";
     case kProviderOpenFailed: return "provider-open-failed";
+    case kCarveoutInvalid: return "carveout-invalid";
+    case kDeviceRangesMalformed: return "device-ranges-malformed";
+    case kCarveoutOverlapsDevice: return "carveout-overlaps-device";
+    case kTableUnavailable: return "table-mapping-unavailable";
+    case kDiscoverySignature: return "discovery-signature";
+    case kDiscoveryChecksum: return "discovery-checksum";
+    case kDiscoveryMalformed: return "discovery-malformed";
+    case kDiscoveryUnsupported: return "discovery-unsupported";
+    case kDiscoveryBaseMismatch: return "discovery-base-mismatch";
     }
     return "unknown";
 }
@@ -104,32 +113,170 @@ Status checkAperture(const PciState &state, uint64_t physical, uint64_t length)
     return kOK;
 }
 
-bool registerAllowed(uint32_t offset)
+bool registerAllowed(uint32_t offset, uint32_t stage)
 {
-    for (uint32_t i = 0; i < kStage1RegisterCount; i++) {
-        if (kStage1Registers[i] == offset) return true;
+    const uint32_t *list = stage >= 2 ? kStage2Registers : kStage1Registers;
+    uint32_t count = stage >= 2 ? kStage2RegisterCount : stage == 1 ? kStage1RegisterCount : 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (list[i] == offset) return true;
     }
     return false;
 }
 
-static Status readRegister(const RegisterReader &registers, uint64_t length, uint32_t offset, uint32_t *value)
+static Status readRegister(const RegisterReader &registers, uint64_t length, uint32_t stage, uint32_t offset,
+                           uint32_t *value)
 {
     *value = 0;
-    if (!registerAllowed(offset) || (offset & 3) != 0 || offset + 4ull > length) return kRegisterNotAllowed;
+    if (!registerAllowed(offset, stage) || (offset & 3) != 0 || offset + 4ull > length) return kRegisterNotAllowed;
     return registers.read32(registers.context, offset, value) ? kOK : kRegisterReadFailed;
 }
 
 Status readBootState(const RegisterReader &registers, uint64_t apertureLength, BootState *state)
 {
     *state = BootState();
-    Status status = readRegister(registers, apertureLength, kRegC2PMsg33, &state->c2pmsg33);
+    Status status = readRegister(registers, apertureLength, 1, kRegC2PMsg33, &state->c2pmsg33);
     if (status != kOK) return status;
-    status = readRegister(registers, apertureLength, kRegConfigMemsize, &state->configMemsize);
+    status = readRegister(registers, apertureLength, 1, kRegConfigMemsize, &state->configMemsize);
     if (status != kOK) return status;
     // A device that has stopped decoding returns all ones for every read.
     if (state->c2pmsg33 == 0xFFFFFFFFu && state->configMemsize == 0xFFFFFFFFu) return kDeviceNotResponding;
     state->ifwiReady = (state->c2pmsg33 & kC2PMsg33IfwiReady) != 0;
     state->vramBytes = static_cast<uint64_t>(state->configMemsize) << 20;
+    return kOK;
+}
+
+Status readCarveout(const RegisterReader &registers, uint64_t apertureLength, const BootState &boot,
+                    Carveout *carveout)
+{
+    *carveout = Carveout();
+    Status status = readRegister(registers, apertureLength, 2, kRegMcVmFbOffset, &carveout->fbOffset);
+    if (status != kOK) return status;
+    if (carveout->fbOffset == 0xFFFFFFFFu) return kDeviceNotResponding;
+    // Reserved bits set, no offset, or a carveout too small to hold the table.
+    if ((carveout->fbOffset & ~kFbOffsetMask) != 0 || carveout->fbOffset == 0 ||
+        boot.vramBytes < kDiscoveryTmrOffset || boot.configMemsize > 0x100000u)
+        return kCarveoutInvalid;
+    carveout->base = static_cast<uint64_t>(carveout->fbOffset) << kFbOffsetShift;
+    carveout->size = boot.vramBytes;
+    if (carveout->base + carveout->size > kPhysicalLimit) return kCarveoutInvalid;
+    carveout->table = carveout->base + carveout->size - kDiscoveryTmrOffset;
+    return kOK;
+}
+
+static uint32_t le32(const uint8_t *p)
+{
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static uint16_t le16(const uint8_t *p)
+{
+    return static_cast<uint16_t>(p[0] | (p[1] << 8));
+}
+
+Status parseAssignedAddresses(const uint8_t *data, uint32_t length, Range *ranges, uint32_t capacity,
+                              uint32_t *count)
+{
+    *count = 0;
+    if (data == nullptr || length == 0 || length % 20 != 0) return kDeviceRangesMalformed;
+    for (uint32_t offset = 0; offset < length; offset += 20) {
+        uint32_t space = (le32(data + offset) >> 24) & 0x3; // 1 I/O, 2 32-bit, 3 64-bit memory
+        uint64_t base = (static_cast<uint64_t>(le32(data + offset + 4)) << 32) | le32(data + offset + 8);
+        uint64_t size = (static_cast<uint64_t>(le32(data + offset + 12)) << 32) | le32(data + offset + 16);
+        if (space == 0) return kDeviceRangesMalformed;
+        if (space == 1) continue;
+        if (size == 0 || base + size < base || *count == capacity) return kDeviceRangesMalformed;
+        ranges[(*count)++] = Range{base, size};
+    }
+    return *count == 0 ? kDeviceRangesMalformed : kOK;
+}
+
+Status checkCarveout(const Carveout &carveout, const Range *ranges, uint32_t count)
+{
+    if (carveout.size == 0) return kCarveoutInvalid;
+    for (uint32_t i = 0; i < count; i++) {
+        if (ranges[i].base < carveout.base + carveout.size && carveout.base < ranges[i].base + ranges[i].length)
+            return kCarveoutOverlapsDevice;
+    }
+    return kOK;
+}
+
+// Discovery binary layout (discovery.h, v6.12; all fields little-endian).
+static const uint32_t kBinarySignature = 0x28211407u, kTableSignature = 0x53445049u;
+static const uint32_t kBinaryHeaderSize = 12 + 6 * 8;       // binary_header
+static const uint32_t kBinaryChecksumStart = 10;            // after binary_checksum
+static const uint32_t kIpHeaderSize = 4 + 2 + 2 + 4 + 2 + 16 * 4 + 2; // ip_discovery_header
+static const uint32_t kIpEntrySize = 8;                     // struct ip without base_address[]
+static const uint32_t kMaxDies = 16, kMaxIps = 256;
+
+static uint16_t byteSum(const uint8_t *data, uint32_t size)
+{
+    uint16_t sum = 0;
+    for (uint32_t i = 0; i < size; i++) sum = static_cast<uint16_t>(sum + data[i]);
+    return sum;
+}
+
+Status parseDiscovery(const uint8_t *binary, uint32_t length, Discovery *d)
+{
+    *d = Discovery();
+    if (binary == nullptr || length < kBinaryHeaderSize) return kDiscoveryMalformed;
+    if (le32(binary) != kBinarySignature) return kDiscoverySignature;
+    d->versionMajor = le16(binary + 4);
+    d->versionMinor = le16(binary + 6);
+    d->binarySize = le16(binary + 10);
+    uint32_t size = d->binarySize;
+    if (size < kBinaryHeaderSize || size > length) return kDiscoveryMalformed;
+    if (byteSum(binary + kBinaryChecksumStart, size - kBinaryChecksumStart) != le16(binary + 8))
+        return kDiscoveryChecksum;
+    d->binaryValid = true;
+
+    // table_list[IP_DISCOVERY] starts at byte 12: offset, checksum, size.
+    uint32_t table = le16(binary + 12);
+    if (table < kBinaryHeaderSize || table + kIpHeaderSize > size) return kDiscoveryMalformed;
+    const uint8_t *ihdr = binary + table;
+    if (le32(ihdr) != kTableSignature) return kDiscoverySignature;
+    d->tableVersion = le16(ihdr + 4);
+    uint32_t tableSize = le16(ihdr + 6);
+    if (tableSize < kIpHeaderSize || table + tableSize > size) return kDiscoveryMalformed;
+    if (byteSum(ihdr, tableSize) != le16(binary + 14)) return kDiscoveryChecksum;
+    // Version 4 may store 64-bit base addresses (flag bit 0 at byte 78).
+    if (d->tableVersion >= 4 && (ihdr[78] & 1) != 0) return kDiscoveryUnsupported;
+    d->numDies = le16(ihdr + 12);
+    if (d->numDies == 0 || d->numDies > kMaxDies) return kDiscoveryMalformed;
+
+    // Like Linux, die and IP entries are bounded by the binary, not the table.
+    uint32_t end = size;
+    for (uint32_t die = 0; die < d->numDies; die++) {
+        uint32_t dieOffset = le16(ihdr + 14 + 4 * die + 2);
+        if (dieOffset < kBinaryHeaderSize || dieOffset + 4 > end) return kDiscoveryMalformed;
+        if (le16(binary + dieOffset) != die) return kDiscoveryMalformed;
+        uint32_t ips = le16(binary + dieOffset + 2);
+        uint32_t ip = dieOffset + 4;
+        for (uint32_t j = 0; j < ips; j++) {
+            if (d->numIps == kMaxIps || ip + kIpEntrySize > end) return kDiscoveryMalformed;
+            const uint8_t *entry = binary + ip;
+            uint16_t hwId = le16(entry);
+            uint8_t instance = entry[2], bases = entry[3];
+            if (ip + kIpEntrySize + 4u * bases > end) return kDiscoveryMalformed;
+            const uint8_t *base = entry + kIpEntrySize;
+            if (hwId == kHwIdGc && instance == 0 && !d->gcFound && bases >= 2) {
+                d->gcFound = true;
+                d->gcMajor = entry[4];
+                d->gcMinor = entry[5];
+                d->gcRevision = entry[6];
+                d->gcBase0 = le32(base);
+                d->gcBase1 = le32(base + 4);
+            } else if (hwId == kHwIdMp0 && instance == 0 && !d->mp0Found && bases >= 1) {
+                d->mp0Found = true;
+                d->mp0Base0 = le32(base);
+            }
+            d->numIps++;
+            ip += kIpEntrySize + 4u * bases;
+        }
+    }
+    if (!d->gcFound || !d->mp0Found) return kDiscoveryMalformed;
+    if (d->gcBase0 != kExpectedGcBase0 || d->gcBase1 != kExpectedGcBase1 || d->mp0Base0 != kExpectedMp0Base0)
+        return kDiscoveryBaseMismatch;
     return kOK;
 }
 

@@ -43,6 +43,12 @@ class CoreTests(unittest.TestCase):
             "kCapabilityListMalformed": ("i == kMaxCapabilities || offset < 0x40", "i == kMaxCapabilities"),
             "kRegisterNotAllowed": ("offset + 4ull > length", "((void)length, false)"),
             "kDeviceNotResponding": ("return kDeviceNotResponding;", "(void)0;"),
+            "registerAllowed(kRegMcVmFbOffset, 1)": (
+                "uint32_t count = stage >= 2 ? kStage2RegisterCount : stage == 1 ? kStage1RegisterCount : 0;",
+                "uint32_t count = kStage2RegisterCount; list = kStage2Registers;"),
+            "kCarveoutOverlapsDevice": ("return kCarveoutOverlapsDevice;", "(void)0;"),
+            "kDiscoveryChecksum": ("if (byteSum(ihdr, tableSize) != le16(binary + 14)) return kDiscoveryChecksum;", ""),
+            "kDiscoveryBaseMismatch": ("return kDiscoveryBaseMismatch;", "(void)0;"),
         }
         for expected, mutation in mutants.items():
             with self.subTest(expected):

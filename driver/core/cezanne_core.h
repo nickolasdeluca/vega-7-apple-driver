@@ -1,4 +1,5 @@
-// Cezanne hardware core: identity, PCI state and boot-state register checks.
+// Cezanne hardware core: identity, PCI state, boot-state registers and the
+// IP discovery table.
 //
 // Freestanding C++ shared by the kext and the host unit tests: it uses no
 // IOKit, libc or allocation. The adapter supplies read callbacks. There is
@@ -24,7 +25,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 1;
+const uint32_t kMaxStage = 2;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -37,6 +38,30 @@ const uint32_t kRegConfigMemsize = 0xde3 * 4;
 // The only registers stage 1 may read; the adapter refuses any other offset.
 const uint32_t kStage1Registers[] = {kRegC2PMsg33, kRegConfigMemsize};
 const uint32_t kStage1RegisterCount = sizeof(kStage1Registers) / sizeof(kStage1Registers[0]);
+
+// Stage 2 adds GC MC_VM_FB_OFFSET: Renoir GC_BASE segment 0 (0x2000,
+// renoir_ip_offset.h) plus dword 0x96b (gc_9_0_offset.h). Linux v6.12 reads it
+// in gfxhub_v1_0_get_mc_fb_offset and never writes it: for APUs the firmware
+// sets it to the system physical address of "VRAM" (the carveout) >> 24, and
+// gmc_v9_0_mc_init accesses VRAM directly there on x86-64.
+const uint32_t kRegMcVmFbOffset = (0x2000 + 0x96b) * 4;
+const uint32_t kFbOffsetMask = 0x00FFFFFFu; // MC_VM_FB_OFFSET__FB_OFFSET_MASK
+const uint32_t kFbOffsetShift = 24;
+const uint32_t kStage2Registers[] = {kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset};
+const uint32_t kStage2RegisterCount = sizeof(kStage2Registers) / sizeof(kStage2Registers[0]);
+
+// The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
+// is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
+const uint32_t kDiscoveryTmrOffset = 64 << 10;
+const uint32_t kDiscoveryTmrSize = 10 << 10;
+// Linux reads below 2^48 only; Zen 3 physical addresses are 48 bits.
+const uint64_t kPhysicalLimit = 1ull << 48;
+
+// Renoir IP bases (renoir_ip_offset.h) the table must confirm: GC segments 0
+// and 1, which locate kRegMcVmFbOffset, and MP0 segment 0, which locates
+// kRegC2PMsg33 (0x16000 + 0x61).
+const uint32_t kExpectedGcBase0 = 0x2000, kExpectedGcBase1 = 0xA000, kExpectedMp0Base0 = 0x16000;
+const uint16_t kHwIdGc = 11, kHwIdMp0 = 255; // soc15_hw_ip.h
 
 enum Status : uint32_t {
     kOK = 0,
@@ -56,6 +81,16 @@ enum Status : uint32_t {
     kDeviceNotResponding,
     // The adapter could not open its provider, so no device access was tried.
     kProviderOpenFailed,
+    // Stage 2.
+    kCarveoutInvalid,
+    kDeviceRangesMalformed,
+    kCarveoutOverlapsDevice,
+    kTableUnavailable,
+    kDiscoverySignature,
+    kDiscoveryChecksum,
+    kDiscoveryMalformed,
+    kDiscoveryUnsupported,
+    kDiscoveryBaseMismatch,
 };
 
 const char *statusName(Status status);
@@ -95,7 +130,8 @@ Status checkPciState(const PciState &state);
 // Checks the adapter's mapping against BAR5 and the stage 1 registers.
 Status checkAperture(const PciState &state, uint64_t physical, uint64_t length);
 
-bool registerAllowed(uint32_t offset);
+// Whether a stage may read a register: stage 1 its two, stage 2 also FB_OFFSET.
+bool registerAllowed(uint32_t offset, uint32_t stage);
 
 struct BootState {
     uint32_t c2pmsg33;
@@ -106,6 +142,44 @@ struct BootState {
 
 // Reads the stage 1 registers in a fixed order through the reader.
 Status readBootState(const RegisterReader &registers, uint64_t apertureLength, BootState *state);
+
+struct Carveout {
+    uint32_t fbOffset; // raw MC_VM_FB_OFFSET
+    uint64_t base;     // system physical address of VRAM offset 0
+    uint64_t size;     // BootState::vramBytes
+    uint64_t table;    // physical address of the discovery binary
+};
+
+// Reads MC_VM_FB_OFFSET (stage 2) and derives the carveout and table address.
+Status readCarveout(const RegisterReader &registers, uint64_t apertureLength, const BootState &boot,
+                    Carveout *carveout);
+
+struct Range {
+    uint64_t base;
+    uint64_t length;
+};
+
+// Parses the memory ranges of an IOPCIDevice "assigned-addresses" property
+// (5 little-endian 32-bit cells per entry); I/O ranges are skipped.
+Status parseAssignedAddresses(const uint8_t *data, uint32_t length, Range *ranges, uint32_t capacity,
+                              uint32_t *count);
+
+// The carveout must not overlap any of the device's memory BARs.
+Status checkCarveout(const Carveout &carveout, const Range *ranges, uint32_t count);
+
+struct Discovery {
+    bool binaryValid; // signature and binary checksum passed
+    uint16_t versionMajor, versionMinor, binarySize;
+    uint16_t tableVersion, numDies, numIps;
+    bool gcFound, mp0Found;
+    uint8_t gcMajor, gcMinor, gcRevision;
+    uint32_t gcBase0, gcBase1, mp0Base0;
+};
+
+// Validates the binary as amdgpu_discovery_init does (signatures and byte-sum
+// checksums), walks every die's IP list with bounds checks, and records GC and
+// MP0 instance 0. Then requires their bases to match the Renoir constants.
+Status parseDiscovery(const uint8_t *binary, uint32_t length, Discovery *discovery);
 
 } // namespace cezanne
 

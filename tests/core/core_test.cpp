@@ -55,6 +55,7 @@ struct FakeConfig {
 struct FakeRegisters {
     uint32_t c2pmsg33 = 0x80000000u;
     uint32_t memsize = 2048;
+    uint32_t fbOffset = 0x580; // 0x580000000 >> 24
     bool fail = false;
     uint32_t order[8];
     int reads = 0;
@@ -65,7 +66,10 @@ struct FakeRegisters {
         if (self->reads < 8) self->order[self->reads] = offset;
         self->reads++;
         if (self->fail) return false;
-        *value = offset == kRegC2PMsg33 ? self->c2pmsg33 : offset == kRegConfigMemsize ? self->memsize : 0xDEADBEEF;
+        *value = offset == kRegC2PMsg33        ? self->c2pmsg33
+                 : offset == kRegConfigMemsize ? self->memsize
+                 : offset == kRegMcVmFbOffset  ? self->fbOffset
+                                               : 0xDEADBEEF;
         return true;
     }
     RegisterReader reader() { return RegisterReader{read32, this}; }
@@ -210,12 +214,243 @@ static void testBootState()
 
 static void testAllowlist()
 {
-    CHECK(registerAllowed(kRegC2PMsg33) && registerAllowed(kRegConfigMemsize));
-    CHECK(!registerAllowed(0) && !registerAllowed(4) && !registerAllowed(kRegConfigMemsize + 4));
-    CHECK(kRegC2PMsg33 == 0x58184 && kRegConfigMemsize == 0x378c);
+    CHECK(registerAllowed(kRegC2PMsg33, 1) && registerAllowed(kRegConfigMemsize, 1));
+    CHECK(!registerAllowed(kRegMcVmFbOffset, 1) && registerAllowed(kRegMcVmFbOffset, 2));
+    CHECK(!registerAllowed(kRegC2PMsg33, 0));
+    CHECK(!registerAllowed(0, 2) && !registerAllowed(4, 2) && !registerAllowed(kRegConfigMemsize + 4, 2));
+    CHECK(kRegC2PMsg33 == 0x58184 && kRegConfigMemsize == 0x378c && kRegMcVmFbOffset == 0xa5ac);
     CHECK(std::strcmp(statusName(kNotInD0), "not-in-d0") == 0);
-    for (uint32_t s = kOK; s <= kProviderOpenFailed; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
+    for (uint32_t s = kOK; s <= kDiscoveryBaseMismatch; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
     CHECK(std::strcmp(statusName(static_cast<Status>(999)), "unknown") == 0);
+}
+
+static BootState bootState()
+{
+    FakeRegisters r;
+    BootState boot;
+    readBootState(r.reader(), 0x80000, &boot);
+    return boot;
+}
+
+static void testCarveout()
+{
+    BootState boot = bootState();
+    {
+        FakeRegisters r;
+        Carveout c;
+        CHECK(readCarveout(r.reader(), 0x80000, boot, &c) == kOK);
+        CHECK(r.reads == 1 && r.order[0] == kRegMcVmFbOffset);
+        CHECK(c.base == 0x580000000ull && c.size == 2048ull << 20);
+        CHECK(c.table == 0x580000000ull + (2048ull << 20) - 0x10000);
+    }
+    {
+        FakeRegisters r;
+        Carveout c;
+        CHECK(readCarveout(r.reader(), 0x4000, boot, &c) == kRegisterNotAllowed); // aperture too short
+        CHECK(r.reads == 0);
+    }
+    const uint32_t bad[] = {0, 0x01000058u, 0xFFFFFFFFu};
+    const Status expected[] = {kCarveoutInvalid, kCarveoutInvalid, kDeviceNotResponding};
+    for (int i = 0; i < 3; i++) {
+        FakeRegisters r;
+        r.fbOffset = bad[i];
+        Carveout c;
+        CHECK(readCarveout(r.reader(), 0x80000, boot, &c) == expected[i]);
+    }
+    {
+        FakeRegisters r;
+        BootState tiny = boot;
+        tiny.vramBytes = 0x8000;
+        Carveout c;
+        CHECK(readCarveout(r.reader(), 0x80000, tiny, &c) == kCarveoutInvalid);
+    }
+    {
+        FakeRegisters r;
+        r.fbOffset = 0x00FFFFFFu; // ends past 2^48
+        Carveout c;
+        CHECK(readCarveout(r.reader(), 0x80000, boot, &c) == kCarveoutInvalid);
+    }
+}
+
+static void putCells(uint8_t *out, uint32_t hi, uint64_t base, uint64_t size)
+{
+    const uint32_t cells[] = {hi, static_cast<uint32_t>(base >> 32), static_cast<uint32_t>(base),
+                              static_cast<uint32_t>(size >> 32), static_cast<uint32_t>(size)};
+    for (int c = 0; c < 5; c++)
+        for (int b = 0; b < 4; b++) out[4 * c + b] = static_cast<uint8_t>(cells[c] >> (8 * b));
+}
+
+static void testDeviceRanges()
+{
+    // The host's BARs at stage 1: BAR0 64-bit 256 MiB, BAR2 64-bit 2 MiB, BAR4 I/O, BAR5 32-bit 512 KiB.
+    uint8_t data[80];
+    putCells(data, 0x83000010u, 0x640000000ull, 0x10000000ull);
+    putCells(data + 20, 0x83000018u, 0x650000000ull, 0x200000ull);
+    putCells(data + 40, 0x81000020u, 0xe000ull, 0x100ull);
+    putCells(data + 60, 0x82000024u, 0xfca00000ull, 0x80000ull);
+    Range ranges[8];
+    uint32_t count = 0;
+    CHECK(parseAssignedAddresses(data, sizeof(data), ranges, 8, &count) == kOK);
+    CHECK(count == 3 && ranges[0].base == 0x640000000ull && ranges[2].length == 0x80000ull);
+    CHECK(parseAssignedAddresses(data, 79, ranges, 8, &count) == kDeviceRangesMalformed);
+    CHECK(parseAssignedAddresses(data, sizeof(data), ranges, 2, &count) == kDeviceRangesMalformed);
+    CHECK(parseAssignedAddresses(data + 40, 20, ranges, 8, &count) == kDeviceRangesMalformed); // I/O only
+    CHECK(parseAssignedAddresses(data, sizeof(data), ranges, 8, &count) == kOK);
+
+    Carveout c = {0x580, 0x580000000ull, 2048ull << 20, 0};
+    CHECK(checkCarveout(c, ranges, count) == kOK);
+    c.base = 0x5f0000000ull; // would run into BAR0
+    CHECK(checkCarveout(c, ranges, count) == kCarveoutOverlapsDevice);
+    c.base = 0xfc000000ull; // contains BAR5
+    CHECK(checkCarveout(c, ranges, count) == kCarveoutOverlapsDevice);
+}
+
+// A minimal valid discovery binary: one die with SDMA0, GC and MP0.
+static const uint32_t kTable = 0x40, kDie = kTable + 80, kFirstIp = kDie + 4;
+
+struct FakeDiscovery {
+    uint8_t bytes[kDiscoveryTmrSize];
+    uint32_t size;
+
+    FakeDiscovery() : size(0)
+    {
+        std::memset(bytes, 0, sizeof(bytes));
+        put32(0, 0x28211407u);
+        put16(4, 2);
+        put16(12, static_cast<uint16_t>(kTable));
+        put32(kTable, 0x53445049u);
+        put16(kTable + 4, 1);
+        put16(kTable + 12, 1); // one die
+        put16(kTable + 14 + 2, static_cast<uint16_t>(kDie));
+        put16(kDie, 0);
+        put16(kDie + 2, 3); // three IPs
+        uint32_t ip = kFirstIp;
+        ip = addIp(ip, 42, 4, 1, 1, 0x1260);        // SDMA0, one base
+        ip = addIp(ip, 11, 9, 3, 2, 0x2000, 0xA000); // GC 9.3.0
+        ip = addIp(ip, 255, 12, 0, 1, 0x16000);      // MP0
+        put16(kTable + 6, static_cast<uint16_t>(ip - kTable));
+        size = ip + 16; // trailing bytes outside the IP table
+        seal();
+    }
+    void put16(uint32_t o, uint16_t v)
+    {
+        bytes[o] = static_cast<uint8_t>(v);
+        bytes[o + 1] = static_cast<uint8_t>(v >> 8);
+    }
+    void put32(uint32_t o, uint32_t v)
+    {
+        put16(o, static_cast<uint16_t>(v));
+        put16(o + 2, static_cast<uint16_t>(v >> 16));
+    }
+    uint32_t addIp(uint32_t o, uint16_t hw, uint8_t major, uint8_t minor, uint8_t n, uint32_t b0, uint32_t b1 = 0)
+    {
+        put16(o, hw);
+        bytes[o + 3] = n;
+        bytes[o + 4] = major;
+        bytes[o + 5] = minor;
+        put32(o + 8, b0);
+        if (n > 1) put32(o + 12, b1);
+        return o + 8 + 4u * n;
+    }
+    static uint16_t sum(const uint8_t *p, uint32_t n)
+    {
+        uint16_t s = 0;
+        for (uint32_t i = 0; i < n; i++) s = static_cast<uint16_t>(s + p[i]);
+        return s;
+    }
+    void sealBinary() { put16(8, sum(bytes + 10, size - 10)); }
+    void seal()
+    {
+        put16(10, static_cast<uint16_t>(size));
+        put16(14, sum(bytes + kTable, static_cast<uint32_t>(bytes[kTable + 6] | (bytes[kTable + 7] << 8))));
+        sealBinary();
+    }
+};
+
+static Status parse(const FakeDiscovery &f, Discovery *d, uint32_t length = kDiscoveryTmrSize)
+{
+    return parseDiscovery(f.bytes, length, d);
+}
+
+static void testDiscovery()
+{
+    Discovery d;
+    {
+        FakeDiscovery f;
+        CHECK(parse(f, &d) == kOK);
+        CHECK(d.versionMajor == 2 && d.tableVersion == 1 && d.numDies == 1 && d.numIps == 3);
+        CHECK(d.gcFound && d.gcMajor == 9 && d.gcMinor == 3 && d.gcBase0 == 0x2000 && d.gcBase1 == 0xA000);
+        CHECK(d.mp0Found && d.mp0Base0 == 0x16000);
+    }
+    {
+        FakeDiscovery f;
+        f.bytes[0] ^= 1;
+        CHECK(parse(f, &d) == kDiscoverySignature);
+    }
+    {
+        FakeDiscovery f;
+        f.bytes[kTable] ^= 1;
+        f.sealBinary();
+        CHECK(parse(f, &d) == kDiscoverySignature);
+    }
+    {
+        FakeDiscovery f;
+        f.bytes[f.size - 1] ^= 1; // outside the IP table: only the binary checksum covers it
+        CHECK(parse(f, &d) == kDiscoveryChecksum);
+    }
+    {
+        FakeDiscovery f;
+        f.bytes[kFirstIp + 8] ^= 1; // SDMA base inside the IP table
+        f.sealBinary();             // binary checksum fixed, table checksum not
+        CHECK(parse(f, &d) == kDiscoveryChecksum);
+    }
+    {
+        FakeDiscovery f;
+        CHECK(parse(f, &d, f.size - 1) == kDiscoveryMalformed); // size beyond the buffer
+    }
+    {
+        FakeDiscovery f;
+        f.put16(kDie + 2, 200); // more IPs than the binary holds
+        f.seal();
+        CHECK(parse(f, &d) == kDiscoveryMalformed);
+    }
+    {
+        FakeDiscovery f;
+        f.put16(kDie, 1); // die id differs from its index
+        f.seal();
+        CHECK(parse(f, &d) == kDiscoveryMalformed);
+    }
+    {
+        FakeDiscovery f;
+        f.put32(kFirstIp + 12 + 8, 0x1260); // GC base 0 differs from renoir_ip_offset.h
+        f.seal();
+        CHECK(parse(f, &d) == kDiscoveryBaseMismatch);
+    }
+    {
+        FakeDiscovery f;
+        f.put32(kFirstIp + 12 + 16 + 8, 0x16100); // MP0 base 0 differs
+        f.seal();
+        CHECK(parse(f, &d) == kDiscoveryBaseMismatch);
+    }
+    {
+        FakeDiscovery f;
+        f.put16(kFirstIp + 12 + 16, 254); // no MP0 entry
+        f.seal();
+        CHECK(parse(f, &d) == kDiscoveryMalformed);
+    }
+    {
+        FakeDiscovery f;
+        f.put16(kTable + 4, 4);
+        f.bytes[kTable + 78] = 1; // 64-bit base addresses
+        f.seal();
+        CHECK(parse(f, &d) == kDiscoveryUnsupported);
+    }
+    {
+        FakeDiscovery f;
+        f.put16(kTable + 12, 0); // no dies
+        f.seal();
+        CHECK(parse(f, &d) == kDiscoveryMalformed);
+    }
 }
 
 int main()
@@ -226,6 +461,9 @@ int main()
     testAperture();
     testBootState();
     testAllowlist();
+    testCarveout();
+    testDeviceRanges();
+    testDiscovery();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }
