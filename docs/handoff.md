@@ -133,14 +133,21 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 9 USB test boot
+## Next task: revise stage 9's free-page check
 
-Stages 0–8 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-Stage 9, the SMU metrics table, was approved and is built under
-`out/test-efi/usb-stage9/`. It has the SMU write its 148-byte table to one
-checked carveout page, on request through `cezanne-diag --smu-metrics`. Follow
-[test-boot.md](test-boot.md#stage-9-smu-metrics-table): back up first,
-record the decoded values, and power off at once on `table-not-written`.
+Stages 0–8 succeeded. Stage 9 stopped safely at its own check in boot 11:
+the chosen carveout page was not all zero, and no SMU message was sent (see
+the [test boot log](test-boot.md#test-boot-log)).
+
+- **The flaw.** "All zero" is the wrong criterion: unused carveout DRAM holds
+  stale data.
+- **What Linux uses.** The VBIOS firmware-usage table.
+- **Where to get it.** It is not visible in macOS 26's registry. Candidates:
+  an OpenCore SysReport ACPI dump (a reviewed test-EFI config change), the
+  `VFCT` table via another route, or a read-only "describe the region" step
+  (content stability over time).
+- **Approval.** Each changes the approved stage 9 design and needs the user's
+  approval.
 
 ## Offline task while waiting: Metal shader frontend boundary
 

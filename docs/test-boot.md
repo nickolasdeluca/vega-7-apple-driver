@@ -13,8 +13,9 @@ read it back, and restored the original value. Stage 7 sent the first SMU
 messages: driver-interface version 14, SMU firmware 64.74.0. One stage 7 boot
 attempt reset before reaching macOS, cause unknown. Stage 8 sent
 `DisallowGfxOff`: response OK, GFX stayed on. Stage 9 (the SMU metrics
-table, on request) is authorized and built under ignored
-`out/test-efi/usb-stage9/`; it has not been booted.
+table) stopped at its own check: the chosen carveout region is not all zero,
+so no SMU message was sent. Its check needs a better criterion before
+another attempt.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -890,9 +891,10 @@ step is printed and flushed first:
 
 ### Stage 9: SMU metrics table
 
-**Status: approved by the user on 2026-10-05, implemented and built; not yet
-booted.** The proposal below is kept as approved. An implementation section
-follows it.
+**Status: approved by the user on 2026-10-05, implemented, and booted in
+boot 11, where it stopped at step 1 (`table-region-in-use`) before any
+message.** The proposal below is kept as approved. The "all zero" criterion
+proved unsuitable (see boot 11).
 
 **Purpose.** Read live clocks, activity, voltages, currents, power and
 temperatures from the SMU. On Renoir these exist only in the SMU's metrics
@@ -1584,6 +1586,39 @@ booted on the first attempt).
 - Captures (`diag.txt`, `ioreg.plist`) are in ignored
   `out/test-efi/boot-10-stage8/`.
 - Result: stage 8 succeeded.
+
+**Boot 11, 2026-10-05, stage 9** (`out/test-efi/usb-stage9/`; cold boot,
+kernel up 16:06:52).
+
+- `kern.bootargs` ends `cezanne-stage=9`; stages 1–3 `ok`; diagnostics v5.
+- `sudo cezanne-diag --smu-metrics`, written 16:08:06:
+  - Step 1 read `MC_VM_FB_LOCATION_BASE` `0xf400` and `MC_VM_FB_OFFSET`
+    `0x5c0`; the GPU and physical targets `0xf440000000` and `0x600000000`
+    were computed as designed.
+  - It then returned **`table-region-in-use`**: the 64 KiB at `0x600000000`
+    was not all zero.
+  - Steps 2 and 3 did not run. No SMU message was sent and nothing was
+    written. The mailbox read `0`/`0`/`0x1` (untouched), and the register dump
+    matched boot 10 apart from the mailbox and the PSP counter.
+- **Finding: "all zero" is the wrong test for "unused".**
+  - Firmware does not clear the carveout, and DRAM does not come up zeroed
+    after a power cycle.
+  - In normal boots the GPU driver uses the whole carveout for its buffers.
+  - So unused carveout memory may hold arbitrary stale data. Non-zero content
+    does not show that the page is in use, and zero content would not prove
+    that it is free.
+  - Linux does not test content. It reserves the firmware-used region from the
+    VBIOS (`vram_usagebyfirmware`), the discovery binary and the boot
+    framebuffer, and treats the rest as free.
+- **VBIOS not available here.** macOS 26 publishes neither the ACPI tables
+  (no `VFCT`) nor a VBIOS image in the registry in this boot, so the firmware
+  usage table could not be read from user space.
+- **Temperature.** The user reports every boot runs hot and then cools; see
+  boot 10.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-11-stage9/`.
+- Result: **stopped safely before any write**. Stage 9 needs a revised,
+  reviewed check before another attempt.
 
 ## Unknowns and limits
 
