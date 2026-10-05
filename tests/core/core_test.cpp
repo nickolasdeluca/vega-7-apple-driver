@@ -56,20 +56,31 @@ struct FakeRegisters {
     uint32_t c2pmsg33 = 0x80000000u;
     uint32_t memsize = 2048;
     uint32_t fbOffset = 0x580; // 0x580000000 >> 24
+    uint32_t gfxIndex = 0xE0000000u;    // broadcast writes, SE 0 / SH 0 / instance 0
+    uint32_t ccShader = 0x00800000u;    // CU 7 fused off
+    uint32_t userShader = 0;
+    uint32_t ccRb = 0, userRb = 0;
     bool fail = false;
-    uint32_t order[8];
+    uint32_t order[16];
     int reads = 0;
 
     static bool read32(void *context, uint32_t offset, uint32_t *value)
     {
         FakeRegisters *self = static_cast<FakeRegisters *>(context);
-        if (self->reads < 8) self->order[self->reads] = offset;
+        if (self->reads < 16) self->order[self->reads] = offset;
         self->reads++;
         if (self->fail) return false;
         *value = offset == kRegC2PMsg33        ? self->c2pmsg33
                  : offset == kRegConfigMemsize ? self->memsize
                  : offset == kRegMcVmFbOffset  ? self->fbOffset
-                                               : 0xDEADBEEF;
+                 : offset == kRegGrbmStatus    ? 0x00003028u
+                 : offset == kRegGrbmGfxIndex  ? self->gfxIndex
+                 : offset == kRegCcShaderArrayConfig   ? self->ccShader
+                 : offset == kRegUserShaderArrayConfig ? self->userShader
+                 : offset == kRegCcRbBackendDisable    ? self->ccRb
+                 : offset == kRegUserRbBackendDisable  ? self->userRb
+                 : offset == kRegGbAddrConfig          ? 0x24000042u
+                                                       : 0xDEADBEEF;
         return true;
     }
     RegisterReader reader() { return RegisterReader{read32, this}; }
@@ -220,7 +231,7 @@ static void testAllowlist()
     CHECK(!registerAllowed(0, 2) && !registerAllowed(4, 2) && !registerAllowed(kRegConfigMemsize + 4, 2));
     CHECK(kRegC2PMsg33 == 0x58184 && kRegConfigMemsize == 0x378c && kRegMcVmFbOffset == 0xa5ac);
     CHECK(std::strcmp(statusName(kNotInD0), "not-in-d0") == 0);
-    for (uint32_t s = kOK; s <= kDiscoveryBaseMismatch; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
+    for (uint32_t s = kOK; s <= kGfxIndexNotSe0Sh0; s++) CHECK(std::strcmp(statusName(static_cast<Status>(s)), "unknown") != 0);
     CHECK(std::strcmp(statusName(static_cast<Status>(999)), "unknown") == 0);
 }
 
@@ -329,7 +340,16 @@ struct FakeDiscovery {
         ip = addIp(ip, 11, 9, 3, 2, 0x2000, 0xA000); // GC 9.3.0
         ip = addIp(ip, 255, 12, 0, 1, 0x16000);      // MP0
         put16(kTable + 6, static_cast<uint16_t>(ip - kTable));
-        size = ip + 16; // trailing bytes outside the IP table
+        // GC info v2.0 after the IP table: 1 SE, 8 CU/SH, 1 SH/SE, 2 RB/SE.
+        put16(20, static_cast<uint16_t>(ip));
+        put32(ip, 0x4347);
+        put16(ip + 4, 2);
+        put32(ip + 8, 80);
+        put32(ip + 12, 1);
+        put32(ip + 16, 8);
+        put32(ip + 20, 1);
+        put32(ip + 24, 2);
+        size = ip + 80 + 16; // GC table and trailing bytes outside the IP table
         seal();
     }
     void put16(uint32_t o, uint16_t v)
@@ -381,6 +401,8 @@ static void testDiscovery()
         CHECK(d.versionMajor == 2 && d.tableVersion == 1 && d.numDies == 1 && d.numIps == 3);
         CHECK(d.gcFound && d.gcMajor == 9 && d.gcMinor == 3 && d.gcBase0 == 0x2000 && d.gcBase1 == 0xA000);
         CHECK(d.mp0Found && d.mp0Base0 == 0x16000);
+        CHECK(d.gcInfoFound && d.gcInfoMajor == 2 && d.gcNumSe == 1 && d.gcCuPerSh == 8 && d.gcShPerSe == 1 &&
+              d.gcRbPerSe == 2);
     }
     {
         FakeDiscovery f;
@@ -453,6 +475,62 @@ static void testDiscovery()
     }
 }
 
+static Discovery discovery()
+{
+    FakeDiscovery f;
+    Discovery d;
+    parse(f, &d);
+    return d;
+}
+
+static void testGfxConfig()
+{
+    const Discovery d = discovery();
+    {
+        FakeRegisters r;
+        GfxConfig g;
+        CHECK(readGfxConfig(r.reader(), 0x80000, d, &g) == kOK);
+        CHECK(r.reads == 7 && r.order[0] == kRegGrbmStatus && r.order[1] == kRegGrbmGfxIndex);
+        CHECK(g.cuActiveMask == 0x7F && g.cuActiveCount == 7);
+        CHECK(g.rbActiveMask == 0x3 && g.rbActiveCount == 2);
+        CHECK(!g.guiActive && g.gbAddrConfig == 0x24000042u);
+    }
+    {
+        FakeRegisters r;
+        r.userShader = 0x00010000u; // user also disables CU 0
+        r.userRb = 0x00020000u;     // and RB 1
+        GfxConfig g;
+        CHECK(readGfxConfig(r.reader(), 0x80000, d, &g) == kOK);
+        CHECK(g.cuActiveMask == 0x7E && g.cuActiveCount == 6 && g.rbActiveMask == 0x1);
+    }
+    {
+        FakeRegisters r;
+        r.gfxIndex = 0x00000100u; // SH 1 selected
+        GfxConfig g;
+        CHECK(readGfxConfig(r.reader(), 0x80000, d, &g) == kGfxIndexNotSe0Sh0);
+        CHECK(g.cuActiveCount == 0 && g.ccShaderArrayConfig == 0x00800000u);
+    }
+    {
+        FakeRegisters r;
+        Discovery two = d;
+        two.gcNumSe = 2;
+        GfxConfig g;
+        CHECK(readGfxConfig(r.reader(), 0x80000, two, &g) == kGcInfoUnavailable);
+        Discovery none = d;
+        none.gcInfoFound = false;
+        CHECK(readGfxConfig(r.reader(), 0x80000, none, &g) == kGcInfoUnavailable);
+    }
+    {
+        FakeRegisters r;
+        GfxConfig g;
+        CHECK(readGfxConfig(r.reader(), 0x30000, d, &g) == kRegisterNotAllowed); // GRBM_GFX_INDEX beyond
+    }
+    CHECK(!registerAllowed(kRegGrbmGfxIndex, 2) && registerAllowed(kRegGrbmGfxIndex, 3));
+    for (uint32_t i = 0; i < kStage2RegisterCount; i++) CHECK(kStage3Registers[i] == kStage2Registers[i]);
+    for (uint32_t i = 0; i < kStage1RegisterCount; i++) CHECK(kStage2Registers[i] == kStage1Registers[i]);
+    CHECK(kRegGrbmGfxIndex == 0x30800 && kRegCcShaderArrayConfig == 0x89bc && kRegGbAddrConfig == 0x98f8);
+}
+
 int main()
 {
     testValidDevice();
@@ -464,6 +542,7 @@ int main()
     testCarveout();
     testDeviceRanges();
     testDiscovery();
+    testGfxConfig();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

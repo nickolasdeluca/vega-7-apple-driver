@@ -40,6 +40,8 @@ const char *statusName(Status status)
     case kDiscoveryMalformed: return "discovery-malformed";
     case kDiscoveryUnsupported: return "discovery-unsupported";
     case kDiscoveryBaseMismatch: return "discovery-base-mismatch";
+    case kGcInfoUnavailable: return "gc-info-unavailable";
+    case kGfxIndexNotSe0Sh0: return "gfx-index-not-se0-sh0";
     }
     return "unknown";
 }
@@ -115,10 +117,11 @@ Status checkAperture(const PciState &state, uint64_t physical, uint64_t length)
 
 bool registerAllowed(uint32_t offset, uint32_t stage)
 {
-    const uint32_t *list = stage >= 2 ? kStage2Registers : kStage1Registers;
-    uint32_t count = stage >= 2 ? kStage2RegisterCount : stage == 1 ? kStage1RegisterCount : 0;
+    // Each stage's list extends the previous one (checked by the tests), so a
+    // prefix of the stage 3 list is the list for any stage.
+    uint32_t count = stage >= 3 ? kStage3RegisterCount : stage == 2 ? kStage2RegisterCount : stage == 1 ? kStage1RegisterCount : 0;
     for (uint32_t i = 0; i < count; i++) {
-        if (list[i] == offset) return true;
+        if (kStage3Registers[i] == offset) return true;
     }
     return false;
 }
@@ -208,6 +211,7 @@ static const uint32_t kBinaryChecksumStart = 10;            // after binary_chec
 static const uint32_t kIpHeaderSize = 4 + 2 + 2 + 4 + 2 + 16 * 4 + 2; // ip_discovery_header
 static const uint32_t kIpEntrySize = 8;                     // struct ip without base_address[]
 static const uint32_t kMaxDies = 16, kMaxIps = 256;
+static const uint32_t kGcTableId = 0x4347; // GC_TABLE_ID
 
 static uint16_t byteSum(const uint8_t *data, uint32_t size)
 {
@@ -274,9 +278,75 @@ Status parseDiscovery(const uint8_t *binary, uint32_t length, Discovery *d)
             ip += kIpEntrySize + 4u * bases;
         }
     }
+    // table_list[GC] (byte 20): gpu_info_header then gc_info_v2_x fields.
+    uint32_t gc = le16(binary + 20);
+    if (gc >= kBinaryHeaderSize && gc + 12 + 16 <= size && le32(binary + gc) == kGcTableId) {
+        d->gcInfoMajor = le16(binary + gc + 4);
+        d->gcInfoMinor = le16(binary + gc + 6);
+        if (d->gcInfoMajor == 2) {
+            d->gcInfoFound = true;
+            d->gcNumSe = le32(binary + gc + 12);
+            d->gcCuPerSh = le32(binary + gc + 16);
+            d->gcShPerSe = le32(binary + gc + 20);
+            d->gcRbPerSe = le32(binary + gc + 24);
+        }
+    }
     if (!d->gcFound || !d->mp0Found) return kDiscoveryMalformed;
     if (d->gcBase0 != kExpectedGcBase0 || d->gcBase1 != kExpectedGcBase1 || d->mp0Base0 != kExpectedMp0Base0)
         return kDiscoveryBaseMismatch;
+    return kOK;
+}
+
+static uint32_t bitmask(uint32_t bits)
+{
+    return bits >= 32 ? 0xFFFFFFFFu : (1u << bits) - 1;
+}
+
+static uint32_t popcount(uint32_t value)
+{
+    uint32_t count = 0;
+    for (; value != 0; value &= value - 1) count++;
+    return count;
+}
+
+Status readGfxConfig(const RegisterReader &registers, uint64_t apertureLength, const Discovery &discovery,
+                     GfxConfig *config)
+{
+    *config = GfxConfig();
+    struct {
+        uint32_t offset;
+        uint32_t *value;
+    } reads[] = {
+        {kRegGrbmStatus, &config->grbmStatus},
+        {kRegGrbmGfxIndex, &config->grbmGfxIndex},
+        {kRegCcShaderArrayConfig, &config->ccShaderArrayConfig},
+        {kRegUserShaderArrayConfig, &config->userShaderArrayConfig},
+        {kRegCcRbBackendDisable, &config->ccRbBackendDisable},
+        {kRegUserRbBackendDisable, &config->userRbBackendDisable},
+        {kRegGbAddrConfig, &config->gbAddrConfig},
+    };
+    bool allOnes = true;
+    for (auto &read : reads) {
+        Status status = readRegister(registers, apertureLength, 3, read.offset, read.value);
+        if (status != kOK) return status;
+        allOnes = allOnes && *read.value == 0xFFFFFFFFu;
+    }
+    if (allOnes) return kDeviceNotResponding;
+    config->guiActive = (config->grbmStatus & 0x80000000u) != 0;
+
+    if (!discovery.gcInfoFound || discovery.gcNumSe != 1 || discovery.gcShPerSe != 1 || discovery.gcCuPerSh == 0 ||
+        discovery.gcCuPerSh > 16 || discovery.gcRbPerSe == 0 || discovery.gcRbPerSe > 8)
+        return kGcInfoUnavailable;
+    // SE_INDEX (23:16) and SH_INDEX (15:8) select where reads come from; the
+    // BROADCAST bits name writes only.
+    if ((config->grbmGfxIndex & 0x00FFFF00u) != 0) return kGfxIndexNotSe0Sh0;
+
+    uint32_t inactiveCus = ((config->ccShaderArrayConfig | config->userShaderArrayConfig) & 0xFFFF0000u) >> 16;
+    config->cuActiveMask = ~inactiveCus & bitmask(discovery.gcCuPerSh);
+    uint32_t disabledRbs = ((config->ccRbBackendDisable | config->userRbBackendDisable) & 0x00FF0000u) >> 16;
+    config->rbActiveMask = ~disabledRbs & bitmask(discovery.gcRbPerSe / discovery.gcShPerSe);
+    config->cuActiveCount = popcount(config->cuActiveMask);
+    config->rbActiveCount = popcount(config->rbActiveMask);
     return kOK;
 }
 

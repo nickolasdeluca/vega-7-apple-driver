@@ -25,7 +25,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 2;
+const uint32_t kMaxStage = 3;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -49,6 +49,20 @@ const uint32_t kFbOffsetMask = 0x00FFFFFFu; // MC_VM_FB_OFFSET__FB_OFFSET_MASK
 const uint32_t kFbOffsetShift = 24;
 const uint32_t kStage2Registers[] = {kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset};
 const uint32_t kStage2RegisterCount = sizeof(kStage2Registers) / sizeof(kStage2Registers[0]);
+
+// Stage 3 adds GC configuration registers Linux v6.12 gfx_v9_0.c reads
+// (gc_9_0_offset.h dwords; segment 0 base 0x2000, segment 1 base 0xA000):
+const uint32_t kRegGrbmStatus = (0x2000 + 0x0004) * 4;           // GUI_ACTIVE bit 31
+const uint32_t kRegCcShaderArrayConfig = (0x2000 + 0x026f) * 4;   // INACTIVE_CUS 31:16
+const uint32_t kRegUserShaderArrayConfig = (0x2000 + 0x0270) * 4; // INACTIVE_CUS 31:16
+const uint32_t kRegCcRbBackendDisable = (0x2000 + 0x063d) * 4;    // BACKEND_DISABLE 23:16
+const uint32_t kRegGbAddrConfig = (0x2000 + 0x063e) * 4;
+const uint32_t kRegUserRbBackendDisable = (0x2000 + 0x06df) * 4;  // BACKEND_DISABLE 23:16
+const uint32_t kRegGrbmGfxIndex = (0xA000 + 0x2200) * 4;          // SE_INDEX 23:16, SH_INDEX 15:8
+const uint32_t kStage3Registers[] = {kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset, kRegGrbmStatus,
+                                     kRegGrbmGfxIndex, kRegCcShaderArrayConfig, kRegUserShaderArrayConfig,
+                                     kRegCcRbBackendDisable, kRegUserRbBackendDisable, kRegGbAddrConfig};
+const uint32_t kStage3RegisterCount = sizeof(kStage3Registers) / sizeof(kStage3Registers[0]);
 
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
@@ -91,6 +105,9 @@ enum Status : uint32_t {
     kDiscoveryMalformed,
     kDiscoveryUnsupported,
     kDiscoveryBaseMismatch,
+    // Stage 3.
+    kGcInfoUnavailable,
+    kGfxIndexNotSe0Sh0,
 };
 
 const char *statusName(Status status);
@@ -130,7 +147,8 @@ Status checkPciState(const PciState &state);
 // Checks the adapter's mapping against BAR5 and the stage 1 registers.
 Status checkAperture(const PciState &state, uint64_t physical, uint64_t length);
 
-// Whether a stage may read a register: stage 1 its two, stage 2 also FB_OFFSET.
+// Whether a stage may read a register: stage 1 its two, stage 2 also
+// FB_OFFSET, stage 3 also the GC configuration registers.
 bool registerAllowed(uint32_t offset, uint32_t stage);
 
 struct BootState {
@@ -174,12 +192,33 @@ struct Discovery {
     bool gcFound, mp0Found;
     uint8_t gcMajor, gcMinor, gcRevision;
     uint32_t gcBase0, gcBase1, mp0Base0;
+    // GC info table (gc_info_v2_x only; gfx9 parts use version 2).
+    bool gcInfoFound;
+    uint16_t gcInfoMajor, gcInfoMinor;
+    uint32_t gcNumSe, gcCuPerSh, gcShPerSe, gcRbPerSe;
 };
 
 // Validates the binary as amdgpu_discovery_init does (signatures and byte-sum
 // checksums), walks every die's IP list with bounds checks, and records GC and
 // MP0 instance 0. Then requires their bases to match the Renoir constants.
 Status parseDiscovery(const uint8_t *binary, uint32_t length, Discovery *discovery);
+
+struct GfxConfig {
+    uint32_t grbmStatus, grbmGfxIndex, gbAddrConfig;
+    uint32_t ccShaderArrayConfig, userShaderArrayConfig, ccRbBackendDisable, userRbBackendDisable;
+    bool guiActive;
+    // As gfx_v9_0_get_cu_active_bitmap and _get_rb_active_bitmap compute them
+    // for SE 0 / SH 0; valid only when the status is kOK.
+    uint32_t cuActiveMask, rbActiveMask, cuActiveCount, rbActiveCount;
+};
+
+// Reads the stage 3 registers in a fixed order. Linux selects SE 0 / SH 0 by
+// writing GRBM_GFX_INDEX first; this never writes, so the masks are computed
+// only if the index already selects SE 0 / SH 0 and the GC info table reports
+// one SE with one SH (kGfxIndexNotSe0Sh0 / kGcInfoUnavailable otherwise; the raw
+// values are still filled in).
+Status readGfxConfig(const RegisterReader &registers, uint64_t apertureLength, const Discovery &discovery,
+                     GfxConfig *config);
 
 } // namespace cezanne
 
