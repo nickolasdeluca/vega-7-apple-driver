@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-05: **stages 0 to 5 succeeded** (see
+Status, 2026-10-05: **stages 0 to 6 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -8,9 +8,8 @@ discovery table from the carveout without writes. Stage 3 read the GC
 configuration: 7 of 8 CUs and both RBs active. Stage 4's root-only, read-only
 diagnostic interface re-read every register from the running system. Stage 5
 read 38 power, clock-gating, engine and memory-hub registers through it.
-Stage 6, the first reviewed write (a reversible `SCRATCH_REG0` test), is
-authorized and built under ignored `out/test-efi/usb-stage6/`; it has not been
-booted.
+Stage 6, the first reviewed write, wrote `0xCAFEDEAD` to `SCRATCH_REG0`,
+read it back, and restored the original value. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -460,8 +459,8 @@ known-good EFI. Nothing is written.
 
 ### Stage 6: first reviewed write
 
-**Status: approved by the user on 2026-10-05, implemented and built; not yet
-booted.** The proposal below is kept as approved. The implementation section
+**Status: approved by the user on 2026-10-05, implemented, and run
+successfully in boot 8.** The proposal below is kept as approved. The implementation section
 after it records one refinement: the test runs as three ordered calls.
 
 The purpose is to prove a register write works and is reversible, with
@@ -958,6 +957,29 @@ EFI verified unchanged against the stage 2 manifest before it).
 - Captures (`ioreg.plist`, `diag.txt`) are in ignored
   `out/test-efi/boot-7-stage5/`.
 - Result: stage 5 succeeded.
+
+**Boot 8, 2026-10-05, stage 6** (`out/test-efi/usb-stage6/`; cold boot).
+
+- Desktop reached; `kern.bootargs` ends `cezanne-stage=6`; stages 1–3 `ok`,
+  diagnostics `true`.
+- `sudo cezanne-diag --scratch-test`:
+
+  | Step | Result |
+  | --- | --- |
+  | 1 check | `ok`: `SMUIO_GFX_MISC_CNTL` `0x5`, `CP_ME_CNTL` `0x15000000`, `CP_MEC_CNTL` `0x50000000`, `RLC_CNTL` `0`, `GRBM_STATUS` `0x3028`; `SCRATCH_REG0` original `0x00000000`, stable |
+  | 2 write | `ok`: wrote `0xcafedead`, read back `0xcafedead` |
+  | 3 restore | `ok`: wrote `0x00000000`, read back `0x00000000` |
+
+- The 49-register dump that followed matched boot 7 in all 48 shared
+  registers except `MP0_SMN_C2PMSG_81` (the PSP's running counter), and
+  `SCRATCH_REG0` read `0x00000000`. No hang; no user client remained; no
+  abandoned-restore property was set.
+- First register write to this GPU from the driver: the write path, the
+  writable page mapping and the restore work as designed, and the GPU state
+  is unchanged afterwards.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-8-stage6/`.
+- Result: stage 6 succeeded.
 
 ## Unknowns and limits
 

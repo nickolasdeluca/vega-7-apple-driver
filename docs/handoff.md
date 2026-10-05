@@ -133,14 +133,16 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 6 USB test boot
+## Next task: choose the next reviewed write
 
-Stages 0–5 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-Stage 6, the first reviewed write, was approved and is built under
-`out/test-efi/usb-stage6/`. It is a reversible `SCRATCH_REG0` test, run only
-with `sudo cezanne-diag --scratch-test`. Follow
-[test-boot.md](test-boot.md#stage-6-first-reviewed-write) and record the
-three steps and the following register dump.
+Stages 0–6 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
+Stage 6 proved the reviewed write path with a reversible `SCRATCH_REG0` test
+(written, read back, restored; GPU state unchanged). Any further write needs
+its own proposal in test-boot.md and the user's approval. Candidates, in
+rising order of effect: selecting SE/SH through `GRBM_GFX_INDEX` as Linux does
+before its CU reads; programming the Renoir golden `GB_ADDR_CONFIG`; and the
+first SMU message (for example a read-style query), which starts the
+power-firmware path that clocks and firmware loading depend on.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
