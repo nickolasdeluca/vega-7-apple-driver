@@ -78,8 +78,8 @@ experiments run only from that USB EFI. `tools/diag/build.sh` builds
 `cezanne-diag`, which re-reads the driver's allowlisted registers through its
 root-only diagnostic interface during a stage 4 or later test boot;
 `--scratch-test` runs the stage 6 reversible write test, `--smu-query` the
-stage 7 SMU version queries and `--gfxoff-disallow` the stage 8
-`DisallowGfxOff` message.
+stage 7 SMU version queries, `--gfxoff-disallow` the stage 8
+`DisallowGfxOff` message and `--smu-metrics` the stage 9 metrics table.
 
 ## Verify
 

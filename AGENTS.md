@@ -41,7 +41,8 @@ Experimental booting is available only through the USB test EFI in
   38 more read-only state registers through that interface; and stage 6, the
   first reviewed write, a reversible `SCRATCH_REG0` test run on request; and
   stage 7, the first SMU messages, two version queries run on request; and
-  stage 8, `DisallowGfxOff` sent on request). Advancing
+  stage 8, `DisallowGfxOff` sent on request; and stage 9, the SMU metrics
+  table written to one checked carveout page on request). Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS
   volume, or load it with `kmutil`. The user performs disk, EFI and reboot steps.

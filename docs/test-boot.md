@@ -12,9 +12,9 @@ Stage 6, the first reviewed write, wrote `0xCAFEDEAD` to `SCRATCH_REG0`,
 read it back, and restored the original value. Stage 7 sent the first SMU
 messages: driver-interface version 14, SMU firmware 64.74.0. One stage 7 boot
 attempt reset before reaching macOS, cause unknown. Stage 8 sent
-`DisallowGfxOff`: response OK, GFX stayed on. No later stage is authorized;
-reading the SMU metrics table is
-[proposed](#proposed-stage-9-smu-metrics-table) for review.
+`DisallowGfxOff`: response OK, GFX stayed on. Stage 9 (the SMU metrics
+table, on request) is authorized and built under ignored
+`out/test-efi/usb-stage9/`; it has not been booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -65,6 +65,9 @@ off restores the known-good boot. This is the experimental environment
    - **Stage 8** (proposed and approved by the user on 2026-10-05): stage 7
      plus `DisallowGfxOff`, sent only on request, described
      [below](#stage-8-disallow-gfxoff).
+   - **Stage 9** (proposed and approved by the user on 2026-10-05): stage 8
+     plus the SMU metrics table, written by the SMU into one checked carveout
+     page on request, described [below](#stage-9-smu-metrics-table).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -885,10 +888,11 @@ step is printed and flushed first:
 - It writes no GC register.
 - The scratch test and the version queries are unchanged.
 
-### Proposed stage 9: SMU metrics table
+### Stage 9: SMU metrics table
 
-**Status: proposal for the user's review. Not authorized, not implemented,
-not built.**
+**Status: approved by the user on 2026-10-05, implemented and built; not yet
+booted.** The proposal below is kept as approved. An implementation section
+follows it.
 
 **Purpose.** Read live clocks, activity, voltages, currents, power and
 temperatures from the SMU. On Renoir these exist only in the SMU's metrics
@@ -1034,6 +1038,52 @@ is printed and flushed first:
   the test boot uses it; a full power-off resets it before the known-good
   boot, where NootedRed sets its own.
 
+**Implementation (as built):**
+
+- **Core:**
+  - `smuArgumentAllowed(message, argument, stage)` pairs every SMU message with
+    its exact argument. `sendSmuMessage` checks the pair before any write.
+  - `writeAllowed` adds `C2PMSG_66` ← `0x1A`/`0x1B`/`0x1C` and `C2PMSG_82` ←
+    `0xF4`/`0x40000000`/`7`, from stage 9.
+  - `checkMetricsTarget`:
+    - reads MMHUB `MC_VM_FB_LOCATION_BASE`, `MC_VM_FB_OFFSET` and
+      `RCC_CONFIG_MEMSIZE`;
+    - requires `0xf400` and `0x5c0`;
+    - keeps the 64 KiB check region clear of the carveout's lowest and highest
+      64 MiB and of every device range.
+  - `checkRegionUnused` reads the region twice through a read callback, a
+    pause apart.
+  - `requestMetrics` sends the three messages in order and stops at the first
+    failure.
+  - `verifyMetricsPage` requires bytes 148–4095 to be zero and bytes 0–147
+    not all zero, then decodes 74 words (`SmuMetrics`, word indices
+    `kMetrics*`).
+- **Adapter:**
+  - Three selectors, accepted only in order per connection: check (needs the
+    idle mailbox and the target and zero checks), transfer (SMU page
+    writable), and read.
+  - Carveout memory is mapped only at `kMetricsPhysical`, 64 KiB for the check
+    or 4 KiB for the read, `kIOMapReadOnly | kIOMapInhibitCache`, and released
+    at once. The table goes to the tool as a fixed 148-byte structure.
+  - Diagnostics version 5.
+- **Tool:** `cezanne-diag --smu-metrics` runs the three steps, printing each
+  first. It prints the clocks by name in MHz, the average clocks, activity,
+  VDD/SoC voltage, current and power, and socket and APU power. It also
+  prints each core's MHz, mW and °C, L3, GFX and SoC temperatures, throttler
+  status, and the STAPM, TDC and EDC values.
+- **Tests:**
+  - Message and argument pairs, including every other table ID and `0x1D`.
+  - The address arithmetic, the register checks, the carveout bounds and
+    device-range overlap.
+  - The zero check: a dirty last word and a failed read.
+  - Three messages with exact arguments, and stopping after a failure.
+  - The fake SMU writes only to the address it was given; the tests cover
+    verification, overflow and an unwritten page.
+  - Three more weakened cores must fail: an unpaired argument, the in-use
+    check removed, the overflow check removed.
+  - The compiler's `bzero` for the zero-initialised table buffer is the one
+    new direct call.
+
 **What it does not do:**
 
 - It sends no table to the SMU (`Dram2Smu`) and no clock, power or watermark
@@ -1058,7 +1108,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8; do
+for stage in 0 1 2 3 4 5 6 7 8 9; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -1165,6 +1215,21 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 9 succeeds when:
+
+- the stage 8 conditions hold with `CezanneGPU stage` 9;
+- `sudo cezanne-diag --smu-metrics` reports `ok` for the check, for the
+  transfer (three responses `0x01`) and for the read;
+- the decoded values are plausible and recorded;
+- the machine stays as before.
+
+`table-region-in-use`, `metrics-address-mismatch` or
+`metrics-target-invalid` stops before any message, and is a finding. If the
+read reports `table-not-written`, treat it as a possibly misdirected write:
+save nothing, power off at once, and boot the known-good EFI. Make a Time
+Machine backup before this boot. Save the output with `tee` in an ignored
+directory.
 
 Stage 8 succeeds when:
 

@@ -133,19 +133,14 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: user review of the SMU metrics table proposal
+## Next task: stage 9 USB test boot
 
 Stages 0–8 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
-
-- **SMU:** driver-interface 14, firmware 64.74.0. `DisallowGfxOff` was
-  accepted.
-- **Open finding:** one stage 7 boot attempt reset early.
-- **Proposed next**, in
-  [test-boot.md](test-boot.md#proposed-stage-9-smu-metrics-table): have the
-  SMU write its 148-byte metrics table into one fixed, checked carveout page
-  (GPU `0xF440000000`, CPU `0x600000000`), read through a read-only mapping.
-  It runs on request through `cezanne-diag --smu-metrics`.
-- **Not authorized.** Implement it only after the user approves that section.
+Stage 9, the SMU metrics table, was approved and is built under
+`out/test-efi/usb-stage9/`. It has the SMU write its 148-byte table to one
+checked carveout page, on request through `cezanne-diag --smu-metrics`. Follow
+[test-boot.md](test-boot.md#stage-9-smu-metrics-table): back up first,
+record the decoded values, and power off at once on `table-not-written`.
 
 ## Offline task while waiting: Metal shader frontend boundary
 
