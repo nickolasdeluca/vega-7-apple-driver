@@ -6,12 +6,13 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current research checkpoint: Cezanne shader compiler target, 2026-10-05, on
-branch `cezanne-discovery`, extending `4966bc5`. This handoff is committed
+Current research checkpoint: USB test boot prepared, 2026-10-05, on branch
+`cezanne-discovery`, extending `1cd61ee`. This handoff is committed
 with the continuation; check Git history for its commit rather than assuming a
 recorded hash is HEAD.
-The project remains in **read-only discovery and specification**. No independent
-hardware, display or acceleration driver has been implemented or loaded.
+The project remains in **discovery and specification**. A USB test EFI and a
+passive stage 0 probe kext are prepared and verified offline but not yet booted;
+no independent driver has been loaded.
 
 Initial target and observed host: PCI `1002:1638`, revision `c9`, reported Ryzen
 5 5600GT, macOS 26.4.1 build 25E253. SDK observations used 26.5 on x86_64; do not
@@ -93,6 +94,17 @@ Completed work:
   fallback. The compiler is the official, attested LLVM 20.1.7 x86_64 archive
   under `out/` (23.1.2 has no x86_64 macOS build). A wave32 request silently
   emits no kernel. The host's GC version and any execution remain unverified.
+- USB test boot prepared, not yet booted: [test boot](test-boot.md).
+  `tools/test_efi.py` derives a test EFI from a copy of the known-good OpenCore
+  1.0.7 EFI. It removes NootedRed and SMCRadeonSensors, adds the passive
+  `CezanneProbe.kext` (`driver/probe/`) and verbose boot arguments with the
+  `-cezanne-probe` interlock, and rejects any other config or file difference,
+  an NVRAM value the other boot would not reset, or a self-registering
+  launcher. The release `ocvalidate` accepts both configs. The probe reads only
+  registry properties; its build test checks call targets and symbol
+  resolution against this host's kernel. Display behaviour without NootedRed,
+  firmware boot-menu listing and the kext's acceptance are unknown until the
+  first boot.
 
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
@@ -100,7 +112,17 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: Metal shader frontend boundary
+## Next task: stage 0 USB test boot
+
+Waits for the user's USB drive. Follow [test-boot.md](test-boot.md): the user
+erases the drive and performs every disk, EFI and reboot step. Before copying,
+rebuild the test EFI if the known-good EFI, the probe or the tool changed, and
+check the copy with `test_efi.py verify --side test`. Record the boot as the
+document lists. Success is the stage 0 criteria there; afterwards confirm the
+internal EFI with `verify --side known_good`. Stage 1 (register reads) needs a
+reviewed update to test-boot.md and the user's approval first.
+
+## Offline task while waiting: Metal shader frontend boundary
 
 Continue offline work before driver bring-up:
 
@@ -160,9 +182,9 @@ and complete commit dispatch remain separate open interfaces.
 
 Parallel areas of future investigation, when relevant: primary vendor admission
 contracts and the PSP/ASD/TA service questions in the firmware study. Keep those separate from a focused lifecycle batch. Driver
-installation/loading, PCI ownership, register writes or GPU takeover require an
-explicitly available experimental environment and recovery path; this handoff
-does not authorize them.
+loading, PCI ownership, register access or GPU takeover happen only through the
+staged USB test boot in [test-boot.md](test-boot.md); this handoff authorizes
+stage 0 only.
 
 ## Evidence and reproduction
 
@@ -188,6 +210,7 @@ Saved evidence on this workspace is ignored and contains sensitive/raw details:
 | `out/shader-target/` | Verified LLVM 20.1.7 archive, attestation and unpacked toolchain, pinned LLVM/Linux/Mesa sources, compile outputs, checker and mutation results, preserved failures |
 | `out/shader-target-reproduced/` | Fresh run of the documented scripts against the verified toolchain: identical objects and checker summary |
 | `out/iokit-async-reproduced/` | Fresh documented reproduction from extracted document code: separate launch, identical normalized instructions, 16 comparison groups, nine rejected mutations |
+| `out/test-efi/` | Known-good EFI copy, verified OpenCore 1.0.7 DEBUG release and `ocvalidate`, built probe, derived `usb/` test EFI with `manifest.json`; contains SMBIOS serials, never tracked |
 | `out/discovery-progress.md` | Local execution ledger; supplementary to this tracked handoff |
 
 A fresh clone will not contain `out/`. Tracked documents supply reproduction
@@ -201,6 +224,14 @@ public enumeration may initialize the existing stack internally; that is not
 manual private invocation or independent-driver proof.
 
 ## Verification record and commands
+
+The USB test boot preparation ran the probe build and test-EFI tests (16 new),
+built the real test EFI with `ocvalidate` exit 0, and confirmed the internal EFI
+still matched the known-good copy. A planted unresolved symbol was missed by
+`kmutil` itself but rejected by both build checks. Preserved failures: the
+non-root read-only mount, SDK header warnings under `-I`, the IOPCIDevice
+deprecation, `kmutil` rejecting a `/var`-symlinked path, and zsh's `log`
+builtin. Nothing was booted or loaded.
 
 The shader target continuation verified the LLVM archive by digest and offline
 attestation. Its checker passed and rejected 15 controlled defects, and the

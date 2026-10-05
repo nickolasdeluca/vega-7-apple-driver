@@ -1,8 +1,9 @@
 # Independent Cezanne graphics driver
 
 Initial target: AMD Cezanne `1002:1638`, revision `c9`, Ryzen 5 5600GT,
-macOS 26.4.1. Current milestone: read-only hardware discovery and graphics
-interface specification. No independent driver is implemented or loaded yet.
+macOS 26.4.1. Current milestone: hardware discovery and graphics interface
+specification. A passive probe kext and a USB test boot are prepared; no
+independent driver has been loaded yet.
 
 Read [AGENTS.md](AGENTS.md) before working on the project.
 For current progress and where to resume, read [the project handoff](docs/handoff.md).
@@ -65,6 +66,14 @@ means at least one was rejected (see its `error`); 1 means a file could not be
 read. Keep firmware under ignored `out/`; see
 [firmware provenance](docs/firmware-provenance.md) for the pinned release.
 
+## Prepare the USB test boot
+
+`driver/probe/build.sh` builds the passive stage 0 kext and
+`tools/test_efi.py` derives a USB test EFI from a copy of the known-good
+OpenCore EFI, rejecting any change beyond the intended ones. Neither writes to
+disks, NVRAM or EFI partitions. Follow [the test boot procedure](docs/test-boot.md);
+experiments run only from that USB EFI.
+
 ## Verify
 
 ```sh
@@ -74,8 +83,9 @@ git diff --check
 
 Tests cover PCI byte order and topology, unavailable fields, profiler schema
 variants, malformed evidence, subprocess failures/timeouts, and overwrite
-protection. The native inventory test compiles and runs on macOS with `xcrun`;
-it is skipped elsewhere. Host observations require independent system queries.
+protection, and test-EFI derivation and rejection on synthetic OpenCore trees.
+The native inventory and probe kext tests compile on macOS with `xcrun` (the
+kext is built, never loaded); they are skipped elsewhere. Host observations require independent system queries.
 
 ## Specification
 
@@ -84,6 +94,7 @@ it is skipped elsewhere. Host observations require independent system queries.
 - [Target IP and firmware selection manifest](docs/cezanne-target-manifest.md)
 - [Green Sardine firmware provenance and header validation](docs/firmware-provenance.md)
 - [Cezanne shader compiler target](docs/shader-target.md)
+- [USB test boot](docs/test-boot.md)
 - [Tahoe graphics contracts and experiments](docs/graphics-contract.md)
 - [Metal loader and factory investigation](docs/metal-loader-study.md)
 - [Metal bundle admission and construction](docs/metal-admission.md)
