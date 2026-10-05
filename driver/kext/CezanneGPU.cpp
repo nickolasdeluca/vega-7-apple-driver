@@ -8,11 +8,16 @@
 //   Stage 1: also read PCI configuration space, then, only if the device is
 //            already in D0 with memory decoding on, map the register BAR
 //            read-only and read the two boot-state registers the core allows.
-//            Nothing is written to configuration space or registers, and the
-//            mapping and provider are released before start() returns.
+//   Stage 2: also read GC MC_VM_FB_OFFSET, derive the carveout's physical
+//            address, check it overlaps none of the device's BARs, map only
+//            the 10 KiB IP discovery binary read-only, copy and validate it.
+//            Nothing is written to configuration space, registers or memory,
+//            and every mapping and the provider are released before start()
+//            returns.
 //
 // Hardware rules live in driver/core; this file only adapts IOKit to them.
 
+#include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/pci/IOPCIDevice.h>
@@ -24,6 +29,12 @@
 
 #define LOG_PREFIX "CezanneGPU: "
 
+struct Aperture {
+    const volatile UInt32 *base;
+    UInt64 length;
+    UInt32 stage;
+};
+
 class CezanneGPU : public IOService {
     OSDeclareDefaultStructors(CezanneGPU)
 
@@ -34,9 +45,12 @@ public:
 
 private:
     UInt32 stage_ = 0;
+    UInt32 table_[cezanne::kDiscoveryTmrSize / 4]; // stage 2 copy; too large for the stack
     void publish(const char *key, UInt64 value, UInt32 bits);
     void publishRegistryIdentity(IOService *provider);
-    cezanne::Status runStage1(IOPCIDevice *pci);
+    cezanne::Status runDevice(IOPCIDevice *pci);
+    cezanne::Status runStage2(IOPCIDevice *pci, Aperture *aperture, const cezanne::BootState &boot);
+    cezanne::Status copyDiscovery(UInt64 physical);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPU, IOService)
@@ -75,16 +89,11 @@ static bool configRead(void *context, uint8_t offset, uint8_t width, uint32_t *v
     }
 }
 
-struct Aperture {
-    const volatile UInt32 *base;
-    UInt64 length;
-};
-
 static bool registerRead(void *context, uint32_t offset, uint32_t *value)
 {
     const Aperture *aperture = static_cast<const Aperture *>(context);
     // The core already checks this; the adapter refuses independently.
-    if (!cezanne::registerAllowed(offset) || (offset & 3) != 0 || offset + 4ull > aperture->length) {
+    if (!cezanne::registerAllowed(offset, aperture->stage) || (offset & 3) != 0 || offset + 4ull > aperture->length) {
         return false;
     }
     *value = aperture->base[offset / 4];
@@ -144,7 +153,85 @@ void CezanneGPU::publishRegistryIdentity(IOService *provider)
     }
 }
 
-cezanne::Status CezanneGPU::runStage1(IOPCIDevice *pci)
+cezanne::Status CezanneGPU::copyDiscovery(UInt64 physical)
+{
+    IODeviceMemory *memory = IODeviceMemory::withRange(physical, cezanne::kDiscoveryTmrSize);
+    if (memory == nullptr) {
+        return cezanne::kTableUnavailable;
+    }
+    IOMemoryMap *map = memory->map(kIOMapInhibitCache | kIOMapReadOnly);
+    cezanne::Status status = cezanne::kTableUnavailable;
+    if (map != nullptr && map->getLength() >= cezanne::kDiscoveryTmrSize) {
+        const volatile UInt32 *source = reinterpret_cast<const volatile UInt32 *>(map->getVirtualAddress());
+        for (UInt32 i = 0; i < cezanne::kDiscoveryTmrSize / 4; i++) {
+            table_[i] = source[i];
+        }
+        status = cezanne::kOK;
+    }
+    if (map != nullptr) {
+        map->release();
+    }
+    memory->release();
+    return status;
+}
+
+cezanne::Status CezanneGPU::runStage2(IOPCIDevice *pci, Aperture *aperture, const cezanne::BootState &boot)
+{
+    cezanne::Carveout carveout;
+    cezanne::RegisterReader registers = {registerRead, aperture};
+    cezanne::Status status = cezanne::readCarveout(registers, aperture->length, boot, &carveout);
+    publish("MC_VM_FB_OFFSET", carveout.fbOffset, 32);
+    if (status != cezanne::kOK) {
+        return status;
+    }
+    publish("carveout base", carveout.base, 64);
+    publish("discovery address", carveout.table, 64);
+
+    OSData *assigned = OSDynamicCast(OSData, pci->getProperty("assigned-addresses"));
+    cezanne::Range ranges[8];
+    uint32_t count = 0;
+    status = cezanne::parseAssignedAddresses(
+        assigned != nullptr ? static_cast<const uint8_t *>(assigned->getBytesNoCopy()) : nullptr,
+        assigned != nullptr ? assigned->getLength() : 0, ranges, 8, &count);
+    if (status == cezanne::kOK) {
+        status = cezanne::checkCarveout(carveout, ranges, count);
+    }
+    if (status != cezanne::kOK) {
+        return status;
+    }
+
+    status = copyDiscovery(carveout.table);
+    if (status != cezanne::kOK) {
+        IOLog(LOG_PREFIX "discovery mapping failed\n");
+        return status;
+    }
+    cezanne::Discovery discovery;
+    status = cezanne::parseDiscovery(reinterpret_cast<const uint8_t *>(table_), sizeof(table_), &discovery);
+    publish("discovery signature", table_[0], 32);
+    // Publish the bytes only once the signature and checksum prove they are
+    // the discovery binary, never arbitrary memory.
+    if (discovery.binaryValid) {
+        setProperty("CezanneGPU discovery binary", table_, discovery.binarySize);
+        publish("discovery version", (UInt32(discovery.versionMajor) << 16) | discovery.versionMinor, 32);
+        publish("discovery table version", discovery.tableVersion, 16);
+        publish("discovery IP count", discovery.numIps, 16);
+    }
+    if (discovery.gcFound) {
+        publish("discovery GC version",
+                (UInt32(discovery.gcMajor) << 16) | (UInt32(discovery.gcMinor) << 8) | discovery.gcRevision, 32);
+        publish("discovery GC base 0", discovery.gcBase0, 32);
+        publish("discovery GC base 1", discovery.gcBase1, 32);
+    }
+    if (discovery.mp0Found) {
+        publish("discovery MP0 base 0", discovery.mp0Base0, 32);
+    }
+    IOLog(LOG_PREFIX "discovery %s: v%u.%u, %u IPs, GC %u.%u.%u\n", cezanne::statusName(status),
+          discovery.versionMajor, discovery.versionMinor, discovery.numIps, discovery.gcMajor, discovery.gcMinor,
+          discovery.gcRevision);
+    return status;
+}
+
+cezanne::Status CezanneGPU::runDevice(IOPCIDevice *pci)
 {
     cezanne::PciState state;
     cezanne::ConfigReader config = {configRead, pci};
@@ -168,7 +255,8 @@ cezanne::Status CezanneGPU::runStage1(IOPCIDevice *pci)
         IOLog(LOG_PREFIX "register BAR mapping failed\n");
         return cezanne::kApertureUnavailable;
     }
-    Aperture aperture = {reinterpret_cast<const volatile UInt32 *>(map->getVirtualAddress()), map->getLength()};
+    Aperture aperture = {reinterpret_cast<const volatile UInt32 *>(map->getVirtualAddress()), map->getLength(),
+                         stage_};
     publish("bar5 length", aperture.length, 64);
     status = cezanne::checkAperture(state, map->getPhysicalAddress(), aperture.length);
     if (status == cezanne::kOK) {
@@ -180,6 +268,11 @@ cezanne::Status CezanneGPU::runStage1(IOPCIDevice *pci)
         if (status == cezanne::kOK || status == cezanne::kDeviceNotResponding) {
             publish("MP0_SMN_C2PMSG_33", boot.c2pmsg33, 32);
             publish("RCC_CONFIG_MEMSIZE", boot.configMemsize, 32);
+        }
+        if (status == cezanne::kOK && stage_ >= 2) {
+            cezanne::Status stage2 = runStage2(pci, &aperture, boot);
+            setProperty("CezanneGPU stage 2 result", cezanne::statusName(stage2));
+            IOLog(LOG_PREFIX "stage 2 result: %s\n", cezanne::statusName(stage2));
         }
     }
     map->release();
@@ -198,7 +291,7 @@ bool CezanneGPU::start(IOService *provider)
         IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
         cezanne::Status status = cezanne::kProviderOpenFailed;
         if (pci != nullptr && pci->open(this)) {
-            status = runStage1(pci);
+            status = runDevice(pci);
             pci->close(this);
         } else {
             // Another client (the boot framebuffer or AMDSupport also attach

@@ -23,14 +23,16 @@ FORBIDDEN = ("configWrite", "extendedConfigWrite", "ioWrite", "memoryWrite", "se
              "enableInterrupt", "IOInterruptEventSource", "PMinit", "joinPMtree", "registerPowerDriver",
              "setPowerState", "enablePCIPowerManagement", "IOMapper", "ioRead")
 # Direct call targets in the built binary: metaclass plumbing, logging, boot
-# argument, configuration-space reads, the mapping's address and the core.
+# argument, configuration-space reads, the mapping's address, the discovery
+# table's physical range (stage 2) and the core.
 DIRECT_CALLS = {"___stack_chk_fail", "__ZN11OSMetaClassC2EPKcPKS_j", "__ZN11OSMetaClassD2Ev",
                 "__ZN15OSMetaClassBase12safeMetaCastEPKS_PK11OSMetaClass",
                 "__ZN8OSObjectdlEPvm", "__ZN8OSObjectnwEm",
                 "__ZN9IOServiceC2EPK11OSMetaClass", "__ZN9IOServiceD2Ev",
                 "__ZNK11OSMetaClass19instanceConstructedEv", "_IOLog", "_PE_parse_boot_argn", "_snprintf",
                 "__ZN11IOPCIDevice19extendedConfigRead8Ey", "__ZN11IOPCIDevice20extendedConfigRead16Ey",
-                "__ZN11IOPCIDevice20extendedConfigRead32Ey", "__ZN11IOMemoryMap18getPhysicalAddressEv"}
+                "__ZN11IOPCIDevice20extendedConfigRead32Ey", "__ZN11IOMemoryMap18getPhysicalAddressEv",
+                "__ZN14IODeviceMemory9withRangeEyy"}
 OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU")
 
 
@@ -42,8 +44,11 @@ def hardware_calls(source):
     """Forbidden names used in code, unguarded register mappings and register-pointer stores."""
     code = strip_comments(source)
     found = [name for name in FORBIDDEN if re.search(r"\b%s" % name, code)]
-    maps = re.findall(r"mapDeviceMemoryWithRegister\s*\(([^;]*)\)\s*;", code)
+    maps = re.findall(r"(?:mapDeviceMemoryWithRegister|->map)\s*\(([^;]*)\)\s*;", code)
     found += ["writable mapping" for args in maps if "kIOMapReadOnly" not in args]
+    # Physical ranges are created only for the discovery binary's fixed size.
+    ranges = re.findall(r"\bwithRange\s*\(([^;]*)\)\s*;", code)
+    found += ["unbounded range" for args in ranges if not args.strip().endswith("cezanne::kDiscoveryTmrSize")]
     if re.search(r"\bvolatile\b", code) and re.search(r"(?<!const )volatile", code):
         found.append("non-const volatile")
     if re.search(r"->base\s*\[[^\]]*\]\s*=[^=]", code):
@@ -61,12 +66,15 @@ class KextSourceTests(unittest.TestCase):
 void f(IOPCIDevice *p, Aperture *a) {
     p->configWrite32(4, 6);
     p->mapDeviceMemoryWithRegister(0x24, kIOMapInhibitCache);
+    IODeviceMemory *m = IODeviceMemory::withRange(0x1000, 0x80000000);
+    m->map(kIOMapInhibitCache);
     volatile UInt32 *w = nullptr;
     a->base[0] = 1;
 } // setBusMaster
 """
         self.assertEqual(hardware_calls(planted),
-                         ["configWrite", "writable mapping", "non-const volatile", "register store"])
+                         ["configWrite", "writable mapping", "writable mapping", "unbounded range",
+                          "non-const volatile", "register store"])
 
     def test_stage_interlock_and_identity_are_declared(self):
         info = plistlib.loads((KEXT / "Info.plist").read_bytes())
@@ -80,8 +88,10 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 1;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 2;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
+        self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
+        self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
 
 
 @unittest.skipUnless(sys.platform == "darwin" and shutil.which("xcrun"), "macOS SDK required")
