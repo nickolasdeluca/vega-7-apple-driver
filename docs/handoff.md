@@ -133,20 +133,20 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: user review of the revised stage 9 check
+## Next task: stage 9 USB test boot (revised check)
 
-Stages 0–8 succeeded. Stage 9 stopped safely in boot 11, because "all zero"
-is the wrong test.
+Stages 0–8 succeeded.
 
-- **What boot 12 showed.** The SysReport dump gave the VBIOS from `VFCT`:
-  - `vram_usagebyfirmware` is all zero, so the firmware reserves no carveout
-    memory;
-  - the boot framebuffer is the first 7.9 MiB.
-- **The proposal.** In
-  [test-boot.md](test-boot.md#proposed-revision-stage-9-free-page-check):
-  replace the zero test with a 1 s stability test, and compare the page after
-  the transfer with a snapshot taken before it.
-- **Not authorized.** Implement it only after the user approves.
+- **Boot 11.** Stage 9's first boot stopped safely: the "all zero" test is
+  wrong for stale DRAM.
+- **Boot 12.** The SysReport dump showed the VBIOS reserves no carveout
+  memory.
+- **The revised check.** It requires the region to stay unchanged over about
+  1 s and compares the page after the transfer with a snapshot. It is approved
+  and built under `out/test-efi/usb-stage9/`.
+- **Next.** Follow [test-boot.md](test-boot.md#stage-9-smu-metrics-table) and
+  the [revision](test-boot.md#revision-stage-9-free-page-check). Back up first
+  and power off at once on `table-not-written` or `table-overflow`.
 
 ## Offline task while waiting: Metal shader frontend boundary
 

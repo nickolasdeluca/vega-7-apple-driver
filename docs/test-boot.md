@@ -16,8 +16,10 @@ attempt reset before reaching macOS, cause unknown. Stage 8 sent
 table) stopped at its own check: the chosen carveout region is not all zero,
 so no SMU message was sent. Its check needs a better criterion before
 another attempt. The [SysReport dump boot](#sysreport-dump-boot) gave the
-VBIOS: the firmware reserves no carveout memory. A revised stage 9 check is
-[proposed](#proposed-revision-stage-9-free-page-check) for review.
+VBIOS: the firmware reserves no carveout memory. The
+[revised stage 9 check](#revision-stage-9-free-page-check) (stable over 1 s,
+compared with a snapshot) is approved and built under ignored
+`out/test-efi/usb-stage9/`; it has not been booted.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -414,9 +416,10 @@ user copied them to ignored `out/test-efi/sysreport/`.
   `0xFFE0000000`, `0x7E9000` bytes (about 7.9 MiB). That is where the firmware
   had placed BAR0, so the framebuffer is the first 7.9 MiB of the carveout.
 
-### Proposed revision: stage 9 free-page check
+### Revision: stage 9 free-page check
 
-**Status: proposal for the user's review. Not authorized, not implemented.**
+**Status: approved by the user on 2026-10-05, implemented and built; not yet
+booted.**
 It replaces stage 9 step 1's "all zero" test, which boot 11 showed is wrong
 for stale DRAM.
 
@@ -454,6 +457,29 @@ zero:
 Steps 2 and 3 (the three messages) and every other guard are unchanged. The
 driver keeps the 4 KiB snapshot in its own memory and never writes the
 carveout.
+
+**As built:**
+
+- **Core.** `checkRegionUnused` is replaced by `checkRegionStable(memory,
+  length, writer, pauses, snapshot)`.
+  - It reads the 64 KiB into the snapshot, waits `kMetricsStablePauses`
+    (1000) pauses of 1 ms, then compares a second read word by word.
+  - `verifyMetricsPage(page, snapshot, metrics)` compares with the snapshot
+    instead of zero.
+- **Adapter.**
+  - The snapshot is a 64 KiB array inside the driver object; its first 4 KiB
+    is the page.
+  - The 1 ms pause now sleeps (`IOSleep(1)`) instead of busy-waiting
+    (`IODelay`), so the 1 s wait does not spin a CPU. This also applies to the
+    SMU polls.
+- **Tests.**
+  - The core tests use stale non-zero data throughout: it passes when stable
+    and fails when one word changes during the wait.
+  - After the transfer, unchanged bytes past 148 pass. A write past 148 fails
+    (`table-overflow`), and a page the SMU did not write fails
+    (`table-not-written`).
+  - Two more weakened cores must fail: the change check removed, and the wait
+    shortened to one pause.
 
 **What this does not establish.** A region that something writes rarely, or
 holds unchanged, would pass the stability test. That is acceptable here
