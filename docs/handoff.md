@@ -6,8 +6,8 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current research checkpoint: Green Sardine firmware provenance and header
-validation, 2026-10-02, on branch `cezanne-discovery`, extending `4a12148`. This handoff is committed
+Current research checkpoint: Cezanne shader compiler target, 2026-10-05, on
+branch `cezanne-discovery`, extending `4966bc5`. This handoff is committed
 with the continuation; check Git history for its commit rather than assuming a
 recorded hash is HEAD.
 The project remains in **read-only discovery and specification**. No independent
@@ -84,6 +84,15 @@ Completed work:
   license allows binary-only redistribution with notices and forbids reverse
   engineering or disassembly, so payloads stay opaque and untracked. Signature
   acceptance and host IP versions remain unverified.
+- Shader compiler target selected offline as `gfx90c`: [shader target](shader-target.md).
+  Linux v6.12 KFD gives GC 9.3.0 `gfx_target_version` 90012; Mesa 26.2.4 uses
+  `gfx909` for the same chip family. `gfx902`, `gfx909` and `gfx90c` resolve to
+  identical LLVM feature sets and produced byte-identical code and descriptors
+  for one fixed kernel, so the name changes only the ELF machine value. Use
+  XNACK "any", no SRAM ECC, wave64; `gfx9-generic` (code object v6) is the
+  fallback. The compiler is the official, attested LLVM 20.1.7 x86_64 archive
+  under `out/` (23.1.2 has no x86_64 macOS build). A wave32 request silently
+  emits no kernel. The host's GC version and any execution remain unverified.
 
 These are observations and static consumer expectations. Independent bundle
 admission, a complete negotiated kernel ABI, mapping protection/ownership,
@@ -91,24 +100,29 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: qualify the shader compiler target
+## Next task: Metal shader frontend boundary
 
 Continue offline work before driver bring-up:
 
-1. Read the [hardware map](cezanne-hardware.md), [target manifest](cezanne-target-manifest.md),
-   [firmware provenance](firmware-provenance.md) and the shader row of the
-   [graphics contract](graphics-contract.md). Use a new ignored output directory.
-2. Using pinned primary sources (LLVM AMDGPU processor tables and documentation,
-   Linux v6.12 GC 9.3.0 code), establish how a GC 9.3.0 / Green Sardine identity
-   maps to an LLVM processor, independently of product names. Record the evidence
-   for and against `gfx90c`, including feature flags (XNACK, SRAM ECC, wave size).
-3. Compile one fixed, trivial kernel offline with a locally available LLVM, if
-   one targets AMDGPU; otherwise record that as unavailable. Record inputs, the
-   emitted ISA and code-object metadata, and errors. Do not dispatch anything.
+1. Read the [shader target study](shader-target.md), the shader rows of the
+   [graphics contract](graphics-contract.md) and the
+   [loader study](metal-loader-study.md). Use a new ignored output directory.
+2. Determine what Apple's permitted, public Metal toolchain emits for one fixed
+   MSL compute kernel. `xcrun -f metal` resolves in the selected Xcode, but
+   `metallib` does not, and whether the compiler runs without a separate
+   toolchain component is untested. Record the tool versions, stdout/stderr and
+   exit status; if the compiler is unavailable, record that rather than
+   installing anything without asking.
+3. If it compiles, record the intermediate form's container and metadata (for
+   example AIR's LLVM bitcode version, target triple, kernel argument and
+   resource-binding metadata, intrinsic names) using public tools only. Note any
+   license terms that limit inspection or reuse. Do not create a device library
+   through the AMD plugin, dispatch anything, or translate AIR yet.
 
-Success means a sourced target decision or an explicit list of what blocks one,
-plus reproducible compiler evidence. Compiling a kernel does not show that the
-hardware runs it, and an LLVM target does not supply a Metal backend.
+Success means a sourced statement of what a permitted frontend exposes and what
+an independent backend would still lack, or an explicit list of what blocks the
+question. Readable intermediate output does not establish that Metal would
+accept an independent backend.
 
 ## Parked task: trace IOAcceleratorFamily2 queue reply production
 
@@ -171,6 +185,8 @@ Saved evidence on this workspace is ignored and contains sensitive/raw details:
 | `out/iokit-async-dispatch/` | OS/kernel/SDK queries, probe build, IOKit symbol lookups, readable and normalized disassembly, layout build, IDL routine IDs, checker and mutation results, preserved inspection-code failures, kernel-collection availability and verification index |
 | `out/firmware-provenance/` | Pinned firmware, `WHENCE`, license, Linux v6.12 sources, GitLab partial clone, artifact index, parser output, tool mutation check, test run and preserved failures; firmware is never tracked |
 | `out/firmware-provenance-reproduced/` | Fresh run of the documented download, blob verification and parser commands |
+| `out/shader-target/` | Verified LLVM 20.1.7 archive, attestation and unpacked toolchain, pinned LLVM/Linux/Mesa sources, compile outputs, checker and mutation results, preserved failures |
+| `out/shader-target-reproduced/` | Fresh run of the documented scripts against the verified toolchain: identical objects and checker summary |
 | `out/iokit-async-reproduced/` | Fresh documented reproduction from extracted document code: separate launch, identical normalized instructions, 16 comparison groups, nine rejected mutations |
 | `out/discovery-progress.md` | Local execution ledger; supplementary to this tracked handoff |
 
@@ -185,6 +201,14 @@ public enumeration may initialize the existing stack internally; that is not
 manual private invocation or independent-driver proof.
 
 ## Verification record and commands
+
+The shader target continuation verified the LLVM archive by digest and offline
+attestation. Its checker passed and rejected 15 controlled defects, and the
+documented scripts reproduced 21 byte-identical objects in a fresh directory.
+Preserved failures: `llc` aborts on target-ID `-mcpu` values, clang needs
+`-nogpulib`, a missing descriptor symbol in linked objects, and two corrected
+checker drafts. Nothing was loaded or dispatched; details are in
+[the study](shader-target.md).
 
 The firmware continuation ran all 26 tests successfully: 13 existing and 13 new
 synthetic-fixture parser tests. All 13 pinned files matched across the kernel.org

@@ -69,10 +69,11 @@ Shader compilation belongs to a separate subsystem. The
 describes instructions, registers, wave execution and memory operations; it
 does not specify Metal's compilation ABI. The
 [LLVM AMDGPU backend](https://llvm.org/docs/AMDGPUUsage.html) documents `gfx90c`
-for Ryzen 4000 APUs in the related family. It is a candidate compiler target for
-this study; establish the Cezanne mapping independently before selecting it.
-A target's availability does not prove its code-object ABI or resource
-descriptors match our queues or Metal.
+for Ryzen 4000 APUs in the related family. The
+[shader target study](shader-target.md) selects it from Linux's GC 9.3.0 compute
+mapping and identical LLVM feature sets, with `gfx9-generic` as fallback; the
+host's GC version remains unmeasured. A target's availability does not prove
+its code-object ABI or resource descriptors match our queues or Metal.
 
 ## Proposed bring-up dependencies
 

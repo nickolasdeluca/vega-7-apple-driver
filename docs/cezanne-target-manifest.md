@@ -120,7 +120,7 @@ material, not incorporated driver code. Review per-file licensing before reuse.
 | Next experiment | Scope | Success criterion |
 | --- | --- | --- |
 | Firmware provenance/header specification | Done: [provenance study](firmware-provenance.md) | Exact release/license for each image, bounded parser and required/optional decisions recorded |
-| Compiler target mapping | Offline primary-source study | Establish Cezanne-to-compiler mapping independently of a product string; verify emitted ISA/resource metadata before selecting `gfx90c` |
+| Compiler target mapping | Done: [shader target study](shader-target.md) | `gfx90c` selected (XNACK any, no SRAM ECC, wave64; `gfx9-generic` fallback); emitted ISA, descriptor and metadata recorded for one kernel. Host GC version still unmeasured |
 | Target IP validation | Deferred to experimental boot | Checked discovery/IP identity and instance counts agree with selected handlers; unsupported versions stop initialization |
 | Firmware and copy/fence | Deferred to own PCI ownership and recovery | Signed image acceptance, bounded rejection behavior, guarded byte-for-byte DMA copy and reliable fence/interrupt completion |
 
