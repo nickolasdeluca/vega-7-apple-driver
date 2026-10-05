@@ -14,6 +14,10 @@
 //   Stage 3: also read seven GC configuration registers and derive the
 //            active CU and render-backend masks for SE 0 / SH 0, without
 //            writing GRBM_GFX_INDEX to select them.
+//   Stage 4: after stage 3 succeeds, also offer a root-only diagnostic
+//            IOUserClient that re-reads any stage 3 register on request. Each
+//            read re-checks D0, decoding and BAR5, maps BAR5 read-only, reads
+//            one allowlisted register and releases the mapping.
 //            Nothing is written to configuration space, registers or memory,
 //            and every mapping and the provider are released before start()
 //            returns.
@@ -22,7 +26,9 @@
 
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOService.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSNumber.h>
@@ -45,9 +51,19 @@ public:
     IOService *probe(IOService *provider, SInt32 *score) override;
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
+    void free() override;
+    using IOService::newUserClient;
+    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+                           IOUserClient **handler) override;
+
+    // Stage 4 diagnostic interface.
+    UInt32 stage() const { return stage_; }
+    cezanne::Status diagnosticRead(uint32_t offset, uint32_t *value);
 
 private:
     UInt32 stage_ = 0;
+    bool diagnosticsReady_ = false; // stage 3 succeeded, so the GC bases are confirmed
+    IOLock *lock_ = nullptr;        // serializes diagnostic reads
     UInt32 table_[cezanne::kDiscoveryTmrSize / 4]; // stage 2 copy; too large for the stack
     void publish(const char *key, UInt64 value, UInt32 bits);
     void publishRegistryIdentity(IOService *provider);
@@ -319,6 +335,7 @@ cezanne::Status CezanneGPU::runDevice(IOPCIDevice *pci)
                 cezanne::Status stage3 = runStage3(&aperture, discovery);
                 setProperty("CezanneGPU stage 3 result", cezanne::statusName(stage3));
                 IOLog(LOG_PREFIX "stage 3 result: %s\n", cezanne::statusName(stage3));
+                diagnosticsReady_ = stage3 == cezanne::kOK && stage_ >= cezanne::kDiagnosticStage;
             }
         }
     }
@@ -349,10 +366,159 @@ bool CezanneGPU::start(IOService *provider)
         setProperty("CezanneGPU stage 1 result", cezanne::statusName(status));
         IOLog(LOG_PREFIX "stage 1 result: %s\n", cezanne::statusName(status));
     }
+    if (diagnosticsReady_) {
+        lock_ = IOLockAlloc();
+        diagnosticsReady_ = lock_ != nullptr;
+    }
+    setProperty("CezanneGPU diagnostics", diagnosticsReady_);
     IOLog(LOG_PREFIX "attached at stage %u to %s; no register or configuration writes performed\n", stage_,
           provider->getName());
     registerService();
     return true;
+}
+
+void CezanneGPU::free()
+{
+    if (lock_ != nullptr) {
+        IOLockFree(lock_);
+        lock_ = nullptr;
+    }
+    IOService::free();
+}
+
+cezanne::Status CezanneGPU::diagnosticRead(uint32_t offset, uint32_t *value)
+{
+    *value = 0;
+    if (!diagnosticsReady_ || !cezanne::registerAllowed(offset, stage_)) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, getProvider());
+    if (pci == nullptr) {
+        return cezanne::kProviderOpenFailed;
+    }
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kProviderOpenFailed;
+    if (pci->open(this)) {
+        // Re-check every time: the device may have changed state since start().
+        cezanne::PciState state;
+        cezanne::ConfigReader config = {configRead, pci};
+        status = cezanne::readPciState(config, &state);
+        if (status == cezanne::kOK) {
+            status = cezanne::checkPciState(state);
+        }
+        if (status == cezanne::kOK) {
+            IOMemoryMap *map =
+                pci->mapDeviceMemoryWithRegister(cezanne::kRegisterBar, kIOMapInhibitCache | kIOMapReadOnly);
+            if (map == nullptr) {
+                status = cezanne::kApertureUnavailable;
+            } else {
+                Aperture aperture = {reinterpret_cast<const volatile UInt32 *>(map->getVirtualAddress()),
+                                     map->getLength(), stage_};
+                status = cezanne::checkAperture(state, map->getPhysicalAddress(), aperture.length);
+                if (status == cezanne::kOK) {
+                    cezanne::RegisterReader registers = {registerRead, &aperture};
+                    status = cezanne::readAllowedRegister(registers, aperture.length, stage_, offset, value);
+                }
+                map->release();
+            }
+        }
+        pci->close(this);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+// Root-only, read-only diagnostic connection to CezanneGPU (stage 4).
+class CezanneGPUUserClient : public IOUserClient {
+    OSDeclareDefaultStructors(CezanneGPUUserClient)
+
+public:
+    bool start(IOService *provider) override;
+    IOReturn clientClose() override;
+    IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
+                            IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) override;
+
+private:
+    CezanneGPU *gpu_ = nullptr;
+    static IOReturn getInfo(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn readRegister(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+};
+
+OSDefineMetaClassAndStructors(CezanneGPUUserClient, IOUserClient)
+
+bool CezanneGPUUserClient::start(IOService *provider)
+{
+    gpu_ = OSDynamicCast(CezanneGPU, provider);
+    return gpu_ != nullptr && IOUserClient::start(provider);
+}
+
+IOReturn CezanneGPUUserClient::clientClose()
+{
+    terminate();
+    return kIOReturnSuccess;
+}
+
+IOReturn CezanneGPUUserClient::getInfo(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    arguments->scalarOutput[0] = cezanne::kDiagnosticVersion;
+    arguments->scalarOutput[1] = self->gpu_->stage();
+    return kIOReturnSuccess;
+}
+
+IOReturn CezanneGPUUserClient::readRegister(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint64_t offset = arguments->scalarInput[0];
+    if (offset > 0xFFFFFFFFull) {
+        return kIOReturnBadArgument;
+    }
+    uint32_t value = 0;
+    cezanne::Status status = self->gpu_->diagnosticRead(static_cast<uint32_t>(offset), &value);
+    arguments->scalarOutput[0] = status;
+    arguments->scalarOutput[1] = value;
+    return kIOReturnSuccess;
+}
+
+IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
+                                              IOExternalMethodDispatch *, OSObject *, void *reference)
+{
+    // Fixed scalar counts; IOUserClient::externalMethod rejects any mismatch.
+    static IOExternalMethodDispatch methods[cezanne::kDiagnosticSelectorCount] = {
+        {getInfo, 0, 0, 2, 0},      // kDiagnosticGetInfo
+        {readRegister, 1, 0, 2, 0}, // kDiagnosticReadRegister
+    };
+    if (selector >= cezanne::kDiagnosticSelectorCount) {
+        return kIOReturnUnsupported;
+    }
+    return IOUserClient::externalMethod(selector, arguments, &methods[selector], this, reference);
+}
+
+IOReturn CezanneGPU::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
+                                   IOUserClient **handler)
+{
+    *handler = nullptr;
+    if (!diagnosticsReady_ || stage_ < cezanne::kDiagnosticStage || type != 0) {
+        return kIOReturnUnsupported;
+    }
+    if (IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
+        return kIOReturnNotPrivileged;
+    }
+    CezanneGPUUserClient *client = OSTypeAlloc(CezanneGPUUserClient);
+    if (client == nullptr) {
+        return kIOReturnNoMemory;
+    }
+    if (!client->initWithTask(owningTask, securityID, type, properties) || !client->attach(this)) {
+        client->release();
+        return kIOReturnError;
+    }
+    if (!client->start(this)) {
+        client->detach(this);
+        client->release();
+        return kIOReturnError;
+    }
+    *handler = client;
+    return kIOReturnSuccess;
 }
 
 void CezanneGPU::stop(IOService *provider)

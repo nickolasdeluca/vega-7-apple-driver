@@ -24,7 +24,8 @@ FORBIDDEN = ("configWrite", "extendedConfigWrite", "ioWrite", "memoryWrite", "se
              "setPowerState", "enablePCIPowerManagement", "IOMapper", "ioRead")
 # Direct call targets in the built binary: metaclass plumbing, logging, boot
 # argument, configuration-space reads, the mapping's address, the discovery
-# table's physical range (stage 2) and the core.
+# table's physical range (stage 2), the stage 4 user client's privilege check
+# and lock, and the core.
 DIRECT_CALLS = {"___stack_chk_fail", "__ZN11OSMetaClassC2EPKcPKS_j", "__ZN11OSMetaClassD2Ev",
                 "__ZN15OSMetaClassBase12safeMetaCastEPKS_PK11OSMetaClass",
                 "__ZN8OSObjectdlEPvm", "__ZN8OSObjectnwEm",
@@ -32,8 +33,10 @@ DIRECT_CALLS = {"___stack_chk_fail", "__ZN11OSMetaClassC2EPKcPKS_j", "__ZN11OSMe
                 "__ZNK11OSMetaClass19instanceConstructedEv", "_IOLog", "_PE_parse_boot_argn", "_snprintf",
                 "__ZN11IOPCIDevice19extendedConfigRead8Ey", "__ZN11IOPCIDevice20extendedConfigRead16Ey",
                 "__ZN11IOPCIDevice20extendedConfigRead32Ey", "__ZN11IOMemoryMap18getPhysicalAddressEv",
-                "__ZN14IODeviceMemory9withRangeEyy"}
-OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU")
+                "__ZN14IODeviceMemory9withRangeEyy", "__ZN12IOUserClient18clientHasPrivilegeEPvPKc",
+                "__ZN12IOUserClientC2EPK11OSMetaClass", "__ZN12IOUserClientD2Ev", "_IOLockAlloc", "_IOLockFree",
+                "_IOLockLock", "_IOLockUnlock"}
+OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU", "__ZN20CezanneGPUUserClient")
 
 
 def strip_comments(source):
@@ -56,7 +59,28 @@ def hardware_calls(source):
     return found
 
 
+def user_client_gate(source):
+    """The newUserClient body, which must refuse non-root callers and early stages."""
+    match = re.search(r"IOReturn CezanneGPU::newUserClient\(.*?\n}\n", strip_comments(source), re.S)
+    return match.group(0) if match else ""
+
+
 class KextSourceTests(unittest.TestCase):
+    def test_diagnostic_interface_is_root_only_and_stage_gated(self):
+        source = (KEXT / "CezanneGPU.cpp").read_text()
+        gate = user_client_gate(source)
+        self.assertIn("clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator)", gate)
+        self.assertIn("stage_ < cezanne::kDiagnosticStage", gate)
+        self.assertIn("!diagnosticsReady_", gate)
+        # The privilege and stage checks come before a client is created.
+        self.assertLess(gate.index("clientHasPrivilege"), gate.index("OSTypeAlloc"))
+        self.assertLess(gate.index("kDiagnosticStage"), gate.index("OSTypeAlloc"))
+        # Reads go through the allowlist with the driver's own stage.
+        self.assertIn("readAllowedRegister(registers, aperture.length, stage_, offset, value)", source)
+        self.assertNotIn("IOConnectMapMemory", source)
+        self.assertNotIn("clientMemoryForType", source)
+
+
     def test_source_makes_no_forbidden_calls(self):
         self.assertEqual(hardware_calls((KEXT / "CezanneGPU.cpp").read_text()), [])
 
@@ -88,7 +112,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 3;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 4;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
