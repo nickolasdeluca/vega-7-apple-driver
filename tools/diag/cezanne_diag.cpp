@@ -7,11 +7,12 @@
 // ring create and destroy (--psp-ring) and the stage 12 TMR setup and
 // teardown through the ring (--psp-tmr) and the stage 13 SDMA0 firmware load
 // (--psp-sdma), and the stage 14 SDMA power-up register inventory
-// (--sdma-inventory). --psp-state (stage 10) only reads.
+// (--sdma-inventory), and the stage 15 first SDMA copy (--sdma-copy).
+// --psp-state (stage 10) only reads.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
 //                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--sdma-inventory]
-//                          [--psp-state]
+//                          [--sdma-copy] [--psp-state]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -150,7 +151,7 @@ void usage(FILE *out)
 {
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
-                      "                         [--psp-sdma] [--sdma-inventory] [--psp-state]\n"
+                      "                         [--psp-sdma] [--sdma-inventory] [--sdma-copy] [--psp-state]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
@@ -166,6 +167,8 @@ void usage(FILE *out)
                       "and DESTROY_TMR; SDMA0 stays halted.\n"
                       "--sdma-inventory does --psp-sdma, then reads 31 SDMA registers before PowerUpSdma, after\n"
                       "it and after PowerDownSdma, before the teardown.\n"
+                      "--sdma-copy does --psp-sdma, then starts SDMA0, runs the ring test and one 4 KiB copy with a\n"
+                      "fence, verifies it, and halts, powers down and tears down.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n");
 }
 
@@ -636,7 +639,76 @@ bool sdmaInventory(io_connect_t connection)
     return scalars[0] == kOK;
 }
 
-bool pspSdma(io_connect_t connection, bool inventory)
+// Runs the stage 15 stop selector (halt, PowerDownSdma, DESTROY_TMR, ring
+// destroy) and prints it.
+bool copyStop(io_connect_t connection)
+{
+    uint64_t stop[5] = {};
+    step("copy 6/6 stop: halt SDMA0, PowerDownSdma, DESTROY_TMR, DESTROY_RINGS");
+    if (!call(connection, kDiagnosticSdmaStop, stop, 5)) return false;
+    std::printf("%s\n  SDMA0_F32_CNTL 0x%08llx, PowerDownSdma 0x%02llx, DESTROY_TMR fence %llu, ring response 0x%08llx\n",
+                statusName(static_cast<Status>(stop[0])), static_cast<unsigned long long>(stop[1]),
+                static_cast<unsigned long long>(stop[2]), static_cast<unsigned long long>(stop[3]),
+                static_cast<unsigned long long>(stop[4]));
+    return stop[0] == kOK && (stop[1] & kSdmaF32Halt) != 0;
+}
+
+// The stage 15 copy, after the stage 13 load: check, start, ring test,
+// copy, verify, stop. Returns whether every step passed; the caller's
+// teardown is skipped once the check passed (stop does it).
+bool sdmaCopy(io_connect_t connection, bool *stopped)
+{
+    *stopped = false;
+    uint64_t check[3] = {};
+    step("copy 1/6 check: SDMA0 holds its boot 19 values; work area 0xf440300000 placed and stable");
+    if (!call(connection, kDiagnosticSdmaCopyCheck, check, 3)) return false;
+    std::printf("%s", statusName(static_cast<Status>(check[0])));
+    if (check[0] == kSdmaUnexpectedState)
+        std::printf(" (%s reads 0x%08llx, boot 19 0x%08x)", registerName(kSdmaInventory[check[1]]),
+                    static_cast<unsigned long long>(check[2]), kSdmaBoot19[check[1]]);
+    std::printf("\n");
+    if (check[0] != kOK) return false;
+
+    *stopped = true; // from here the stop selector undoes everything
+    uint64_t start[3] = {};
+    step("copy 2/6 start: write the work area, PowerUpSdma, 10 golden settings, 24 start writes");
+    bool ok = call(connection, kDiagnosticSdmaStart, start, 3);
+    if (ok) {
+        std::printf("%s, progress %llu, PowerUpSdma 0x%02llx\n", statusName(static_cast<Status>(start[0])),
+                    static_cast<unsigned long long>(start[1]), static_cast<unsigned long long>(start[2]));
+        ok = start[0] == kOK;
+    }
+    const char *frames[] = {"copy 3/6 ring test: WRITE_LINEAR 0xDEADBEEF, GFX_RB_WPTR <- 1024",
+                            "copy 4/6 copy: COPY_LINEAR 4 KiB and FENCE 1, GFX_RB_WPTR <- 2048"};
+    for (uint64_t frame = 0; ok && frame < 2; frame++) {
+        uint64_t out[4] = {};
+        step(frames[frame]);
+        ok = call(connection, kDiagnosticSdmaSubmit, out, 4, &frame, 1);
+        if (ok) {
+            std::printf("%s, observed 0x%08llx, GFX_RB_RPTR %llu, GFX_RB_WPTR %llu\n",
+                        statusName(static_cast<Status>(out[0])), static_cast<unsigned long long>(out[1]),
+                        static_cast<unsigned long long>(out[2]), static_cast<unsigned long long>(out[3]));
+            ok = out[0] == kOK;
+        }
+    }
+    if (ok) {
+        uint64_t verify[5] = {};
+        step("copy 5/6 verify: destination equals source, fence 1, 64 KiB region");
+        ok = call(connection, kDiagnosticSdmaVerify, verify, 5);
+        if (ok) {
+            std::printf("%s\n  GFX_RB_RPTR %llu, %llu unexpected words (first +0x%llx), SDMA0_STATUS_REG 0x%08llx\n",
+                        statusName(static_cast<Status>(verify[0])), static_cast<unsigned long long>(verify[1]),
+                        static_cast<unsigned long long>(verify[2]), static_cast<unsigned long long>(verify[3]),
+                        static_cast<unsigned long long>(verify[4]));
+            ok = verify[0] == kOK;
+        }
+    }
+    bool halted = copyStop(connection);
+    return ok && halted;
+}
+
+// mode: 0 load only, 1 with the stage 14 inventory, 2 with the stage 15 copy.
+bool pspSdma(io_connect_t connection, int mode)
 {
     uint64_t check[7] = {};
     step("sdma 1/6 check: PSP, ring, TMR and firmware-buffer regions; embedded SDMA0 image header");
@@ -713,7 +785,17 @@ bool pspSdma(io_connect_t connection, bool inventory)
     }
 
     bool inventoried = true;
-    if (inventory) {
+    if (mode == 2) {
+        if (!(loadedCall && loaded[1] == 2)) {
+            std::printf("copy: skipped, LOAD_IP_FW did not fence\n");
+        } else {
+            bool stopped = false;
+            bool copied = sdmaCopy(connection, &stopped);
+            if (stopped) return copied && loaded[0] == kOK;
+        }
+        inventoried = false;
+    }
+    if (mode == 1) {
         // Only with the firmware loaded: LOAD_IP_FW fenced.
         if (loadedCall && loaded[1] == 2) {
             inventoried = sdmaInventory(connection);
@@ -731,7 +813,7 @@ int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
     bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
-         inventory = false, psp = false;
+         inventory = false, copy = false, psp = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -763,6 +845,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--sdma-inventory") == 0) {
             inventory = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--sdma-copy") == 0) {
+            copy = true;
             continue;
         }
         if (std::strcmp(argv[i], "--psp-state") == 0) {
@@ -874,7 +960,7 @@ int main(int argc, char **argv)
             IOServiceClose(connection);
             return 1;
         }
-        if (!pspSdma(connection, false)) failures++;
+        if (!pspSdma(connection, 0)) failures++;
     }
     if (inventory) {
         if (info[1] < kSdmaInventoryStage) {
@@ -882,7 +968,15 @@ int main(int argc, char **argv)
             IOServiceClose(connection);
             return 1;
         }
-        if (!pspSdma(connection, true)) failures++;
+        if (!pspSdma(connection, 1)) failures++;
+    }
+    if (copy) {
+        if (info[1] < kSdmaCopyStage) {
+            std::fprintf(stderr, "cezanne-diag: --sdma-copy needs driver stage %u\n", kSdmaCopyStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspSdma(connection, 2)) failures++;
     }
     if (psp) {
         if (info[1] < kPspStateStage) {
