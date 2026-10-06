@@ -81,8 +81,8 @@ class CoreTests(unittest.TestCase):
             "kScratchRestoreMismatch": ("return *readback == original ? kOK : kScratchRestoreMismatch;",
                                         "return kOK;"),
             "registerAllowed(kRegMp1C2PMsg90, 4)": (": stage >= 3 ? kStage3RegisterCount", ": stage >= 3 ? kStage5RegisterCount"),
-            "!registerAllowed(kRegMp0C2PMsg64, 9)": ("stage >= 10  ? kStage10RegisterCount",
-                                                     "stage >= 9  ? kStage10RegisterCount"),
+            "!registerAllowed(kRegMp0C2PMsg64, 9)": (": stage >= 10 ? kStage10RegisterCount",
+                                                     ": stage >= 9 ? kStage10RegisterCount"),
             "!pspCommandAllowed(kPspCmdInitGpcomRing, 3, 0x0015244bu, kPspRingSize, 11)": (
                 "    case kPspCmdInitGpcomRing:\n        return low ==", "    case kPspCmdInitGpcomRing:\n        return (void)low, true;\n        return low =="),
             "11, true, &response) == kPspNotReady": ("if ((ready & kPspResponseFlag) == 0) return kPspNotReady;", ""),
@@ -96,11 +96,17 @@ class CoreTests(unittest.TestCase):
             "kPspReadbackMismatch": ("return kPspReadbackMismatch;", "(void)0;"),
             "kPspFenceTimeout": ("if (i == kPspFencePollPauses) return kPspFenceTimeout;",
                                  "if (i == kPspFencePollPauses) return kOK;"),
-            "!writeAllowed(kRegMp0C2PMsg67, 48, 12)": ("return value == kPspFrameDwords || value == 2 * kPspFrameDwords;",
-                                                       "return value <= 3 * kPspFrameDwords;"),
+            "!writeAllowed(kRegMp0C2PMsg67, 48, 12)": ("return value == kPspFrameDwords || value == 2 * kPspFrameDwords ||",
+                                                       "return value <= 3 * kPspFrameDwords ||"),
             "!pspWorkWriteAllowed(kPspWorkSize, 0, 12)": (
                 "if (stage < kPspTmrStage || (offset & 3) != 0 || offset >= kPspWorkSize) return false;",
                 "if (stage < kPspTmrStage || (offset & 3) != 0) return false;"),
+            "checkSdmaImage(image, kSdmaImageSize) == kSdmaImageInvalid": ("return kSdmaImageInvalid;\n    return kSdmaUcodeOffset", "(void)0;\n    return kSdmaUcodeOffset"),
+            "!sdmaFirmwareWriteAllowed(image, kSdmaFwBufferSize, 0, 13)": (
+                "if (stage < kPspSdmaStage || (offset & 3) != 0 || offset >= kSdmaFwBufferSize) return false;",
+                "if (stage < kPspSdmaStage || (offset & 3) != 0) return false;"),
+            "!writeAllowed(kRegMp0C2PMsg67, 64, 13)": ("(stage >= kPspSdmaStage && value == 3 * kPspFrameDwords);",
+                                                       "(stage >= kPspSdmaStage && value >= 3 * kPspFrameDwords);"),
             "gfxGated(kRegGcApertureHigh)": ("if (kStage10GfxGatedRegisters[i] == offset) return true;", "(void)0;"),
             "registerAllowed(kRegGrbmGfxIndex, 2)": ("stage == 2 ? kStage2RegisterCount",
                                                      "stage == 2 ? kStage3RegisterCount"),
@@ -118,8 +124,12 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("volatile", source, name)
         source = (CORE / "cezanne_core.cpp").read_text()
         # The only calls of the write callbacks: writeRegister after the
-        # register allowlist, writeWork after the work-area allowlist.
-        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 2)
+        # register allowlist, writeWork after the work-area allowlist,
+        # writeFirmwareWord after the firmware-buffer allowlist.
+        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 3)
+        firmware = re.search(r"static Status writeFirmwareWord\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(firmware.index("sdmaFirmwareWriteAllowed(image, offset, value, stage)"),
+                        firmware.index("write32"))
         work = re.search(r"static Status writeWork\(.*?\n}\n", source, re.S).group(0)
         self.assertLess(work.index("pspWorkWriteAllowed(offset, value, stage)"), work.index("write32"))
         body = re.search(r"static Status writeRegister\(.*?\n}\n", source, re.S).group(0)

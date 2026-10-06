@@ -31,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 12;
+const uint32_t kMaxStage = 13;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -364,6 +364,52 @@ const uint32_t kPspTmrFlagVirtPhysAddr = 0x2; // tmr_flags.virt_phy_addr
 const uint32_t kPspFencePollPauses = 2000;
 const uint32_t kPspTmrStage = 12;
 
+// Stage 13: GFX_CMD_ID_LOAD_IP_FW for SDMA0 after SETUP_TMR
+// (psp_load_non_psp_fw: SDMA0 is the first ucode ID, CAP being absent).
+// Frames: SETUP_TMR 0, LOAD_IP_FW 1, DESTROY_TMR 2.
+const uint32_t kGfxCmdLoadIpFw = 6;
+const uint32_t kGfxFwTypeSdma0 = 9; // psp_gfx_if.h GFX_FW_TYPE_SDMA0
+// The pinned green_sardine_sdma.bin (linux-firmware 20260916): its
+// common_firmware_header fields. amdgpu_ucode_init_single_fw copies
+// ucode_size_bytes from ucode_array_offset_bytes; the payload is opaque.
+const uint32_t kSdmaImageSize = 17408;
+const uint32_t kSdmaUcodeSize = 17152;
+const uint32_t kSdmaUcodeOffset = 256;
+const uint32_t kSdmaUcodeVersion = 40;
+// A page-aligned firmware buffer (amdgpu_ucode_init_bo), 1 MiB above the ring.
+const uint64_t kSdmaFwCarveoutOffset = 0x40200000ull;
+const uint64_t kSdmaFwGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kSdmaFwCarveoutOffset;
+const uint64_t kSdmaFwPhysical = (uint64_t(kExpectedFbOffset) << 24) + kSdmaFwCarveoutOffset;
+const uint32_t kSdmaFwBufferSize = 0x5000; // ALIGN(17152, 4096)
+const uint32_t kSdmaFwCheckSize = 0x10000;
+// SDMA0_UCODE_CHECKSUM: in Linux's sdma_reg_list_4_0 (IP dump); read only.
+const uint32_t kRegSdma0UcodeChecksum = (0x1260 + 0x0029) * 4;
+const uint32_t kStage13Registers[] = {kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset, kRegGrbmStatus,
+                                      kRegGrbmGfxIndex, kRegCcShaderArrayConfig, kRegUserShaderArrayConfig,
+                                      kRegCcRbBackendDisable, kRegUserRbBackendDisable, kRegGbAddrConfig,
+                                      kRegSmuioGfxMiscCntl, kRegMp1C2PMsg66, kRegMp1C2PMsg82,
+                                      kRegMp1C2PMsg90, kRegMp0C2PMsg35, kRegMp0C2PMsg81,
+                                      kRegRlcCgttMgcgOverride, kRegRlcCgcgCglsCtrl,
+                                      kRegRlcCgcgCglsCtrl3d, kRegRlcMemSlpCntl, kRegCpMemSlpCntl,
+                                      kRegRlcPgCntl, kRegGrbmStatus2, kRegGrbmStatusSe0,
+                                      kRegCpBusyStat, kRegCpCpfStatus, kRegCpMeCntl, kRegCpMecCntl,
+                                      kRegRlcCntl, kRegRlcStat, kRegCpPfpInstrPntr, kRegCpMeInstrPntr,
+                                      kRegCpMec1InstrPntr, kRegSdma0ClkCtrl, kRegSdma0PowerCntl,
+                                      kRegSdma0F32Cntl, kRegSdma0StatusReg, kRegSdma0GfxRbCntl,
+                                      kRegHdpMemPowerLs, kRegAthubMiscCntl, kRegAtcL2MiscCg,
+                                      kRegDagb0CntlMisc2, kRegMmhubFbLocationBase, kRegMmhubFbLocationTop,
+                                      kRegMmhubVmL2Cntl, kRegMmhubVmContext0Cntl, kRegMmhubMxL1TlbCntl,
+                                      kRegIhRbCntl, kRegScratchReg0, kRegMp0C2PMsg36, kRegMp0C2PMsg64,
+                                      kRegMp0C2PMsg67, kRegMp0C2PMsg69, kRegMp0C2PMsg70, kRegMp0C2PMsg71,
+                                      kRegMmhubFbOffset, kRegMmhubDefaultAddrLsb, kRegMmhubDefaultAddrMsb,
+                                      kRegMmhubAgpTop, kRegMmhubAgpBot, kRegMmhubAgpBase,
+                                      kRegMmhubApertureLow, kRegMmhubApertureHigh, kRegGcFbLocationBase,
+                                      kRegGcFbLocationTop, kRegGcAgpTop, kRegGcAgpBot, kRegGcAgpBase,
+                                      kRegGcApertureLow, kRegGcApertureHigh, kRegSdma0UcodeChecksum};
+const uint32_t kStage13RegisterCount = sizeof(kStage13Registers) / sizeof(kStage13Registers[0]);
+const uint32_t kSdmaF32Halt = 0x1; // SDMA0_F32_CNTL.HALT
+const uint32_t kPspSdmaStage = 13;
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -445,6 +491,9 @@ enum Status : uint32_t {
     kPspReadbackMismatch,
     kPspFenceTimeout,
     kPspCommandFailed,
+    // Stage 13.
+    kSdmaImageInvalid,
+    kSdmaNotHalted,
 };
 
 const char *statusName(Status status);
@@ -563,7 +612,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 8;
+const uint32_t kDiagnosticVersion = 9;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -589,7 +638,10 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticPspTmrSubmit = 15,   // out: Status, fence, response status, fw_addr lo, hi, tmr_size, C2PMSG_67
     kDiagnosticPspTmrObserve = 16,  // out: Status, unexpected words, first unexpected work-area offset
     kDiagnosticPspTmrTeardown = 17, // out: Status, DESTROY_TMR fence, its status, ring response, C2PMSG_64, 67
-    kDiagnosticSelectorCount = 18,
+    // Stage 13, after a SETUP_TMR submit (selector 15) that fenced with status 0.
+    kDiagnosticSdmaLoad = 18,    // out: Status, fence, response status, fw_addr lo, hi, C2PMSG_67
+    kDiagnosticSdmaObserve = 19, // out: Status, work unexpected, first; firmware unexpected, first; checksum, F32_CNTL
+    kDiagnosticSelectorCount = 20,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -771,13 +823,17 @@ Status checkRegionChecksum(const MemoryReader &memory, uint32_t length, const Re
 
 // Writes a command into the work area as psp_cmd_submit_buf and
 // psp_ring_cmd_submit do: the whole command page (zeros and the command), the
-// fence page zeroed (SETUP_TMR only), and its frame (0 for SETUP_TMR, 1 for
-// DESTROY_TMR); then reads every written word back (kPspReadbackMismatch).
-Status writePspCommand(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage, uint32_t command);
+// fence page zeroed (SETUP_TMR only), and its frame; then reads every written
+// word back (kPspReadbackMismatch). Allowed pairs: SETUP_TMR in frame 0,
+// DESTROY_TMR in frame 1 (stage 12) or 2 (stage 13), LOAD_IP_FW in frame 1
+// (stage 13).
+Status writePspCommand(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage, uint32_t command,
+                       uint32_t frame);
 
 // Advances C2PMSG_67 from frame * 16 (kPspOutOfOrder otherwise) to
 // (frame + 1) * 16 and polls the fence dword for frame + 1, up to
-// kPspFencePollPauses pauses (kPspFenceTimeout).
+// kPspFencePollPauses pauses (kPspFenceTimeout). Frames 0 and 1 from stage
+// 12, frame 2 from stage 13.
 Status submitPspFrame(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                       const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *fence);
 
@@ -795,6 +851,32 @@ Status readPspResponse(const MemoryReader &work, PspResponse *response);
 // Counts the words that differ (kPspRegionChanged if any).
 Status verifyPspWorkArea(const MemoryReader &region, const uint32_t *snapshot, uint32_t frames, uint32_t command,
                          uint32_t fence, uint32_t *unexpected, uint32_t *firstOffset);
+
+// Stage 13. Checks the embedded SDMA image's common_firmware_header against
+// the pinned values (kSdmaImageInvalid); the payload is not interpreted.
+Status checkSdmaImage(const uint8_t *image, uint32_t length);
+
+// The firmware buffer's word at a byte offset: the image's ucode bytes, then
+// zero padding to kSdmaFwBufferSize.
+uint32_t sdmaFirmwareWord(const uint8_t *image, uint32_t offset);
+
+// Firmware-buffer writes allowed from stage 13: inside the buffer, only its
+// word at that offset.
+bool sdmaFirmwareWriteAllowed(const uint8_t *image, uint32_t offset, uint32_t value, uint32_t stage);
+
+// The firmware buffer and its check region: the stage 9 page checks.
+Status checkSdmaFirmwareTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                               const Range *ranges, uint32_t rangeCount, MetricsTarget *target);
+
+// Writes the whole firmware buffer (checkSdmaImage first), then reads every
+// word back (kPspReadbackMismatch).
+Status writeSdmaFirmware(const uint8_t *image, uint32_t length, const MemoryReader &buffer,
+                         const MemoryWriter &writer, uint32_t stage);
+
+// Compares the 64 KiB from the firmware buffer: the buffer must hold the
+// image's words, the rest the snapshot. kPspRegionChanged if any differ.
+Status verifySdmaFirmwareRegion(const MemoryReader &region, const uint32_t *snapshot, const uint8_t *image,
+                                uint32_t *unexpected, uint32_t *firstOffset);
 
 } // namespace cezanne
 

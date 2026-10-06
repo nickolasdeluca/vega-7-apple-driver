@@ -1353,7 +1353,7 @@ static void testPspTmr()
         r.work = &work;
         r.frameDelay = 3;
         FakeWriter w(&r);
-        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr) == kOK);
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr, 0) == kOK);
         CHECK(work.writes == 1024 + 1024 + 16);
         for (uint32_t i = 0; i < 256; i++) CHECK(work.words[kPspCmdPage / 4 + i] == pspCommandWord(kGfxCmdSetupTmr, i));
         for (uint32_t i = 0; i < 16; i++) CHECK(work.words[i] == pspFrameWord(0, i));
@@ -1376,7 +1376,7 @@ static void testPspTmr()
         work.words[0x8000 / 4] ^= 1;
         // Teardown: DESTROY_TMR as frame 1.
         CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 12, 0, &fence) == kPspOutOfOrder);
-        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdDestroyTmr) == kOK);
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdDestroyTmr, 1) == kOK);
         CHECK(work.words[kPspFencePage / 4] == 1 && work.words[kPspCmdPage / 4 + 2] == 7 && work.words[16 + 5] == 2);
         CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 12, 1, &fence) == kOK);
         CHECK(fence == 2 && r.psp67 == 32);
@@ -1388,7 +1388,7 @@ static void testPspTmr()
         r.work = &work;
         r.frameDelay = -1; // never processes the frame
         FakeWriter w(&r);
-        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr) == kOK);
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr, 0) == kOK);
         uint32_t fence = 0;
         CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 12, 0, &fence) == kPspFenceTimeout);
         CHECK(r.pauses == int(kPspFencePollPauses) && fence == 0);
@@ -1399,7 +1399,7 @@ static void testPspTmr()
         r.work = &work;
         r.cmdStatus = 0xFFFF000Au; // TEE_ERROR_NOT_SUPPORTED
         FakeWriter w(&r);
-        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr) == kOK);
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr, 0) == kOK);
         uint32_t fence = 0;
         CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 12, 0, &fence) == kOK);
         PspResponse response;
@@ -1408,14 +1408,129 @@ static void testPspTmr()
     {
         FakeMemory work;
         work.stuckOffset = kPspCmdPage + kPspCmdIdOffset;
-        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr) == kPspReadbackMismatch);
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr, 0) == kPspReadbackMismatch);
         FakeMemory fence;
         fence.stuckOffset = kPspFencePage;
         fence.words[kPspFencePage / 4] = 1;
-        CHECK(writePspCommand(fence.reader(), fence.writer(), 12, kGfxCmdSetupTmr) == kPspReadbackMismatch);
+        CHECK(writePspCommand(fence.reader(), fence.writer(), 12, kGfxCmdSetupTmr, 0) == kPspReadbackMismatch);
         FakeMemory any;
-        CHECK(writePspCommand(any.reader(), any.writer(), 11, kGfxCmdSetupTmr) == kRegisterNotAllowed);
-        CHECK(writePspCommand(any.reader(), any.writer(), 12, 6) == kRegisterNotAllowed && any.writes == 0);
+        CHECK(writePspCommand(any.reader(), any.writer(), 11, kGfxCmdSetupTmr, 0) == kRegisterNotAllowed);
+        CHECK(writePspCommand(any.reader(), any.writer(), 12, 6, 1) == kRegisterNotAllowed && any.writes == 0);
+    }
+}
+
+// A synthetic image with the pinned header and a patterned payload; never
+// the real firmware.
+static void makeSdmaImage(uint8_t *image)
+{
+    std::memset(image, 0, kSdmaImageSize);
+    const uint32_t header[] = {kSdmaImageSize, 48, 0x00000001u, 0x00010004u, kSdmaUcodeVersion, kSdmaUcodeSize,
+                               kSdmaUcodeOffset};
+    for (uint32_t i = 0; i < 7; i++)
+        for (uint32_t b = 0; b < 4; b++) image[i * 4 + b] = static_cast<uint8_t>(header[i] >> (8 * b));
+    for (uint32_t i = kSdmaUcodeOffset; i < kSdmaImageSize; i++) image[i] = static_cast<uint8_t>(i * 7 + 3);
+}
+
+static void testSdmaLoad()
+{
+    static uint8_t image[kSdmaImageSize];
+    makeSdmaImage(image);
+    CHECK(kSdmaFwGpuAddress == 0xF440200000ull && kSdmaFwPhysical == 0x600200000ull);
+    CHECK(kSdmaFwPhysical >= kPspRingPhysical + kPspRingCheckSize && kSdmaFwPhysical + kSdmaFwCheckSize <= kPspTmrPhysical);
+    CHECK(kSdmaFwBufferSize == ((kSdmaUcodeSize + 0xFFF) & ~0xFFFu) && kRegSdma0UcodeChecksum == 0x4a24);
+    // Readable from stage 13 only; the stage 13 list extends stage 10's.
+    CHECK(registerAllowed(kRegSdma0UcodeChecksum, 13) && !registerAllowed(kRegSdma0UcodeChecksum, 12));
+    CHECK(kStage13RegisterCount == kStage10RegisterCount + 1);
+    for (uint32_t i = 0; i < kStage10RegisterCount; i++) CHECK(kStage13Registers[i] == kStage10Registers[i]);
+    CHECK(!writeAllowed(kRegSdma0UcodeChecksum, 0, 13) && !writeAllowed(kRegSdma0F32Cntl, 0, 13));
+
+    // The image check.
+    CHECK(checkSdmaImage(image, kSdmaImageSize) == kOK);
+    CHECK(checkSdmaImage(image, kSdmaImageSize - 4) == kSdmaImageInvalid && checkSdmaImage(nullptr, kSdmaImageSize) == kSdmaImageInvalid);
+    const uint32_t fields[] = {0, 8, 12, 16, 20, 24};
+    for (uint32_t field : fields) {
+        image[field] ^= 1;
+        CHECK(checkSdmaImage(image, kSdmaImageSize) == kSdmaImageInvalid);
+        image[field] ^= 1;
+    }
+    CHECK(sdmaFirmwareWord(image, 0) == (uint32_t(image[256]) | uint32_t(image[257]) << 8 | uint32_t(image[258]) << 16 |
+                                         uint32_t(image[259]) << 24));
+    CHECK(sdmaFirmwareWord(image, kSdmaUcodeSize - 4) != 0 && sdmaFirmwareWord(image, kSdmaUcodeSize) == 0);
+
+    // LOAD_IP_FW words and the stage 13 frames and pointer.
+    const uint32_t load[] = {0, 0, 6, 0, 0, 0, 0, 0x40200000u, 0xF4u, kSdmaUcodeSize, 9, 0};
+    for (uint32_t i = 0; i < 12; i++) CHECK(pspCommandWord(kGfxCmdLoadIpFw, i) == load[i]);
+    CHECK(pspFrameWord(2, 5) == 3 && pspFrameWord(2, 0) == 0x40101000u);
+    CHECK(pspWorkWriteAllowed(kPspCmdPage + 8, 6, 13) && !pspWorkWriteAllowed(kPspCmdPage + 8, 6, 12));
+    CHECK(pspWorkWriteAllowed(128 + 20, 3, 13) && !pspWorkWriteAllowed(128 + 20, 3, 12) && !pspWorkWriteAllowed(192, 0, 13));
+    CHECK(writeAllowed(kRegMp0C2PMsg67, 48, 13) && !writeAllowed(kRegMp0C2PMsg67, 48, 12));
+    CHECK(!writeAllowed(kRegMp0C2PMsg67, 64, 13));
+
+    // The firmware-buffer allowlist.
+    CHECK(sdmaFirmwareWriteAllowed(image, 0, sdmaFirmwareWord(image, 0), 13));
+    CHECK(!sdmaFirmwareWriteAllowed(image, 0, sdmaFirmwareWord(image, 0), 12));
+    CHECK(!sdmaFirmwareWriteAllowed(image, 0, sdmaFirmwareWord(image, 0) ^ 1, 13));
+    CHECK(sdmaFirmwareWriteAllowed(image, kSdmaFwBufferSize - 4, 0, 13));
+    CHECK(!sdmaFirmwareWriteAllowed(image, kSdmaFwBufferSize, 0, 13));
+    CHECK(!sdmaFirmwareWriteAllowed(image, 2, 0, 13));
+
+    // The firmware copy and the region check.
+    static uint32_t fwSnapshot[kSdmaFwCheckSize / 4];
+    {
+        FakeMemory buffer;
+        for (uint32_t i = 0; i < kSdmaFwCheckSize / 4; i++) buffer.words[i] = fwSnapshot[i] = 0x9E3779B9u * i;
+        CHECK(writeSdmaFirmware(image, kSdmaImageSize, buffer.reader(), buffer.writer(), 13) == kOK);
+        CHECK(buffer.writes == int(kSdmaFwBufferSize / 4));
+        for (uint32_t o = 0; o < kSdmaFwBufferSize; o += 4) CHECK(buffer.words[o / 4] == sdmaFirmwareWord(image, o));
+        CHECK(buffer.words[kSdmaFwBufferSize / 4] == fwSnapshot[kSdmaFwBufferSize / 4]);
+        uint32_t unexpected = 9, first = 9;
+        CHECK(verifySdmaFirmwareRegion(buffer.reader(), fwSnapshot, image, &unexpected, &first) == kOK && unexpected == 0);
+        buffer.words[0x6000 / 4] ^= 1;
+        CHECK(verifySdmaFirmwareRegion(buffer.reader(), fwSnapshot, image, &unexpected, &first) == kPspRegionChanged);
+        CHECK(unexpected == 1 && first == 0x6000);
+    }
+    {
+        FakeMemory buffer;
+        buffer.stuckOffset = 0x100;
+        CHECK(writeSdmaFirmware(image, kSdmaImageSize, buffer.reader(), buffer.writer(), 13) == kPspReadbackMismatch);
+        FakeMemory other;
+        CHECK(writeSdmaFirmware(image, kSdmaImageSize, other.reader(), other.writer(), 12) == kRegisterNotAllowed);
+        image[20] ^= 1;
+        CHECK(writeSdmaFirmware(image, kSdmaImageSize, other.reader(), other.writer(), 13) == kSdmaImageInvalid);
+        image[20] ^= 1;
+        CHECK(other.writes == 0);
+    }
+
+    // Command and frame pairs.
+    {
+        FakeMemory work;
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdLoadIpFw, 1) == kRegisterNotAllowed);
+        CHECK(writePspCommand(work.reader(), work.writer(), 13, kGfxCmdLoadIpFw, 2) == kRegisterNotAllowed);
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdDestroyTmr, 2) == kRegisterNotAllowed);
+        CHECK(writePspCommand(work.reader(), work.writer(), 13, kGfxCmdSetupTmr, 1) == kRegisterNotAllowed);
+        CHECK(work.writes == 0);
+    }
+
+    // Three frames against the fake PSP.
+    static uint32_t snapshot[kPspRingCheckSize / 4];
+    {
+        FakeRegisters r;
+        FakeMemory work;
+        for (uint32_t i = 0; i < kPspRingCheckSize / 4; i++) work.words[i] = snapshot[i] = 0x9E3779B9u * i;
+        r.work = &work;
+        FakeWriter w(&r);
+        uint32_t fence = 0, unexpected = 9, first = 9;
+        CHECK(writePspCommand(work.reader(), work.writer(), 13, kGfxCmdSetupTmr, 0) == kOK);
+        CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 13, 0, &fence) == kOK && fence == 1);
+        CHECK(writePspCommand(work.reader(), work.writer(), 13, kGfxCmdLoadIpFw, 1) == kOK);
+        CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 13, 1, &fence) == kOK && fence == 2);
+        CHECK(r.psp67 == 32);
+        CHECK(verifyPspWorkArea(work.reader(), snapshot, 2, kGfxCmdLoadIpFw, 2, &unexpected, &first) == kOK);
+        CHECK(writePspCommand(work.reader(), work.writer(), 13, kGfxCmdDestroyTmr, 2) == kOK);
+        CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 13, 2, &fence) == kOK && fence == 3);
+        CHECK(r.psp67 == 48 && w.values[2] == 48);
+        CHECK(verifyPspWorkArea(work.reader(), snapshot, 3, kGfxCmdDestroyTmr, 3, &unexpected, &first) == kOK);
+        CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 12, 2, &fence) == kRegisterNotAllowed);
     }
 }
 
@@ -1439,6 +1554,7 @@ int main()
     testMetrics();
     testPspRing();
     testPspTmr();
+    testSdmaLoad();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

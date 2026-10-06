@@ -72,6 +72,8 @@ const char *statusName(Status status)
     case kPspReadbackMismatch: return "psp-readback-mismatch";
     case kPspFenceTimeout: return "psp-fence-timeout";
     case kPspCommandFailed: return "psp-command-failed";
+    case kSdmaImageInvalid: return "sdma-image-invalid";
+    case kSdmaNotHalted: return "sdma-not-halted";
     }
     return "unknown";
 }
@@ -148,8 +150,9 @@ Status checkAperture(const PciState &state, uint64_t physical, uint64_t length)
 bool registerAllowed(uint32_t offset, uint32_t stage)
 {
     // Each stage's list extends the previous one (checked by the tests), so a
-    // prefix of the stage 10 list is the list for any stage.
-    uint32_t count = stage >= 10  ? kStage10RegisterCount
+    // prefix of the stage 13 list is the list for any stage.
+    uint32_t count = stage >= 13  ? kStage13RegisterCount
+                     : stage >= 10 ? kStage10RegisterCount
                      : stage >= 6 ? kStage6RegisterCount
                      : stage == 5 ? kStage5RegisterCount
                      : stage >= 3 ? kStage3RegisterCount
@@ -157,7 +160,7 @@ bool registerAllowed(uint32_t offset, uint32_t stage)
                      : stage == 1 ? kStage1RegisterCount
                                   : 0;
     for (uint32_t i = 0; i < count; i++) {
-        if (kStage10Registers[i] == offset) return true;
+        if (kStage13Registers[i] == offset) return true;
     }
     return false;
 }
@@ -438,7 +441,9 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (offset == kRegMp0C2PMsg70) return value == uint32_t(kPspRingGpuAddress >> 32);
     if (offset == kRegMp0C2PMsg71) return value == kPspRingSize;
     if (stage < kPspTmrStage) return false;
-    if (offset == kRegMp0C2PMsg67) return value == kPspFrameDwords || value == 2 * kPspFrameDwords;
+    if (offset == kRegMp0C2PMsg67)
+        return value == kPspFrameDwords || value == 2 * kPspFrameDwords ||
+               (stage >= kPspSdmaStage && value == 3 * kPspFrameDwords);
     return false;
 }
 
@@ -834,6 +839,16 @@ Status destroyPspRing(const RegisterReader &registers, uint64_t apertureLength, 
 uint32_t pspCommandWord(uint32_t command, uint32_t word)
 {
     if (word == kPspCmdIdOffset / 4) return command;
+    if (command == kGfxCmdLoadIpFw) {
+        // psp_prep_load_ip_fw_cmd_buf: psp_gfx_cmd_load_ip_fw at +28.
+        switch (word - kPspCmdFieldsOffset / 4) {
+        case 0: return uint32_t(kSdmaFwGpuAddress);
+        case 1: return uint32_t(kSdmaFwGpuAddress >> 32);
+        case 2: return kSdmaUcodeSize;
+        case 3: return kGfxFwTypeSdma0;
+        default: return 0;
+        }
+    }
     if (command != kGfxCmdSetupTmr) return 0;
     // psp_prep_tmr_cmd_buf: psp_gfx_cmd_setup_tmr at +28.
     switch (word - kPspCmdFieldsOffset / 4) {
@@ -867,10 +882,12 @@ bool pspWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (offset >= kPspCmdPage) {
         uint32_t word = (offset - kPspCmdPage) / 4;
         return value == 0 || value == pspCommandWord(kGfxCmdSetupTmr, word) ||
-               value == pspCommandWord(kGfxCmdDestroyTmr, word);
+               value == pspCommandWord(kGfxCmdDestroyTmr, word) ||
+               (stage >= kPspSdmaStage && value == pspCommandWord(kGfxCmdLoadIpFw, word));
     }
     uint32_t frame = offset / kPspFrameSize;
-    return frame < 2 && (value == 0 || value == pspFrameWord(frame, (offset % kPspFrameSize) / 4));
+    uint32_t frames = stage >= kPspSdmaStage ? 3 : 2;
+    return frame < frames && (value == 0 || value == pspFrameWord(frame, (offset % kPspFrameSize) / 4));
 }
 
 static Status writeWork(const MemoryWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
@@ -915,11 +932,21 @@ Status checkRegionChecksum(const MemoryReader &memory, uint32_t length, const Re
     return first == second ? kOK : kTableRegionInUse;
 }
 
-Status writePspCommand(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage, uint32_t command)
+static bool commandFrameAllowed(uint32_t command, uint32_t frame, uint32_t stage)
 {
-    if (stage < kPspTmrStage || (command != kGfxCmdSetupTmr && command != kGfxCmdDestroyTmr))
-        return kRegisterNotAllowed;
-    uint32_t frame = command == kGfxCmdSetupTmr ? 0 : 1;
+    if (stage < kPspTmrStage) return false;
+    switch (command) {
+    case kGfxCmdSetupTmr: return frame == 0;
+    case kGfxCmdDestroyTmr: return frame == 1 || (stage >= kPspSdmaStage && frame == 2);
+    case kGfxCmdLoadIpFw: return stage >= kPspSdmaStage && frame == 1;
+    default: return false;
+    }
+}
+
+Status writePspCommand(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage, uint32_t command,
+                       uint32_t frame)
+{
+    if (!commandFrameAllowed(command, frame, stage)) return kRegisterNotAllowed;
     // Each pass writes, then reads back: the command page, the fence page
     // (SETUP_TMR only), and the frame.
     for (int pass = 0; pass < 2; pass++) {
@@ -964,7 +991,7 @@ Status submitPspFrame(const RegisterReader &registers, uint64_t apertureLength, 
                       const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *fence)
 {
     *fence = 0;
-    if (stage < kPspTmrStage || frame > 1) return kRegisterNotAllowed;
+    if (stage < kPspTmrStage || frame > (stage >= kPspSdmaStage ? 2u : 1u)) return kRegisterNotAllowed;
     uint32_t pointer = 0;
     Status status = readRegister(registers, apertureLength, stage, kRegMp0C2PMsg67, &pointer);
     if (status != kOK) return status;
@@ -1012,6 +1039,81 @@ Status verifyPspWorkArea(const MemoryReader &region, const uint32_t *snapshot, u
             ok = value == snapshot[offset / 4];
         }
         if (!ok && (*unexpected)++ == 0) *firstOffset = offset;
+    }
+    return *unexpected == 0 ? kOK : kPspRegionChanged;
+}
+
+Status checkSdmaImage(const uint8_t *image, uint32_t length)
+{
+    // common_firmware_header: size_bytes, header_size_bytes, header version
+    // 1.0 and IP 4.1 (four uint16), ucode_version, ucode_size_bytes,
+    // ucode_array_offset_bytes.
+    if (image == nullptr || length != kSdmaImageSize) return kSdmaImageInvalid;
+    if (le32(image) != kSdmaImageSize || le32(image + 8) != 0x00000001u || le32(image + 12) != 0x00010004u ||
+        le32(image + 16) != kSdmaUcodeVersion || le32(image + 20) != kSdmaUcodeSize ||
+        le32(image + 24) != kSdmaUcodeOffset)
+        return kSdmaImageInvalid;
+    return kSdmaUcodeOffset + kSdmaUcodeSize <= length ? kOK : kSdmaImageInvalid;
+}
+
+uint32_t sdmaFirmwareWord(const uint8_t *image, uint32_t offset)
+{
+    return offset + 4 <= kSdmaUcodeSize ? le32(image + kSdmaUcodeOffset + offset) : 0;
+}
+
+bool sdmaFirmwareWriteAllowed(const uint8_t *image, uint32_t offset, uint32_t value, uint32_t stage)
+{
+    if (stage < kPspSdmaStage || (offset & 3) != 0 || offset >= kSdmaFwBufferSize) return false;
+    return value == sdmaFirmwareWord(image, offset);
+}
+
+static Status writeFirmwareWord(const uint8_t *image, const MemoryWriter &writer, uint32_t stage, uint32_t offset)
+{
+    uint32_t value = sdmaFirmwareWord(image, offset);
+    if (!sdmaFirmwareWriteAllowed(image, offset, value, stage)) return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+Status checkSdmaFirmwareTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                               const Range *ranges, uint32_t rangeCount, MetricsTarget *target)
+{
+    *target = MetricsTarget();
+    if (stage < kPspSdmaStage) return kRegisterNotAllowed;
+    Status status = checkCarveoutPage(registers, apertureLength, stage, kSdmaFwCarveoutOffset, kSdmaFwCheckSize,
+                                      ranges, rangeCount, target);
+    if (status != kOK) return status;
+    if (target->gpuAddress != kSdmaFwGpuAddress || target->physical != kSdmaFwPhysical) return kMetricsAddressMismatch;
+    return kOK;
+}
+
+Status writeSdmaFirmware(const uint8_t *image, uint32_t length, const MemoryReader &buffer,
+                         const MemoryWriter &writer, uint32_t stage)
+{
+    if (stage < kPspSdmaStage) return kRegisterNotAllowed;
+    Status status = checkSdmaImage(image, length);
+    if (status != kOK) return status;
+    for (uint32_t offset = 0; offset < kSdmaFwBufferSize; offset += 4) {
+        status = writeFirmwareWord(image, writer, stage, offset);
+        if (status != kOK) return status;
+    }
+    for (uint32_t offset = 0; offset < kSdmaFwBufferSize; offset += 4) {
+        uint32_t value = 0;
+        if (!buffer.read32(buffer.context, offset, &value)) return kRegisterReadFailed;
+        if (value != sdmaFirmwareWord(image, offset)) return kPspReadbackMismatch;
+    }
+    return kOK;
+}
+
+Status verifySdmaFirmwareRegion(const MemoryReader &region, const uint32_t *snapshot, const uint8_t *image,
+                                uint32_t *unexpected, uint32_t *firstOffset)
+{
+    *unexpected = 0;
+    *firstOffset = 0;
+    for (uint32_t offset = 0; offset < kSdmaFwCheckSize; offset += 4) {
+        uint32_t value = 0;
+        if (!region.read32(region.context, offset, &value)) return kRegisterReadFailed;
+        uint32_t expected = offset < kSdmaFwBufferSize ? sdmaFirmwareWord(image, offset) : snapshot[offset / 4];
+        if (value != expected && (*unexpected)++ == 0) *firstOffset = offset;
     }
     return *unexpected == 0 ? kOK : kPspRegionChanged;
 }
