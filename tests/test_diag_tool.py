@@ -21,7 +21,8 @@ class DiagSourceTests(unittest.TestCase):
         self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore",
                                   "kDiagnosticSmuCheck", "kDiagnosticSmuQuery", "kDiagnosticSmuCheck",
                                   "kDiagnosticGfxOffDisallow", "kDiagnosticMetricsCheck",
-                                  "kDiagnosticMetricsTransfer"])
+                                  "kDiagnosticMetricsTransfer", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate",
+                                  "kDiagnosticPspRingObserve", "kDiagnosticPspRingDestroy"])
         # The only messages the tool can ask for are the two version queries.
         self.assertEqual(re.findall(r'\{"smu \d/3 query: \w+ \(0x\d\)", (\w+)\}', source),
                          ["kSmuMsgGetDriverIfVersion", "kSmuMsgGetSmuVersion"])
@@ -36,6 +37,8 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(gfxoff\) \{[^}]*info\[1\] < kGfxOffStage")
         self.assertEqual(len(re.findall(r"\bsmuMetrics\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(metrics\) \{[^}]*info\[1\] < kMetricsStage")
+        self.assertEqual(len(re.findall(r"\bpspRing\(connection\)", source)), 1)
+        self.assertRegex(source, r"if \(ring\) \{[^}]*info\[1\] < kPspRingStage")
         self.assertEqual(len(re.findall(r"\bpspState\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(psp\) \{[^}]*info\[1\] < kPspStateStage")
         self.assertEqual(len(re.findall(r"\bscratchTest\(connection\)", source)), 1)

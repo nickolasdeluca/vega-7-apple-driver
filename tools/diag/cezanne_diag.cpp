@@ -3,11 +3,11 @@
 // the register BAR read-only for every read. The only writes it can request
 // are the stage 6 scratch test (--scratch-test), the stage 7 SMU version
 // queries (--smu-query), the stage 8 DisallowGfxOff (--gfxoff-disallow) and
-// the stage 9 metrics-table transfer (--smu-metrics). --psp-state (stage 10)
-// only reads.
+// the stage 9 metrics-table transfer (--smu-metrics) and the stage 11 PSP
+// ring create and destroy (--psp-ring). --psp-state (stage 10) only reads.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
-//                          [--smu-metrics] [--psp-state]
+//                          [--smu-metrics] [--psp-ring] [--psp-state]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -109,7 +109,7 @@ static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage10RegisterCoun
 void usage(FILE *out)
 {
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
-                      "                         [--gfxoff-disallow] [--smu-metrics] [--psp-state]\n"
+                      "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-state]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
@@ -117,6 +117,8 @@ void usage(FILE *out)
                       "--gfxoff-disallow first sends DisallowGfxOff and waits for GFX to report on.\n"
                       "--smu-metrics first has the SMU write its metrics table to the checked carveout page\n"
                       "and prints it.\n"
+                      "--psp-ring first creates the PSP kernel-mode ring at the checked carveout page, compares\n"
+                      "the page region with its snapshot, and destroys the ring.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n");
 }
 
@@ -406,10 +408,62 @@ bool pspState(io_connect_t connection)
     return mmhubOk && gcOk;
 }
 
+void printMailbox(const uint64_t *values)
+{
+    std::printf("  C2PMSG_64 0x%08llx  C2PMSG_67 0x%08llx  C2PMSG_69 0x%08llx  C2PMSG_70 0x%08llx  C2PMSG_71 0x%08llx\n",
+                static_cast<unsigned long long>(values[0]), static_cast<unsigned long long>(values[1]),
+                static_cast<unsigned long long>(values[2]), static_cast<unsigned long long>(values[3]),
+                static_cast<unsigned long long>(values[4]));
+}
+
+// The stage 11 PSP ring: check, reroute and create, observe, destroy. The
+// destroy runs after any create that returned ok, even if observing fails;
+// the driver also destroys the ring if this exits in between.
+bool pspRing(io_connect_t connection)
+{
+    uint64_t check[7] = {};
+    step("psp 1/4 check: secure OS running, C2PMSG_64 ready, no ring; 64 KiB at the ring page stable for ~1 s");
+    if (!call(connection, kDiagnosticPspRingCheck, check, 7)) return false;
+    std::printf("%s\n  C2PMSG_81 0x%08llx\n", statusName(static_cast<Status>(check[0])),
+                static_cast<unsigned long long>(check[1]));
+    printMailbox(check + 2);
+    if (check[0] != kOK) return false;
+
+    uint64_t created[4] = {};
+    std::printf("psp 2/4 create: GBR_IH_SET VMC (3, 0x%08x), GBR_IH_SET UMC (4, 0x%08x), INIT_GPCOM_RING at\n"
+                "  GPU 0x%010llx (physical 0x%010llx), size 0x%x ... ",
+                kPspIhVmcConfig, kPspIhUmcConfig, static_cast<unsigned long long>(kPspRingGpuAddress),
+                static_cast<unsigned long long>(kPspRingPhysical), kPspRingSize);
+    std::fflush(stdout);
+    if (!call(connection, kDiagnosticPspRingCreate, created, 4)) return false;
+    std::printf("%s, responses 0x%08llx 0x%08llx 0x%08llx\n", statusName(static_cast<Status>(created[0])),
+                static_cast<unsigned long long>(created[1]), static_cast<unsigned long long>(created[2]),
+                static_cast<unsigned long long>(created[3]));
+    if (created[0] != kOK) return false;
+
+    uint64_t observed[8] = {};
+    step("psp 3/4 observe: mailbox; 64 KiB at the ring compared with the snapshot");
+    bool observedCall = call(connection, kDiagnosticPspRingObserve, observed, 8);
+    if (observedCall) {
+        std::printf("%s\n", statusName(static_cast<Status>(observed[0])));
+        printMailbox(observed + 1);
+        std::printf("  changed words: %llu in the ring page, %llu in the 60 KiB after it\n",
+                    static_cast<unsigned long long>(observed[6]), static_cast<unsigned long long>(observed[7]));
+    }
+
+    uint64_t destroyed[7] = {};
+    step("psp 4/4 destroy: DESTROY_RINGS");
+    if (!call(connection, kDiagnosticPspRingDestroy, destroyed, 7)) return false;
+    std::printf("%s, response 0x%08llx\n", statusName(static_cast<Status>(destroyed[0])),
+                static_cast<unsigned long long>(destroyed[1]));
+    printMailbox(destroyed + 2);
+    return observedCall && observed[0] == kOK && destroyed[0] == kOK;
+}
+
 int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
-    bool scratch = false, smu = false, gfxoff = false, metrics = false, psp = false;
+    bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, psp = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -425,6 +479,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--smu-metrics") == 0) {
             metrics = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--psp-ring") == 0) {
+            ring = true;
             continue;
         }
         if (std::strcmp(argv[i], "--psp-state") == 0) {
@@ -511,6 +569,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!smuMetrics(connection)) failures++;
+    }
+    if (ring) {
+        if (info[1] < kPspRingStage) {
+            std::fprintf(stderr, "cezanne-diag: --psp-ring needs driver stage %u\n", kPspRingStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspRing(connection)) failures++;
     }
     if (psp) {
         if (info[1] < kPspStateStage) {
