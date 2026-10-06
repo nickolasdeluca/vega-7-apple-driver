@@ -41,11 +41,11 @@ the interrupt ring) succeeded in boot 25: the MMHUB GART translated an SDMA
 read through a driver-built page table, the SDMA0 trap arrived in IH ring 0,
 and every register was restored. Boot 24 had stopped at the precondition
 check on a live display status bit, since fixed. Stage 18 (interrupt
-delivery) is approved and built. Its first boot (26) delivered the SDMA0
-trap as an MSI to the kext's handler, but the verify counted a second MSI
-that arrived before the trap; the verify now counts only MSIs after the
-submit and records each one's time, rebuilt for boot 27. No later stage is
-authorized.
+delivery) succeeded in boot 27: SDMA0's trap reached the kext's handler as
+an MSI 31 µs after the write pointer, the acknowledgement caused no re-fire,
+and everything was restored. Boot 26 had counted an extra MSI at the
+`ENABLE_INTR` write; the verify now counts only MSIs after the submit. No
+later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -4359,6 +4359,34 @@ build; cold boot; `tools/capture_boot.sh boot-26-stage18 --gfxoff-disallow
 - Captures are in ignored `out/test-efi/boot-26-stage18/`.
 - Result: **MSI delivery works; the verify's count is fixed.** Boot 27
   repeats the run and should show when the extra MSI arrives.
+
+**Boot 27, 2026-10-06, stage 18 with the count after the submit**
+(`out/test-efi/usb-stage18/`, rebuilt; cold boot; `tools/capture_boot.sh
+boot-27-stage18 --gfxoff-disallow --ih-intr --psp-state`; exit 0).
+
+- The stage 15 copy and the stage 17 flow passed as before.
+- **Check and enable:** ok, as in boot 26 (MSI index 1; the capability goes
+  from `0x0084` to `0x0085` with address `0xfee00000`, data `0x4079`).
+- **Frame 3:** fence 3, `GFX_RB_RPTR` 4096.
+- **Verify: ok.** The times are measured from the `ENABLE_INTR` write:
+  - **MSI 1 at 23 µs**, before the submit at 52 µs, with the ring empty.
+    This confirms boot 26: setting `ENABLE_INTR` raises one MSI by itself.
+    Linux's handler would find `rptr == wptr` and do nothing.
+  - **MSI 2 at 83 µs**: the trap's, 31 µs after the write pointer.
+  - One ring entry, client 8, source 224, ring 0, VMID 0. dw1 holds the GPU
+    timestamp `085b9e46`.
+  - Fence 3, no VM fault, both regions clean, display unchanged.
+- **Acknowledge: ok.** `IH_RB_RPTR` ← `0x20`. After 100 ms the MSI count was
+  still 2 and the write-back still `0x20`: no re-fire.
+- **Restores and stop:** ok. The MSI capability went back to `0x0084`.
+  Against boot 26, the final dump differs only in the `C2PMSG_81` counter.
+- **Observations for later stages:**
+  - The `ENABLE_INTR` MSI does not use up `RPTR_REARM`'s single interrupt:
+    the trap still raised one with no `IH_RB_RPTR` write in between.
+  - Delivery takes about 30 µs from the write-pointer commit,
+    measured with the handler's `mach_absolute_time()`.
+- Captures are in ignored `out/test-efi/boot-27-stage18/`.
+- Result: **stage 18 succeeded.**
 
 ## Unknowns and limits
 

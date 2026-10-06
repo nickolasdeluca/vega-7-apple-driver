@@ -7,7 +7,7 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 ## Current checkpoint
 
 Current checkpoint, 2026-10-06, branch `cezanne-discovery`: **driver stages
-0–17 succeeded on the USB test EFI** (boots 1–25; see the
+0–18 succeeded on the USB test EFI** (boots 1–27; see the
 [test boot log](test-boot.md#test-boot-log)). The driver can do the
 following:
 - read the GPU, the discovery table and the engine state;
@@ -17,13 +17,16 @@ following:
 - run a verified SDMA copy and fence (boot 21);
 - read the display, MMHUB VM and IH state (boot 22);
 - enable the MMHUB GART and IH ring 0, copy through the GART and receive the
-  SDMA0 trap, then restore (boot 25).
+  SDMA0 trap, then restore (boot 25);
+- deliver that trap as an MSI to a kext handler, acknowledge it, then
+  restore (boot 27).
 
 Stage 17 (GART and the IH ring) succeeded in boot 25: an SDMA copy read
 through a driver-built GART page table, its trap arrived in IH ring 0, and
-everything was restored. Stage 18 (MSI interrupt delivery) delivered the
-trap as an MSI in boot 26; the verify's count was fixed and rebuilt for boot
-27; see "Next task" below. The sections that follow are the earlier discovery record and
+everything was restored. Stage 18 (MSI interrupt delivery) succeeded in
+boot 27: the trap reached the kext's handler 31 µs after the write pointer,
+with no re-fire after the acknowledgement. Stage 19 (display test pattern)
+is next, to be proposed; see "Next task" below. The sections that follow are the earlier discovery record and
 still apply.
 
 Completed work:
@@ -137,9 +140,17 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 18 again (boot 27)
+## Next task: propose stage 19 (display test pattern)
 
-**Resume here.** Boot 26 (2026-10-06) delivered SDMA0's trap as an MSI to the
+**Resume here.** Stage 18 succeeded in boot 27 (2026-10-06). The user chose
+the display test pattern as stage 19: point pipe 0's surface at a pattern in
+the carveout for a few seconds, on the firmware's mode, then restore the
+surface address to the GOP framebuffer `0xF400000000`. It needs a proposal in
+[test-boot.md](test-boot.md) and the user's approval.
+
+### Earlier: booting stage 18
+
+ Boot 26 (2026-10-06) delivered SDMA0's trap as an MSI to the
 kext's handler, but counted a second MSI that came before the trap (see the
 boot 26 entry in the [test boot log](test-boot.md#test-boot-log)). The verify
 now counts only MSIs after the submit and records each one's time. The
