@@ -89,7 +89,9 @@ kernel-mode ring; `--psp-tmr` (stage 12) submits `SETUP_TMR` and
 firmware between them; `--sdma-inventory` (stage 14) adds the SDMA
 power-up and a read-only register inventory; `--sdma-copy` (stage 15) runs
 the first SDMA copy and fence; `--inventory16` (stage 16, reads only)
-surveys the display, memory-hub VM and interrupt registers. Building the kext needs that firmware in ignored
+surveys the display, memory-hub VM and interrupt registers; `--gart-ih`
+(stage 17) enables GART and the interrupt ring, copies through GART with a
+fence and a trap, and restores every register. Building the kext needs that firmware in ignored
 `out/firmware-provenance/fw/` (see
 [firmware provenance](docs/firmware-provenance.md)).
 

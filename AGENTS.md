@@ -52,7 +52,10 @@ Experimental booting is available only through the USB test EFI in
   halted, on request; and stage 14, `PowerUpSdma`/`PowerDownSdma` and 25
   read-only SDMA registers, on request; and stage 15, starting SDMA0 with
   exact register values and the first 4 KiB copy with a fence, on request;
-  and stage 16, 92 read-only display, memory-hub VM and interrupt registers).
+  and stage 16, 92 read-only display, memory-hub VM and interrupt registers;
+  and stage 17, GART (MMHUB context 0) and IH ring 0 with values pinned from
+  boot 22, an SDMA copy through GART with a fence and a trap, then a restore
+  of every register, on request).
   Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS

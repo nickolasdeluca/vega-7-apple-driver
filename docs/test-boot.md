@@ -36,8 +36,9 @@ driver wrote only the low half of the write pointer. With that fixed,
 `0xDEADBEEF`, copied 4 KiB exactly and signalled fence 1, and nothing else
 in the checked region changed. Stage 16 (a read-only display, VM and
 interrupt inventory) succeeded in boot 22, apart from one semaphore register
-whose read has a side effect, now removed from the list. No later stage is
-authorized.
+whose read has a side effect, now removed from the list. Stage 17 (GART and
+the interrupt ring) is approved and built (`usb-stage17`), and waits for
+its first boot. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -121,7 +122,7 @@ off restores the known-good boot. This is the experimental environment
      registers, read only through the diagnostic interface, described
      [below](#stage-16-display-vm-and-interrupt-inventory-proposal).
    - **Stage 17** (proposed 2026-10-06 and approved by the user the same
-     day; not yet implemented): stage 16 plus GART (MMHUB context 0) and IH
+     day; implemented and built the same day, not yet booted): stage 16 plus GART (MMHUB context 0) and IH
      ring 0 with values pinned from boot 22, proven by an SDMA copy through
      GART with a fence and a trap, then restored. Described
      [below](#stage-17-gart-and-the-interrupt-ring-proposal).
@@ -2772,9 +2773,9 @@ boot the known-good EFI.
 
 ### Stage 17: GART and the interrupt ring (proposal)
 
-**Status: proposed 2026-10-06 and approved by the user the same day. Not
-yet implemented: implementation and the test boot were deferred to the next
-session.**
+**Status: proposed 2026-10-06 and approved by the user the same day;
+implemented and built (`out/test-efi/usb-stage17`) the same day. Not yet
+booted.**
 
 **Purpose.** Turn on the two remaining memory and interrupt foundations,
 with every value pinned from boot 22:
@@ -2928,6 +2929,51 @@ the flush.
 - The display unchanged, and every register back at its boot 22 value
   after the restore.
 
+**Implementation** (2026-10-06). Diagnostic interface version 13, selectors
+26–29, and selector 23 with frame 2:
+
+| Step | Selector | What it does |
+| --- | --- | --- |
+| check | 26 `GartCheck` | Only after a passing stage 15 verify on the same connection. Reads the 41-entry precondition list in order: the 21 GART registers, the 8 IH registers, `SDMA0_CNTL` (2, as the stage 15 start leaves it), then display pipe 0's 11 registers. Places the new area (stage 9 checks) and snapshots its 64 KiB after the 1 s stability check, then snapshots the 55 display registers. No write. |
+| enable | 27 `GartEnable` | Writes the GART area (one non-zero PTE), frame 2 and the zeroed second destination, all read back. Then the 21 GART writes, the flush, the 8 IH writes, the ring on, and `SDMA0_CNTL` ← 3. Reports progress 0–3 (none, GART, IH, `SDMA0_CNTL`), which drives the restore. |
+| frame 2 | 23 `SdmaSubmit`, frame 2 | `GFX_RB_WPTR` 2048 → 3072, then `_HI` ← 0; polls fence 2 for 100 ms. |
+| verify | 28 `GartVerify` | Reads only. Polls the IH write-back for SDMA0's trap for up to 100 ms, then returns a `GartReport`: pointers, fence, fault status, IH counts, the first 32 entries, and unexpected-word and display-change counts. |
+| restore | 29 `GartRestore` | Restores by progress, then reads every written register back (see below). The stage 15 stop (selector 25) runs it first whenever the enable was sent and not yet restored. So does a closed or abandoned connection, which goes through the stop. |
+
+- **Register writes** go through a third BAR5 page set, `kGartPages`:
+  - `0x4000`: IH and SDMA0;
+  - `0x69000`: VM L2, context 0 and engine 17;
+  - `0x6a000`: L1 TLB and default address.
+- **Semaphore:** `VM_INVALIDATE_ENG17_SEM` is in no read allowlist. The
+  adapter lets only that page set's operations read it, and in the core only
+  `flushGart` reads it.
+- **Flush:**
+  - If the semaphore never reads 1 within 100 polls, the flush writes
+    nothing (`gart-semaphore-timeout`).
+  - After an acquire it always writes the release, even when `ACK` never
+    sets (`gart-ack-timeout`).
+- **Memory:** the GART area is the fourth writable memory mapping (16 KiB).
+  From stage 17 the copy work area maps 20 KiB (the second destination);
+  stage 15 and 16 boots keep 16 KiB.
+
+**Choices not fixed by the proposal:**
+- **`VM_INVALIDATE_ENG17_ADDR_RANGE_LO32`/`HI32` were never read** (stage 16
+  read engine 0's). The table's "0/0" for them is an expectation, and the
+  check reads them first (stage 17 adds them to the read list). If either is
+  not 0, the check stops with nothing written: a finding.
+- **The restore check does not require `IH_RB_WPTR`;** it reports it. Bit 19
+  of its boot 22 value `0x80000` is `RB_MAY_OVERFLOW`, a status the IH sets
+  itself (`osssys_4_0_sh_mask.h`), so a written value need not read back.
+  Every other written register, and `SDMA0_CNTL`, must read its boot 22
+  value (`gart-not-restored` with the register otherwise).
+- **IH entries** are taken from the write-back pointer (`OFFSET` bits 17:2, in
+  bytes, 32 bytes per entry):
+  - The ring holds anything below that pointer and must be zero above it.
+  - Overflow, or an offset past 4 KiB, marks the ring wrapped, and the whole
+    page is then accepted.
+  - An entry from client 8, source 224 is SDMA0's trap. Any other client is
+    counted and printed, not treated as a failure.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -2939,7 +2985,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -3055,6 +3101,34 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 17 succeeds when:
+
+- the stage 16 conditions hold with `CezanneGPU stage` 17;
+- `sudo cezanne-diag --gfxoff-disallow --gart-ih --psp-state` reports `ok`
+  for every stage 15 step up to the verify, then for:
+  - the check;
+  - the enable: progress 3, `VM_INVALIDATE_ENG17_ACK` bit 0 set;
+  - frame 2: fence 2, read pointer 3072;
+  - the verify: fault status 0, at least one SDMA0 trap entry (client 8,
+    source 224), 0 unexpected words in both regions, 0 display changes;
+  - the restore: every register back at its boot 22 value, with
+    `IH_RB_WPTR` reported;
+  - the stop, as in stage 15;
+- the final register dump shows the boot 22 values (including the two
+  engine 17 range registers);
+- the display and the machine stay as before.
+
+**On failure:**
+- `gart-unexpected-state` at the check names the register. Nothing was
+  written; record it.
+- A failure after the enable still runs the restore and the stop.
+- `gart-fault`, `ih-no-trap` and `gart-verify-failed` are findings to
+  record.
+- A black or glitching screen during the run: let the tool finish (the
+  restore runs), then shut down fully. A hang: power off.
+- Unexpected words outside the two work areas: power off at once.
+- Make a Time Machine backup first. Save the output with `tee`.
 
 Stage 16 succeeds when:
 
