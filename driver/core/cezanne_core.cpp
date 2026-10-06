@@ -62,6 +62,13 @@ const char *statusName(Status status)
     case kTableNotWritten: return "table-not-written";
     case kTableOverflow: return "table-overflow";
     case kMetricsOutOfOrder: return "metrics-out-of-order";
+    case kPspNotRunning: return "psp-not-running";
+    case kPspNotReady: return "psp-not-ready";
+    case kPspRingExists: return "psp-ring-exists";
+    case kPspTimeout: return "psp-timeout";
+    case kPspResponseNotOk: return "psp-response-not-ok";
+    case kPspRegionChanged: return "psp-region-changed";
+    case kPspOutOfOrder: return "psp-out-of-order";
     }
     return "unknown";
 }
@@ -422,6 +429,14 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
                (stage >= kMetricsStage && (value == kSmuMsgSetDriverDramAddrHigh ||
                                            value == kSmuMsgSetDriverDramAddrLow ||
                                            value == kSmuMsgTransferTableSmu2Dram));
+    if (stage < kPspRingStage) return false;
+    if (offset == kRegMp0C2PMsg64)
+        return value == kPspCmdGbrIhSet || value == kPspCmdInitGpcomRing || value == kPspCmdDestroyRings;
+    if (offset == kRegMp0C2PMsg69)
+        return value == kPspIhClientVmc || value == kPspIhClientUmc || value == uint32_t(kPspRingGpuAddress);
+    if (offset == kRegMp0C2PMsg70)
+        return value == kPspIhVmcConfig || value == kPspIhUmcConfig || value == uint32_t(kPspRingGpuAddress >> 32);
+    if (offset == kRegMp0C2PMsg71) return value == kPspRingSize;
     return false;
 }
 
@@ -586,11 +601,11 @@ static bool overlaps(uint64_t base, uint64_t length, uint64_t otherBase, uint64_
     return base < otherBase + otherLength && otherBase < base + length;
 }
 
-Status checkMetricsTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
-                          const Range *ranges, uint32_t rangeCount, MetricsTarget *target)
+// The stage 9 checks for one fixed carveout page and its check region.
+static Status checkCarveoutPage(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                                uint64_t carveoutOffset, uint32_t checkSize, const Range *ranges,
+                                uint32_t rangeCount, MetricsTarget *target)
 {
-    *target = MetricsTarget();
-    if (stage < kMetricsStage) return kRegisterNotAllowed;
     const struct {
         uint32_t offset;
         uint32_t *value;
@@ -605,20 +620,29 @@ Status checkMetricsTarget(const RegisterReader &registers, uint64_t apertureLeng
     }
     if (target->fbLocationBase != kExpectedFbLocationBase || target->fbOffset != kExpectedFbOffset)
         return kMetricsAddressMismatch;
-    target->gpuAddress = (uint64_t(target->fbLocationBase) << 24) + kMetricsCarveoutOffset;
-    target->physical = (uint64_t(target->fbOffset) << 24) + kMetricsCarveoutOffset;
-    if (target->gpuAddress != kMetricsGpuAddress || target->physical != kMetricsPhysical) return kMetricsAddressMismatch;
+    target->gpuAddress = (uint64_t(target->fbLocationBase) << 24) + carveoutOffset;
+    target->physical = (uint64_t(target->fbOffset) << 24) + carveoutOffset;
     // Inside the carveout, clear of its reserved low and high regions.
     uint64_t carveoutSize = uint64_t(target->configMemsize) << 20;
     if (target->configMemsize == 0xFFFFFFFFu || carveoutSize < kCarveoutLowReserve + kCarveoutHighReserve ||
-        kMetricsCarveoutOffset < kCarveoutLowReserve ||
-        kMetricsCarveoutOffset + kMetricsCheckSize > carveoutSize - kCarveoutHighReserve)
+        carveoutOffset < kCarveoutLowReserve || carveoutOffset + checkSize > carveoutSize - kCarveoutHighReserve)
         return kMetricsTargetInvalid;
     if (rangeCount == 0) return kMetricsTargetInvalid;
     for (uint32_t i = 0; i < rangeCount; i++) {
-        if (overlaps(target->physical, kMetricsCheckSize, ranges[i].base, ranges[i].length))
-            return kMetricsTargetInvalid;
+        if (overlaps(target->physical, checkSize, ranges[i].base, ranges[i].length)) return kMetricsTargetInvalid;
     }
+    return kOK;
+}
+
+Status checkMetricsTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                          const Range *ranges, uint32_t rangeCount, MetricsTarget *target)
+{
+    *target = MetricsTarget();
+    if (stage < kMetricsStage) return kRegisterNotAllowed;
+    Status status = checkCarveoutPage(registers, apertureLength, stage, kMetricsCarveoutOffset, kMetricsCheckSize,
+                                      ranges, rangeCount, target);
+    if (status != kOK) return status;
+    if (target->gpuAddress != kMetricsGpuAddress || target->physical != kMetricsPhysical) return kMetricsAddressMismatch;
     return kOK;
 }
 
@@ -675,6 +699,140 @@ Status verifyMetricsPage(const MemoryReader &page, const uint32_t *snapshot, Smu
         metrics->words[offset / 2 + 1] = static_cast<uint16_t>(value >> 16);
     }
     return written ? kOK : kTableNotWritten;
+}
+
+Status readPspMailbox(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                      PspMailbox *mailbox)
+{
+    *mailbox = PspMailbox();
+    const struct {
+        uint32_t offset;
+        uint32_t *value;
+    } reads[] = {
+        {kRegMp0C2PMsg81, &mailbox->signOfLife}, {kRegMp0C2PMsg64, &mailbox->command},
+        {kRegMp0C2PMsg67, &mailbox->writePointer}, {kRegMp0C2PMsg69, &mailbox->ringLow},
+        {kRegMp0C2PMsg70, &mailbox->ringHigh}, {kRegMp0C2PMsg71, &mailbox->ringSize},
+    };
+    for (const auto &read : reads) {
+        Status status = readRegister(registers, apertureLength, stage, read.offset, read.value);
+        if (status != kOK) return status;
+    }
+    return kOK;
+}
+
+bool pspCommandAllowed(uint32_t command, uint32_t low, uint32_t high, uint32_t size, uint32_t stage)
+{
+    if (stage < kPspRingStage) return false;
+    switch (command) {
+    case kPspCmdGbrIhSet:
+        return size == 0 && ((low == kPspIhClientVmc && high == kPspIhVmcConfig) ||
+                             (low == kPspIhClientUmc && high == kPspIhUmcConfig));
+    case kPspCmdInitGpcomRing:
+        return low == uint32_t(kPspRingGpuAddress) && high == uint32_t(kPspRingGpuAddress >> 32) &&
+               size == kPspRingSize;
+    case kPspCmdDestroyRings: return low == 0 && high == 0 && size == 0;
+    default: return false;
+    }
+}
+
+// The state stage 10 found after a cold boot: secure OS running, ready, no ring.
+static Status checkPspIdle(const PspMailbox &mailbox)
+{
+    if (mailbox.signOfLife == 0) return kPspNotRunning;
+    if (mailbox.command != kPspResponseFlag) return kPspNotReady;
+    if ((mailbox.writePointer | mailbox.ringLow | mailbox.ringHigh | mailbox.ringSize) != 0) return kPspRingExists;
+    return kOK;
+}
+
+Status checkPspRing(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, const Range *ranges,
+                    uint32_t rangeCount, PspMailbox *mailbox, MetricsTarget *target)
+{
+    *target = MetricsTarget();
+    *mailbox = PspMailbox();
+    if (stage < kPspRingStage) return kRegisterNotAllowed;
+    Status status = readPspMailbox(registers, apertureLength, stage, mailbox);
+    if (status == kOK) status = checkPspIdle(*mailbox);
+    if (status != kOK) return status;
+    status = checkCarveoutPage(registers, apertureLength, stage, kPspRingCarveoutOffset, kPspRingCheckSize, ranges,
+                               rangeCount, target);
+    if (status != kOK) return status;
+    if (target->gpuAddress != kPspRingGpuAddress || target->physical != kPspRingPhysical) return kMetricsAddressMismatch;
+    return kOK;
+}
+
+// psp_v12_0: arguments, then the command in C2PMSG_64, a 20 ms settle, and a
+// poll for the response flag.
+static Status sendPspCommand(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                             uint32_t stage, uint32_t command, uint32_t low, uint32_t high, uint32_t size,
+                             uint32_t *response)
+{
+    *response = 0;
+    if (!pspCommandAllowed(command, low, high, size, stage)) return kRegisterNotAllowed;
+    uint32_t ready = 0;
+    Status status = readRegister(registers, apertureLength, stage, kRegMp0C2PMsg64, &ready);
+    if (status != kOK) return status;
+    if (ready != kPspResponseFlag) return kPspNotReady;
+    if (command != kPspCmdDestroyRings) {
+        status = writeRegister(writer, stage, kRegMp0C2PMsg69, low);
+        if (status == kOK) status = writeRegister(writer, stage, kRegMp0C2PMsg70, high);
+    }
+    if (status == kOK && command == kPspCmdInitGpcomRing) status = writeRegister(writer, stage, kRegMp0C2PMsg71, size);
+    if (status == kOK) status = writeRegister(writer, stage, kRegMp0C2PMsg64, command);
+    if (status != kOK) return status;
+    for (uint32_t i = 0; i < kPspSettlePauses; i++) writer.pause(writer.context);
+    for (uint32_t i = 0; i <= kPspPollPauses; i++) {
+        status = readRegister(registers, apertureLength, stage, kRegMp0C2PMsg64, response);
+        if (status != kOK) return status;
+        if ((*response & kPspResponseFlag) != 0) break;
+        if (i == kPspPollPauses) return kPspTimeout;
+        writer.pause(writer.context);
+    }
+    return *response == kPspResponseFlag ? kOK : kPspResponseNotOk;
+}
+
+Status createPspRing(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                     uint32_t stage, uint32_t responses[3])
+{
+    responses[0] = responses[1] = responses[2] = 0;
+    if (stage < kPspRingStage) return kRegisterNotAllowed;
+    PspMailbox mailbox;
+    Status status = readPspMailbox(registers, apertureLength, stage, &mailbox);
+    if (status == kOK) status = checkPspIdle(mailbox);
+    if (status != kOK) return status;
+    const struct {
+        uint32_t command, low, high, size;
+    } commands[] = {
+        {kPspCmdGbrIhSet, kPspIhClientVmc, kPspIhVmcConfig, 0},
+        {kPspCmdGbrIhSet, kPspIhClientUmc, kPspIhUmcConfig, 0},
+        {kPspCmdInitGpcomRing, uint32_t(kPspRingGpuAddress), uint32_t(kPspRingGpuAddress >> 32), kPspRingSize},
+    };
+    for (uint32_t i = 0; i < 3; i++) {
+        status = sendPspCommand(registers, apertureLength, writer, stage, commands[i].command, commands[i].low,
+                                commands[i].high, commands[i].size, &responses[i]);
+        if (status != kOK) return status;
+    }
+    return kOK;
+}
+
+Status compareRegion(const MemoryReader &memory, uint32_t length, uint32_t pageSize, const uint32_t *snapshot,
+                     uint32_t *changedInPage, uint32_t *changedOutside)
+{
+    *changedInPage = *changedOutside = 0;
+    for (uint32_t offset = 0; offset < length; offset += 4) {
+        uint32_t value = 0;
+        if (!memory.read32(memory.context, offset, &value)) return kRegisterReadFailed;
+        if (value != snapshot[offset / 4]) (offset < pageSize ? *changedInPage : *changedOutside) += 1;
+    }
+    return *changedInPage == 0 && *changedOutside == 0 ? kOK : kPspRegionChanged;
+}
+
+Status destroyPspRing(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, bool created, uint32_t *response)
+{
+    *response = 0;
+    if (stage < kPspRingStage) return kRegisterNotAllowed;
+    if (!created) return kPspOutOfOrder;
+    return sendPspCommand(registers, apertureLength, writer, stage, kPspCmdDestroyRings, 0, 0, 0, response);
 }
 
 } // namespace cezanne

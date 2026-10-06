@@ -69,8 +69,8 @@ class CoreTests(unittest.TestCase):
             "misc == 0x4": ("        if (((*gfxMisc & kGfxOffStatusMask) >> kGfxOffStatusShift) == kGfxOffStatusOn) return kOK;\n        if (i == kGfxOffConfirmPauses)",
                             "        return kOK;\n        if (i == kGfxOffConfirmPauses)"),
             "writeAllowed(kRegMp1C2PMsg90, 1, 7)": ("return value == 0;", "return true;"),
-            "writeAllowed(offset, 0, 7)": ("    return false;\n}\n\nbool smuArgumentAllowed",
-                                           "    return offset >= kSmuPageOffset;\n}\n\nbool smuArgumentAllowed"),
+            "writeAllowed(offset, 0, 7)": ("    if (stage < kPspRingStage) return false;\n    if (offset ==",
+                                           "    if (stage < kPspRingStage) return offset >= kSmuPageOffset;\n    if (offset =="),
             "kSmuBusy": ("return mailbox->response == 0 ? kSmuBusy : kOK;", "return kOK;"),
             "kSmuTimeout": ("if (i == kSmuPollPauses) return kSmuTimeout;", "if (i == kSmuPollPauses) break;"),
             "kSmuResponseNotOk": ("if (*response != kSmuResponseOk) return kSmuResponseNotOk;", ""),
@@ -83,6 +83,12 @@ class CoreTests(unittest.TestCase):
             "registerAllowed(kRegMp1C2PMsg90, 4)": (": stage >= 3 ? kStage3RegisterCount", ": stage >= 3 ? kStage5RegisterCount"),
             "!registerAllowed(kRegMp0C2PMsg64, 9)": ("stage >= 10  ? kStage10RegisterCount",
                                                      "stage >= 9  ? kStage10RegisterCount"),
+            "!pspCommandAllowed(kPspCmdInitGpcomRing, kPspIhClientVmc, kPspIhVmcConfig, kPspRingSize, 11)": (
+                "    case kPspCmdInitGpcomRing:\n        return low ==", "    case kPspCmdInitGpcomRing:\n        return (void)low, true;\n        return low =="),
+            "11, true, &response) == kPspNotReady": ("if (ready != kPspResponseFlag) return kPspNotReady;", ""),
+            "kPspTimeout": ("if (i == kPspPollPauses) return kPspTimeout;", "if (i == kPspPollPauses) break;"),
+            "kPspOutOfOrder": ("if (!created) return kPspOutOfOrder;", "(void)created;"),
+            "kPspRingExists": ("return kPspRingExists;", "(void)0;"),
             "gfxGated(kRegGcApertureHigh)": ("if (kStage10GfxGatedRegisters[i] == offset) return true;", "(void)0;"),
             "registerAllowed(kRegGrbmGfxIndex, 2)": ("stage == 2 ? kStage2RegisterCount",
                                                      "stage == 2 ? kStage3RegisterCount"),
@@ -104,16 +110,21 @@ class CoreTests(unittest.TestCase):
         body = re.search(r"static Status writeRegister\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("if (!writeAllowed(offset, value, stage)) return kRegisterNotAllowed;", body)
         self.assertLess(body.index("writeAllowed"), body.index("write32"))
-        # Scratch pattern and restore; SMU response, argument and message.
-        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 5)
+        # Scratch pattern and restore; SMU response, argument and message; PSP
+        # arguments (C2PMSG_69, _70, _71) and command.
+        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 9)
         allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
-        self.assertEqual(allow.count("return"), 6)
+        self.assertEqual(allow.count("return"), 11)
         self.assertIn("if (stage >= kScratchStage && offset == kRegScratchReg0) return true;", allow)
         self.assertIn("if (offset == kRegMp1C2PMsg90) return value == 0;", allow)
         # Every SMU message is checked against its argument before any write.
         send = re.search(r"static Status sendSmuMessage\(.*?\n}\n", source, re.S).group(0)
         self.assertLess(send.index("smuArgumentAllowed(message, argument, stage)"), send.index("writeRegister"))
         self.assertIn("(stage >= kGfxOffStage && value == kSmuMsgDisableGfxOff)", allow)
+        # Every PSP command is checked against its arguments before any write.
+        psp = re.search(r"static Status sendPspCommand\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(psp.index("pspCommandAllowed(command, low, high, size, stage)"), psp.index("writeRegister"))
+        self.assertIn("if (stage < kPspRingStage) return false;", allow)
 
 
 if __name__ == "__main__":

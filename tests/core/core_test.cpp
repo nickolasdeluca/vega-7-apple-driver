@@ -90,6 +90,12 @@ struct FakeRegisters {
     bool tableOverflows = false;  // write past the 148 bytes too
     uint32_t smuAddrHigh = 0, smuAddrLow = 0;
     int gfxOffPending = -1;
+    // A fake PSP mailbox (boot 14 state): secure OS up, ready, no ring.
+    uint32_t psp81 = 0x0016d568u, psp64 = 0x80000000u, psp67 = 0, psp69 = 0, psp70 = 0, psp71 = 0;
+    uint32_t pspReply = 0x80000000u; // C2PMSG_64 once it answers
+    int pspDelay = 0;                // pauses before it answers; -1 never
+    int pspPending = -1;
+    int pauses = 0;
     bool fail = false;
     uint32_t order[32];
     int reads = 0;
@@ -119,6 +125,12 @@ struct FakeRegisters {
                  : offset == kRegUserRbBackendDisable  ? self->userRb
                  : offset == kRegGbAddrConfig          ? 0x24000042u
                  : offset == kRegSmuioGfxMiscCntl      ? self->gfxMisc
+                 : offset == kRegMp0C2PMsg81           ? self->psp81
+                 : offset == kRegMp0C2PMsg64           ? self->psp64
+                 : offset == kRegMp0C2PMsg67           ? self->psp67
+                 : offset == kRegMp0C2PMsg69           ? self->psp69
+                 : offset == kRegMp0C2PMsg70           ? self->psp70
+                 : offset == kRegMp0C2PMsg71           ? self->psp71
                                                        : 0xDEADBEEF;
         return true;
     }
@@ -685,6 +697,14 @@ struct FakeWriter {
             r->smuPending = r->smuDelay;
             if (r->smuPending == 0) answer(r);
         }
+        if (offset == kRegMp0C2PMsg69) r->psp69 = value;
+        if (offset == kRegMp0C2PMsg70) r->psp70 = value;
+        if (offset == kRegMp0C2PMsg71) r->psp71 = value;
+        if (offset == kRegMp0C2PMsg64) {
+            r->psp64 = value; // response flag clear until the PSP answers
+            r->pspPending = r->pspDelay;
+            if (r->pspPending == 0) r->psp64 = r->pspReply;
+        }
         return true;
     }
     static void answer(FakeRegisters *r)
@@ -711,6 +731,8 @@ struct FakeWriter {
         FakeRegisters *r = self->registers;
         if (r->smuPending > 0 && --r->smuPending == 0) answer(r);
         if (r->gfxOffPending > 0 && --r->gfxOffPending == 0) r->gfxMisc = 0x4;
+        if (r->pspPending > 0 && --r->pspPending == 0) r->psp64 = r->pspReply;
+        r->pauses++;
     }
     RegisterWriter writer() { return RegisterWriter{write32, pause, this}; }
 };
@@ -1078,6 +1100,142 @@ static void testMetrics()
     }
 }
 
+static void testPspRing()
+{
+    CHECK(kPspRingGpuAddress == 0xF440100000ull && kPspRingPhysical == 0x600100000ull);
+    CHECK(uint32_t(kPspRingGpuAddress) == 0x40100000u && uint32_t(kPspRingGpuAddress >> 32) == 0xF4u);
+    CHECK(kPspCmdGbrIhSet == 0x80000u && kPspCmdInitGpcomRing == (2u << 16) && kPspCmdDestroyRings == 0x30000u);
+    CHECK(kPspIhVmcConfig == (0x1244bu | (1u << 18) | (1u << 20)) && kPspIhUmcConfig == (0x1216bu | (1u << 20)));
+    // The ring's check region is clear of the stage 9 metrics region.
+    CHECK(kPspRingPhysical >= kMetricsPhysical + kMetricsCheckSize);
+
+    // Commands and their only arguments.
+    CHECK(pspCommandAllowed(kPspCmdGbrIhSet, kPspIhClientVmc, kPspIhVmcConfig, 0, 11));
+    CHECK(pspCommandAllowed(kPspCmdGbrIhSet, kPspIhClientUmc, kPspIhUmcConfig, 0, 11));
+    CHECK(pspCommandAllowed(kPspCmdInitGpcomRing, 0x40100000u, 0xF4u, kPspRingSize, 11));
+    CHECK(pspCommandAllowed(kPspCmdDestroyRings, 0, 0, 0, 11));
+    CHECK(!pspCommandAllowed(kPspCmdGbrIhSet, kPspIhClientVmc, kPspIhVmcConfig, 0, 10));
+    CHECK(!pspCommandAllowed(kPspCmdGbrIhSet, kPspIhClientVmc, kPspIhUmcConfig, 0, 11));
+    CHECK(!pspCommandAllowed(kPspCmdGbrIhSet, 0x40100000u, 0xF4u, 0, 11));
+    CHECK(!pspCommandAllowed(kPspCmdInitGpcomRing, kPspIhClientVmc, kPspIhVmcConfig, kPspRingSize, 11));
+    CHECK(!pspCommandAllowed(kPspCmdInitGpcomRing, 0x40100000u, 0xF4u, 0x2000, 11));
+    CHECK(!pspCommandAllowed(kPspCmdInitGpcomRing, 0x40000000u, 0xF4u, kPspRingSize, 11));
+    CHECK(!pspCommandAllowed(kPspCmdDestroyRings, 3, 0, 0, 11));
+    CHECK(!pspCommandAllowed(0x00010000u, 0, 0, 0, 11) && !pspCommandAllowed(0x00070000u, 0, 0, 0, 11));
+    // Register values, from stage 11 only.
+    CHECK(writeAllowed(kRegMp0C2PMsg64, kPspCmdInitGpcomRing, 11) && !writeAllowed(kRegMp0C2PMsg64, kPspCmdInitGpcomRing, 10));
+    CHECK(!writeAllowed(kRegMp0C2PMsg64, 0x00070000u, 11) && !writeAllowed(kRegMp0C2PMsg64, 0x00010000u, 11));
+    CHECK(writeAllowed(kRegMp0C2PMsg69, 0x40100000u, 11) && !writeAllowed(kRegMp0C2PMsg69, 0x40000000u, 11));
+    CHECK(writeAllowed(kRegMp0C2PMsg70, 0xF4u, 11) && !writeAllowed(kRegMp0C2PMsg70, 0xF5u, 11));
+    CHECK(writeAllowed(kRegMp0C2PMsg71, 0x1000u, 11) && !writeAllowed(kRegMp0C2PMsg71, 0x2000u, 11));
+    CHECK(!writeAllowed(kRegMp0C2PMsg67, 0, 11) && !writeAllowed(kRegMp0C2PMsg81, 0, 11));
+
+    uint8_t data[80];
+    putCells(data, 0x83000010u, 0x640000000ull, 0x10000000ull);
+    putCells(data + 20, 0x83000018u, 0x650000000ull, 0x200000ull);
+    putCells(data + 40, 0x81000020u, 0xe000ull, 0x100ull);
+    putCells(data + 60, 0x82000024u, 0xfca00000ull, 0x80000ull);
+    Range ranges[8];
+    uint32_t count = 0;
+    CHECK(parseAssignedAddresses(data, sizeof(data), ranges, 8, &count) == kOK);
+    PspMailbox m;
+    MetricsTarget t;
+    {
+        FakeRegisters r;
+        r.fbOffset = 0x5c0;
+        CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kOK);
+        CHECK(t.gpuAddress == 0xF440100000ull && t.physical == 0x600100000ull && m.signOfLife == 0x0016d568u);
+        CHECK(checkPspRing(r.reader(), 0x80000, 10, ranges, count, &m, &t) == kRegisterNotAllowed);
+        Range clash[1] = {{0x600108000ull, 0x1000}};
+        CHECK(checkPspRing(r.reader(), 0x80000, 11, clash, 1, &m, &t) == kMetricsTargetInvalid);
+        r.psp81 = 0;
+        CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kPspNotRunning);
+        r.psp81 = 1;
+        r.psp64 = 0x80000001u;
+        CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kPspNotReady);
+        r.psp64 = 0x80000000u;
+        r.psp71 = 0x1000;
+        CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kPspRingExists);
+        r.psp71 = 0;
+        r.psp67 = 1;
+        CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kPspRingExists);
+    }
+    {
+        FakeRegisters r; // FB offset 0x580
+        CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kMetricsAddressMismatch);
+    }
+
+    uint32_t responses[3];
+    {
+        FakeRegisters r;
+        r.pspDelay = 25; // answers 5 pauses into the poll
+        FakeWriter w(&r);
+        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, responses) == kOK);
+        const uint32_t offsets[] = {kRegMp0C2PMsg69, kRegMp0C2PMsg70, kRegMp0C2PMsg64, kRegMp0C2PMsg69,
+                                    kRegMp0C2PMsg70, kRegMp0C2PMsg64, kRegMp0C2PMsg69, kRegMp0C2PMsg70,
+                                    kRegMp0C2PMsg71, kRegMp0C2PMsg64};
+        const uint32_t values[] = {3, 0x0015244bu, 0x00080000u, 4, 0x0011216bu, 0x00080000u,
+                                   0x40100000u, 0xF4u, 0x1000u, 0x00020000u};
+        CHECK(w.writes == 10);
+        for (int i = 0; i < 10; i++) CHECK(w.offsets[i] == offsets[i] && w.values[i] == values[i]);
+        CHECK(responses[0] == 0x80000000u && responses[1] == 0x80000000u && responses[2] == 0x80000000u);
+        CHECK(r.pauses == 3 * 25);
+        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 10, responses) == kRegisterNotAllowed);
+    }
+    {
+        FakeRegisters r;
+        r.pspReply = 0x80000005u; // answered, status 5
+        FakeWriter w(&r);
+        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, responses) == kPspResponseNotOk);
+        CHECK(w.writes == 3 && responses[0] == 0x80000005u && responses[1] == 0);
+    }
+    {
+        FakeRegisters r;
+        r.pspDelay = -1; // never answers
+        FakeWriter w(&r);
+        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, responses) == kPspTimeout);
+        CHECK(w.writes == 3 && r.pauses == int(kPspSettlePauses + kPspPollPauses));
+    }
+    {
+        FakeRegisters r;
+        r.psp69 = 0x1234; // a ring address already set
+        FakeWriter w(&r);
+        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, responses) == kPspRingExists);
+        CHECK(w.writes == 0);
+    }
+
+    uint32_t response = 0;
+    {
+        FakeRegisters r;
+        FakeWriter w(&r);
+        CHECK(destroyPspRing(r.reader(), 0x80000, w.writer(), 11, false, &response) == kPspOutOfOrder);
+        CHECK(w.writes == 0);
+        CHECK(destroyPspRing(r.reader(), 0x80000, w.writer(), 11, true, &response) == kOK);
+        CHECK(w.writes == 1 && w.offsets[0] == kRegMp0C2PMsg64 && w.values[0] == kPspCmdDestroyRings);
+        CHECK(response == 0x80000000u && r.pauses == int(kPspSettlePauses));
+        r.psp64 = 0x00020000u; // still busy with an earlier command
+        int before = w.writes;
+        CHECK(destroyPspRing(r.reader(), 0x80000, w.writer(), 11, true, &response) == kPspNotReady);
+        CHECK(w.writes == before);
+    }
+
+    // The region compare.
+    static uint32_t snapshot[kPspRingCheckSize / 4];
+    {
+        FakeMemory memory;
+        for (uint32_t i = 0; i < kPspRingCheckSize / 4; i++) memory.words[i] = snapshot[i] = 0x9E3779B9u * i;
+        uint32_t inPage = 9, outside = 9;
+        CHECK(compareRegion(memory.reader(), kPspRingCheckSize, kPspRingSize, snapshot, &inPage, &outside) == kOK);
+        CHECK(inPage == 0 && outside == 0);
+        memory.words[3] ^= 1;
+        memory.words[kPspRingSize / 4] ^= 1;
+        memory.words[kPspRingCheckSize / 4 - 1] ^= 1;
+        CHECK(compareRegion(memory.reader(), kPspRingCheckSize, kPspRingSize, snapshot, &inPage, &outside) ==
+              kPspRegionChanged);
+        CHECK(inPage == 1 && outside == 2);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -1096,6 +1254,7 @@ int main()
     testSmu();
     testGfxOff();
     testMetrics();
+    testPspRing();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

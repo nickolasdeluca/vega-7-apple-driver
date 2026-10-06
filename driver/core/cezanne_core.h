@@ -29,7 +29,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 10;
+const uint32_t kMaxStage = 11;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -309,6 +309,29 @@ const uint32_t kPspResponseFlag = 0x80000000u;
 const uint32_t kPspStatusMask = 0xFFFFu;
 const uint32_t kPspStateStage = 10;
 
+// Stage 11: create and destroy the PSP kernel-mode ring, as Linux v6.12
+// psp_v12_0_ring_create (with psp_v12_0_reroute_ih) and psp_v12_0_ring_stop
+// do; no frame is submitted. Command IDs: psp_gfx_if.h; ring type:
+// amdgpu_psp.h (PSP_RING_TYPE__KM = 2, so the create command is 2 << 16).
+const uint32_t kPspCmdInitGpcomRing = 0x00020000;
+const uint32_t kPspCmdDestroyRings = 0x00030000;
+const uint32_t kPspCmdGbrIhSet = 0x00080000;
+// psp_v12_0_reroute_ih: IH_CLIENT_CFG_DATA for VMC (credit return 0x1244b,
+// client type 1, ring 1) and UMC (0x1216b, ring 1); osssys_4_0_sh_mask.h.
+const uint32_t kPspIhClientVmc = 3, kPspIhVmcConfig = 0x0015244b;
+const uint32_t kPspIhClientUmc = 4, kPspIhUmcConfig = 0x0011216b;
+// One 4 KiB ring (psp_ring_init), 1 MiB above the stage 9 metrics page.
+const uint64_t kPspRingCarveoutOffset = 0x40100000ull;
+const uint64_t kPspRingGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kPspRingCarveoutOffset;
+const uint64_t kPspRingPhysical = (uint64_t(kExpectedFbOffset) << 24) + kPspRingCarveoutOffset;
+const uint32_t kPspRingSize = 0x1000;
+const uint32_t kPspRingCheckSize = 0x10000; // the ring page and the 60 KiB after it
+// Linux waits 20 ms after each command, then polls for usec_timeout
+// (AMDGPU_MAX_USEC_TIMEOUT, 100 ms); here both in 1 ms pauses.
+const uint32_t kPspSettlePauses = 20;
+const uint32_t kPspPollPauses = 100;
+const uint32_t kPspRingStage = 11;
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -378,6 +401,14 @@ enum Status : uint32_t {
     kTableNotWritten,
     kTableOverflow,
     kMetricsOutOfOrder,
+    // Stage 11.
+    kPspNotRunning,
+    kPspNotReady,
+    kPspRingExists,
+    kPspTimeout,
+    kPspResponseNotOk,
+    kPspRegionChanged,
+    kPspOutOfOrder,
 };
 
 const char *statusName(Status status);
@@ -496,7 +527,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 5;
+const uint32_t kDiagnosticVersion = 6;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -513,7 +544,12 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticMetricsCheck = 8,    // out: Status, FB location base, FB offset, GPU address, physical
     kDiagnosticMetricsTransfer = 9, // out: Status, responses to AddrHigh, AddrLow, Transfer
     kDiagnosticMetricsRead = 10,    // out: Status; structure: the 148-byte table
-    kDiagnosticSelectorCount = 11,
+    // Stage 11, accepted only in this order per connection.
+    kDiagnosticPspRingCheck = 11,   // out: Status, C2PMSG_81, 64, 67, 69, 70, 71
+    kDiagnosticPspRingCreate = 12,  // out: Status, responses to VMC reroute, UMC reroute, create
+    kDiagnosticPspRingObserve = 13, // out: Status, C2PMSG_64, 67, 69, 70, 71, changed in page, changed outside
+    kDiagnosticPspRingDestroy = 14, // out: Status, response, C2PMSG_64, 67, 69, 70, 71
+    kDiagnosticSelectorCount = 15,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -623,6 +659,46 @@ struct SmuMetrics {
 // bytes kMetricsSize.. must be unchanged (kTableOverflow), and the table bytes
 // must differ somewhere (kTableNotWritten). Decodes the table.
 Status verifyMetricsPage(const MemoryReader &page, const uint32_t *snapshot, SmuMetrics *metrics);
+
+// Stage 11. The PSP mailbox registers stage 10 reads.
+struct PspMailbox {
+    uint32_t signOfLife;   // C2PMSG_81
+    uint32_t command;      // C2PMSG_64
+    uint32_t writePointer; // C2PMSG_67
+    uint32_t ringLow, ringHigh, ringSize; // C2PMSG_69, _70, _71
+};
+
+Status readPspMailbox(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                      PspMailbox *mailbox);
+
+// Each PSP command with its only allowed arguments (C2PMSG_69, _70, _71; 0
+// where Linux writes none): GBR_IH_SET with the VMC or UMC pair, the create
+// with the ring's address and size, the destroy with none.
+bool pspCommandAllowed(uint32_t command, uint32_t low, uint32_t high, uint32_t size, uint32_t stage);
+
+// No writes. Requires the secure OS running (kPspNotRunning), C2PMSG_64
+// exactly kPspResponseFlag (kPspNotReady) and no ring (kPspRingExists), then
+// the stage 9 address checks for the ring page and its check region.
+Status checkPspRing(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, const Range *ranges,
+                    uint32_t rangeCount, PspMailbox *mailbox, MetricsTarget *target);
+
+// Re-checks the mailbox as checkPspRing does, then sends the two GBR_IH_SET
+// commands and the create, each after a ready C2PMSG_64, with
+// kPspSettlePauses then up to kPspPollPauses polls for the response flag
+// (kPspTimeout). Each response must be exactly kPspResponseFlag
+// (kPspResponseNotOk). Stops at the first failure.
+Status createPspRing(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                     uint32_t stage, uint32_t responses[3]);
+
+// Compares the region with the snapshot: counts changed words in the first
+// pageSize bytes and after them. kPspRegionChanged if any changed.
+Status compareRegion(const MemoryReader &memory, uint32_t length, uint32_t pageSize, const uint32_t *snapshot,
+                     uint32_t *changedInPage, uint32_t *changedOutside);
+
+// Sends DESTROY_RINGS, only if created (kPspOutOfOrder otherwise), with the
+// same settle, poll and response checks.
+Status destroyPspRing(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, bool created, uint32_t *response);
 
 } // namespace cezanne
 
