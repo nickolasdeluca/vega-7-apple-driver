@@ -16,12 +16,15 @@ ROOT = Path(__file__).resolve().parents[1]
 KEXT = ROOT / "driver" / "kext"
 CORE = ROOT / "driver" / "core"
 # Hardware-facing calls no authorized stage makes: configuration or register
-# writes, decode/bus-master changes, DMA, interrupts and power management.
+# writes, decode/bus-master changes, DMA, direct interrupt registration and
+# power management. Stage 18's one MSI handler goes through an
+# IOFilterInterruptEventSource, confined by test_interrupt_path_is_confined.
 # Virtual calls are indirect in the binary, so this source check is the guard.
 FORBIDDEN = ("configWrite", "extendedConfigWrite", "ioWrite", "memoryWrite", "setMemoryEnable",
              "setIOEnable", "setBusMaster", "setBusLead", "IOBufferMemoryDescriptor", "IODMACommand",
              "IOMemoryDescriptor", "getDeviceMemory", "mapDeviceMemoryWithIndex", "registerInterrupt",
-             "enableInterrupt", "IOInterruptEventSource", "PMinit", "joinPMtree", "registerPowerDriver",
+             "enableInterrupt", "IOInterruptEventSource::interruptEventSource", "IOTimerEventSource",
+             "PMinit", "joinPMtree", "registerPowerDriver",
              "setPowerState", "enablePCIPowerManagement", "IOMapper", "ioRead")
 # Direct call targets in the built binary: metaclass plumbing, logging, boot
 # argument, configuration-space reads, the mapping's address, the discovery
@@ -38,7 +41,13 @@ DIRECT_CALLS = {"___stack_chk_fail", "__ZN11OSMetaClassC2EPKcPKS_j", "__ZN11OSMe
                 "__ZN12IOUserClientC2EPK11OSMetaClass", "__ZN12IOUserClientD2Ev", "_IOLockAlloc", "_IOLockFree",
                 "_IOLockLock", "_IOLockUnlock", "_IOSleep",
                 # Zeroing the driver's own 148-byte metrics buffer (stage 9).
-                "___bzero"}
+                "___bzero",
+                # Stage 18: the MSI handler on the driver's own work loop, its
+                # counter and its timing.
+                "__ZN10IOWorkLoop8workLoopEv",
+                "__ZN28IOFilterInterruptEventSource26filterInterruptEventSourceEP8OSObjectPFvS1_"
+                "P22IOInterruptEventSourceiEPFbS1_PS_EP9IOServicei",
+                "_OSAddAtomic", "_OSIncrementAtomic", "_mach_absolute_time", "_absolutetime_to_nanoseconds"}
 OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU", "__ZN20CezanneGPUUserClient")
 
 
@@ -161,6 +170,11 @@ void f(IOPCIDevice *p, Aperture *a) {
         # only it may read the invalidation semaphore (the flush).
         self.assertEqual(sorted(re.findall(r"accessDevice\(cezanne::kGartPageSet, (\w+)", source)),
                          ["gartEnableOperation", "gartRestoreOperation"])
+        # The interrupt page set: only these operations, only these pages.
+        self.assertEqual(sorted(re.findall(r"accessDevice\(cezanne::kIntrPageSet, (\w+)", source)),
+                         ["intrAckOperation", "intrArmOperation", "intrQuiesceOperation", "intrRestoreOperation",
+                          "intrStartOperation"])
+        self.assertIn("const uint32_t kIntrPages[] = {0x3000, 0x4000};", (CORE / "cezanne_core.h").read_text())
         self.assertIn("const uint32_t kGartPages[] = {0x4000, 0x69000, 0x6a000};", (CORE / "cezanne_core.h").read_text())
         self.assertIn("Aperture aperture = {nullptr, 0, stage_, writablePage == cezanne::kGartPageSet};", source)
         self.assertIn("stage_, false};", source)
@@ -202,7 +216,7 @@ void f(IOPCIDevice *p, Aperture *a) {
                                     ("cezanne::kSmuPageOffset", "tmrTeardownOperation")])
         self.assertEqual(sorted(re.findall(r"accessDevice\(0, (\w+)", source)),
                          ["copyCheckOperation", "copyVerifyOperation", "gartCheckOperation", "gartVerifyOperation",
-                          "metricsCheckOperation", "metricsReadOperation", "pspCheckOperation", "pspObserveOperation",
+                          "intrCheckOperation", "intrVerifyOperation", "metricsCheckOperation", "metricsReadOperation", "pspCheckOperation", "pspObserveOperation",
                           "readOperation", "scratchCheckOperation", "sdmaObserveOperation", "smuCheckOperation",
                           "tmrObserveOperation"])
         # Carveout memory: only the metrics page's and the PSP ring page's
@@ -213,13 +227,14 @@ void f(IOPCIDevice *p, Aperture *a) {
                       "        physical != cezanne::kSdmaWorkPhysical && physical != cezanne::kGartWorkPhysical) {", source)
         self.assertEqual(sorted(re.findall(r"withCarveoutMemory\(cezanne::(\w+), cezanne::(\w+),", source)),
                          [("kGartWorkPhysical", "kGartWorkCheckSize"), ("kGartWorkPhysical", "kGartWorkCheckSize"),
+                          ("kGartWorkPhysical", "kGartWorkCheckSize"), ("kGartWorkPhysical", "kGartWorkCheckSize"),
                           ("kMetricsPhysical", "kMetricsCheckSize"), ("kMetricsPhysical", "kPageSize"),
                           ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
                           ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
                           ("kPspTmrPhysical", "kPspTmrSize"), ("kSdmaFwPhysical", "kSdmaFwCheckSize"),
                           ("kSdmaFwPhysical", "kSdmaFwCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"),
                           ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"),
-                          ("kSdmaWorkPhysical", "kSdmaWorkCheckSize")])
+                          ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize")])
         # A PSP ring created by a connection is destroyed if it closes early.
         abandon = re.search(r"void CezanneGPU::scratchAbandon\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("pspDestroyLocked(&response, &mailbox)", abandon)
@@ -231,7 +246,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn("memory->map(kIOMapReadOnly | kIOMapInhibitCache)", source)
         self.assertIn("writablePage != 0 && writablePage != cezanne::kScratchPageOffset && "
                       "writablePage != cezanne::kSmuPageOffset &&\n        writablePage != cezanne::kSdmaPageSet && "
-                      "writablePage != cezanne::kGartPageSet) {", source)
+                      "writablePage != cezanne::kGartPageSet &&\n        writablePage != cezanne::kIntrPageSet) {", source)
         page = re.search(r"IODeviceMemory::withRange\(\(state\.bar5 & ~0xFull\) \+ page\.pageOffset\[i\], "
                          r"cezanne::kPageSize\)", source)
         self.assertIsNotNone(page)
@@ -239,6 +254,43 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertEqual(source.count("if (smuChecked_ && smuOwner_ == owner) {"), 2)  # query and GFXOFF
         # A connection closed mid-test restores the register.
         self.assertRegex(source, r"clientClose\(\)\s*\{\s*gpu_->scratchAbandon\(this\);")
+
+    def test_interrupt_path_is_confined(self):
+        source = strip_comments((KEXT / "CezanneGPU.cpp").read_text())
+        # One registration: the MSI index intrCheck found, on the driver's
+        # own work loop, made only by addIntrSourceLocked.
+        self.assertEqual(source.count("filterInterruptEventSource("), 1)
+        self.assertEqual(source.count("IOWorkLoop::workLoop()"), 1)
+        add = re.search(r"cezanne::Status CezanneGPU::addIntrSourceLocked\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("filterInterruptEventSource(this, intrAction, intrFilter, pci,", add)
+        self.assertIn("msiIndex_);", add)
+        check = re.search(r"cezanne::Status CezanneGPU::intrCheck\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("(type & kIOInterruptTypePCIMessaged) != 0", check)
+        # The enable arms the IH, then registers the handler, and only then
+        # sets ENABLE_INTR; it is the only caller.
+        self.assertEqual(source.count("status = addIntrSourceLocked();"), 1)
+        self.assertEqual(source.count("addIntrSourceLocked()"), 3)  # declaration, definition, call
+        enable = re.search(r"cezanne::Status CezanneGPU::intrEnable\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(enable.index("intrArmOperation"), enable.index("addIntrSourceLocked()"))
+        self.assertLess(enable.index("addIntrSourceLocked()"), enable.index("intrStartOperation"))
+        # The filter only counts and times: no lock, log, device or memory access.
+        filt = re.search(r"bool CezanneGPU::intrFilter\(.*?\n}\n", source, re.S).group(0)
+        for name in ("IOLock", "IOLog", "accessDevice", "read32", "write32", "->base", "setProperty", "IOSleep"):
+            self.assertNotIn(name, filt)
+        self.assertIn("return false;", filt)
+        # The restore quiets the IH, removes the handler, then restores
+        # INTERRUPT_CNTL2; the GART restore (and so the stop) runs it first;
+        # stop() removes a handler that is somehow still registered.
+        restore = re.search(r"cezanne::Status CezanneGPU::intrRestoreLocked\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(restore.index("intrQuiesceOperation"), restore.index("removeIntrSourceLocked()"))
+        self.assertLess(restore.index("removeIntrSourceLocked()"), restore.index("intrRestoreOperation"))
+        gart = re.search(r"cezanne::Status CezanneGPU::gartRestoreLocked\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(gart.index("intrRestoreLocked(index, value, msi)"), gart.index("gartRestoreOperation"))
+        self.assertIn("if (intrProgress_ != 0 || intrSource_ != nullptr) {", gart)
+        stop = re.search(r"void CezanneGPU::stop\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(stop.index("removeIntrSourceLocked()"), stop.index("IOService::stop(provider)"))
+        # Calls: a failed registration, the restore and stop().
+        self.assertEqual(len(re.findall(r"^\s+removeIntrSourceLocked\(\);", source, re.M)), 3)
 
     def test_stage_interlock_and_identity_are_declared(self):
         info = plistlib.loads((KEXT / "Info.plist").read_bytes())
@@ -252,7 +304,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 17;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 18;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
