@@ -45,8 +45,8 @@ delivery) succeeded in boot 27: SDMA0's trap reached the kext's handler as
 an MSI 31 µs after the write pointer, the acknowledgement caused no re-fire,
 and everything was restored. Boot 26 had counted an extra MSI at the
 `ENABLE_INTR` write; the verify now counts only MSIs after the submit.
-Stage 19 (a display test pattern) is proposed and awaits approval; no later
-stage is authorized.
+Stage 19 (a display test pattern) is approved, and its implementation is in
+progress; no later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -3177,7 +3177,8 @@ also removes the event source if it is still registered.
 
 ### Stage 19: display test pattern (proposal)
 
-**Status: proposed 2026-10-06; awaiting the user's approval.**
+**Status: proposed 2026-10-06 and approved by the user the same day;
+implementation in progress (see the handoff). Not built.**
 
 **Purpose.** The first write that changes what is on screen. Pipe 0 keeps
 the firmware's mode and everything else it set up. Only its surface address
