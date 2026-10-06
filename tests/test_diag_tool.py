@@ -24,7 +24,9 @@ class DiagSourceTests(unittest.TestCase):
                                   "kDiagnosticMetricsTransfer", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate",
                                   "kDiagnosticPspRingObserve", "kDiagnosticPspRingDestroy",
                                   "kDiagnosticPspRingDestroy", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate",
-                                  "kDiagnosticPspTmrSubmit", "kDiagnosticPspTmrObserve", "kDiagnosticPspTmrTeardown"])
+                                  "kDiagnosticPspTmrSubmit", "kDiagnosticPspTmrObserve", "kDiagnosticPspTmrTeardown",
+                                  "kDiagnosticPspTmrTeardown", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate",
+                                  "kDiagnosticPspTmrSubmit", "kDiagnosticSdmaLoad", "kDiagnosticSdmaObserve"])
         # The only messages the tool can ask for are the two version queries.
         self.assertEqual(re.findall(r'\{"smu \d/3 query: \w+ \(0x\d\)", (\w+)\}', source),
                          ["kSmuMsgGetDriverIfVersion", "kSmuMsgGetSmuVersion"])
@@ -43,16 +45,18 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(ring\) \{[^}]*info\[1\] < kPspRingStage")
         self.assertEqual(len(re.findall(r"\bpspTmr\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(tmr\) \{[^}]*info\[1\] < kPspTmrStage")
+        self.assertEqual(len(re.findall(r"\bpspSdma\(connection\)", source)), 1)
+        self.assertRegex(source, r"if \(sdma\) \{[^}]*info\[1\] < kPspSdmaStage")
         self.assertEqual(len(re.findall(r"\bpspState\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(psp\) \{[^}]*info\[1\] < kPspStateStage")
         self.assertEqual(len(re.findall(r"\bscratchTest\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(scratch\) \{[^}]*info\[1\] < kScratchStage")
         self.assertIn('std::strcmp(argv[i], "--scratch-test") == 0', source)
 
-    def test_tool_names_every_stage_10_register_in_order(self):
+    def test_tool_names_every_stage_13_register_in_order(self):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
-        listed = re.search(r"kStage10Registers\[\] = \{([^}]*)\}", header).group(1)
+        listed = re.search(r"kStage13Registers\[\] = \{([^}]*)\}", header).group(1)
         expected = [name.strip() for name in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
 

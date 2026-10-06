@@ -5,10 +5,11 @@
 // queries (--smu-query), the stage 8 DisallowGfxOff (--gfxoff-disallow) and
 // the stage 9 metrics-table transfer (--smu-metrics) and the stage 11 PSP
 // ring create and destroy (--psp-ring) and the stage 12 TMR setup and
-// teardown through the ring (--psp-tmr). --psp-state (stage 10) only reads.
+// teardown through the ring (--psp-tmr) and the stage 13 SDMA0 firmware load
+// (--psp-sdma). --psp-state (stage 10) only reads.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
-//                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-state]
+//                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--psp-state]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -28,7 +29,7 @@ struct Named {
     uint32_t offset;
 };
 
-// Every register the driver allows at stage 10, in its list order; earlier
+// Every register the driver allows at stage 13, in its list order; earlier
 // stages allow a prefix.
 const Named kRegisters[] = {
     {"MP0_SMN_C2PMSG_33", kRegC2PMsg33},
@@ -104,14 +105,16 @@ const Named kRegisters[] = {
     {"MC_VM_AGP_BASE_GC", kRegGcAgpBase},
     {"MC_VM_SYS_APR_LOW_GC", kRegGcApertureLow},
     {"MC_VM_SYS_APR_HIGH_GC", kRegGcApertureHigh},
+    // Stage 13.
+    {"SDMA0_UCODE_CHECKSUM", kRegSdma0UcodeChecksum},
 };
-static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage10RegisterCount, "one name per register");
+static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage13RegisterCount, "one name per register");
 
 void usage(FILE *out)
 {
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
-                      "                         [--psp-state]\n"
+                      "                         [--psp-sdma] [--psp-state]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
@@ -123,6 +126,8 @@ void usage(FILE *out)
                       "the page region with its snapshot, and destroys the ring.\n"
                       "--psp-tmr first creates the ring, submits SETUP_TMR through it, checks the memory around\n"
                       "it, then sends DESTROY_TMR and destroys the ring.\n"
+                      "--psp-sdma does the same with the SDMA0 firmware load (LOAD_IP_FW) between SETUP_TMR\n"
+                      "and DESTROY_TMR; SDMA0 stays halted.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n");
 }
 
@@ -547,10 +552,109 @@ bool pspTmr(io_connect_t connection)
     return submitted[0] == kOK && observedCall && observed[0] == kOK && teardown[0] == kOK;
 }
 
+// Runs the stage 12 teardown selector and prints it.
+bool tmrTeardown(io_connect_t connection, const char *text)
+{
+    uint64_t teardown[6] = {};
+    step(text);
+    if (!call(connection, kDiagnosticPspTmrTeardown, teardown, 6)) return false;
+    std::printf("%s\n  DESTROY_TMR fence %llu, status 0x%08llx; ring response 0x%08llx; C2PMSG_64 0x%08llx, "
+                "C2PMSG_67 %llu\n",
+                statusName(static_cast<Status>(teardown[0])), static_cast<unsigned long long>(teardown[1]),
+                static_cast<unsigned long long>(teardown[2]), static_cast<unsigned long long>(teardown[3]),
+                static_cast<unsigned long long>(teardown[4]), static_cast<unsigned long long>(teardown[5]));
+    return teardown[0] == kOK;
+}
+
+// The stage 13 SDMA0 load: check, create, SETUP_TMR, firmware copy and
+// LOAD_IP_FW, observe, teardown. Every created ring gets a destroy; the
+// driver also tears down if this exits in between.
+bool pspSdma(io_connect_t connection)
+{
+    uint64_t check[7] = {};
+    step("sdma 1/6 check: PSP, ring, TMR and firmware-buffer regions; embedded SDMA0 image header");
+    if (!call(connection, kDiagnosticPspRingCheck, check, 7)) return false;
+    std::printf("%s\n", statusName(static_cast<Status>(check[0])));
+    printMailbox(check + 2);
+    if (check[0] != kOK) return false;
+    uint64_t input = kRegSdma0UcodeChecksum, before[2] = {}, halt[2] = {};
+    uint32_t count = 2;
+    IOConnectCallScalarMethod(connection, kDiagnosticReadRegister, &input, 1, before, &count);
+    input = kRegSdma0F32Cntl;
+    count = 2;
+    IOConnectCallScalarMethod(connection, kDiagnosticReadRegister, &input, 1, halt, &count);
+    std::printf("  before: SDMA0_UCODE_CHECKSUM 0x%08llx (%s), SDMA0_F32_CNTL 0x%08llx (%s)\n",
+                static_cast<unsigned long long>(before[1]), statusName(static_cast<Status>(before[0])),
+                static_cast<unsigned long long>(halt[1]), statusName(static_cast<Status>(halt[0])));
+
+    uint64_t created[3] = {};
+    step("sdma 2/6 create: INIT_GPCOM_RING");
+    if (!call(connection, kDiagnosticPspRingCreate, created, 3)) return false;
+    std::printf("%s, response 0x%08llx\n", statusName(static_cast<Status>(created[0])),
+                static_cast<unsigned long long>(created[1]));
+    if (!created[2]) return false;
+    if (created[0] != kOK) {
+        destroyRingOnly(connection);
+        return false;
+    }
+
+    uint64_t submitted[7] = {};
+    step("sdma 3/6 SETUP_TMR as frame 0, wait for fence 1");
+    if (!call(connection, kDiagnosticPspTmrSubmit, submitted, 7)) return false;
+    std::printf("%s, fence %llu, status 0x%08llx, C2PMSG_67 %llu\n", statusName(static_cast<Status>(submitted[0])),
+                static_cast<unsigned long long>(submitted[1]), static_cast<unsigned long long>(submitted[2]),
+                static_cast<unsigned long long>(submitted[6]));
+    if (submitted[6] != kPspFrameDwords) {
+        destroyRingOnly(connection);
+        return false;
+    }
+    if (submitted[0] != kOK) {
+        tmrTeardown(connection, "sdma teardown: DESTROY_TMR if fenced, then DESTROY_RINGS");
+        return false;
+    }
+
+    uint64_t loaded[6] = {};
+    std::printf("sdma 4/6 load: copy the SDMA0 image (%u bytes) to GPU 0x%010llx, then LOAD_IP_FW (type %u) as\n"
+                "  frame 1, wait for fence 2 ... ",
+                kSdmaUcodeSize, static_cast<unsigned long long>(kSdmaFwGpuAddress), kGfxFwTypeSdma0);
+    std::fflush(stdout);
+    bool loadedCall = call(connection, kDiagnosticSdmaLoad, loaded, 6);
+    if (loadedCall) {
+        uint64_t fwAddress = (loaded[4] << 32) | loaded[3];
+        bool inTmr = fwAddress >= kPspTmrGpuAddress && fwAddress < kPspTmrGpuAddress + kPspTmrSize;
+        std::printf("%s\n  fence %llu, status 0x%08llx, fw_addr 0x%010llx (%s), C2PMSG_67 %llu\n",
+                    statusName(static_cast<Status>(loaded[0])), static_cast<unsigned long long>(loaded[1]),
+                    static_cast<unsigned long long>(loaded[2]), static_cast<unsigned long long>(fwAddress),
+                    inTmr ? "inside the TMR" : "not a TMR address", static_cast<unsigned long long>(loaded[5]));
+    }
+
+    uint64_t observed[7] = {};
+    bool observedCall = false;
+    if (loadedCall && loaded[5] == 2 * kPspFrameDwords) {
+        step("sdma 5/6 observe: both regions, SDMA0_UCODE_CHECKSUM, SDMA0_F32_CNTL still halted");
+        observedCall = call(connection, kDiagnosticSdmaObserve, observed, 7);
+        if (observedCall) {
+            std::printf("%s\n  work area: %llu unexpected (first +0x%llx); firmware region: %llu unexpected "
+                        "(first +0x%llx)\n  after: SDMA0_UCODE_CHECKSUM 0x%08llx, SDMA0_F32_CNTL 0x%08llx\n",
+                        statusName(static_cast<Status>(observed[0])), static_cast<unsigned long long>(observed[1]),
+                        static_cast<unsigned long long>(observed[2]), static_cast<unsigned long long>(observed[3]),
+                        static_cast<unsigned long long>(observed[4]), static_cast<unsigned long long>(observed[5]),
+                        static_cast<unsigned long long>(observed[6]));
+        }
+    } else {
+        std::printf("sdma 5/6 observe: skipped, LOAD_IP_FW was not submitted\n");
+    }
+
+    bool torn = tmrTeardown(connection, "sdma 6/6 teardown: DESTROY_TMR as the next frame if the last fenced, "
+                                        "then DESTROY_RINGS");
+    return loadedCall && loaded[0] == kOK && observedCall && observed[0] == kOK && torn;
+}
+
 int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
-    bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, psp = false;
+    bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
+         psp = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -574,6 +678,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--psp-tmr") == 0) {
             tmr = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--psp-sdma") == 0) {
+            sdma = true;
             continue;
         }
         if (std::strcmp(argv[i], "--psp-state") == 0) {
@@ -624,7 +732,8 @@ int main(int argc, char **argv)
     std::printf("CezanneGPU diagnostics v%llu, driver stage %llu\n", static_cast<unsigned long long>(info[0]),
                 static_cast<unsigned long long>(info[1]));
 
-    const uint32_t count = info[1] >= 10  ? kStage10RegisterCount
+    const uint32_t count = info[1] >= 13  ? kStage13RegisterCount
+                           : info[1] >= 10 ? kStage10RegisterCount
                            : info[1] >= 6 ? kStage6RegisterCount
                            : info[1] == 5 ? kStage5RegisterCount
                                           : kStage3RegisterCount;
@@ -676,6 +785,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!pspTmr(connection)) failures++;
+    }
+    if (sdma) {
+        if (info[1] < kPspSdmaStage) {
+            std::fprintf(stderr, "cezanne-diag: --psp-sdma needs driver stage %u\n", kPspSdmaStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspSdma(connection)) failures++;
     }
     if (psp) {
         if (info[1] < kPspStateStage) {
