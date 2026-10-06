@@ -3793,6 +3793,18 @@ with `tools/update_stick.sh 16`; cold boot, kernel up 10:39:35 local).
 - Result: **stage 16 succeeded**, apart from the semaphore read, which is
   fixed. Every value stage 17 needs is measured.
 
+**Boot 23, 2026-10-06, stage 16 with the semaphore read removed**
+(`out/test-efi/usb-stage16/`; cold boot, kernel up 10:46:41 local).
+
+- `sudo cezanne-diag --inventory16`: **all 91 reads succeeded**, and every
+  value equals boot 22.
+- The only difference is `HUBP0_DCHUBP_CNTL`, which read `0x000f000a` in
+  the first pass and `0x000f0002` in the second. Bit 3 is `HUBP_IN_BLANK`,
+  the live vertical-blank status: it depends on when the read lands in the
+  frame, and is not a change of state.
+- Captures are in ignored `out/test-efi/boot-23-stage16/`.
+- Result: **the stage 16 fix is confirmed.**
+
 ## Unknowns and limits
 
 - The firmware lists both partitions `eraseDisk … GPT` creates. Partition 1 is
