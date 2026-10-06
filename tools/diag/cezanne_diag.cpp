@@ -213,7 +213,6 @@ const Named kRegisters[] = {
     {"VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32", kRegVmL2ContextIdentityPhysicalOffsetLo32},
     {"VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_HI32", kRegVmL2ContextIdentityPhysicalOffsetHi32},
     {"VM_INVALIDATE_ENG17_ACK", kRegVmInvalidateEng17Ack},
-    {"VM_INVALIDATE_ENG17_SEM", kRegVmInvalidateEng17Sem},
     {"VM_INVALIDATE_ENG0_ADDR_RANGE_LO32", kRegVmInvalidateEng0AddrRangeLo32},
     {"VM_INVALIDATE_ENG0_ADDR_RANGE_HI32", kRegVmInvalidateEng0AddrRangeHi32},
     {"IH_RB_BASE", kRegIhRbBase},

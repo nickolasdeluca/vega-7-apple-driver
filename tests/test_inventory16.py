@@ -39,7 +39,8 @@ class Inventory16OffsetTests(unittest.TestCase):
                    for m in re.finditer(r"#define mm(\w+)_BASE_IDX\s+(\d+)", text)}
             tables.append((regs, idx, bases))
         constants = stage16_constants()
-        self.assertEqual(len(constants), 92)
+        self.assertEqual(len(constants), 91)
+        self.assertNotIn("VM_INVALIDATE_ENG17_SEM", [name for name, _ in constants])
         for name, offset in constants:
             with self.subTest(name):
                 found = [(bases[idx[name]] + regs[name]) * 4 for regs, idx, bases in tables if name in regs]

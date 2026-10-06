@@ -477,6 +477,8 @@ const uint32_t kSdmaInventoryStage = 14;
 // mmhub_1_0_offset.h (0x1A000), osssys_4_0_offset.h (0x10A0) and
 // nbio_7_0_offset.h (NBIF 0x14/0xD20/0x10400), bases as measured in the
 // stage 2 discovery table; each register is one Linux v6.12 reads.
+// VM_INVALIDATE_ENG17_SEM is excluded: a read acquires the semaphore
+// (gmc_v9_0_flush_gpu_tlb), so it is not side-effect free (boot 22).
 const uint32_t kRegOtg0OtgControl = 0x14004; // OTG0_OTG_CONTROL: optc1_read_otg_state
 const uint32_t kRegOtg0OtgHTotal = 0x13fa8; // OTG0_OTG_H_TOTAL: optc1_read_otg_state
 const uint32_t kRegOtg0OtgVTotal = 0x13fbc; // OTG0_OTG_V_TOTAL: optc1_read_otg_state
@@ -553,7 +555,6 @@ const uint32_t kRegVmL2Context1IdentityApertureHighAddrHi32 = 0x69a50; // VM_L2_
 const uint32_t kRegVmL2ContextIdentityPhysicalOffsetLo32 = 0x69a54; // VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32: disable_identity_aperture
 const uint32_t kRegVmL2ContextIdentityPhysicalOffsetHi32 = 0x69a58; // VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_HI32: disable_identity_aperture
 const uint32_t kRegVmInvalidateEng17Ack = 0x69c18; // VM_INVALIDATE_ENG17_ACK: gmc_v9_0_flush_gpu_tlb (engine 17 via vm_inv_eng0_ack + eng_distance)
-const uint32_t kRegVmInvalidateEng17Sem = 0x69b88; // VM_INVALIDATE_ENG17_SEM: gmc_v9_0_flush_gpu_tlb (engine 17 semaphore)
 const uint32_t kRegVmInvalidateEng0AddrRangeLo32 = 0x69c1c; // VM_INVALIDATE_ENG0_ADDR_RANGE_LO32: program_invalidation
 const uint32_t kRegVmInvalidateEng0AddrRangeHi32 = 0x69c20; // VM_INVALIDATE_ENG0_ADDR_RANGE_HI32: program_invalidation
 const uint32_t kRegIhRbBase = 0x04484; // IH_RB_BASE: vega10_ih_enable_ring
@@ -570,7 +571,7 @@ const uint32_t kRegInterruptCntl = 0x03844; // INTERRUPT_CNTL: nbio_v7_0_ih_cont
 const uint32_t kRegInterruptCntl2 = 0x03848; // INTERRUPT_CNTL2: nbio_v7_0_ih_control
 const uint32_t kRegBifIhDoorbellRange = 0x03bc8; // BIF_IH_DOORBELL_RANGE: nbio_v7_0_ih_doorbell_range
 const uint32_t kDisplayInventory[] = {kRegOtg0OtgControl, kRegOtg0OtgHTotal, kRegOtg0OtgVTotal, kRegOtg0OtgHBlankStartEnd, kRegOtg0OtgVBlankStartEnd, kRegHubp0DchubpCntl, kRegHubp0DcsurfSurfaceConfig, kRegHubp0DcsurfPriViewportDimension, kRegHubpreq0DcsurfSurfacePitch, kRegHubpreq0DcsurfPrimarySurfaceAddress, kRegHubpreq0DcsurfPrimarySurfaceAddressHigh, kRegOtg1OtgControl, kRegOtg1OtgHTotal, kRegOtg1OtgVTotal, kRegOtg1OtgHBlankStartEnd, kRegOtg1OtgVBlankStartEnd, kRegHubp1DchubpCntl, kRegHubp1DcsurfSurfaceConfig, kRegHubp1DcsurfPriViewportDimension, kRegHubpreq1DcsurfSurfacePitch, kRegHubpreq1DcsurfPrimarySurfaceAddress, kRegHubpreq1DcsurfPrimarySurfaceAddressHigh, kRegOtg2OtgControl, kRegOtg2OtgHTotal, kRegOtg2OtgVTotal, kRegOtg2OtgHBlankStartEnd, kRegOtg2OtgVBlankStartEnd, kRegHubp2DchubpCntl, kRegHubp2DcsurfSurfaceConfig, kRegHubp2DcsurfPriViewportDimension, kRegHubpreq2DcsurfSurfacePitch, kRegHubpreq2DcsurfPrimarySurfaceAddress, kRegHubpreq2DcsurfPrimarySurfaceAddressHigh, kRegOtg3OtgControl, kRegOtg3OtgHTotal, kRegOtg3OtgVTotal, kRegOtg3OtgHBlankStartEnd, kRegOtg3OtgVBlankStartEnd, kRegHubp3DchubpCntl, kRegHubp3DcsurfSurfaceConfig, kRegHubp3DcsurfPriViewportDimension, kRegHubpreq3DcsurfSurfacePitch, kRegHubpreq3DcsurfPrimarySurfaceAddress, kRegHubpreq3DcsurfPrimarySurfaceAddressHigh, kRegDcnVmFbLocationBase, kRegDcnVmFbLocationTop, kRegDcnVmFbOffset, kRegDcnVmAgpBase, kRegDcnVmAgpBot, kRegDcnVmAgpTop, kRegDig0DigBeCntl, kRegDig1DigBeCntl, kRegDig2DigBeCntl, kRegDig3DigBeCntl, kRegDig4DigBeCntl};
-const uint32_t kVmInventory[] = {kRegVmContext0PageTableBaseAddrLo32, kRegVmContext0PageTableBaseAddrHi32, kRegVmContext0PageTableStartAddrLo32, kRegVmContext0PageTableStartAddrHi32, kRegVmContext0PageTableEndAddrLo32, kRegVmContext0PageTableEndAddrHi32, kRegVmL2ProtectionFaultDefaultAddrLo32, kRegVmL2ProtectionFaultDefaultAddrHi32, kRegVmL2ProtectionFaultCntl, kRegVmL2ProtectionFaultCntl2, kRegVmL2ProtectionFaultStatus, kRegVmL2Cntl2, kRegVmL2Cntl3, kRegVmL2Cntl4, kRegVmL2Context1IdentityApertureLowAddrLo32, kRegVmL2Context1IdentityApertureLowAddrHi32, kRegVmL2Context1IdentityApertureHighAddrLo32, kRegVmL2Context1IdentityApertureHighAddrHi32, kRegVmL2ContextIdentityPhysicalOffsetLo32, kRegVmL2ContextIdentityPhysicalOffsetHi32, kRegVmInvalidateEng17Ack, kRegVmInvalidateEng17Sem, kRegVmInvalidateEng0AddrRangeLo32, kRegVmInvalidateEng0AddrRangeHi32};
+const uint32_t kVmInventory[] = {kRegVmContext0PageTableBaseAddrLo32, kRegVmContext0PageTableBaseAddrHi32, kRegVmContext0PageTableStartAddrLo32, kRegVmContext0PageTableStartAddrHi32, kRegVmContext0PageTableEndAddrLo32, kRegVmContext0PageTableEndAddrHi32, kRegVmL2ProtectionFaultDefaultAddrLo32, kRegVmL2ProtectionFaultDefaultAddrHi32, kRegVmL2ProtectionFaultCntl, kRegVmL2ProtectionFaultCntl2, kRegVmL2ProtectionFaultStatus, kRegVmL2Cntl2, kRegVmL2Cntl3, kRegVmL2Cntl4, kRegVmL2Context1IdentityApertureLowAddrLo32, kRegVmL2Context1IdentityApertureLowAddrHi32, kRegVmL2Context1IdentityApertureHighAddrLo32, kRegVmL2Context1IdentityApertureHighAddrHi32, kRegVmL2ContextIdentityPhysicalOffsetLo32, kRegVmL2ContextIdentityPhysicalOffsetHi32, kRegVmInvalidateEng17Ack, kRegVmInvalidateEng0AddrRangeLo32, kRegVmInvalidateEng0AddrRangeHi32};
 const uint32_t kIhInventory[] = {kRegIhRbBase, kRegIhRbBaseHi, kRegIhRbWptr, kRegIhRbRptr, kRegIhRbWptrAddrLo, kRegIhRbWptrAddrHi, kRegIhDoorbellRptr, kRegIhChicken, kRegIhRbCntlRing1, kRegIhRbCntlRing2, kRegInterruptCntl, kRegInterruptCntl2, kRegBifIhDoorbellRange};
 const uint32_t kDisplayInventoryCount = sizeof(kDisplayInventory) / sizeof(kDisplayInventory[0]);
 const uint32_t kVmInventoryCount = sizeof(kVmInventory) / sizeof(kVmInventory[0]);
@@ -679,7 +680,6 @@ const uint32_t kStage16Registers[] = {kRegC2PMsg33, kRegConfigMemsize, kRegMcVmF
                                       kRegVmL2ContextIdentityPhysicalOffsetLo32,
                                       kRegVmL2ContextIdentityPhysicalOffsetHi32,
                                       kRegVmInvalidateEng17Ack,
-                                      kRegVmInvalidateEng17Sem,
                                       kRegVmInvalidateEng0AddrRangeLo32,
                                       kRegVmInvalidateEng0AddrRangeHi32,
                                       kRegIhRbBase,

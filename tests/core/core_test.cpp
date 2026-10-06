@@ -1805,8 +1805,8 @@ static void testSdmaCopy()
 
 static void testInventory16()
 {
-    CHECK(kDisplayInventoryCount == 55 && kVmInventoryCount == 24 && kIhInventoryCount == 13);
-    CHECK(kStage16RegisterCount == kStage14RegisterCount + 92);
+    CHECK(kDisplayInventoryCount == 55 && kVmInventoryCount == 23 && kIhInventoryCount == 13);
+    CHECK(kStage16RegisterCount == kStage14RegisterCount + 91);
     CHECK(kDisplayInventoryCount == kDisplayPipes * kDisplayPipeRegisters + 11);
     for (uint32_t i = 0; i < kStage14RegisterCount; i++) CHECK(kStage16Registers[i] == kStage14Registers[i]);
     for (uint32_t i = 0; i < kStage16RegisterCount; i++) {
