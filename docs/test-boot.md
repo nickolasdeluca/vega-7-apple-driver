@@ -1654,6 +1654,167 @@ That is four writes to the PSP in total, all values approved for stage 11.
 The risks are as in the stage 11 section. The boot must be a cold boot, so
 the PSP starts from the boot 14 state, not boot 15's rejected command.
 
+### Stage 12: first PSP ring frame, TMR setup (proposal)
+
+**Status: proposed 2026-10-06, not approved, not implemented.**
+
+**Purpose.** Submit the first command through the ring stage 11 proved: set
+up the PSP's trusted memory region (TMR). Linux v6.12 does this right after
+creating the ring, and every firmware load after it (SDMA first) needs it.
+It is also the first time:
+- the CPU writes GPU memory (the command buffer, fence and ring frame);
+- the PSP reads a command from memory and writes a result back.
+
+**Linux v6.12 for this host** (MP0 12.0.1):
+
+- **Setup.** `psp_early_init` sets `autoload_supported = false` and
+  `boot_time_tmr = false`, so `psp_hw_start` runs `psp_tmr_init`. With no
+  TOC for this firmware, that allocates `PSP_TMR_SIZE` = 4 MiB in VRAM,
+  aligned to `PSP_TMR_ALIGNMENT` (1 MiB). The comment there says the PSP
+  prefers natural alignment, meaning aligned to the size itself.
+- **The command.** `psp_tmr_load` → `psp_prep_tmr_cmd_buf` builds
+  `GFX_CMD_ID_SETUP_TMR` (5) with these fields:
+  - `buf_phy_addr_lo`/`hi` = the TMR's GPU (MC) address;
+  - `buf_size` = 4 MiB;
+  - `tmr_flags` bit 1 (`virt_phy_addr`) = 1;
+  - `system_phy_addr_lo`/`hi` = `amdgpu_gmc_vram_pa`, i.e. MC address −
+    `vram_start` (`0xF400000000`) + `vram_base_offset` (`0x5C0000000`,
+    from `MC_VM_FB_OFFSET`, `gmc_v9_0.c`).
+- **Submitting it.** `psp_cmd_submit_buf` → `psp_ring_cmd_submit`:
+  1. zero the 4 KiB command buffer and copy in the 1024-byte
+     `psp_gfx_cmd_resp`. Linux sets only `cmd_id` and the command fields;
+     `buf_size` and `buf_version` stay 0.
+  2. Take the next fence value (1 for the first command).
+  3. At the current write pointer (`C2PMSG_67`, in dwords), zero one 64-byte
+     `psp_gfx_rb_frame` and fill in the command buffer address, the fence
+     address and the fence value. `cmd_buf_size` stays 0.
+  4. Advance the write pointer by 16 dwords, modulo 1024, and write it to
+     `C2PMSG_67`.
+  5. Poll the fence buffer's first dword until it equals the fence value,
+     up to `psp_timeout` = 20000 tries 10–100 µs apart. Then read the
+     response at command buffer offset 864 (`psp_gfx_resp.status`). A
+     non-zero status is only a warning in Linux.
+- **No cache maintenance on this host.** On x86-64 APUs,
+  `amdgpu_device_flush_hdp` and `amdgpu_device_invalidate_hdp` return
+  immediately, so the CPU and PSP share the carveout with no HDP
+  maintenance.
+- **Teardown.** `psp_hw_fini` sends `GFX_CMD_ID_DESTROY_TMR` (7, no
+  fields) through the ring, then destroys the ring.
+
+**Placement** (carveout offsets; GPU address = `0xF400000000` + offset,
+physical = `0x5C0000000` + offset):
+
+| Buffer | Offset | Size | GPU address |
+| --- | --- | --- | --- |
+| Ring (stage 11) | `0x40100000` | 4 KiB | `0xF440100000` |
+| Command buffer | `0x40101000` | 4 KiB | `0xF440101000` |
+| Fence buffer | `0x40102000` | 4 KiB | `0xF440102000` |
+| TMR | `0x40400000` | 4 MiB (4 MiB-aligned) | `0xF440400000` |
+
+All of these lie inside the 64 KiB stage 11 checks, or in a 4 MiB region
+starting 3 MiB above it. All are in the middle of the carveout, clear of
+the stage 9 metrics page.
+
+**Steps** (on request only, `sudo cezanne-diag --psp-tmr`, each printed
+first; ordered selectors):
+
+1. **Check (no writes).**
+   - The stage 11 check: secure OS running, PSP ready, no ring, and the
+     64 KiB at the ring stable over about 1 s, snapshotted.
+   - The TMR region inside the carveout and outside every device range.
+   - The 4 MiB TMR region read twice about 1 s apart, with a checksum
+     instead of a snapshot; it must not change.
+2. **Create the ring**, exactly as stage 11.
+3. **Write the command.** These are the first CPU writes to carveout memory,
+   through one new writable, uncached mapping of the three pages at
+   `0x40100000`–`0x40102FFF`, and nowhere else:
+   - zero the command and fence pages, and frame 0 (64 bytes);
+   - fill the command buffer: `cmd_id` 5, then `0x40400000`, `0xF4`,
+     `0x00400000`, flags `0x2`, and `0x00400000`, `0x6` (physical
+     `0x600400000`);
+   - fill frame 0: command buffer `0xF440101000`, fence `0xF440102000`,
+     fence value 1;
+   - read all three pages back, and stop unless they match exactly.
+4. **Submit.** `C2PMSG_67` ← `16`. Then poll the fence dword every 1 ms, up
+   to 2000 times (2 s, Linux's upper bound).
+5. **Result.** Read the response status (offset 864) and `fw_addr`/`tmr_size`
+   for the record. Compare the 64 KiB around the ring with the snapshot.
+   Only the bytes this step wrote may differ, plus the 96-byte response area
+   (`+864`–`+959`) and the fence dword.
+6. **Teardown.**
+   - `DESTROY_TMR` as frame 1: `cmd_id` 7, fence value 2, then
+     `C2PMSG_67` ← `32`, and the same fence wait.
+   - Then the stage 11 `DESTROY_RINGS`.
+   - If the connection closes after step 4, the driver does the same
+     teardown itself.
+
+**The CPU never reads or writes the TMR after step 1.** Once it is set up,
+the PSP may protect it; it is reserved until the next cold boot.
+
+**New writes:**
+
+| Target | Values |
+| --- | --- |
+| `C2PMSG_67` (write pointer) | `16`, `32` only, in that order after a create |
+| Memory | only the three pages at physical `0x600100000`–`0x600102FFF`, with exactly the contents above (frames 0 and 1, the two command buffers, zeroed fence) |
+
+Everything else (the ring create and destroy values) is stage 11's.
+
+**Changes:**
+
+- **Core:**
+  - A `MemoryWriter` callback.
+  - `buildSetupTmr`, `buildDestroyTmr` and `buildFrame`, which produce exact
+    word images that the tests check.
+  - `submitPspFrame` (write pointer and fence poll), `checkTmrRegion` (a
+    stability checksum), and the response decode.
+  - The memory-write allowlist (the three pages) and the write-pointer
+    values.
+- **Adapter:**
+  - Selectors for check, create, submit SETUP_TMR, observe, and teardown
+    (DESTROY_TMR then DESTROY_RINGS). Diagnostics version 8.
+  - The one new writable carveout mapping, of the three pages, created only
+    during write steps.
+  - Teardown on abandon.
+- **Tool:** `--psp-tmr` prints each step, the fence value, the response
+  status, `fw_addr` and `tmr_size`, and the region comparison.
+- **Tests:**
+  - Exact page images (cross-checked with the `psp_gfx_if.h` offsets: the
+    command at +8, the fields at +28, the response at +864; the frame
+    layout).
+  - The write-pointer arithmetic and the fence timeout.
+  - Teardown order, and teardown on abandon after the submit only.
+  - Memory writes refused outside the three pages and in any other order.
+  - Weakened cores that must fail: the readback check removed, the
+    fence-timeout removed, a write-pointer value other than 16/32, and a
+    memory write outside the pages.
+
+**Expected results:**
+- The fence reads 1 within milliseconds. The response status is 0.
+- `DESTROY_TMR` fences 2 with status 0, and the ring destroy is as in boot
+  16.
+- Only the expected words change around the ring.
+
+**Risks:**
+
+- These are the first CPU writes to GPU memory and the first command the
+  PSP reads from memory. If the frame or command is malformed, the PSP may
+  hang the ring. Shut down fully afterwards.
+- If `SETUP_TMR` succeeds, the PSP may protect the 4 MiB TMR region from
+  the CPU until the next cold boot. macOS does not use the carveout beyond
+  the boot framebuffer at offset 0, and the driver never touches the TMR
+  after step 1.
+- A misdirected PSP write could land outside the three pages. Only the
+  64 KiB around them is compared; any unexpected change there means power
+  off at once.
+- A fence that never arrives means the PSP did not process the frame:
+  teardown is still attempted, then shut down fully.
+- Make a Time Machine backup before this boot.
+
+**What it does not do.** It loads no firmware (`LOAD_IP_FW` is the next
+stage), and no TOC, ASD or TA. It makes no IH, GART or default-page
+change. It sends no second command while the first is unfenced.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
