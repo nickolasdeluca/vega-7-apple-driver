@@ -29,7 +29,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 9;
+const uint32_t kMaxStage = 10;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -248,6 +248,66 @@ enum MetricsWord : uint32_t {
     kMetricsSocEdc = 71,
     kMetricsWordCount = 74,
 };
+
+// Stage 10: read-only PSP mailbox and memory-aperture state, before any PSP
+// write (psp_v12_0 ring_create, mmhub_v1_0/gfxhub_v1_0
+// init_system_aperture_regs). Offsets: mp_12_0_0_offset.h,
+// mmhub_1_0_offset.h, gc_9_0_offset.h, measured bases.
+const uint32_t kRegMp0C2PMsg36 = (0x16000 + 0x0064) * 4; // bootloader firmware address
+const uint32_t kRegMp0C2PMsg64 = (0x16000 + 0x0080) * 4; // ring command and response
+const uint32_t kRegMp0C2PMsg67 = (0x16000 + 0x0083) * 4; // ring write pointer
+const uint32_t kRegMp0C2PMsg69 = (0x16000 + 0x0085) * 4; // ring address low
+const uint32_t kRegMp0C2PMsg70 = (0x16000 + 0x0086) * 4; // ring address high
+const uint32_t kRegMp0C2PMsg71 = (0x16000 + 0x0087) * 4; // ring size
+const uint32_t kRegMmhubFbOffset = (0x1A000 + 0x0817) * 4;
+const uint32_t kRegMmhubDefaultAddrLsb = (0x1A000 + 0x0818) * 4;
+const uint32_t kRegMmhubDefaultAddrMsb = (0x1A000 + 0x0819) * 4;
+const uint32_t kRegMmhubAgpTop = (0x1A000 + 0x082e) * 4;
+const uint32_t kRegMmhubAgpBot = (0x1A000 + 0x082f) * 4;
+const uint32_t kRegMmhubAgpBase = (0x1A000 + 0x0830) * 4;
+const uint32_t kRegMmhubApertureLow = (0x1A000 + 0x0831) * 4;
+const uint32_t kRegMmhubApertureHigh = (0x1A000 + 0x0832) * 4;
+const uint32_t kRegGcFbLocationBase = (0x2000 + 0x0980) * 4;
+const uint32_t kRegGcFbLocationTop = (0x2000 + 0x0981) * 4;
+const uint32_t kRegGcAgpTop = (0x2000 + 0x0982) * 4;
+const uint32_t kRegGcAgpBot = (0x2000 + 0x0983) * 4;
+const uint32_t kRegGcAgpBase = (0x2000 + 0x0984) * 4;
+const uint32_t kRegGcApertureLow = (0x2000 + 0x0985) * 4;
+const uint32_t kRegGcApertureHigh = (0x2000 + 0x0986) * 4;
+const uint32_t kStage10Registers[] = {kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset, kRegGrbmStatus,
+                                      kRegGrbmGfxIndex, kRegCcShaderArrayConfig, kRegUserShaderArrayConfig,
+                                      kRegCcRbBackendDisable, kRegUserRbBackendDisable, kRegGbAddrConfig,
+                                      kRegSmuioGfxMiscCntl, kRegMp1C2PMsg66, kRegMp1C2PMsg82,
+                                      kRegMp1C2PMsg90, kRegMp0C2PMsg35, kRegMp0C2PMsg81,
+                                      kRegRlcCgttMgcgOverride, kRegRlcCgcgCglsCtrl,
+                                      kRegRlcCgcgCglsCtrl3d, kRegRlcMemSlpCntl, kRegCpMemSlpCntl,
+                                      kRegRlcPgCntl, kRegGrbmStatus2, kRegGrbmStatusSe0,
+                                      kRegCpBusyStat, kRegCpCpfStatus, kRegCpMeCntl, kRegCpMecCntl,
+                                      kRegRlcCntl, kRegRlcStat, kRegCpPfpInstrPntr, kRegCpMeInstrPntr,
+                                      kRegCpMec1InstrPntr, kRegSdma0ClkCtrl, kRegSdma0PowerCntl,
+                                      kRegSdma0F32Cntl, kRegSdma0StatusReg, kRegSdma0GfxRbCntl,
+                                      kRegHdpMemPowerLs, kRegAthubMiscCntl, kRegAtcL2MiscCg,
+                                      kRegDagb0CntlMisc2, kRegMmhubFbLocationBase, kRegMmhubFbLocationTop,
+                                      kRegMmhubVmL2Cntl, kRegMmhubVmContext0Cntl, kRegMmhubMxL1TlbCntl,
+                                      kRegIhRbCntl, kRegScratchReg0, kRegMp0C2PMsg36, kRegMp0C2PMsg64,
+                                      kRegMp0C2PMsg67, kRegMp0C2PMsg69, kRegMp0C2PMsg70, kRegMp0C2PMsg71,
+                                      kRegMmhubFbOffset, kRegMmhubDefaultAddrLsb, kRegMmhubDefaultAddrMsb,
+                                      kRegMmhubAgpTop, kRegMmhubAgpBot, kRegMmhubAgpBase,
+                                      kRegMmhubApertureLow, kRegMmhubApertureHigh, kRegGcFbLocationBase,
+                                      kRegGcFbLocationTop, kRegGcAgpTop, kRegGcAgpBot, kRegGcAgpBase,
+                                      kRegGcApertureLow, kRegGcApertureHigh};
+const uint32_t kStage10RegisterCount = sizeof(kStage10Registers) / sizeof(kStage10Registers[0]);
+// The GC-hub registers take the stage 5 GFX gate.
+const uint32_t kStage10GfxGatedRegisters[] = {kRegGcFbLocationBase, kRegGcFbLocationTop, kRegGcAgpTop,
+                                              kRegGcAgpBot, kRegGcAgpBase, kRegGcApertureLow,
+                                              kRegGcApertureHigh};
+const uint32_t kStage10GfxGatedRegisterCount =
+    sizeof(kStage10GfxGatedRegisters) / sizeof(kStage10GfxGatedRegisters[0]);
+// C2PMSG_64: bit 31 set by the PSP when it has answered; bits 15:0 status
+// (psp_v12_0 waits for 0x80000000 under mask 0x8000FFFF).
+const uint32_t kPspResponseFlag = 0x80000000u;
+const uint32_t kPspStatusMask = 0xFFFFu;
+const uint32_t kPspStateStage = 10;
 
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).

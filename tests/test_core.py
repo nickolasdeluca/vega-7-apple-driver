@@ -81,6 +81,9 @@ class CoreTests(unittest.TestCase):
             "kScratchRestoreMismatch": ("return *readback == original ? kOK : kScratchRestoreMismatch;",
                                         "return kOK;"),
             "registerAllowed(kRegMp1C2PMsg90, 4)": (": stage >= 3 ? kStage3RegisterCount", ": stage >= 3 ? kStage5RegisterCount"),
+            "!registerAllowed(kRegMp0C2PMsg64, 9)": ("stage >= 10  ? kStage10RegisterCount",
+                                                     "stage >= 9  ? kStage10RegisterCount"),
+            "gfxGated(kRegGcApertureHigh)": ("if (kStage10GfxGatedRegisters[i] == offset) return true;", "(void)0;"),
             "registerAllowed(kRegGrbmGfxIndex, 2)": ("stage == 2 ? kStage2RegisterCount",
                                                      "stage == 2 ? kStage3RegisterCount"),
         }

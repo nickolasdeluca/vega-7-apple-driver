@@ -619,6 +619,45 @@ static void testStage5()
     }
 }
 
+static void testStage10()
+{
+    CHECK(kRegMp0C2PMsg36 == 0x58190 && kRegMp0C2PMsg64 == 0x58200 && kRegMp0C2PMsg67 == 0x5820c);
+    CHECK(kRegMp0C2PMsg69 == 0x58214 && kRegMp0C2PMsg70 == 0x58218 && kRegMp0C2PMsg71 == 0x5821c);
+    CHECK(kRegMmhubFbOffset == 0x6a05c && kRegMmhubDefaultAddrLsb == 0x6a060 && kRegMmhubAgpTop == 0x6a0b8);
+    CHECK(kRegMmhubApertureLow == 0x6a0c4 && kRegMmhubApertureHigh == 0x6a0c8);
+    CHECK(kRegGcFbLocationBase == 0xa600 && kRegGcAgpTop == 0xa608 && kRegGcApertureHigh == 0xa618);
+    CHECK(kStage10RegisterCount == kStage6RegisterCount + 21);
+    for (uint32_t i = 0; i < kStage6RegisterCount; i++) CHECK(kStage10Registers[i] == kStage6Registers[i]);
+    for (uint32_t i = 0; i < kStage10RegisterCount; i++) {
+        CHECK(kStage10Registers[i] % 4 == 0 && kStage10Registers[i] + 4 <= 0x80000); // inside BAR5
+        for (uint32_t j = i + 1; j < kStage10RegisterCount; j++) CHECK(kStage10Registers[i] != kStage10Registers[j]);
+    }
+    for (uint32_t i = kStage6RegisterCount; i < kStage10RegisterCount; i++) {
+        CHECK(registerAllowed(kStage10Registers[i], 10) && !registerAllowed(kStage10Registers[i], 9));
+        CHECK(!writeAllowed(kStage10Registers[i], 0, 10));
+    }
+    CHECK(!registerAllowed(kRegMp0C2PMsg64, 9));
+    for (uint32_t i = 0; i < kStage10GfxGatedRegisterCount; i++) CHECK(gfxGated(kStage10GfxGatedRegisters[i]));
+    CHECK(gfxGated(kRegGcApertureHigh) && !gfxGated(kRegMp0C2PMsg64) && !gfxGated(kRegMmhubApertureHigh));
+
+    uint32_t value = 0;
+    {
+        FakeRegisters r;
+        r.gfxMisc = 0;
+        CHECK(readDiagnosticRegister(r.reader(), 0x80000, 10, kRegGcApertureLow, &value) == kGfxNotOn);
+        CHECK(r.reads == 1 && value == 0);
+        CHECK(readDiagnosticRegister(r.reader(), 0x80000, 10, kRegMp0C2PMsg64, &value) == kOK);
+        CHECK(r.reads == 2); // not gated: SMUIO not consulted
+        CHECK(readDiagnosticRegister(r.reader(), 0x80000, 9, kRegMp0C2PMsg64, &value) == kRegisterNotAllowed);
+    }
+    {
+        FakeRegisters r;
+        r.gfxMisc = 0x4;
+        CHECK(readDiagnosticRegister(r.reader(), 0x80000, 10, kRegGcApertureLow, &value) == kOK);
+        CHECK(r.reads == 2 && r.order[0] == kRegSmuioGfxMiscCntl && r.order[1] == kRegGcApertureLow);
+    }
+}
+
 // Records writes into a FakeRegisters; pause can simulate another writer.
 struct FakeWriter {
     FakeRegisters *registers;
@@ -1052,6 +1091,7 @@ int main()
     testDiscovery();
     testGfxConfig();
     testStage5();
+    testStage10();
     testScratch();
     testSmu();
     testGfxOff();

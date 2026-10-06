@@ -138,15 +138,16 @@ Status checkAperture(const PciState &state, uint64_t physical, uint64_t length)
 bool registerAllowed(uint32_t offset, uint32_t stage)
 {
     // Each stage's list extends the previous one (checked by the tests), so a
-    // prefix of the stage 6 list is the list for any stage.
-    uint32_t count = stage >= 6   ? kStage6RegisterCount
+    // prefix of the stage 10 list is the list for any stage.
+    uint32_t count = stage >= 10  ? kStage10RegisterCount
+                     : stage >= 6 ? kStage6RegisterCount
                      : stage == 5 ? kStage5RegisterCount
                      : stage >= 3 ? kStage3RegisterCount
                      : stage == 2 ? kStage2RegisterCount
                      : stage == 1 ? kStage1RegisterCount
                                   : 0;
     for (uint32_t i = 0; i < count; i++) {
-        if (kStage6Registers[i] == offset) return true;
+        if (kStage10Registers[i] == offset) return true;
     }
     return false;
 }
@@ -169,6 +170,9 @@ bool gfxGated(uint32_t offset)
 {
     for (uint32_t i = 0; i < kGfxGatedRegisterCount; i++) {
         if (kGfxGatedRegisters[i] == offset) return true;
+    }
+    for (uint32_t i = 0; i < kStage10GfxGatedRegisterCount; i++) {
+        if (kStage10GfxGatedRegisters[i] == offset) return true;
     }
     return false;
 }
