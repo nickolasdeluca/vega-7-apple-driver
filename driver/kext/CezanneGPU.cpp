@@ -261,7 +261,10 @@ private:
     IOWorkLoop *intrLoop_ = nullptr;
     IOFilterInterruptEventSource *intrSource_ = nullptr;
     SInt32 msiCount_ = 0;
-    UInt64 intrSubmitTime_ = 0, intrFirstTime_ = 0;
+    uint32_t msiAtSubmit_ = 0;                 // the count when frame 3 was submitted
+    UInt64 intrEnableTime_ = 0, intrSubmitTime_ = 0; // before the ENABLE_INTR write and the frame 3 submit
+    UInt64 msiTimes_[cezanne::kIntrTimes] = {};   // of the first MSIs, written by intrFilter
+    uint32_t sinceEnable(UInt64 time) const;
     static bool intrFilter(OSObject *owner, IOFilterInterruptEventSource *source);
     static void intrAction(OSObject *owner, IOInterruptEventSource *source, int count);
     static uint32_t intrCount(void *context);
@@ -1878,6 +1881,7 @@ cezanne::Status CezanneGPU::sdmaSubmit(const void *owner, uint32_t frame, uint32
     if (next && pspOwner_ == owner) {
         CopyArgument copy = {nullptr, 0, nullptr, observed, rptr, wptr, f32Cntl, status, frame, 0, false};
         if (frame == 3) {
+            msiAtSubmit_ = intrCount(this);
             intrSubmitTime_ = mach_absolute_time();
         }
         result = accessDevice(cezanne::kSdmaPageSet, copySubmitOperation, &copy);
@@ -2134,6 +2138,7 @@ struct IntrArgument {
     uint32_t *snapshot, *display;
     const uint32_t *sdmaSnapshot;
     cezanne::InterruptCounter counter;
+    uint32_t msiBefore;
     cezanne::IntrReport *report;
 };
 
@@ -2176,7 +2181,7 @@ static cezanne::Status intrVerifyOperation(UInt32 stage, const cezanne::Register
         return withCarveoutMemory(cezanne::kGartWorkPhysical, cezanne::kGartWorkCheckSize,
                                   [&](const cezanne::MemoryReader &gartRegion) {
             return cezanne::verifyIntr(registers, length, sdmaRegion, intr->sdmaSnapshot, gartRegion, intr->snapshot,
-                                       intr->display, *writer, intr->counter, stage, intr->report);
+                                       intr->display, *writer, intr->counter, intr->msiBefore, stage, intr->report);
         });
     });
 }
@@ -2210,8 +2215,9 @@ bool CezanneGPU::intrFilter(OSObject *owner, IOFilterInterruptEventSource *)
     // log, no register access; returning false schedules nothing.
     CezanneGPU *self = static_cast<CezanneGPU *>(owner);
     UInt64 now = mach_absolute_time();
-    if (OSIncrementAtomic(&self->msiCount_) == 0) {
-        self->intrFirstTime_ = now;
+    SInt32 n = OSIncrementAtomic(&self->msiCount_);
+    if (n >= 0 && n < static_cast<SInt32>(cezanne::kIntrTimes)) {
+        self->msiTimes_[n] = now;
     }
     return false;
 }
@@ -2219,6 +2225,17 @@ bool CezanneGPU::intrFilter(OSObject *owner, IOFilterInterruptEventSource *)
 void CezanneGPU::intrAction(OSObject *, IOInterruptEventSource *, int)
 {
     // Never scheduled: intrFilter always returns false.
+}
+
+uint32_t CezanneGPU::sinceEnable(UInt64 time) const
+{
+    // Microseconds from the ENABLE_INTR write; 0 for a time before it.
+    if (time <= intrEnableTime_) {
+        return 0;
+    }
+    UInt64 nanoseconds = 0;
+    absolutetime_to_nanoseconds(time - intrEnableTime_, &nanoseconds);
+    return static_cast<uint32_t>(nanoseconds / 1000);
 }
 
 uint32_t CezanneGPU::intrCount(void *context)
@@ -2265,7 +2282,9 @@ cezanne::Status CezanneGPU::addIntrSourceLocked()
     }
     // Nothing can interrupt before enable().
     msiCount_ = 0;
-    intrFirstTime_ = 0;
+    for (uint32_t i = 0; i < cezanne::kIntrTimes; i++) {
+        msiTimes_[i] = 0;
+    }
     intrSource_->enable();
     return cezanne::kOK;
 }
@@ -2316,7 +2335,7 @@ cezanne::Status CezanneGPU::intrCheck(const void *owner, uint32_t *index, uint32
         status = cezanne::kIntrNoMsi;
         if (msiIndex_ >= 0) {
             *msiIndex = static_cast<uint32_t>(msiIndex_);
-            IntrArgument intr = {index, value, nullptr, nullptr, nullptr, nullptr, nullptr, {nullptr, nullptr}, nullptr};
+            IntrArgument intr = {index, value, nullptr, nullptr, nullptr, nullptr, nullptr, {nullptr, nullptr}, 0, nullptr};
             status = accessDevice(0, intrCheckOperation, &intr);
         }
         intrState_ = status == cezanne::kOK ? kIntrChecked : kIntrIdle;
@@ -2335,13 +2354,14 @@ cezanne::Status CezanneGPU::intrEnable(const void *owner, uint32_t *progress, ui
     cezanne::Status status = cezanne::kIntrOutOfOrder;
     if (intrState_ == kIntrChecked && pspOwner_ == owner) {
         // Arm the IH, then the handler, and only then ENABLE_INTR.
-        IntrArgument intr = {progress, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {nullptr, nullptr}, nullptr};
+        IntrArgument intr = {progress, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {nullptr, nullptr}, 0, nullptr};
         status = accessDevice(cezanne::kIntrPageSet, intrArmOperation, &intr);
         intrProgress_ = *progress;
         if (status == cezanne::kOK) {
             status = addIntrSourceLocked();
         }
         if (status == cezanne::kOK) {
+            intrEnableTime_ = mach_absolute_time();
             status = accessDevice(cezanne::kIntrPageSet, intrStartOperation, &intr);
             intrProgress_ = *progress;
         }
@@ -2362,18 +2382,22 @@ cezanne::Status CezanneGPU::intrVerify(const void *owner, cezanne::IntrReport *r
     cezanne::Status status = cezanne::kIntrOutOfOrder;
     if (intrState_ == kIntrSubmitted && pspOwner_ == owner) {
         IntrArgument intr = {nullptr, nullptr, nullptr, nullptr, gartSnapshot_, gartDisplay_, sdmaWorkSnapshot_,
-                             {intrCount, this}, report};
+                             {intrCount, this}, msiAtSubmit_, report};
         status = accessDevice(0, intrVerifyOperation, &intr);
         intrState_ = kIntrVerified;
         intrVerified_ = status == cezanne::kOK;
-        if (intrFirstTime_ > intrSubmitTime_ && intrSubmitTime_ != 0) {
-            UInt64 nanoseconds = 0;
-            absolutetime_to_nanoseconds(intrFirstTime_ - intrSubmitTime_, &nanoseconds);
-            report->latencyMicroseconds = static_cast<uint32_t>(nanoseconds / 1000);
+        report->submitMicroseconds = sinceEnable(intrSubmitTime_);
+        for (uint32_t i = 0; i < cezanne::kIntrTimes && i < report->msiCount; i++) {
+            report->msiMicroseconds[i] = sinceEnable(msiTimes_[i]);
         }
-        IOLog(LOG_PREFIX "interrupt verify: %s, %u MSI after %u us, fence %u, IH write-back 0x%08x, %u entries, "
-                         "%u SDMA traps; %u + %u unexpected words, %u display changes\n",
-              cezanne::statusName(status), report->msiCount, report->latencyMicroseconds, report->fence3,
+        if (msiAtSubmit_ < report->msiCount && msiAtSubmit_ < cezanne::kIntrTimes) {
+            uint32_t first = report->msiMicroseconds[msiAtSubmit_];
+            report->latencyMicroseconds = first > report->submitMicroseconds ? first - report->submitMicroseconds : 0;
+        }
+        IOLog(LOG_PREFIX "interrupt verify: %s, %u MSI (%u before the submit), first after it in %u us, fence %u, "
+                         "IH write-back 0x%08x, %u entries, %u SDMA traps; %u + %u unexpected words, %u display changes\n",
+              cezanne::statusName(status), report->msiCount, report->msiBefore, report->latencyMicroseconds,
+              report->fence3,
               report->ihWriteback, report->ihEntries, report->sdmaTraps, report->sdmaUnexpected,
               report->gartUnexpected, report->displayChanged);
     }
@@ -2389,7 +2413,7 @@ cezanne::Status CezanneGPU::intrAck(const void *owner, uint32_t *rptr, uint32_t 
     cezanne::Status status = cezanne::kIntrOutOfOrder;
     // Once, after a passing verify.
     if (intrState_ == kIntrVerified && intrVerified_ && pspOwner_ == owner) {
-        IntrArgument intr = {rptr, countBefore, countAfter, writeback, nullptr, nullptr, nullptr, {intrCount, this},
+        IntrArgument intr = {rptr, countBefore, countAfter, writeback, nullptr, nullptr, nullptr, {intrCount, this}, 0,
                              nullptr};
         status = accessDevice(cezanne::kIntrPageSet, intrAckOperation, &intr);
         intrVerified_ = false;
@@ -2404,7 +2428,7 @@ cezanne::Status CezanneGPU::intrRestoreLocked(uint32_t *index, uint32_t *value, 
 {
     // Caller holds lock_: the IH quiet, the handler removed, INTERRUPT_CNTL2
     // back, in that order (vega10_ih_irq_disable before free_irq).
-    IntrArgument intr = {index, value, nullptr, nullptr, nullptr, nullptr, nullptr, {nullptr, nullptr}, nullptr};
+    IntrArgument intr = {index, value, nullptr, nullptr, nullptr, nullptr, nullptr, {nullptr, nullptr}, 0, nullptr};
     cezanne::Status quiesce = cezanne::kOK, restore = cezanne::kOK;
     if (intrProgress_ != 0) {
         quiesce = accessDevice(cezanne::kIntrPageSet, intrQuiesceOperation, &intr);

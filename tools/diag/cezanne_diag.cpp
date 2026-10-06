@@ -827,7 +827,8 @@ bool intrIh(io_connect_t connection)
         }
     }
     if (ok) {
-        step("intr 4/6 verify: fence 3, the SDMA0 trap in the IH ring, exactly one MSI, no VM fault, regions, display");
+        step("intr 4/6 verify: fence 3, the SDMA0 trap in the IH ring, exactly one MSI after the submit, no VM fault,\n"
+             "  regions, display");
         uint64_t scalar = 0;
         uint32_t scalarCount = 1;
         IntrReport report = {};
@@ -838,17 +839,20 @@ bool intrIh(io_connect_t connection)
         if (!ok) {
             std::printf("call failed 0x%08x\n", result);
         } else {
-            std::printf("%s\n  MSI count %u, first %u us after the WPTR write; fence 3 %u, GFX_RB_RPTR %u\n"
+            std::printf("%s\n  MSI count %u (%u before the submit), the first after it %u us after the WPTR write;\n"
+                        "  fence 3 %u, GFX_RB_RPTR %u\n"
                         "  IH_RB_CNTL 0x%08x, VM_L2_PROTECTION_FAULT_STATUS 0x%08x\n"
                         "  IH write-back 0x%08x, IH_RB_WPTR 0x%08x, IH_RB_RPTR 0x%08x: %u entries, %u SDMA0 traps, %u other\n"
                         "  SDMA region %u unexpected (first +0x%x), GART region %u unexpected (first +0x%x)\n"
                         "  display: %u changed",
-                        statusName(static_cast<Status>(scalar)), report.msiCount, report.latencyMicroseconds,
-                        report.fence3, report.rptr, report.ihRbCntl, report.faultStatus, report.ihWriteback,
+                        statusName(static_cast<Status>(scalar)), report.msiCount, report.msiBefore,
+                        report.latencyMicroseconds, report.fence3, report.rptr, report.ihRbCntl, report.faultStatus, report.ihWriteback,
                         report.ihWptr, report.ihRptr, report.ihEntries, report.sdmaTraps, report.otherEntries,
                         report.sdmaUnexpected, report.sdmaFirst, report.gartUnexpected, report.gartFirst,
                         report.displayChanged);
             if (report.displayChanged != 0) std::printf(" (first %s)", registerName(kDisplayInventory[report.displayFirst]));
+            std::printf("\n  times from the ENABLE_INTR write: submit %u us; MSI", report.submitMicroseconds);
+            for (uint32_t i = 0; i < report.msiCount && i < kIntrTimes; i++) std::printf(" %u us", report.msiMicroseconds[i]);
             std::printf("\n");
             for (uint32_t entry = 0; entry < report.ihEntries && entry < kIhReportEntries; entry++) {
                 const uint32_t *dw = report.ring + entry * kIhEntryBytes / 4;

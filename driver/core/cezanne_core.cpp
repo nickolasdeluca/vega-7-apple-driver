@@ -1911,10 +1911,11 @@ Status startIntr(const RegisterWriter &writer, uint32_t stage, uint32_t *progres
 Status verifyIntr(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &sdmaRegion,
                   const uint32_t *sdmaSnapshot, const MemoryReader &gartRegion, const uint32_t *gartSnapshot,
                   const uint32_t *display, const RegisterWriter &writer, const InterruptCounter &counter,
-                  uint32_t stage, IntrReport *report)
+                  uint32_t msiBefore, uint32_t stage, IntrReport *report)
 {
     *report = IntrReport();
     if (stage < kIntrStage) return kRegisterNotAllowed;
+    report->msiBefore = msiBefore;
     // The fence, the IH entry and the MSI may arrive in any order.
     uint32_t end = 0;
     bool wrapped = false;
@@ -1924,7 +1925,8 @@ Status verifyIntr(const RegisterReader &registers, uint64_t apertureLength, cons
         if (!sdmaRegion.read32(sdmaRegion.context, kSdmaWbPage + kSdmaWbFence3, &report->fence3))
             return kRegisterReadFailed;
         report->msiCount = counter.count(counter.context);
-        if ((report->sdmaTraps != 0 && report->fence3 == 3 && report->msiCount != 0) || i == kSdmaPollPauses) break;
+        if ((report->sdmaTraps != 0 && report->fence3 == 3 && report->msiCount > msiBefore) || i == kSdmaPollPauses)
+            break;
         writer.pause(writer.context);
     }
     const struct {
@@ -1952,8 +1954,8 @@ Status verifyIntr(const RegisterReader &registers, uint64_t apertureLength, cons
     report->msiCount = counter.count(counter.context);
     if (report->faultStatus != 0) return kGartFault;
     if (report->sdmaTraps == 0) return kIhNoTrap;
-    if (report->msiCount == 0) return kIntrNotDelivered;
-    return report->fence3 == 3 && report->msiCount == 1 && report->sdmaUnexpected == 0 &&
+    if (report->msiCount <= msiBefore) return kIntrNotDelivered;
+    return report->fence3 == 3 && report->msiCount - msiBefore == 1 && report->sdmaUnexpected == 0 &&
                    report->gartUnexpected == 0 && report->displayChanged == 0
                ? kOK
                : kIntrVerifyFailed;

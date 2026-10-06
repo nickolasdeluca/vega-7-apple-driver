@@ -1628,25 +1628,32 @@ struct InterruptCounter {
     void *context;
 };
 
+const uint32_t kIntrTimes = 8; // the first MSIs whose times the kext records
 struct IntrReport {
-    uint32_t msiCount, fence3, rptr, faultStatus, ihRbCntl;
+    uint32_t msiCount, msiBefore, fence3, rptr, faultStatus, ihRbCntl; // msiBefore: the count at the submit
     uint32_t ihWriteback, ihWptr, ihRptr;
     uint32_t ihEntries, sdmaTraps, otherEntries;
     uint32_t sdmaUnexpected, sdmaFirst, gartUnexpected, gartFirst;
     uint32_t displayChanged, displayFirst;
-    uint32_t latencyMicroseconds; // filled in by the kext
+    // Filled in by the kext: from the submit to the first MSI after it; the
+    // submit and the first kIntrTimes MSIs, from the ENABLE_INTR write.
+    uint32_t latencyMicroseconds, submitMicroseconds;
+    uint32_t msiMicroseconds[kIntrTimes];
     uint32_t ring[kIhReportEntries * kIhEntryBytes / 4];
 };
 
 // Reads only. Polls (up to kSdmaPollPauses) until fence 3, an SDMA0 trap
-// entry and an MSI have all arrived, then checks as verifyGart does with
-// frame 3 in the ring and fence 3 in the write-back page. kGartFault,
-// kIhNoTrap, kIntrNotDelivered (no MSI), or kIntrVerifyFailed (fence, more
-// than one MSI, unexpected words or a display change).
+// entry and an MSI after the submit have all arrived, then checks as
+// verifyGart does with frame 3 in the ring and fence 3 in the write-back
+// page. msiBefore is the count when frame 3 was submitted: MSIs before it
+// (boot 26: one at ENABLE_INTR) are reported, not counted. kGartFault,
+// kIhNoTrap, kIntrNotDelivered (no MSI after the submit), or
+// kIntrVerifyFailed (fence, more than one MSI after the submit, unexpected
+// words or a display change).
 Status verifyIntr(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &sdmaRegion,
                   const uint32_t *sdmaSnapshot, const MemoryReader &gartRegion, const uint32_t *gartSnapshot,
                   const uint32_t *display, const RegisterWriter &writer, const InterruptCounter &counter,
-                  uint32_t stage, IntrReport *report);
+                  uint32_t msiBefore, uint32_t stage, IntrReport *report);
 
 // amdgpu_ih_process's acknowledgement: IH_RB_RPTR <- the write-back's offset.
 // Then kIntrSettlePauses pauses; kIntrRefired if the MSI count or the

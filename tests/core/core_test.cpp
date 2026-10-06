@@ -2203,7 +2203,7 @@ static void testGart()
 
 // A stage 18 rig: the stage 17 flow through a passing verify on the fakes.
 struct IntrRig : GartRig {
-    uint32_t intrProgress = 0;
+    uint32_t intrProgress = 0, msiBefore = 0;
     InterruptCounter counter{[](void *c) { return static_cast<FakeRegisters *>(c)->msiCount; }, &r};
     IntrRig()
     {
@@ -2219,13 +2219,14 @@ struct IntrRig : GartRig {
         if (status == kOK) status = writeSdmaFrame3(work.reader(), work.writer(), 18);
         if (status == kOK) status = armIntr(gartWork.reader(), gartWork.writer(), w.writer(), 18, &intrProgress);
         if (status == kOK) status = startIntr(w.writer(), 18, &intrProgress);
+        msiBefore = r.msiCount;
         if (status == kOK) status = submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 18, 3, observed);
         return status;
     }
     Status verify18(IntrReport *report)
     {
         return verifyIntr(r.reader(), 0x80000, work.reader(), sdmaSnapshot, gartWork.reader(), gartSnapshot, display,
-                          w.writer(), counter, 18, report);
+                          w.writer(), counter, msiBefore, 18, report);
     }
 };
 
@@ -2334,13 +2335,19 @@ static void testIntr()
         CHECK(g.r.pauses == pauses + 100);
     }
     {
-        // Two MSIs, then a re-fire after the acknowledgement.
+        // Two MSIs after the submit, then a re-fire after the acknowledgement.
         IntrRig g;
         uint32_t observed = 0;
         CHECK(g.run(&observed) == kOK);
         g.r.msiCount = 2;
         IntrReport report;
         CHECK(g.verify18(&report) == kIntrVerifyFailed && report.msiCount == 2);
+        // Boot 26: one MSI before the submit (at ENABLE_INTR) is reported only.
+        g.msiBefore = 1;
+        CHECK(g.verify18(&report) == kOK && report.msiCount == 2 && report.msiBefore == 1);
+        g.msiBefore = 2;
+        CHECK(g.verify18(&report) == kIntrNotDelivered);
+        g.msiBefore = 0;
         g.r.msiCount = 1;
         CHECK(g.verify18(&report) == kOK);
         g.r.msiRefire = true;
@@ -2364,8 +2371,10 @@ static void testIntr()
         uint32_t observed = 0;
         CHECK(g.run(&observed) == kOK);
         IntrReport report;
-        // The other entry took the one MSI; the trap is in the ring.
-        CHECK(g.verify18(&report) == kOK && report.otherEntries == 1 && report.sdmaTraps == 1 && report.msiCount == 1);
+        // The other entry took the one MSI before the submit; with RPTR_REARM
+        // the trap, in the ring, raises none: not delivered, and reported.
+        CHECK(g.verify18(&report) == kIntrNotDelivered && report.otherEntries == 1 && report.sdmaTraps == 1);
+        CHECK(report.msiCount == 1 && report.msiBefore == 1);
     }
     {
         // Preconditions and order.
