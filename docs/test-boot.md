@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-06: **stages 0 to 13 succeeded** (see
+Status, 2026-10-06: **stages 0 to 14 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -27,9 +27,9 @@ destroyed (`0x80030000`) a kernel-mode ring without touching its memory.
 Stage 12 succeeded in boot 17: the first ring frames, `SETUP_TMR` and
 `DESTROY_TMR`, both fenced with status 0. Stage 13 succeeded in boot 18:
 the PSP accepted and loaded the SDMA0 firmware (`SDMA0_UCODE_CHECKSUM` 0 →
-`0x25a1ba79`) with the engine left halted. Stage 14 (SDMA power-up and a
-read-only register inventory) is approved and built, not yet booted. No
-later stage is authorized.
+`0x25a1ba79`) with the engine left halted. Stage 14 succeeded in boot 19:
+`PowerUpSdma`/`PowerDownSdma` answered `0x01`, and the 31-register SDMA
+inventory is recorded. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -2101,8 +2101,8 @@ makes no IH, GART or default-page change.
 
 ### Stage 14: SDMA0 power-up and register inventory (proposal)
 
-**Status: proposed 2026-10-06, approved by the user the same day, and
-implemented; not yet booted.**
+**Status: proposed 2026-10-06, approved by the user the same day,
+implemented, and succeeded in boot 19.**
 
 **Implementation notes:**
 
@@ -3087,6 +3087,62 @@ with `tools/update_stick.sh 13`; cold boot, kernel up 09:42:22 local).
   accepted the pinned SDMA0 image (signature and all) and installed it, and
   SDMA0 stayed halted. `tools/update_stick.sh` was used for the first time
   and verified the stick.
+
+**Boot 19, 2026-10-06, stage 14** (`out/test-efi/usb-stage14/`, written
+with `tools/update_stick.sh 14`; cold boot, kernel up 09:56:34 local).
+
+- `CezanneGPU stage` 14, diagnostics v10; stages 1–3 `ok`.
+- The stage 13 steps repeated boot 18 exactly:
+  - check, create `0x80020000`, `SETUP_TMR` fence 1, `LOAD_IP_FW` fence 2;
+  - status 0 throughout;
+  - 0 unexpected words; checksum 0 → `0x25a1ba79`; still halted.
+- **Inventory:** `ok`. **`PowerUpSdma` → `0x01`, `PowerDownSdma` →
+  `0x01`.** All 31 registers read **the same in all three passes**: power
+  gating through the SMU changed none of them, and the firmware checksum
+  survived both messages.
+
+  | Register | Value |
+  | --- | --- |
+  | `F32_CNTL` | `0x00000001` (halted) |
+  | `CLK_CTRL` | `0xdf000100` |
+  | `POWER_CNTL` | `0x40000050` |
+  | `STATUS_REG` | `0x46dee557` |
+  | `GFX_RB_CNTL` | `0x00040000` |
+  | `UCODE_CHECKSUM` | `0x25a1ba79` |
+  | `CNTL` | `0x00000002` |
+  | `CHICKEN_BITS` | `0x00831f07` |
+  | `GB_ADDR_CONFIG`, `_READ` | `0x00100012` |
+  | `SEM_WAIT_FAIL_TIMER_CNTL` | `0x00000000` |
+  | `UTCL1_WATERMK` | `0xfffbe1fe` |
+  | `UTCL1_TIMEOUT` | `0x00010001` |
+  | `UTCL1_PAGE` | `0x000003e0` |
+  | `GFX_RB_BASE`/`_HI`, `RPTR`/`_HI`, `WPTR`/`_HI`, `RPTR_ADDR_HI`/`_LO` | `0` |
+  | `GFX_RB_WPTR_POLL_CNTL`, `RLC0`/`RLC1_RB_WPTR_POLL_CNTL` | `0x00401000` |
+  | `GFX_IB_CNTL` | `0x00000100` |
+  | `GFX_DOORBELL`, `_OFFSET`, `WPTR_POLL_ADDR_HI`/`_LO`, `MINOR_PTR_UPDATE` | `0` |
+
+- **What `golden_settings_sdma_4_3` would write from these values**
+  (`soc15_program_register_sequence` arithmetic):
+
+  | Register | Now | Golden result |
+  | --- | --- | --- |
+  | `CHICKEN_BITS` | `0x00831f07` | `0x02831f07` |
+  | `CLK_CTRL` (plain write) | `0xdf000100` | `0x3f000100` |
+  | `GB_ADDR_CONFIG`, `_READ` | `0x00100012` | `0x00000002` |
+  | `GFX_RB_WPTR_POLL_CNTL`, `RLC0`/`RLC1_…` | `0x00401000` | `0x00403000` |
+  | `POWER_CNTL` | `0x40000050` | `0x40000051` |
+  | `UTCL1_WATERMK` | `0xfffbe1fe` | `0x03fbe1fe` |
+  | `UTCL1_PAGE` | `0x000003e0` | unchanged |
+
+  `SDMA0_GB_ADDR_CONFIG` differs from its golden value in the same way the
+  GC `GB_ADDR_CONFIG` did at stage 3 (`NUM_PIPES` and related fields). That
+  is for review in the stage 15 proposal.
+- The teardown fenced 3 and the ring was destroyed, as in boot 18. The
+  machine stayed as before.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-19-stage14/`.
+- Result: **stage 14 succeeded.** Every value stage 15 needs is now
+  measured.
 
 ## Unknowns and limits
 

@@ -133,12 +133,20 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 14, then propose stage 15 (the first copy)
+## Next task: propose stage 15, the first SDMA copy
 
-Stage 14 (SDMA power-up through the SMU and a three-pass read-only inventory
-of 31 SDMA registers) is approved and built: `out/test-efi/usb-stage14`,
-`--sdma-inventory`. Next: a cold boot, then record the values; they pin
-stage 15's exact write values.
+Stages 0–14 succeeded. Boot 19:
+- `PowerUpSdma`/`PowerDownSdma` answered `0x01`;
+- all 31 SDMA registers are measured and identical across the power
+  messages;
+- the golden-setting results are computed (see the
+  [boot 19 log](test-boot.md#test-boot-log)).
+
+Next is the stage 15 proposal: golden settings plus the `sdma_v4_0_start`
+writes with exact values computed from boot 19, no doorbell, the ring test,
+then a 4 KiB `COPY_LINEAR` and a `FENCE` at carveout `0x40300000`, verified,
+then halt, power down and tear down. It must decide whether to apply the
+`GB_ADDR_CONFIG` golden value, and how to handle the zero default page.
 
 ### Earlier: planning the first copy
 
