@@ -4,10 +4,11 @@
 // are the stage 6 scratch test (--scratch-test), the stage 7 SMU version
 // queries (--smu-query), the stage 8 DisallowGfxOff (--gfxoff-disallow) and
 // the stage 9 metrics-table transfer (--smu-metrics) and the stage 11 PSP
-// ring create and destroy (--psp-ring). --psp-state (stage 10) only reads.
+// ring create and destroy (--psp-ring) and the stage 12 TMR setup and
+// teardown through the ring (--psp-tmr). --psp-state (stage 10) only reads.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
-//                          [--smu-metrics] [--psp-ring] [--psp-state]
+//                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-state]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -109,7 +110,8 @@ static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage10RegisterCoun
 void usage(FILE *out)
 {
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
-                      "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-state]\n"
+                      "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
+                      "                         [--psp-state]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
@@ -119,6 +121,8 @@ void usage(FILE *out)
                       "and prints it.\n"
                       "--psp-ring first creates the PSP kernel-mode ring at the checked carveout page, compares\n"
                       "the page region with its snapshot, and destroys the ring.\n"
+                      "--psp-tmr first creates the ring, submits SETUP_TMR through it, checks the memory around\n"
+                      "it, then sends DESTROY_TMR and destroys the ring.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n");
 }
 
@@ -464,10 +468,89 @@ bool pspRing(io_connect_t connection)
     return created[0] == kOK && observedCall && observed[0] == kOK && destroyed[0] == kOK;
 }
 
+// Destroys a ring created without a TMR submit (the stage 11 selector).
+bool destroyRingOnly(io_connect_t connection)
+{
+    uint64_t destroyed[7] = {};
+    step("psp destroy: DESTROY_RINGS");
+    if (!call(connection, kDiagnosticPspRingDestroy, destroyed, 7)) return false;
+    std::printf("%s, response 0x%08llx\n", statusName(static_cast<Status>(destroyed[0])),
+                static_cast<unsigned long long>(destroyed[1]));
+    return destroyed[0] == kOK;
+}
+
+// The stage 12 TMR: check, create, SETUP_TMR, observe, then DESTROY_TMR and
+// the ring destroy. Every created ring gets a destroy; the driver also tears
+// down if this exits in between.
+bool pspTmr(io_connect_t connection)
+{
+    uint64_t check[7] = {};
+    step("tmr 1/5 check: PSP ready, no ring; 64 KiB at the ring stable; 4 MiB TMR region placed and stable");
+    if (!call(connection, kDiagnosticPspRingCheck, check, 7)) return false;
+    std::printf("%s\n  C2PMSG_81 0x%08llx\n", statusName(static_cast<Status>(check[0])),
+                static_cast<unsigned long long>(check[1]));
+    printMailbox(check + 2);
+    if (check[0] != kOK) return false;
+
+    uint64_t created[3] = {};
+    std::printf("tmr 2/5 create: INIT_GPCOM_RING at GPU 0x%010llx ... ",
+                static_cast<unsigned long long>(kPspRingGpuAddress));
+    std::fflush(stdout);
+    if (!call(connection, kDiagnosticPspRingCreate, created, 3)) return false;
+    std::printf("%s, response 0x%08llx\n", statusName(static_cast<Status>(created[0])),
+                static_cast<unsigned long long>(created[1]));
+    if (!created[2]) return false;
+    if (created[0] != kOK) {
+        destroyRingOnly(connection);
+        return false;
+    }
+
+    uint64_t submitted[7] = {};
+    std::printf("tmr 3/5 submit: SETUP_TMR (TMR GPU 0x%010llx, physical 0x%010llx, 0x%x bytes) as frame 0,\n"
+                "  command 0x%010llx, fence 0x%010llx; C2PMSG_67 <- %u; wait for fence 1 ... ",
+                static_cast<unsigned long long>(kPspTmrGpuAddress), static_cast<unsigned long long>(kPspTmrPhysical),
+                kPspTmrSize, static_cast<unsigned long long>(kPspCmdGpuAddress),
+                static_cast<unsigned long long>(kPspFenceGpuAddress), kPspFrameDwords);
+    std::fflush(stdout);
+    if (!call(connection, kDiagnosticPspTmrSubmit, submitted, 7)) return false;
+    std::printf("%s\n  fence %llu, response status 0x%08llx, fw_addr 0x%08llx%08llx, tmr_size 0x%llx, C2PMSG_67 %llu\n",
+                statusName(static_cast<Status>(submitted[0])), static_cast<unsigned long long>(submitted[1]),
+                static_cast<unsigned long long>(submitted[2]), static_cast<unsigned long long>(submitted[4]),
+                static_cast<unsigned long long>(submitted[3]), static_cast<unsigned long long>(submitted[5]),
+                static_cast<unsigned long long>(submitted[6]));
+    if (submitted[6] != kPspFrameDwords) {
+        // The frame never reached the PSP: only the ring needs destroying.
+        destroyRingOnly(connection);
+        return false;
+    }
+
+    uint64_t observed[3] = {};
+    step("tmr 4/5 observe: 64 KiB at the ring against the snapshot and the driver's words");
+    bool observedCall = call(connection, kDiagnosticPspTmrObserve, observed, 3);
+    if (observedCall) {
+        std::printf("%s, %llu unexpected words", statusName(static_cast<Status>(observed[0])),
+                    static_cast<unsigned long long>(observed[1]));
+        if (observed[1] != 0)
+            std::printf(", first at ring + 0x%llx", static_cast<unsigned long long>(observed[2]));
+        std::printf("\n");
+    }
+
+    uint64_t teardown[6] = {};
+    step(submitted[1] == 1 ? "tmr 5/5 teardown: DESTROY_TMR as frame 1 (C2PMSG_67 <- 32, fence 2), then DESTROY_RINGS"
+                           : "tmr 5/5 teardown: no fence, so DESTROY_RINGS only");
+    if (!call(connection, kDiagnosticPspTmrTeardown, teardown, 6)) return false;
+    std::printf("%s\n  DESTROY_TMR fence %llu, status 0x%08llx; ring response 0x%08llx; C2PMSG_64 0x%08llx, "
+                "C2PMSG_67 %llu\n",
+                statusName(static_cast<Status>(teardown[0])), static_cast<unsigned long long>(teardown[1]),
+                static_cast<unsigned long long>(teardown[2]), static_cast<unsigned long long>(teardown[3]),
+                static_cast<unsigned long long>(teardown[4]), static_cast<unsigned long long>(teardown[5]));
+    return submitted[0] == kOK && observedCall && observed[0] == kOK && teardown[0] == kOK;
+}
+
 int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
-    bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, psp = false;
+    bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, psp = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -487,6 +570,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--psp-ring") == 0) {
             ring = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--psp-tmr") == 0) {
+            tmr = true;
             continue;
         }
         if (std::strcmp(argv[i], "--psp-state") == 0) {
@@ -581,6 +668,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!pspRing(connection)) failures++;
+    }
+    if (tmr) {
+        if (info[1] < kPspTmrStage) {
+            std::fprintf(stderr, "cezanne-diag: --psp-tmr needs driver stage %u\n", kPspTmrStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspTmr(connection)) failures++;
     }
     if (psp) {
         if (info[1] < kPspStateStage) {
