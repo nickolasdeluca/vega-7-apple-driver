@@ -57,7 +57,10 @@
 //            into a five-page firmware buffer (the second writable memory
 //            mapping), send LOAD_IP_FW as frame 1, compare both regions and
 //            check SDMA0 is still halted; DESTROY_TMR then moves to frame 2.
-//            Apart from the stage 6 to 13 tests, nothing is written to
+//   Stage 14: after that load, read 31 SDMA registers, send PowerUpSdma,
+//            read them, send PowerDownSdma, read them again. No SDMA
+//            register is written.
+//            Apart from the stage 6 to 14 tests, nothing is written to
 //            configuration space, registers or memory, and every mapping and
 //            the provider are released before start() returns.
 //
@@ -141,6 +144,8 @@ public:
     cezanne::Status sdmaObserve(const void *owner, uint32_t *workUnexpected, uint32_t *workFirst,
                                 uint32_t *firmwareUnexpected, uint32_t *firmwareFirst, uint32_t *checksum,
                                 uint32_t *f32Cntl);
+    cezanne::Status sdmaInventory(const void *owner, cezanne::SdmaInventory *inventory, uint32_t *upResponse,
+                                  uint32_t *downResponse);
 
 private:
     enum ScratchState { kScratchIdle, kScratchChecked, kScratchWritten };
@@ -1470,6 +1475,41 @@ cezanne::Status CezanneGPU::sdmaObserve(const void *owner, uint32_t *workUnexpec
     return status;
 }
 
+struct InventoryArgument {
+    cezanne::SdmaInventory *inventory;
+    uint32_t *up, *down;
+};
+
+static cezanne::Status sdmaInventoryOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                              const cezanne::RegisterWriter *writer, void *argument)
+{
+    InventoryArgument *inventory = static_cast<InventoryArgument *>(argument);
+    return cezanne::runSdmaInventory(registers, length, *writer, stage, inventory->inventory, inventory->up,
+                                     inventory->down);
+}
+
+cezanne::Status CezanneGPU::sdmaInventory(const void *owner, cezanne::SdmaInventory *inventory, uint32_t *upResponse,
+                                          uint32_t *downResponse)
+{
+    *inventory = cezanne::SdmaInventory();
+    *upResponse = *downResponse = 0;
+    if (stage_ < cezanne::kSdmaInventoryStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kSdmaOutOfOrder;
+    // Only with the firmware loaded on this connection: LOAD_IP_FW fenced.
+    if ((pspState_ == kPspSdmaLoaded || pspState_ == kPspSdmaObserved) && pspFrames_ == 2 && pspLastFenced_ &&
+        pspOwner_ == owner) {
+        InventoryArgument argument = {inventory, upResponse, downResponse};
+        status = accessDevice(cezanne::kSmuPageOffset, sdmaInventoryOperation, &argument);
+        IOLog(LOG_PREFIX "SDMA inventory: %s, PowerUpSdma 0x%x, PowerDownSdma 0x%x\n", cezanne::statusName(status),
+              *upResponse, *downResponse);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
 void CezanneGPU::scratchAbandon(const void *owner)
 {
     if (lock_ == nullptr) {
@@ -1548,6 +1588,7 @@ private:
     static IOReturn pspTmrTeardown(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn sdmaLoad(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn sdmaObserve(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn sdmaInventory(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPUUserClient, IOUserClient)
@@ -1806,6 +1847,23 @@ IOReturn CezanneGPUUserClient::sdmaObserve(OSObject *target, void *, IOExternalM
     return kIOReturnSuccess;
 }
 
+IOReturn CezanneGPUUserClient::sdmaInventory(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    cezanne::SdmaInventory inventory;
+    uint32_t up = 0, down = 0;
+    arguments->scalarOutput[0] = self->gpu_->sdmaInventory(self, &inventory, &up, &down);
+    arguments->scalarOutput[1] = up;
+    arguments->scalarOutput[2] = down;
+    // The dispatch table fixes the structure size at sizeof(SdmaInventory).
+    UInt8 *out = static_cast<UInt8 *>(arguments->structureOutput);
+    const UInt8 *in = reinterpret_cast<const UInt8 *>(&inventory);
+    for (uint32_t i = 0; i < sizeof(inventory); i++) {
+        out[i] = in[i];
+    }
+    return kIOReturnSuccess;
+}
+
 IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                               IOExternalMethodDispatch *, OSObject *, void *reference)
 {
@@ -1831,6 +1889,7 @@ IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMetho
         {pspTmrTeardown, 0, 0, 6, 0}, // kDiagnosticPspTmrTeardown
         {sdmaLoad, 0, 0, 6, 0},       // kDiagnosticSdmaLoad
         {sdmaObserve, 0, 0, 7, 0},    // kDiagnosticSdmaObserve
+        {sdmaInventory, 0, 0, 3, sizeof(cezanne::SdmaInventory)}, // kDiagnosticSdmaInventory
     };
     if (selector >= cezanne::kDiagnosticSelectorCount) {
         return kIOReturnUnsupported;
