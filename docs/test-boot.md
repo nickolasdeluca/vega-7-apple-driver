@@ -1872,6 +1872,171 @@ change. It sends no second command while the first is unfenced.
     mapping regex was tightened: before, it did not match the stage 6
     page's `map` call at all.
 
+### Stage 13: first firmware load, SDMA0 (proposal)
+
+**Status: proposed 2026-10-06, not approved, not implemented.**
+
+**Purpose.** Load the first engine firmware: SDMA0, the DMA engine needed
+for the "verified DMA copy and fence" milestone. The PSP loads it into the
+TMR set up in stage 12. The engine stays halted: starting it is a later
+stage.
+
+**Linux v6.12:**
+
+- **Order.** After `SETUP_TMR`, `psp_load_non_psp_fw` loads each firmware
+  in `AMDGPU_UCODE_ID` order (`amdgpu_ucode.h`). `CAP` comes first and is
+  absent on this APU, so `SDMA0` is the first firmware loaded.
+- **The bytes.** `amdgpu_sdma_init_microcode` (header v1, PSP load) adds
+  `AMDGPU_UCODE_ID_SDMA0`. `amdgpu_ucode_init_single_fw` (default case)
+  then copies `ucode_size_bytes` from `ucode_array_offset_bytes` into a
+  page-aligned slot of the firmware buffer (`amdgpu_ucode_init_bo`, at
+  `ALIGN(ucode_size, PAGE_SIZE)`).
+- **The command.** `psp_prep_load_ip_fw_cmd_buf` builds
+  `GFX_CMD_ID_LOAD_IP_FW` (6) at +28 (`psp_gfx_cmd_load_ip_fw`):
+  `fw_phy_addr_lo`/`hi` = the slot's GPU address, `fw_size` =
+  `ucode_size`, and `fw_type` = `GFX_FW_TYPE_SDMA0` (9).
+  - It is submitted like stage 12's commands.
+  - The response's `fw_addr_lo`/`hi` gives the firmware's location in the
+    TMR (`psp_cmd_submit_buf` stores it in `ucode->tmr_mc_addr_*`).
+- **Starting the engine** happens later. With PSP loading,
+  `sdma_v4_0_start` skips `sdma_v4_0_load_microcode`; the engine stays
+  halted until `sdma_v4_0_enable` clears `SDMA0_F32_CNTL.HALT`. Stage 13
+  does not do that.
+
+**The firmware.** This is the pinned `green_sardine_sdma.bin` (linux-firmware
+`20260916`, SHA-256 `cba8658e…9e09de`, 17,408 bytes;
+[firmware provenance](firmware-provenance.md)).
+`tools/amdgpu_firmware.py` accepts it:
+- header v1.0, IP 4.1;
+- `ucode_version` 40, feature version 41;
+- `ucode_size_bytes` 17,152 at `ucode_array_offset_bytes` 256.
+
+The payload stays opaque. AMD's license allows binary redistribution with
+its notice and forbids reverse engineering, so it is copied, never
+interpreted.
+
+**How the firmware reaches the driver.** It is embedded at build time.
+
+- `driver/kext/build.sh` takes the pinned file from ignored `out/`, checks
+  its SHA-256, and generates a C array into the build directory. The kext
+  binary then contains the image. It lives only in `out/` and on the USB
+  stick, never in Git.
+- The core accepts the image only if its header matches the pinned values
+  above.
+- The alternative, passing it from `cezanne-diag` through a structure
+  input, would need `IOMemoryDescriptor` in the kext, which its tests
+  forbid.
+- A packaged driver would have to carry `LICENSE.amdgpu`; this test build
+  is not distributed.
+
+**Placement**
+
+| Buffer | Carveout offset | Size | GPU address |
+| --- | --- | --- | --- |
+| Ring, command, fence (stage 12) | `0x40100000` | 12 KiB | `0xF440100000` |
+| Firmware buffer | `0x40200000` | 20 KiB (17,152 + zero padding) | `0xF440200000` |
+| TMR (stage 12) | `0x40400000` | 4 MiB | `0xF440400000` |
+
+**Steps** (on request only, `sudo cezanne-diag --psp-sdma`, each printed
+first; ordered selectors):
+
+1. **Check (no writes).**
+   - Stage 12's check.
+   - The embedded image's header equals the pinned values.
+   - The 64 KiB at the firmware buffer is stable over about 1 s,
+     snapshotted.
+   - Read `SDMA0_UCODE_CHECKSUM` and `SDMA0_F32_CNTL` (halted).
+2. **Create the ring** (stage 11).
+3. **`SETUP_TMR`** as frame 0, fence 1 (stage 12).
+4. **Copy the firmware.** Write the 17,152 bytes and the zero padding to
+   20 KiB through a new writable, uncached mapping of exactly those five
+   pages, then read them back (stop on any mismatch).
+5. **`LOAD_IP_FW`** as frame 1 (`C2PMSG_67` ← 32, fence 2):
+   - `cmd_id` 6, `0x40200000`, `0xF4`, `17152`, `9`.
+   - Read the response status and `fw_addr`.
+6. **Observe (no writes).**
+   - Read `SDMA0_UCODE_CHECKSUM` again and `SDMA0_F32_CNTL`, which must
+     still be halted.
+   - Compare the 64 KiB at the work area (stage 12 rules, now with frames
+     0–1 and the `LOAD_IP_FW` command).
+   - Compare the 64 KiB at the firmware buffer: the image, then the
+     snapshot.
+7. **Teardown.** `DESTROY_TMR` as frame 2 (`C2PMSG_67` ← 48, fence 3), then
+   `DESTROY_RINGS`. Abandon after step 3 does the same.
+
+**New writes:**
+
+| Target | Values |
+| --- | --- |
+| `C2PMSG_67` | adds `48` (frames 0, 1, 2 → 16, 32, 48) |
+| Work area | adds the `LOAD_IP_FW` command words and frame 2 (fence 3); `DESTROY_TMR` moves to frame 2 |
+| Firmware buffer (new) | physical `0x600200000`–`0x600204FFF`, only the validated image's words, or 0 in the padding |
+
+No new register is written beyond the write-pointer value. `SDMA0_F32_CNTL`
+is only read.
+
+**Changes:**
+
+- **Build:**
+  - `build.sh` gains a firmware input, verified by SHA-256, and a generated
+    header in the build output.
+  - The kext tests check that no firmware bytes are tracked and the build
+    refuses a wrong hash.
+- **Core:**
+  - `checkSdmaImage` (pinned header fields).
+  - The firmware-buffer write allowlist and `writeSdmaFirmware` (with
+    readback).
+  - `LOAD_IP_FW` words, frames 0–2, and `submitPspFrame` for frame 2.
+  - Read-only registers `SDMA0_UCODE_CHECKSUM` (`0x4a24`, in Linux's
+    `sdma_reg_list_4_0`) and `SDMA0_F32_CNTL` (stage 5).
+- **Adapter:**
+  - Selectors for the SDMA steps. Diagnostics version 9.
+  - One more writable carveout mapping (the five firmware pages), created
+    only inside the copy step.
+  - Teardown on abandon.
+- **Tool:** `--psp-sdma` prints:
+  - each step;
+  - the fence values and response statuses;
+  - `fw_addr` (and whether it lies inside the TMR);
+  - the checksum before and after;
+  - `F32_CNTL`;
+  - both region comparisons.
+- **Tests:**
+  - The command words and image checks, including a wrong size, offset or
+    version.
+  - The firmware-buffer allowlist, including a wrong word and padding past
+    20 KiB.
+  - A full fake-PSP run over three frames.
+  - Teardown orders.
+  - Weakened cores that must fail: the header check removed, the
+    firmware-buffer bounds removed, and a write pointer of 64 allowed.
+
+**Expected results:**
+- Fences 1, 2 and 3, all with status 0.
+- `fw_addr` inside the TMR (`0xF440400000`–`0xF4407FFFFF`) or a TMR offset;
+  either way recorded.
+- `SDMA0_F32_CNTL` still halted.
+- Only the expected words change in either region.
+- `SDMA0_UCODE_CHECKSUM` may or may not change. It is recorded, not
+  required.
+
+**Risks:**
+
+- The PSP validates the firmware's signature. A rejected image gives a
+  non-zero status (a finding, not a fault).
+- An accepted image puts code into the SDMA engine, which stays halted, as
+  in Linux between loading and `sdma_v4_0_start`.
+- `DESTROY_TMR` with firmware loaded is also what `psp_hw_fini` does. If the
+  PSP refuses it, the status is recorded; the cold boot clears everything.
+- A misdirected write is checked across 64 KiB at each of the two regions
+  only. Unexpected words beyond the work area or the firmware image mean:
+  power off at once.
+- Make a Time Machine backup before this boot.
+
+**What it does not do.** It does not unhalt SDMA, set up an SDMA ring or
+copy anything with SDMA. It loads no other firmware (no CP, RLC or VCN). It
+makes no IH, GART or default-page change.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
