@@ -416,9 +416,10 @@ void printMailbox(const uint64_t *values)
                 static_cast<unsigned long long>(values[4]));
 }
 
-// The stage 11 PSP ring: check, reroute and create, observe, destroy. The
-// destroy runs after any create that returned ok, even if observing fails;
-// the driver also destroys the ring if this exits in between.
+// The stage 11 PSP ring: check, create, observe, destroy. The destroy runs
+// after any create command the driver wrote, whatever its response, and even
+// if observing fails; the driver also destroys the ring if this exits in
+// between.
 bool pspRing(io_connect_t connection)
 {
     uint64_t check[7] = {};
@@ -429,21 +430,24 @@ bool pspRing(io_connect_t connection)
     printMailbox(check + 2);
     if (check[0] != kOK) return false;
 
-    uint64_t created[4] = {};
-    std::printf("psp 2/4 create: GBR_IH_SET VMC (3, 0x%08x), GBR_IH_SET UMC (4, 0x%08x), INIT_GPCOM_RING at\n"
-                "  GPU 0x%010llx (physical 0x%010llx), size 0x%x ... ",
-                kPspIhVmcConfig, kPspIhUmcConfig, static_cast<unsigned long long>(kPspRingGpuAddress),
+    uint64_t created[3] = {};
+    std::printf("psp 2/4 create: INIT_GPCOM_RING at GPU 0x%010llx (physical 0x%010llx), size 0x%x ... ",
+                static_cast<unsigned long long>(kPspRingGpuAddress),
                 static_cast<unsigned long long>(kPspRingPhysical), kPspRingSize);
     std::fflush(stdout);
-    if (!call(connection, kDiagnosticPspRingCreate, created, 4)) return false;
-    std::printf("%s, responses 0x%08llx 0x%08llx 0x%08llx\n", statusName(static_cast<Status>(created[0])),
-                static_cast<unsigned long long>(created[1]), static_cast<unsigned long long>(created[2]),
-                static_cast<unsigned long long>(created[3]));
-    if (created[0] != kOK) return false;
+    if (!call(connection, kDiagnosticPspRingCreate, created, 3)) return false;
+    std::printf("%s, response 0x%08llx%s\n", statusName(static_cast<Status>(created[0])),
+                static_cast<unsigned long long>(created[1]), created[2] ? "" : " (command not written)");
+    if (!created[2]) return false;
 
     uint64_t observed[8] = {};
-    step("psp 3/4 observe: mailbox; 64 KiB at the ring compared with the snapshot");
-    bool observedCall = call(connection, kDiagnosticPspRingObserve, observed, 8);
+    bool observedCall = false;
+    if (created[0] == kOK) {
+        step("psp 3/4 observe: mailbox; 64 KiB at the ring compared with the snapshot");
+        observedCall = call(connection, kDiagnosticPspRingObserve, observed, 8);
+    } else {
+        std::printf("psp 3/4 observe: skipped, the create was not ok\n");
+    }
     if (observedCall) {
         std::printf("%s\n", statusName(static_cast<Status>(observed[0])));
         printMailbox(observed + 1);
@@ -457,7 +461,7 @@ bool pspRing(io_connect_t connection)
     std::printf("%s, response 0x%08llx\n", statusName(static_cast<Status>(destroyed[0])),
                 static_cast<unsigned long long>(destroyed[1]));
     printMailbox(destroyed + 2);
-    return observedCall && observed[0] == kOK && destroyed[0] == kOK;
+    return created[0] == kOK && observedCall && observed[0] == kOK && destroyed[0] == kOK;
 }
 
 int main(int argc, char **argv)
