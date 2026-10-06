@@ -46,7 +46,14 @@
 //            the PSP kernel-mode ring at that page, compare the page region
 //            with its snapshot, and destroy the ring (also on an abandoned
 //            connection after any create attempt). No frame is submitted.
-//            Apart from the stage 6 to 11 tests, nothing is written to
+//   Stage 12: after the stage 11 check (which then also checks the 4 MiB TMR
+//            region) and create, write a SETUP_TMR command, fence and ring
+//            frame into the three-page work area (the only writable memory
+//            mapping), advance the write pointer and wait for the fence;
+//            compare the 64 KiB around it with the snapshot; then send
+//            DESTROY_TMR the same way and destroy the ring (also on an
+//            abandoned connection after the submit).
+//            Apart from the stage 6 to 12 tests, nothing is written to
 //            configuration space, registers or memory, and every mapping and
 //            the provider are released before start() returns.
 //
@@ -116,6 +123,11 @@ public:
     cezanne::Status pspRingObserve(const void *owner, cezanne::PspMailbox *mailbox, uint32_t *changedInPage,
                                    uint32_t *changedOutside);
     cezanne::Status pspRingDestroy(const void *owner, uint32_t *response, cezanne::PspMailbox *mailbox);
+    cezanne::Status pspTmrSubmit(const void *owner, uint32_t *fence, cezanne::PspResponse *response,
+                                 uint32_t *writePointer);
+    cezanne::Status pspTmrObserve(const void *owner, uint32_t *unexpected, uint32_t *firstOffset);
+    cezanne::Status pspTmrTeardown(const void *owner, uint32_t *fence, uint32_t *tmrStatus, uint32_t *ringResponse,
+                                   cezanne::PspMailbox *mailbox);
 
 private:
     enum ScratchState { kScratchIdle, kScratchChecked, kScratchWritten };
@@ -131,8 +143,12 @@ private:
     uint32_t metricsSnapshot_[cezanne::kMetricsCheckSize / 4];
     // Stage 11: a ring may exist from the create command's write until the
     // destroy, whatever the create's response.
-    enum PspState { kPspIdle, kPspChecked, kPspCreated, kPspObserved };
+    enum PspState { kPspIdle, kPspChecked, kPspCreated, kPspObserved, kPspTmrSubmitted, kPspTmrObserved };
     PspState pspState_ = kPspIdle;
+    bool pspCreateOk_ = false;  // the create was answered with status 0
+    bool pspTmrFenced_ = false; // SETUP_TMR's fence arrived
+    cezanne::Status pspTeardownLocked(uint32_t *fence, uint32_t *tmrStatus, uint32_t *ringResponse,
+                                      cezanne::PspMailbox *mailbox);
     const void *pspOwner_ = nullptr;
     uint32_t pspSnapshot_[cezanne::kPspRingCheckSize / 4];
     cezanne::Status pspDestroyLocked(uint32_t *response, cezanne::PspMailbox *mailbox);
@@ -740,7 +756,8 @@ static bool memoryRead(void *context, uint32_t offset, uint32_t *value)
 // and releases the mapping.
 template <typename Check> static cezanne::Status withCarveoutMemory(UInt64 physical, UInt32 length, Check check)
 {
-    if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical) {
+    if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical &&
+        physical != cezanne::kPspTmrPhysical) {
         return cezanne::kRegisterNotAllowed;
     }
     IODeviceMemory *memory = IODeviceMemory::withRange(physical, length);
@@ -758,6 +775,59 @@ template <typename Check> static cezanne::Status withCarveoutMemory(UInt64 physi
         map->release();
     }
     memory->release();
+    return status;
+}
+
+// The stage 12 work area: the ring, command and fence pages, the only
+// carveout memory the driver writes.
+struct WorkWindow {
+    volatile UInt32 *base;
+    UInt32 stage;
+};
+
+static bool workRead(void *context, uint32_t offset, uint32_t *value)
+{
+    const WorkWindow *work = static_cast<const WorkWindow *>(context);
+    if ((offset & 3) != 0 || offset + 4ull > cezanne::kPspWorkSize) {
+        return false;
+    }
+    *value = work->base[offset / 4];
+    return true;
+}
+
+static bool workWrite(void *context, uint32_t offset, uint32_t value)
+{
+    WorkWindow *work = static_cast<WorkWindow *>(context);
+    // The core already checks this; the adapter refuses independently.
+    if (!cezanne::pspWorkWriteAllowed(offset, value, work->stage)) {
+        return false;
+    }
+    work->base[offset / 4] = value;
+    return true;
+}
+
+// Maps the work area writable and uncached, runs use, and releases it.
+template <typename Use> static cezanne::Status withPspWork(UInt32 stage, Use use)
+{
+    if (stage < cezanne::kPspTmrStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IODeviceMemory *workMemory = IODeviceMemory::withRange(cezanne::kPspRingPhysical, cezanne::kPspWorkSize);
+    if (workMemory == nullptr) {
+        return cezanne::kApertureUnavailable;
+    }
+    IOMemoryMap *workMap = workMemory->map(kIOMapInhibitCache);
+    cezanne::Status status = cezanne::kApertureUnavailable;
+    if (workMap != nullptr && workMap->getLength() >= cezanne::kPspWorkSize) {
+        WorkWindow window = {reinterpret_cast<volatile UInt32 *>(workMap->getVirtualAddress()), stage};
+        cezanne::MemoryReader reader = {workRead, &window};
+        cezanne::MemoryWriter writer = {workWrite, &window};
+        status = use(reader, writer);
+    }
+    if (workMap != nullptr) {
+        workMap->release();
+    }
+    workMemory->release();
     return status;
 }
 
@@ -909,6 +979,17 @@ static cezanne::Status pspCheckOperation(UInt32 stage, const cezanne::RegisterRe
                                               cezanne::kMetricsStablePauses, snapshot);
         });
     }
+    if (status == cezanne::kOK && stage >= cezanne::kPspTmrStage) {
+        cezanne::MetricsTarget tmr;
+        status = cezanne::checkPspTmrTarget(registers, length, stage, psp->ranges, psp->rangeCount, &tmr);
+        if (status == cezanne::kOK) {
+            status = withCarveoutMemory(cezanne::kPspTmrPhysical, cezanne::kPspTmrSize,
+                                        [writer](const cezanne::MemoryReader &memory) {
+                return cezanne::checkRegionChecksum(memory, cezanne::kPspTmrSize, *writer,
+                                                    cezanne::kMetricsStablePauses);
+            });
+        }
+    }
     return status;
 }
 
@@ -962,7 +1043,7 @@ cezanne::Status CezanneGPU::pspRingCheck(const void *owner, cezanne::PspMailbox 
     }
     IOLockLock(lock_);
     // A ring this driver created stays tracked until it is destroyed.
-    if (pspState_ == kPspCreated || pspState_ == kPspObserved) {
+    if (pspState_ != kPspIdle && pspState_ != kPspChecked) {
         status = cezanne::kPspOutOfOrder;
     } else {
         PspArgument psp = {ranges, count, mailbox, nullptr, nullptr, pspSnapshot_, nullptr, nullptr};
@@ -985,6 +1066,7 @@ cezanne::Status CezanneGPU::pspRingCreate(const void *owner, uint32_t *response,
         status = accessDevice(cezanne::kSmuPageOffset, pspCreateOperation, &psp);
         // Once the command is written a ring may exist, even after an error.
         pspState_ = *written ? kPspCreated : kPspIdle;
+        pspCreateOk_ = status == cezanne::kOK;
         IOLog(LOG_PREFIX "PSP ring create: %s, response 0x%08x, written %d\n", cezanne::statusName(status),
               *response, *written ? 1 : 0);
     }
@@ -1018,6 +1100,7 @@ cezanne::Status CezanneGPU::pspDestroyLocked(uint32_t *response, cezanne::PspMai
     cezanne::Status status = accessDevice(cezanne::kSmuPageOffset, pspDestroyOperation, &psp);
     pspState_ = kPspIdle;
     pspOwner_ = nullptr;
+    pspCreateOk_ = false;
     IOLog(LOG_PREFIX "PSP ring destroy: %s, response 0x%08x\n", cezanne::statusName(status), *response);
     return status;
 }
@@ -1036,6 +1119,144 @@ cezanne::Status CezanneGPU::pspRingDestroy(const void *owner, uint32_t *response
     return status;
 }
 
+struct TmrArgument {
+    uint32_t *fence;
+    cezanne::PspResponse *response;
+    uint32_t *writePointer;
+    const uint32_t *snapshot;
+    uint32_t *unexpected, *firstOffset;
+    bool fenced; // teardown: whether to send DESTROY_TMR first
+    uint32_t *ringResponse;
+    cezanne::PspMailbox *mailbox;
+};
+
+static cezanne::Status tmrSubmitOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                          const cezanne::RegisterWriter *writer, void *argument)
+{
+    TmrArgument *tmr = static_cast<TmrArgument *>(argument);
+    cezanne::Status status = withPspWork(stage, [&](const cezanne::MemoryReader &work,
+                                                    const cezanne::MemoryWriter &memory) {
+        cezanne::Status result = cezanne::writePspCommand(work, memory, stage, cezanne::kGfxCmdSetupTmr);
+        if (result == cezanne::kOK) {
+            result = cezanne::submitPspFrame(registers, length, *writer, work, stage, 0, tmr->fence);
+        }
+        if (result == cezanne::kOK) {
+            result = cezanne::readPspResponse(work, tmr->response);
+        }
+        return result;
+    });
+    cezanne::readDiagnosticRegister(registers, length, stage, cezanne::kRegMp0C2PMsg67, tmr->writePointer);
+    return status;
+}
+
+static cezanne::Status tmrObserveOperation(UInt32, const cezanne::RegisterReader &, UInt64,
+                                           const cezanne::RegisterWriter *, void *argument)
+{
+    TmrArgument *tmr = static_cast<TmrArgument *>(argument);
+    return withCarveoutMemory(cezanne::kPspRingPhysical, cezanne::kPspRingCheckSize,
+                              [tmr](const cezanne::MemoryReader &region) {
+        return cezanne::verifyPspWorkArea(region, tmr->snapshot, 1, cezanne::kGfxCmdSetupTmr, 1, tmr->unexpected,
+                                          tmr->firstOffset);
+    });
+}
+
+static cezanne::Status tmrTeardownOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                            const cezanne::RegisterWriter *writer, void *argument)
+{
+    TmrArgument *tmr = static_cast<TmrArgument *>(argument);
+    cezanne::Status status = cezanne::kOK;
+    // DESTROY_TMR only after SETUP_TMR fenced: never a second frame while
+    // the first is pending.
+    if (tmr->fenced) {
+        status = withPspWork(stage, [&](const cezanne::MemoryReader &work, const cezanne::MemoryWriter &memory) {
+            cezanne::Status result = cezanne::writePspCommand(work, memory, stage, cezanne::kGfxCmdDestroyTmr);
+            if (result == cezanne::kOK) {
+                result = cezanne::submitPspFrame(registers, length, *writer, work, stage, 1, tmr->fence);
+            }
+            if (result == cezanne::kOK) {
+                result = cezanne::readPspResponse(work, tmr->response);
+            }
+            return result;
+        });
+    }
+    // The ring is destroyed whatever happened to DESTROY_TMR.
+    cezanne::Status ring = cezanne::destroyPspRing(registers, length, *writer, stage, true, tmr->ringResponse);
+    cezanne::readPspMailbox(registers, length, stage, tmr->mailbox);
+    return status != cezanne::kOK ? status : ring;
+}
+
+cezanne::Status CezanneGPU::pspTmrSubmit(const void *owner, uint32_t *fence, cezanne::PspResponse *response,
+                                         uint32_t *writePointer)
+{
+    *fence = *writePointer = 0;
+    *response = cezanne::PspResponse();
+    if (stage_ < cezanne::kPspTmrStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kPspOutOfOrder;
+    if (pspState_ == kPspCreated && pspCreateOk_ && pspOwner_ == owner) {
+        TmrArgument tmr = {fence, response, writePointer, nullptr, nullptr, nullptr, false, nullptr, nullptr};
+        status = accessDevice(cezanne::kSmuPageOffset, tmrSubmitOperation, &tmr);
+        // Once the write pointer moved, the frame is the PSP's.
+        if (*writePointer == cezanne::kPspFrameDwords) {
+            pspState_ = kPspTmrSubmitted;
+            pspTmrFenced_ = *fence == 1;
+        }
+        IOLog(LOG_PREFIX "PSP SETUP_TMR: %s, fence %u, status 0x%08x, C2PMSG_67 %u\n", cezanne::statusName(status),
+              *fence, response->status, *writePointer);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::pspTmrObserve(const void *owner, uint32_t *unexpected, uint32_t *firstOffset)
+{
+    *unexpected = *firstOffset = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kPspOutOfOrder;
+    if (pspState_ == kPspTmrSubmitted && pspOwner_ == owner) {
+        TmrArgument tmr = {nullptr, nullptr, nullptr, pspSnapshot_, unexpected, firstOffset, false, nullptr, nullptr};
+        status = accessDevice(0, tmrObserveOperation, &tmr);
+        pspState_ = kPspTmrObserved;
+        IOLog(LOG_PREFIX "PSP SETUP_TMR observe: %s, %u unexpected words, first at 0x%x\n",
+              cezanne::statusName(status), *unexpected, *firstOffset);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::pspTeardownLocked(uint32_t *fence, uint32_t *tmrStatus, uint32_t *ringResponse,
+                                              cezanne::PspMailbox *mailbox)
+{
+    // Caller holds lock_ and pspState_ shows a submitted SETUP_TMR.
+    cezanne::PspResponse response;
+    TmrArgument tmr = {fence, &response, nullptr, nullptr, nullptr, nullptr, pspTmrFenced_, ringResponse, mailbox};
+    cezanne::Status status = accessDevice(cezanne::kSmuPageOffset, tmrTeardownOperation, &tmr);
+    *tmrStatus = response.status;
+    pspState_ = kPspIdle;
+    pspOwner_ = nullptr;
+    pspTmrFenced_ = false;
+    pspCreateOk_ = false;
+    IOLog(LOG_PREFIX "PSP teardown: %s, DESTROY_TMR fence %u status 0x%08x, ring response 0x%08x\n",
+          cezanne::statusName(status), *fence, *tmrStatus, *ringResponse);
+    return status;
+}
+
+cezanne::Status CezanneGPU::pspTmrTeardown(const void *owner, uint32_t *fence, uint32_t *tmrStatus,
+                                           uint32_t *ringResponse, cezanne::PspMailbox *mailbox)
+{
+    *fence = *tmrStatus = *ringResponse = 0;
+    *mailbox = cezanne::PspMailbox();
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kPspOutOfOrder;
+    if ((pspState_ == kPspTmrSubmitted || pspState_ == kPspTmrObserved) && pspOwner_ == owner) {
+        status = pspTeardownLocked(fence, tmrStatus, ringResponse, mailbox);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
 void CezanneGPU::scratchAbandon(const void *owner)
 {
     if (lock_ == nullptr) {
@@ -1049,6 +1270,13 @@ void CezanneGPU::scratchAbandon(const void *owner)
     if (metricsOwner_ == owner) {
         metricsState_ = kMetricsIdle;
         metricsOwner_ = nullptr;
+    }
+    if (pspOwner_ == owner && (pspState_ == kPspTmrSubmitted || pspState_ == kPspTmrObserved)) {
+        uint32_t fence = 0, tmrStatus = 0, ringResponse = 0;
+        cezanne::PspMailbox mailbox;
+        cezanne::Status status = pspTeardownLocked(&fence, &tmrStatus, &ringResponse, &mailbox);
+        IOLog(LOG_PREFIX "PSP TMR abandoned after the submit; teardown: %s\n", cezanne::statusName(status));
+        setProperty("CezanneGPU PSP TMR abandoned teardown", cezanne::statusName(status));
     }
     if (pspOwner_ == owner) {
         if (pspState_ == kPspCreated || pspState_ == kPspObserved) {
@@ -1101,6 +1329,9 @@ private:
     static IOReturn pspRingCreate(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn pspRingObserve(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn pspRingDestroy(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn pspTmrSubmit(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn pspTmrObserve(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn pspTmrTeardown(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPUUserClient, IOUserClient)
@@ -1296,6 +1527,44 @@ IOReturn CezanneGPUUserClient::pspRingDestroy(OSObject *target, void *, IOExtern
     return kIOReturnSuccess;
 }
 
+IOReturn CezanneGPUUserClient::pspTmrSubmit(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t fence = 0, writePointer = 0;
+    cezanne::PspResponse response;
+    arguments->scalarOutput[0] = self->gpu_->pspTmrSubmit(self, &fence, &response, &writePointer);
+    const uint64_t values[] = {fence, response.status, response.fwAddrLo, response.fwAddrHi, response.tmrSize,
+                               writePointer};
+    for (uint32_t i = 0; i < 6; i++) {
+        arguments->scalarOutput[i + 1] = values[i];
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn CezanneGPUUserClient::pspTmrObserve(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t unexpected = 0, first = 0;
+    arguments->scalarOutput[0] = self->gpu_->pspTmrObserve(self, &unexpected, &first);
+    arguments->scalarOutput[1] = unexpected;
+    arguments->scalarOutput[2] = first;
+    return kIOReturnSuccess;
+}
+
+IOReturn CezanneGPUUserClient::pspTmrTeardown(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t fence = 0, tmrStatus = 0, ringResponse = 0;
+    cezanne::PspMailbox mailbox;
+    arguments->scalarOutput[0] = self->gpu_->pspTmrTeardown(self, &fence, &tmrStatus, &ringResponse, &mailbox);
+    arguments->scalarOutput[1] = fence;
+    arguments->scalarOutput[2] = tmrStatus;
+    arguments->scalarOutput[3] = ringResponse;
+    arguments->scalarOutput[4] = mailbox.command;
+    arguments->scalarOutput[5] = mailbox.writePointer;
+    return kIOReturnSuccess;
+}
+
 IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                               IOExternalMethodDispatch *, OSObject *, void *reference)
 {
@@ -1316,6 +1585,9 @@ IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMetho
         {pspRingCreate, 0, 0, 3, 0},  // kDiagnosticPspRingCreate
         {pspRingObserve, 0, 0, 8, 0}, // kDiagnosticPspRingObserve
         {pspRingDestroy, 0, 0, 7, 0}, // kDiagnosticPspRingDestroy
+        {pspTmrSubmit, 0, 0, 7, 0},   // kDiagnosticPspTmrSubmit
+        {pspTmrObserve, 0, 0, 3, 0},  // kDiagnosticPspTmrObserve
+        {pspTmrTeardown, 0, 0, 6, 0}, // kDiagnosticPspTmrTeardown
     };
     if (selector >= cezanne::kDiagnosticSelectorCount) {
         return kIOReturnUnsupported;

@@ -45,31 +45,37 @@ def strip_comments(source):
     return re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.S)
 
 
-# The stage 6 and 7 write path, and the only writable constructs allowed: one
-# writable map of the test's page, one store (in registerWrite), and the two
-# non-const volatile pointers that carry it.
+# The register write path (stage 6 on) and the work-area write path (stage
+# 12), and the only writable constructs allowed: one writable map each (the
+# test's BAR5 page; the three work-area pages), one store each (registerWrite;
+# workWrite), and the four non-const volatile pointers that carry them.
 SCRATCH_MAP = "pageMemory->map(kIOMapInhibitCache)"
 SCRATCH_STORE = "page->base[(offset - page->pageOffset) / 4] = value;"
-ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize", "length")
-ALLOWED_VOLATILE = 2
+WORK_MAP = "workMemory->map(kIOMapInhibitCache)"
+WORK_STORE = "work->base[offset / 4] = value;"
+ALLOWED_MAPS = (SCRATCH_MAP, WORK_MAP)
+ALLOWED_STORES = (SCRATCH_STORE, WORK_STORE)
+ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize", "cezanne::kPspWorkSize", "length")
+ALLOWED_VOLATILE = 4
 
 
 def hardware_calls(source):
     """Forbidden names used in code, and writable constructs beyond the scratch test's."""
     code = strip_comments(source)
     found = [name for name in FORBIDDEN if re.search(r"\b%s" % name, code)]
-    maps = re.findall(r"((?:mapDeviceMemoryWithRegister|->map)\s*\(([^;]*)\))\s*;", code)
+    maps = re.findall(r"((?:mapDeviceMemoryWithRegister|\w+->map)\s*\(([^;)]*)\))", code)
     writable = [call for call, args in maps if "kIOMapReadOnly" not in args]
-    found += ["writable mapping" for call in writable if call.split("=")[-1].strip() != SCRATCH_MAP]
-    if len([call for call in writable if call.strip().endswith(SCRATCH_MAP)]) > 1:
-        found.append("writable mapping")
+    found += ["writable mapping" for call in writable if call.split("=")[-1].strip() not in ALLOWED_MAPS]
+    for allowed in ALLOWED_MAPS:
+        if len([call for call in writable if call.strip().endswith(allowed)]) > 1:
+            found.append("writable mapping")
     # Physical ranges: the discovery binary and the scratch page, at fixed sizes.
     ranges = re.findall(r"\bwithRange\s*\(([^;]*)\)\s*;", code)
     found += ["unbounded range" for args in ranges if not args.strip().endswith(ALLOWED_RANGE_SIZES)]
     if len(re.findall(r"(?<!const )\bvolatile\b", code)) > ALLOWED_VOLATILE:
         found.append("non-const volatile")
     stores = re.findall(r"\w+->base\s*\[[^\]]*\]\s*=[^=][^;]*;", code)
-    if [store for store in stores if store != SCRATCH_STORE] or len(stores) > 1:
+    if [store for store in stores if store not in ALLOWED_STORES] or len(stores) > len(ALLOWED_STORES):
         found.append("register store")
     return found
 
@@ -120,6 +126,15 @@ void f(IOPCIDevice *p, Aperture *a) {
         source = strip_comments((KEXT / "CezanneGPU.cpp").read_text())
         self.assertEqual(source.count(SCRATCH_MAP), 1)
         self.assertEqual(source.count(SCRATCH_STORE), 1)
+        self.assertEqual(source.count(WORK_MAP), 1)
+        self.assertEqual(source.count(WORK_STORE), 1)
+        # The work area: only its fixed range, written only after the core's
+        # allowlist, from stage 12.
+        work = re.search(r"static bool workWrite\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(work.index("pspWorkWriteAllowed(offset, value, work->stage)"), work.index(WORK_STORE))
+        self.assertIn("IODeviceMemory::withRange(cezanne::kPspRingPhysical, cezanne::kPspWorkSize)", source)
+        self.assertIn("if (stage < cezanne::kPspTmrStage) {", re.search(r"static cezanne::Status withPspWork\(.*?\n}\n",
+                                                                        source, re.S).group(0))
         write = re.search(r"static bool registerWrite\(.*?\n}\n", source, re.S).group(0)
         self.assertIn(SCRATCH_STORE, write)
         self.assertLess(write.index("writeAllowed(offset, value, page->stage)"), write.index(SCRATCH_STORE))
@@ -133,17 +148,21 @@ void f(IOPCIDevice *p, Aperture *a) {
                                     ("cezanne::kSmuPageOffset", "metricsTransferOperation"),
                                     ("cezanne::kSmuPageOffset", "pspCreateOperation"),
                                     ("cezanne::kSmuPageOffset", "pspDestroyOperation"),
-                                    ("cezanne::kSmuPageOffset", "smuQueryOperation")])
+                                    ("cezanne::kSmuPageOffset", "smuQueryOperation"),
+                                    ("cezanne::kSmuPageOffset", "tmrSubmitOperation"),
+                                    ("cezanne::kSmuPageOffset", "tmrTeardownOperation")])
         self.assertEqual(sorted(re.findall(r"accessDevice\(0, (\w+)", source)),
                          ["metricsCheckOperation", "metricsReadOperation", "pspCheckOperation", "pspObserveOperation",
-                          "readOperation", "scratchCheckOperation", "smuCheckOperation"])
+                          "readOperation", "scratchCheckOperation", "smuCheckOperation", "tmrObserveOperation"])
         # Carveout memory: only the metrics page's and the PSP ring page's
         # ranges, read-only, at their check sizes or one page.
         self.assertEqual(re.findall(r"IODeviceMemory::withRange\((\w+), length\)", source), ["physical"])
-        self.assertIn("if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical) {", source)
+        self.assertIn("if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical &&\n"
+                      "        physical != cezanne::kPspTmrPhysical) {", source)
         self.assertEqual(sorted(re.findall(r"withCarveoutMemory\(cezanne::(\w+), cezanne::(\w+),", source)),
                          [("kMetricsPhysical", "kMetricsCheckSize"), ("kMetricsPhysical", "kPageSize"),
-                          ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize")])
+                          ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
+                          ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspTmrPhysical", "kPspTmrSize")])
         # A PSP ring created by a connection is destroyed if it closes early.
         abandon = re.search(r"void CezanneGPU::scratchAbandon\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("pspDestroyLocked(&response, &mailbox)", abandon)
@@ -170,7 +189,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 11;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 12;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
