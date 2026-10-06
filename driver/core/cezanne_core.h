@@ -303,23 +303,23 @@ const uint32_t kStage10GfxGatedRegisters[] = {kRegGcFbLocationBase, kRegGcFbLoca
                                               kRegGcApertureHigh};
 const uint32_t kStage10GfxGatedRegisterCount =
     sizeof(kStage10GfxGatedRegisters) / sizeof(kStage10GfxGatedRegisters[0]);
-// C2PMSG_64: bit 31 set by the PSP when it has answered; bits 15:0 status
-// (psp_v12_0 waits for 0x80000000 under mask 0x8000FFFF).
+// C2PMSG_64: bit 31 set by the PSP when it has answered; bits 19:16 echo the
+// command ID; bits 15:0 status (psp_gfx_if.h). psp_v12_0 waits for
+// 0x80000000 under mask 0x8000FFFF, ignoring the echo (boot 15).
 const uint32_t kPspResponseFlag = 0x80000000u;
 const uint32_t kPspStatusMask = 0xFFFFu;
+const uint32_t kPspResponseMask = kPspResponseFlag | kPspStatusMask;
 const uint32_t kPspStateStage = 10;
 
 // Stage 11: create and destroy the PSP kernel-mode ring, as Linux v6.12
-// psp_v12_0_ring_create (with psp_v12_0_reroute_ih) and psp_v12_0_ring_stop
-// do; no frame is submitted. Command IDs: psp_gfx_if.h; ring type:
-// amdgpu_psp.h (PSP_RING_TYPE__KM = 2, so the create command is 2 << 16).
+// psp_v12_0_ring_create and psp_v12_0_ring_stop do; no frame is submitted.
+// Command IDs: psp_gfx_if.h; ring type: amdgpu_psp.h (PSP_RING_TYPE__KM = 2,
+// so the create command is 2 << 16). Linux first sends two GBR_IH_SET
+// (0x00080000) commands (psp_v12_0_reroute_ih) and ignores their results;
+// this host's secure OS answers PSP_ERR_UNKNOWN_COMMAND (boot 15), so they
+// are not sent.
 const uint32_t kPspCmdInitGpcomRing = 0x00020000;
 const uint32_t kPspCmdDestroyRings = 0x00030000;
-const uint32_t kPspCmdGbrIhSet = 0x00080000;
-// psp_v12_0_reroute_ih: IH_CLIENT_CFG_DATA for VMC (credit return 0x1244b,
-// client type 1, ring 1) and UMC (0x1216b, ring 1); osssys_4_0_sh_mask.h.
-const uint32_t kPspIhClientVmc = 3, kPspIhVmcConfig = 0x0015244b;
-const uint32_t kPspIhClientUmc = 4, kPspIhUmcConfig = 0x0011216b;
 // One 4 KiB ring (psp_ring_init), 1 MiB above the stage 9 metrics page.
 const uint64_t kPspRingCarveoutOffset = 0x40100000ull;
 const uint64_t kPspRingGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kPspRingCarveoutOffset;
@@ -527,7 +527,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 6;
+const uint32_t kDiagnosticVersion = 7;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -546,7 +546,7 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticMetricsRead = 10,    // out: Status; structure: the 148-byte table
     // Stage 11, accepted only in this order per connection.
     kDiagnosticPspRingCheck = 11,   // out: Status, C2PMSG_81, 64, 67, 69, 70, 71
-    kDiagnosticPspRingCreate = 12,  // out: Status, responses to VMC reroute, UMC reroute, create
+    kDiagnosticPspRingCreate = 12,  // out: Status, response, command written
     kDiagnosticPspRingObserve = 13, // out: Status, C2PMSG_64, 67, 69, 70, 71, changed in page, changed outside
     kDiagnosticPspRingDestroy = 14, // out: Status, response, C2PMSG_64, 67, 69, 70, 71
     kDiagnosticSelectorCount = 15,
@@ -672,23 +672,24 @@ Status readPspMailbox(const RegisterReader &registers, uint64_t apertureLength, 
                       PspMailbox *mailbox);
 
 // Each PSP command with its only allowed arguments (C2PMSG_69, _70, _71; 0
-// where Linux writes none): GBR_IH_SET with the VMC or UMC pair, the create
-// with the ring's address and size, the destroy with none.
+// where Linux writes none): the create with the ring's address and size, the
+// destroy with none.
 bool pspCommandAllowed(uint32_t command, uint32_t low, uint32_t high, uint32_t size, uint32_t stage);
 
 // No writes. Requires the secure OS running (kPspNotRunning), C2PMSG_64
-// exactly kPspResponseFlag (kPspNotReady) and no ring (kPspRingExists), then
+// answered with status 0 (kPspNotReady) and no ring (kPspRingExists), then
 // the stage 9 address checks for the ring page and its check region.
 Status checkPspRing(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, const Range *ranges,
                     uint32_t rangeCount, PspMailbox *mailbox, MetricsTarget *target);
 
-// Re-checks the mailbox as checkPspRing does, then sends the two GBR_IH_SET
-// commands and the create, each after a ready C2PMSG_64, with
-// kPspSettlePauses then up to kPspPollPauses polls for the response flag
-// (kPspTimeout). Each response must be exactly kPspResponseFlag
-// (kPspResponseNotOk). Stops at the first failure.
+// Re-checks the mailbox as checkPspRing does, then sends the create: the
+// ring's address and size, then the command; kPspSettlePauses, then up to
+// kPspPollPauses polls for the response flag (kPspTimeout). The response,
+// masked with kPspResponseMask, must be kPspResponseFlag
+// (kPspResponseNotOk). written is set once the command is written, whatever
+// the response: from then on a ring may exist and must be destroyed.
 Status createPspRing(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
-                     uint32_t stage, uint32_t responses[3]);
+                     uint32_t stage, uint32_t *response, bool *written);
 
 // Compares the region with the snapshot: counts changed words in the first
 // pageSize bytes and after them. kPspRegionChanged if any changed.

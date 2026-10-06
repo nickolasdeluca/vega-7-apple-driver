@@ -1104,29 +1104,26 @@ static void testPspRing()
 {
     CHECK(kPspRingGpuAddress == 0xF440100000ull && kPspRingPhysical == 0x600100000ull);
     CHECK(uint32_t(kPspRingGpuAddress) == 0x40100000u && uint32_t(kPspRingGpuAddress >> 32) == 0xF4u);
-    CHECK(kPspCmdGbrIhSet == 0x80000u && kPspCmdInitGpcomRing == (2u << 16) && kPspCmdDestroyRings == 0x30000u);
-    CHECK(kPspIhVmcConfig == (0x1244bu | (1u << 18) | (1u << 20)) && kPspIhUmcConfig == (0x1216bu | (1u << 20)));
+    CHECK(kPspCmdInitGpcomRing == (2u << 16) && kPspCmdDestroyRings == 0x30000u && kPspResponseMask == 0x8000FFFFu);
     // The ring's check region is clear of the stage 9 metrics region.
     CHECK(kPspRingPhysical >= kMetricsPhysical + kMetricsCheckSize);
 
-    // Commands and their only arguments.
-    CHECK(pspCommandAllowed(kPspCmdGbrIhSet, kPspIhClientVmc, kPspIhVmcConfig, 0, 11));
-    CHECK(pspCommandAllowed(kPspCmdGbrIhSet, kPspIhClientUmc, kPspIhUmcConfig, 0, 11));
+    // Commands and their only arguments; GBR_IH_SET is never sent (boot 15).
     CHECK(pspCommandAllowed(kPspCmdInitGpcomRing, 0x40100000u, 0xF4u, kPspRingSize, 11));
     CHECK(pspCommandAllowed(kPspCmdDestroyRings, 0, 0, 0, 11));
-    CHECK(!pspCommandAllowed(kPspCmdGbrIhSet, kPspIhClientVmc, kPspIhVmcConfig, 0, 10));
-    CHECK(!pspCommandAllowed(kPspCmdGbrIhSet, kPspIhClientVmc, kPspIhUmcConfig, 0, 11));
-    CHECK(!pspCommandAllowed(kPspCmdGbrIhSet, 0x40100000u, 0xF4u, 0, 11));
-    CHECK(!pspCommandAllowed(kPspCmdInitGpcomRing, kPspIhClientVmc, kPspIhVmcConfig, kPspRingSize, 11));
+    CHECK(!pspCommandAllowed(kPspCmdInitGpcomRing, 0x40100000u, 0xF4u, kPspRingSize, 10));
+    CHECK(!pspCommandAllowed(0x00080000u, 3, 0x0015244bu, 0, 11) && !pspCommandAllowed(0x00080000u, 0, 0, 0, 11));
+    CHECK(!pspCommandAllowed(kPspCmdInitGpcomRing, 3, 0x0015244bu, kPspRingSize, 11));
     CHECK(!pspCommandAllowed(kPspCmdInitGpcomRing, 0x40100000u, 0xF4u, 0x2000, 11));
     CHECK(!pspCommandAllowed(kPspCmdInitGpcomRing, 0x40000000u, 0xF4u, kPspRingSize, 11));
     CHECK(!pspCommandAllowed(kPspCmdDestroyRings, 3, 0, 0, 11));
     CHECK(!pspCommandAllowed(0x00010000u, 0, 0, 0, 11) && !pspCommandAllowed(0x00070000u, 0, 0, 0, 11));
     // Register values, from stage 11 only.
     CHECK(writeAllowed(kRegMp0C2PMsg64, kPspCmdInitGpcomRing, 11) && !writeAllowed(kRegMp0C2PMsg64, kPspCmdInitGpcomRing, 10));
+    CHECK(writeAllowed(kRegMp0C2PMsg64, kPspCmdDestroyRings, 11) && !writeAllowed(kRegMp0C2PMsg64, 0x00080000u, 11));
     CHECK(!writeAllowed(kRegMp0C2PMsg64, 0x00070000u, 11) && !writeAllowed(kRegMp0C2PMsg64, 0x00010000u, 11));
-    CHECK(writeAllowed(kRegMp0C2PMsg69, 0x40100000u, 11) && !writeAllowed(kRegMp0C2PMsg69, 0x40000000u, 11));
-    CHECK(writeAllowed(kRegMp0C2PMsg70, 0xF4u, 11) && !writeAllowed(kRegMp0C2PMsg70, 0xF5u, 11));
+    CHECK(writeAllowed(kRegMp0C2PMsg69, 0x40100000u, 11) && !writeAllowed(kRegMp0C2PMsg69, 3, 11));
+    CHECK(writeAllowed(kRegMp0C2PMsg70, 0xF4u, 11) && !writeAllowed(kRegMp0C2PMsg70, 0x0015244bu, 11));
     CHECK(writeAllowed(kRegMp0C2PMsg71, 0x1000u, 11) && !writeAllowed(kRegMp0C2PMsg71, 0x2000u, 11));
     CHECK(!writeAllowed(kRegMp0C2PMsg67, 0, 11) && !writeAllowed(kRegMp0C2PMsg81, 0, 11));
 
@@ -1148,10 +1145,14 @@ static void testPspRing()
         CHECK(checkPspRing(r.reader(), 0x80000, 10, ranges, count, &m, &t) == kRegisterNotAllowed);
         Range clash[1] = {{0x600108000ull, 0x1000}};
         CHECK(checkPspRing(r.reader(), 0x80000, 11, clash, 1, &m, &t) == kMetricsTargetInvalid);
+        r.psp64 = 0x80080000u; // an echoed command ID, status 0: ready
+        CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kOK);
         r.psp81 = 0;
         CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kPspNotRunning);
         r.psp81 = 1;
-        r.psp64 = 0x80000001u;
+        r.psp64 = 0x80080100u; // boot 15: unknown command
+        CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kPspNotReady);
+        r.psp64 = 0x00020000u; // busy
         CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kPspNotReady);
         r.psp64 = 0x80000000u;
         r.psp71 = 0x1000;
@@ -1165,54 +1166,56 @@ static void testPspRing()
         CHECK(checkPspRing(r.reader(), 0x80000, 11, ranges, count, &m, &t) == kMetricsAddressMismatch);
     }
 
-    uint32_t responses[3];
+    uint32_t response = 0;
+    bool written = false;
     {
         FakeRegisters r;
-        r.pspDelay = 25; // answers 5 pauses into the poll
+        r.pspDelay = 25;              // answers 5 pauses into the poll
+        r.pspReply = 0x80020000u;     // the create's ID echoed, status 0
         FakeWriter w(&r);
-        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, responses) == kOK);
-        const uint32_t offsets[] = {kRegMp0C2PMsg69, kRegMp0C2PMsg70, kRegMp0C2PMsg64, kRegMp0C2PMsg69,
-                                    kRegMp0C2PMsg70, kRegMp0C2PMsg64, kRegMp0C2PMsg69, kRegMp0C2PMsg70,
-                                    kRegMp0C2PMsg71, kRegMp0C2PMsg64};
-        const uint32_t values[] = {3, 0x0015244bu, 0x00080000u, 4, 0x0011216bu, 0x00080000u,
-                                   0x40100000u, 0xF4u, 0x1000u, 0x00020000u};
-        CHECK(w.writes == 10);
-        for (int i = 0; i < 10; i++) CHECK(w.offsets[i] == offsets[i] && w.values[i] == values[i]);
-        CHECK(responses[0] == 0x80000000u && responses[1] == 0x80000000u && responses[2] == 0x80000000u);
-        CHECK(r.pauses == 3 * 25);
-        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 10, responses) == kRegisterNotAllowed);
+        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, &response, &written) == kOK);
+        const uint32_t offsets[] = {kRegMp0C2PMsg69, kRegMp0C2PMsg70, kRegMp0C2PMsg71, kRegMp0C2PMsg64};
+        const uint32_t values[] = {0x40100000u, 0xF4u, 0x1000u, 0x00020000u};
+        CHECK(w.writes == 4);
+        for (int i = 0; i < 4; i++) CHECK(w.offsets[i] == offsets[i] && w.values[i] == values[i]);
+        CHECK(response == 0x80020000u && written && r.pauses == 25);
+        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 10, &response, &written) == kRegisterNotAllowed);
+        CHECK(!written);
     }
     {
         FakeRegisters r;
-        r.pspReply = 0x80000005u; // answered, status 5
+        r.pspReply = 0x80020100u; // answered with an error status
         FakeWriter w(&r);
-        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, responses) == kPspResponseNotOk);
-        CHECK(w.writes == 3 && responses[0] == 0x80000005u && responses[1] == 0);
+        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, &response, &written) == kPspResponseNotOk);
+        CHECK(w.writes == 4 && response == 0x80020100u && written);
+        // The destroy is still sent after a rejected create.
+        CHECK(destroyPspRing(r.reader(), 0x80000, w.writer(), 11, written, &response) == kPspResponseNotOk);
+        CHECK(w.writes == 5 && w.offsets[4] == kRegMp0C2PMsg64 && w.values[4] == kPspCmdDestroyRings);
     }
     {
         FakeRegisters r;
         r.pspDelay = -1; // never answers
         FakeWriter w(&r);
-        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, responses) == kPspTimeout);
-        CHECK(w.writes == 3 && r.pauses == int(kPspSettlePauses + kPspPollPauses));
+        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, &response, &written) == kPspTimeout && written);
+        CHECK(w.writes == 4 && r.pauses == int(kPspSettlePauses + kPspPollPauses));
     }
     {
         FakeRegisters r;
         r.psp69 = 0x1234; // a ring address already set
         FakeWriter w(&r);
-        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, responses) == kPspRingExists);
-        CHECK(w.writes == 0);
+        CHECK(createPspRing(r.reader(), 0x80000, w.writer(), 11, &response, &written) == kPspRingExists);
+        CHECK(w.writes == 0 && !written);
     }
 
-    uint32_t response = 0;
     {
         FakeRegisters r;
         FakeWriter w(&r);
         CHECK(destroyPspRing(r.reader(), 0x80000, w.writer(), 11, false, &response) == kPspOutOfOrder);
         CHECK(w.writes == 0);
+        r.pspReply = 0x80030000u;
         CHECK(destroyPspRing(r.reader(), 0x80000, w.writer(), 11, true, &response) == kOK);
         CHECK(w.writes == 1 && w.offsets[0] == kRegMp0C2PMsg64 && w.values[0] == kPspCmdDestroyRings);
-        CHECK(response == 0x80000000u && r.pauses == int(kPspSettlePauses));
+        CHECK(response == 0x80030000u && r.pauses == int(kPspSettlePauses));
         r.psp64 = 0x00020000u; // still busy with an earlier command
         int before = w.writes;
         CHECK(destroyPspRing(r.reader(), 0x80000, w.writer(), 11, true, &response) == kPspNotReady);

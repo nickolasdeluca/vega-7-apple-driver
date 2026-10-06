@@ -430,12 +430,9 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
                                            value == kSmuMsgSetDriverDramAddrLow ||
                                            value == kSmuMsgTransferTableSmu2Dram));
     if (stage < kPspRingStage) return false;
-    if (offset == kRegMp0C2PMsg64)
-        return value == kPspCmdGbrIhSet || value == kPspCmdInitGpcomRing || value == kPspCmdDestroyRings;
-    if (offset == kRegMp0C2PMsg69)
-        return value == kPspIhClientVmc || value == kPspIhClientUmc || value == uint32_t(kPspRingGpuAddress);
-    if (offset == kRegMp0C2PMsg70)
-        return value == kPspIhVmcConfig || value == kPspIhUmcConfig || value == uint32_t(kPspRingGpuAddress >> 32);
+    if (offset == kRegMp0C2PMsg64) return value == kPspCmdInitGpcomRing || value == kPspCmdDestroyRings;
+    if (offset == kRegMp0C2PMsg69) return value == uint32_t(kPspRingGpuAddress);
+    if (offset == kRegMp0C2PMsg70) return value == uint32_t(kPspRingGpuAddress >> 32);
     if (offset == kRegMp0C2PMsg71) return value == kPspRingSize;
     return false;
 }
@@ -724,9 +721,6 @@ bool pspCommandAllowed(uint32_t command, uint32_t low, uint32_t high, uint32_t s
 {
     if (stage < kPspRingStage) return false;
     switch (command) {
-    case kPspCmdGbrIhSet:
-        return size == 0 && ((low == kPspIhClientVmc && high == kPspIhVmcConfig) ||
-                             (low == kPspIhClientUmc && high == kPspIhUmcConfig));
     case kPspCmdInitGpcomRing:
         return low == uint32_t(kPspRingGpuAddress) && high == uint32_t(kPspRingGpuAddress >> 32) &&
                size == kPspRingSize;
@@ -739,7 +733,7 @@ bool pspCommandAllowed(uint32_t command, uint32_t low, uint32_t high, uint32_t s
 static Status checkPspIdle(const PspMailbox &mailbox)
 {
     if (mailbox.signOfLife == 0) return kPspNotRunning;
-    if (mailbox.command != kPspResponseFlag) return kPspNotReady;
+    if ((mailbox.command & kPspResponseMask) != kPspResponseFlag) return kPspNotReady;
     if ((mailbox.writePointer | mailbox.ringLow | mailbox.ringHigh | mailbox.ringSize) != 0) return kPspRingExists;
     return kOK;
 }
@@ -761,24 +755,29 @@ Status checkPspRing(const RegisterReader &registers, uint64_t apertureLength, ui
 }
 
 // psp_v12_0: arguments, then the command in C2PMSG_64, a 20 ms settle, and a
-// poll for the response flag.
+// poll for the response flag. written is set once the command is written.
+// The PSP must have answered its previous command (flag set; kPspNotReady
+// otherwise), whatever that answer's status: a destroy must still be sent
+// after a rejected create. Linux checks nothing before writing.
 static Status sendPspCommand(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                              uint32_t stage, uint32_t command, uint32_t low, uint32_t high, uint32_t size,
-                             uint32_t *response)
+                             uint32_t *response, bool *written)
 {
     *response = 0;
+    *written = false;
     if (!pspCommandAllowed(command, low, high, size, stage)) return kRegisterNotAllowed;
     uint32_t ready = 0;
     Status status = readRegister(registers, apertureLength, stage, kRegMp0C2PMsg64, &ready);
     if (status != kOK) return status;
-    if (ready != kPspResponseFlag) return kPspNotReady;
-    if (command != kPspCmdDestroyRings) {
+    if ((ready & kPspResponseFlag) == 0) return kPspNotReady;
+    if (command == kPspCmdInitGpcomRing) {
         status = writeRegister(writer, stage, kRegMp0C2PMsg69, low);
         if (status == kOK) status = writeRegister(writer, stage, kRegMp0C2PMsg70, high);
     }
     if (status == kOK && command == kPspCmdInitGpcomRing) status = writeRegister(writer, stage, kRegMp0C2PMsg71, size);
     if (status == kOK) status = writeRegister(writer, stage, kRegMp0C2PMsg64, command);
     if (status != kOK) return status;
+    *written = true;
     for (uint32_t i = 0; i < kPspSettlePauses; i++) writer.pause(writer.context);
     for (uint32_t i = 0; i <= kPspPollPauses; i++) {
         status = readRegister(registers, apertureLength, stage, kRegMp0C2PMsg64, response);
@@ -787,31 +786,22 @@ static Status sendPspCommand(const RegisterReader &registers, uint64_t apertureL
         if (i == kPspPollPauses) return kPspTimeout;
         writer.pause(writer.context);
     }
-    return *response == kPspResponseFlag ? kOK : kPspResponseNotOk;
+    return (*response & kPspResponseMask) == kPspResponseFlag ? kOK : kPspResponseNotOk;
 }
 
 Status createPspRing(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
-                     uint32_t stage, uint32_t responses[3])
+                     uint32_t stage, uint32_t *response, bool *written)
 {
-    responses[0] = responses[1] = responses[2] = 0;
+    *response = 0;
+    *written = false;
     if (stage < kPspRingStage) return kRegisterNotAllowed;
     PspMailbox mailbox;
     Status status = readPspMailbox(registers, apertureLength, stage, &mailbox);
     if (status == kOK) status = checkPspIdle(mailbox);
     if (status != kOK) return status;
-    const struct {
-        uint32_t command, low, high, size;
-    } commands[] = {
-        {kPspCmdGbrIhSet, kPspIhClientVmc, kPspIhVmcConfig, 0},
-        {kPspCmdGbrIhSet, kPspIhClientUmc, kPspIhUmcConfig, 0},
-        {kPspCmdInitGpcomRing, uint32_t(kPspRingGpuAddress), uint32_t(kPspRingGpuAddress >> 32), kPspRingSize},
-    };
-    for (uint32_t i = 0; i < 3; i++) {
-        status = sendPspCommand(registers, apertureLength, writer, stage, commands[i].command, commands[i].low,
-                                commands[i].high, commands[i].size, &responses[i]);
-        if (status != kOK) return status;
-    }
-    return kOK;
+    return sendPspCommand(registers, apertureLength, writer, stage, kPspCmdInitGpcomRing,
+                          uint32_t(kPspRingGpuAddress), uint32_t(kPspRingGpuAddress >> 32), kPspRingSize, response,
+                          written);
 }
 
 Status compareRegion(const MemoryReader &memory, uint32_t length, uint32_t pageSize, const uint32_t *snapshot,
@@ -832,7 +822,8 @@ Status destroyPspRing(const RegisterReader &registers, uint64_t apertureLength, 
     *response = 0;
     if (stage < kPspRingStage) return kRegisterNotAllowed;
     if (!created) return kPspOutOfOrder;
-    return sendPspCommand(registers, apertureLength, writer, stage, kPspCmdDestroyRings, 0, 0, 0, response);
+    bool written = false;
+    return sendPspCommand(registers, apertureLength, writer, stage, kPspCmdDestroyRings, 0, 0, 0, response, &written);
 }
 
 } // namespace cezanne

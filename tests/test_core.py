@@ -83,12 +83,16 @@ class CoreTests(unittest.TestCase):
             "registerAllowed(kRegMp1C2PMsg90, 4)": (": stage >= 3 ? kStage3RegisterCount", ": stage >= 3 ? kStage5RegisterCount"),
             "!registerAllowed(kRegMp0C2PMsg64, 9)": ("stage >= 10  ? kStage10RegisterCount",
                                                      "stage >= 9  ? kStage10RegisterCount"),
-            "!pspCommandAllowed(kPspCmdInitGpcomRing, kPspIhClientVmc, kPspIhVmcConfig, kPspRingSize, 11)": (
+            "!pspCommandAllowed(kPspCmdInitGpcomRing, 3, 0x0015244bu, kPspRingSize, 11)": (
                 "    case kPspCmdInitGpcomRing:\n        return low ==", "    case kPspCmdInitGpcomRing:\n        return (void)low, true;\n        return low =="),
-            "11, true, &response) == kPspNotReady": ("if (ready != kPspResponseFlag) return kPspNotReady;", ""),
+            "11, true, &response) == kPspNotReady": ("if ((ready & kPspResponseFlag) == 0) return kPspNotReady;", ""),
             "kPspTimeout": ("if (i == kPspPollPauses) return kPspTimeout;", "if (i == kPspPollPauses) break;"),
             "kPspOutOfOrder": ("if (!created) return kPspOutOfOrder;", "(void)created;"),
             "kPspRingExists": ("return kPspRingExists;", "(void)0;"),
+            "11, &response, &written) == kOK": (
+                "return (*response & kPspResponseMask) == kPspResponseFlag ? kOK : kPspResponseNotOk;",
+                "return *response == kPspResponseFlag ? kOK : kPspResponseNotOk;"),
+            "kPspTimeout && written": ("    *written = true;\n    for", "    for"),
             "gfxGated(kRegGcApertureHigh)": ("if (kStage10GfxGatedRegisters[i] == offset) return true;", "(void)0;"),
             "registerAllowed(kRegGrbmGfxIndex, 2)": ("stage == 2 ? kStage2RegisterCount",
                                                      "stage == 2 ? kStage3RegisterCount"),
