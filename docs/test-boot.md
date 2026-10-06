@@ -20,8 +20,9 @@ VBIOS: the firmware reserves no carveout memory. With the
 [revised check](#revision-stage-9-free-page-check), stage 9 read the SMU
 metrics table in boot 13. Stage 10 (boot 14) found the PSP ready with no
 ring, and both memory hubs mapping the carveout identically. Stage 11 (the
-first PSP commands: create and destroy a ring) is approved and built, not
-yet booted. No later stage is authorized.
+first PSP commands: create and destroy a ring) stopped safely in boot 15:
+the PSP answered its first command, `GBR_IH_SET`, with "unknown command". A
+revision is proposed. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -1550,6 +1551,75 @@ page change.
     removed, the timeout removed, the destroy order check removed, and the
     ring-exists check removed.
 
+### Revision: stage 11 PSP responses (proposal)
+
+**Status: proposed 2026-10-06 after boot 15, not approved, not
+implemented.**
+
+**What boot 15 showed.** The first `GBR_IH_SET` (VMC) was answered
+`0x80080100`:
+
+- bit 31 set (answered);
+- bits 19:16 = `0x8`, the command ID echoed back (`psp_gfx_if.h` defines
+  `GFX_CMD_ID_MASK` `0x000F0000`);
+- status `0x0100` = `PSP_ERR_UNKNOWN_COMMAND`.
+
+This secure OS does not know `GBR_IH_SET`. The core stopped there, as
+designed. Nothing more was sent, no ring was created, and no destroy was
+needed.
+
+**What Linux v6.12 would do with the same firmware.**
+
+- `psp_wait_for(..., 0x80000000, 0x8000FFFF)` would read `0x80000100`, wait
+  the full 100 ms and time out. `psp_v12_0_reroute_ih` ignores the result, so
+  it would send the UMC reroute (same outcome) and then create the ring
+  regardless.
+- Linux's effective behaviour on this host is therefore: two rejected
+  commands, then the create.
+
+**Two defects this exposes in stage 11 as built:**
+
+1. **The response check is stricter than Linux's.** It requires
+   `C2PMSG_64` to be exactly `0x80000000`. The PSP echoes the command ID in
+   bits 19:16, and Linux masks them out with `0x8000FFFF`. A successful
+   create would probably read `0x80020000`, which stage 11 would call
+   `psp-response-not-ok`.
+2. **That misreport would leave an untracked ring.** The driver tracks a
+   ring only after an ok create. A successful create misreported as
+   not-ok would leave a ring the driver neither destroys nor refuses to
+   re-check.
+
+**Proposed changes:**
+
+- **Judge readiness and responses as Linux does:**
+  `(C2PMSG_64 & 0x8000FFFF) == 0x80000000`. The tool still prints the whole
+  value. The no-ring check stays (`C2PMSG_67`/`69`/`70`/`71` all 0).
+- **Drop the two `GBR_IH_SET` commands.** This firmware rejects them, and
+  Linux continues as if they had not been sent. They only steer IH routing,
+  which no stage uses yet; revisit them when interrupts are proposed. The
+  `C2PMSG_64` ← `0x00080000` value and the IH reroute values leave the write
+  allowlist.
+- **Track the ring from the moment the create command is written**, not
+  only after an ok response. Any create attempt then gets a destroy, from the
+  tool or on abandon. `DESTROY_RINGS` on a PSP without a ring is expected to
+  be answered with an error status, which is recorded and harmless.
+- Tests: a create answered `0x80020000` is ok. One answered `0x80020100` is
+  `psp-response-not-ok` but still tracked and destroyed. No `GBR_IH_SET`
+  write remains. Two new weakened cores must fail: the response mask
+  replaced by an exact match, and create tracking moved back after the
+  response.
+
+**Steps after the revision:**
+1. Check, as before.
+2. Create: `C2PMSG_69` ← `0x40100000`, `C2PMSG_70` ← `0xF4`,
+   `C2PMSG_71` ← `0x1000`, `C2PMSG_64` ← `0x00020000`.
+3. Observe.
+4. Destroy.
+
+That is four writes to the PSP in total, all values approved for stage 11.
+The risks are as in the stage 11 section. The boot must be a cold boot, so
+the PSP starts from the boot 14 state, not boot 15's rejected command.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -2175,6 +2245,31 @@ kernel up 08:13:53 local).
   `out/test-efi/boot-14-stage10/`.
 - Result: stage 10 succeeded. The PSP starts clean, which is the case the
   stage 10 section names for proposing stage 11.
+
+**Boot 15, 2026-10-06, stage 11** (`out/test-efi/usb-stage11/`; cold boot,
+kernel up 08:31:23 local).
+
+- `CezanneGPU stage` 11; stages 1–3 `ok`.
+- `sudo cezanne-diag --gfxoff-disallow --psp-ring --psp-state`:
+  - **DisallowGfxOff:** `ok`, response `0x01`.
+  - **Check:** `ok`. `C2PMSG_81` `0x0016dae2`, `C2PMSG_64` `0x80000000`, no
+    ring, and the 64 KiB at the ring page stable.
+  - **Create step, first command** (`GBR_IH_SET` VMC: `C2PMSG_69` ← 3,
+    `C2PMSG_70` ← `0x0015244b`, `C2PMSG_64` ← `0x00080000`): answered
+    `0x80080100`. That is: answered, command ID 8 echoed, status `0x0100`
+    `PSP_ERR_UNKNOWN_COMMAND`. Stopped as `psp-response-not-ok`.
+  - The UMC reroute and the create were **not sent**. With no ring,
+    observe and destroy were skipped, as designed.
+- **Afterwards:** `C2PMSG_64` `0x80080100`, `C2PMSG_69` 3, `C2PMSG_70`
+  `0x0015244b`, `C2PMSG_67`/`71` 0. The secure OS is still alive:
+  `C2PMSG_81` advanced to `0x0016dbc7`. The rest of the dump equals boot 14,
+  and the machine stayed as before.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-15-stage11/`.
+- Result: **stopped safely after one rejected command.** This secure OS does
+  not implement `GBR_IH_SET`. The response check is stricter than Linux's
+  (it does not mask the echoed command ID). See the
+  [proposed revision](#revision-stage-11-psp-responses-proposal).
 
 ## Unknowns and limits
 
