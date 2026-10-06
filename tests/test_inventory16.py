@@ -1,4 +1,4 @@
-"""Recompute every stage 16 register offset from the pinned Linux v6.12 headers.
+"""Recompute every stage 16 and 17 register offset from the pinned Linux v6.12 headers.
 
 The headers live in ignored out/references (docs/test-boot.md, stage 16); the
 test skips when they are absent, as in a fresh clone.
@@ -19,12 +19,20 @@ SOURCES = (
 )
 
 
-def stage16_constants():
-    """(name, offset) for each constant in the header's stage 16 block."""
+def block_constants(start, end):
+    """(name, offset) for each annotated constant in one header block."""
     text = HEADER.read_text()
-    block = text[text.index("// Stage 16:"):text.index("const uint32_t kDisplayInventory[]")]
+    block = text[text.index(start):text.index(end)]
     return [(name, int(offset, 16))
             for offset, name in re.findall(r"= 0x([0-9a-f]+); // (\w+):", block)]
+
+
+def stage16_constants():
+    return block_constants("// Stage 16:", "const uint32_t kDisplayInventory[]")
+
+
+def stage17_constants():
+    return block_constants("// Stage 17:", "// Read from stage 17 on")
 
 
 @unittest.skipUnless(all((REFS / name).is_file() for name, _ in SOURCES), "pinned headers not in out/references")
@@ -41,7 +49,12 @@ class Inventory16OffsetTests(unittest.TestCase):
         constants = stage16_constants()
         self.assertEqual(len(constants), 91)
         self.assertNotIn("VM_INVALIDATE_ENG17_SEM", [name for name, _ in constants])
-        for name, offset in constants:
+        # Stage 17's engine 17 semaphore, request and address range.
+        stage17 = stage17_constants()
+        self.assertEqual([name for name, _ in stage17],
+                         ["VM_INVALIDATE_ENG17_SEM", "VM_INVALIDATE_ENG17_REQ", "VM_INVALIDATE_ENG17_ADDR_RANGE_LO32",
+                          "VM_INVALIDATE_ENG17_ADDR_RANGE_HI32"])
+        for name, offset in constants + stage17:
             with self.subTest(name):
                 found = [(bases[idx[name]] + regs[name]) * 4 for regs, idx, bases in tables if name in regs]
                 self.assertEqual(found, [offset])

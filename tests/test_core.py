@@ -123,6 +123,40 @@ class CoreTests(unittest.TestCase):
             "gfxGated(kRegGcApertureHigh)": ("if (kStage10GfxGatedRegisters[i] == offset) return true;", "(void)0;"),
             "registerAllowed(kRegGrbmGfxIndex, 2)": ("stage == 2 ? kStage2RegisterCount",
                                                      "stage == 2 ? kStage3RegisterCount"),
+            # Stage 17.
+            "!registerAllowed(kRegVmInvalidateEng17AddrRangeHi32, 16)": (
+                "stage >= kGartStage && i < kStage17RegisterCount", "i < kStage17RegisterCount"),
+            "!semaphoreReadAllowed(kRegVmInvalidateEng17Ack, 17)": (
+                "return stage >= kGartStage && offset == kRegVmInvalidateEng17Sem;", "return stage >= kGartStage && offset >= kRegVmInvalidateEng17Sem;"),
+            "!writeAllowed(g.offset, g.value, 16)": ("if (stage >= kGartStage && gartWriteListed(offset, value))",
+                                                     "if (stage >= kSdmaCopyStage && gartWriteListed(offset, value))"),
+            "!writeAllowed(kRegIhRbCntl, kIhRbCntlOn | 0x20000, 17)": (
+                "(offset == kRegIhRbCntl && value == kIhRbCntlOn)",
+                "(offset == kRegIhRbCntl && (value & ~0x20000u) == kIhRbCntlOn)"),
+            "!gartWorkWriteAllowed(kGartWorkSize, 0, 17)": (
+                "if (stage < kGartStage || (offset & 3) != 0 || offset >= kGartWorkSize) return false;",
+                "if (stage < kGartStage || (offset & 3) != 0) return false;"),
+            "gartRingWord(512 + i) == frame[i]": ("                              kSdmaOpTrap,\n",
+                                                  "                              kSdmaOpNop,\n"),
+            "kGartUnexpectedState": ("if ((*value & mask) != (expected & mask)) return kGartUnexpectedState;",
+                                     "(void)mask;"),
+            "17, &index, &value) == kOK)\n": ("               ? ~kHubpInBlank\n", "               ? 0xFFFFFFFFu\n"),
+            "kGartSemaphoreTimeout": ("        if ((semaphore & 1) != 0) break;\n", "        break;\n"),
+            "kGartAckTimeout": ("if (i == kGartPollPauses) status = kGartAckTimeout;", "if (i == kGartPollPauses) break;"),
+            "!g.r.semHeld": ("    Status release = writeRegister(writer, stage, kRegVmInvalidateEng17Sem, 0);",
+                             "    Status release = kOK;"),
+            "kGartFault": ("if (report->faultStatus != 0) return kGartFault;", ""),
+            "kIhNoTrap": ("if (report->sdmaTraps == 0) return kIhNoTrap;", ""),
+            "report.gartFirst == kIhRingPage + 0x800": ("ok = wrapped || offset - kIhRingPage < end || value == 0;",
+                                                         "ok = true;"),
+            "report.displayChanged == 1": ("!= (display[i] & displayMask(i)) &&",
+                                           "!= (display[i] & displayMask(i) & 0) + (value & displayMask(i)) &&"),
+            "kRegMmhubVmContext0Cntl && g.w.values[before + 10]": (
+                "        note(writeRegister(writer, stage, context.offset, context.boot22));\n", "        (void)context;\n"),
+            "ihWptr == 0x20": ("        if (offset == kRegIhRbWptr) {", "        if (false) {"),
+            "g.w.writes == before + 21 + 2 && g.w.offsets[before] == kRegMmhubVmContext0Cntl": (
+                "    if (progress >= 2) {\n        note(writeRegister(writer, stage, kRegIhRbCntl, kIhRbCntlOff));",
+                "    if (progress >= 1) {\n        note(writeRegister(writer, stage, kRegIhRbCntl, kIhRbCntlOff));"),
         }
         for expected, mutation in mutants.items():
             with self.subTest(expected):
@@ -138,8 +172,13 @@ class CoreTests(unittest.TestCase):
         source = (CORE / "cezanne_core.cpp").read_text()
         # The only calls of the write callbacks: writeRegister after the
         # register allowlist, writeWork after the work-area allowlist,
-        # writeFirmwareWord after the firmware-buffer allowlist.
-        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 4)
+        # writeFirmwareWord after the firmware-buffer allowlist, and the SDMA
+        # and GART work-area words after theirs.
+        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 5)
+        for helper, check in (("writeSdmaWorkWord", "sdmaWorkWriteAllowed(offset, value, stage)"),
+                              ("writeGartWorkWord", "gartWorkWriteAllowed(offset, value, stage)")):
+            body = re.search(r"static Status %s\(.*?\n}\n" % helper, source, re.S).group(0)
+            self.assertLess(body.index(check), body.index("write32"), helper)
         firmware = re.search(r"static Status writeFirmwareWord\(.*?\n}\n", source, re.S).group(0)
         self.assertLess(firmware.index("sdmaFirmwareWriteAllowed(image, offset, value, stage)"),
                         firmware.index("write32"))
@@ -150,9 +189,18 @@ class CoreTests(unittest.TestCase):
         self.assertLess(body.index("writeAllowed"), body.index("write32"))
         # Scratch pattern and restore; SMU response, argument and message; PSP
         # arguments (C2PMSG_69, _70, _71) and command; the ring write pointer.
-        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 15)
+        # Stage 17 adds the GART, IH and SDMA0_CNTL writes, the flush's request
+        # and release, frame 2's write pointer, and their restores.
+        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 26)
         allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
-        self.assertEqual(allow.count("return"), 14)
+        self.assertEqual(allow.count("return"), 15)
+        self.assertIn("if (stage >= kGartStage && gartWriteListed(offset, value)) return true;", allow)
+        # The semaphore is read only by the flush, through the reader directly
+        # (never the allowlisted read), after its own stage check.
+        self.assertEqual(source.count("kRegVmInvalidateEng17Sem, &"), 1)
+        flush = re.search(r"Status flushGart\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("registers.read32(registers.context, kRegVmInvalidateEng17Sem, &semaphore)", flush)
+        self.assertLess(flush.index("semaphoreReadAllowed(kRegVmInvalidateEng17Sem, stage)"), flush.index("read32"))
         self.assertIn("if (stage >= kScratchStage && offset == kRegScratchReg0) return true;", allow)
         self.assertIn("if (offset == kRegMp1C2PMsg90) return value == 0;", allow)
         # Every SMU message is checked against its argument before any write.

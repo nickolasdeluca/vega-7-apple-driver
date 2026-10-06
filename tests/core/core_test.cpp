@@ -126,6 +126,27 @@ struct FakeRegisters {
     {
         for (uint32_t i = 0; i < kSdmaInventoryCount; i++) sdma[kSdmaInventory[i]] = kSdmaBoot19[i];
     }
+    // A fake MMHUB VM and IH (stage 17): registers preset to boot 22, the
+    // engine 17 semaphore, and the GART work area it translates through and
+    // posts IH entries into.
+    std::map<uint32_t, uint32_t> gart;
+    FakeMemory *gartWork = nullptr;
+    bool semHeld = false;
+    int semBusy = 0; // reads that find the semaphore taken; -1 always
+    int semReads = 0;
+    int ackDelay = 0, ackPending = -1; // pauses before ACK; -1 never
+    int flushes = 0, unsafeRequests = 0;
+    bool tlbValid = false;
+    bool ihDropTrap = false, ihOtherEntry = false, dummyStray = false;
+    uint32_t displayFlip = 0; // XORed into pipe 0's DCHUBP_CNTL on each pause
+    void presetBoot22()
+    {
+        for (const GartWrite &w : kGartEnable) gart[w.offset] = w.boot22;
+        for (const GartWrite &w : kIhEnable) gart[w.offset] = w.boot22;
+        for (uint32_t i = 0; i < 11; i++) gart[kDisplayInventory[i]] = kDisplayPipe0Boot22[i];
+        gart[kRegVmInvalidateEng17Ack] = 0;
+        gart[kRegVmL2ProtectionFaultStatus] = 0;
+    }
     bool fail = false;
     uint32_t order[32];
     int reads = 0;
@@ -136,9 +157,26 @@ struct FakeRegisters {
         if (self->reads < 32) self->order[self->reads] = offset;
         self->reads++;
         if (self->fail) return false;
+        if (offset == kRegVmInvalidateEng17Sem) {
+            // A read that finds it free acquires it.
+            self->semReads++;
+            if (self->semBusy != 0) {
+                if (self->semBusy > 0) self->semBusy--;
+                *value = 0;
+                return true;
+            }
+            *value = self->semHeld ? 0 : 1;
+            self->semHeld = true;
+            return true;
+        }
         auto preset = self->sdma.find(offset);
         if (preset != self->sdma.end()) {
             *value = preset->second;
+            return true;
+        }
+        auto vm = self->gart.find(offset);
+        if (vm != self->gart.end()) {
+            *value = vm->second;
             return true;
         }
         *value = offset == kRegC2PMsg33        ? self->c2pmsg33
@@ -710,14 +748,14 @@ struct FakeWriter {
     FakeRegisters *registers;
     bool fail = false;
     uint32_t pauseWrites = 0; // non-zero: value something else writes during the pause
-    uint32_t offsets[64], values[64];
+    uint32_t offsets[512], values[512];
     int writes = 0;
 
     explicit FakeWriter(FakeRegisters *r) : registers(r) {}
     static bool write32(void *context, uint32_t offset, uint32_t value)
     {
         FakeWriter *self = static_cast<FakeWriter *>(context);
-        if (self->writes < 64) {
+        if (self->writes < 512) {
             self->offsets[self->writes] = offset;
             self->values[self->writes] = value;
         }
@@ -732,6 +770,8 @@ struct FakeWriter {
             r->smuPending = r->smuDelay;
             if (r->smuPending == 0) answer(r);
         }
+        if (offset == kRegVmInvalidateEng17Sem || offset == kRegVmInvalidateEng17Req || r->gart.count(offset) != 0)
+            mmhub(r, offset, value);
         if (offset == kRegMp0C2PMsg69) r->psp69 = value;
         if (offset == kRegMp0C2PMsg70) r->psp70 = value;
         if (offset == kRegMp0C2PMsg71) r->psp71 = value;
@@ -777,18 +817,59 @@ struct FakeWriter {
         }
         r->smuPending = -1;
     }
+    // The semaphore, the invalidation engine and the other MMHUB and IH
+    // registers.
+    static void mmhub(FakeRegisters *r, uint32_t offset, uint32_t value)
+    {
+        if (offset == kRegVmInvalidateEng17Sem) {
+            if (value == 0) r->semHeld = false;
+            return;
+        }
+        if (offset == kRegVmInvalidateEng17Req) {
+            if (!r->semHeld) r->unsafeRequests++;
+            r->flushes++;
+            r->tlbValid = (r->gart[kRegMmhubVmContext0Cntl] & 1) != 0;
+            r->gart[kRegVmInvalidateEng17Ack] = r->ackDelay == 0 ? 1 : 0;
+            r->ackPending = r->ackDelay == 0 ? -1 : r->ackDelay;
+            return;
+        }
+        r->gart[offset] = value;
+        if (offset == kRegIhRbCntl && (value & 1) != 0 && r->ihOtherEntry) postIh(r, 0x1234);
+    }
+    // Writes one IH entry at the write pointer and the pointer's write-back.
+    static void postIh(FakeRegisters *r, uint32_t dw0)
+    {
+        if (r->gartWork == nullptr || (r->gart[kRegIhRbCntl] & 1) == 0) return;
+        uint32_t wptr = r->gart[kRegIhRbWptr], at = (kIhRingPage + (wptr & (kIhRingBytes - 1))) / 4;
+        for (uint32_t k = 0; k < kIhEntryBytes / 4; k++) r->gartWork->words[at + k] = k == 0 ? dw0 : 0x100 + k;
+        wptr = (wptr + kIhEntryBytes) & kIhWptrOffsetMask;
+        r->gart[kRegIhRbWptr] = wptr;
+        r->gartWork->words[kIhWbPage / 4] = wptr;
+    }
     // Executes the SDMA ring between two write pointers (bytes) if the
-    // engine is unhalted with its ring enabled: WRITE, COPY, FENCE and NOP,
-    // at GPU addresses inside the work area only.
+    // engine is unhalted with its ring enabled: WRITE, COPY, FENCE, TRAP and
+    // NOP, at GPU addresses inside the work area, or GART addresses that
+    // translate there through a flushed context 0 (a VM fault otherwise).
     static void runSdma(FakeRegisters *r, uint32_t from, uint32_t to)
     {
         if (r->sdmaWork == nullptr || r->sdma[kRegSdma0F32Cntl] != 0 || (r->sdma[kRegSdma0GfxRbCntl] & 1) == 0) return;
         uint32_t *m = r->sdmaWork->words;
-        auto at = [](uint32_t lo, uint32_t hi) -> int64_t {
+        auto at = [r](uint32_t lo, uint32_t hi) -> int64_t {
             uint64_t a = (uint64_t(hi) << 32) | lo;
-            return a >= kSdmaWorkGpuAddress && a < kSdmaWorkGpuAddress + kSdmaWorkCheckSize
-                       ? int64_t((a - kSdmaWorkGpuAddress) / 4)
-                       : -1;
+            if (a >= kSdmaWorkGpuAddress && a < kSdmaWorkGpuAddress + kSdmaWorkCheckSize)
+                return int64_t((a - kSdmaWorkGpuAddress) / 4);
+            if (r->gartWork != nullptr && a < uint64_t(kGartTableEntries) * kPageSize) {
+                const uint32_t *t = r->gartWork->words;
+                uint64_t pte = (uint64_t(t[(a >> 12) * 2 + 1]) << 32) | t[(a >> 12) * 2];
+                uint64_t base = (uint64_t(r->gart[kRegVmContext0PageTableBaseAddrHi32]) << 32) |
+                                r->gart[kRegVmContext0PageTableBaseAddrLo32];
+                uint64_t p = (pte & 0x0000FFFFFFFFF000ull) + (a & 0xFFF);
+                if (r->tlbValid && (r->gart[kRegMmhubVmContext0Cntl] & 1) != 0 && base == (kGartTableAddress | 1) &&
+                    (pte & 1) != 0 && p >= kSdmaWorkPhysical && p < kSdmaWorkPhysical + kSdmaWorkCheckSize)
+                    return int64_t((p - kSdmaWorkPhysical) / 4);
+                r->gart[kRegVmL2ProtectionFaultStatus] = 1;
+            }
+            return -1;
         };
         uint32_t d = from / 4;
         while (d < to / 4) {
@@ -807,6 +888,10 @@ struct FakeWriter {
                 int64_t w = at(m[d + 1], m[d + 2]);
                 if (w >= 0) m[w] = m[d + 3];
                 d += 4;
+            } else if (op == kSdmaOpTrap) {
+                if ((r->sdma[kRegSdma0Cntl] & 1) != 0 && !r->ihDropTrap) postIh(r, 0x0000E008u);
+                if (r->dummyStray && r->gartWork != nullptr) r->gartWork->words[kGartDummyPage / 4] = 1;
+                d += 2;
             } else {
                 d += 1;
             }
@@ -837,6 +922,8 @@ struct FakeWriter {
         if (r->pspPending > 0 && --r->pspPending == 0) r->psp64 = r->pspReply;
         if (r->framePending > 0 && --r->framePending == 0) process(r);
         if (r->mutateOnPause != nullptr) r->mutateOnPause->words[100] ^= 1;
+        if (r->ackPending > 0 && --r->ackPending == 0) r->gart[kRegVmInvalidateEng17Ack] = 1;
+        if (r->displayFlip != 0) r->gart[kRegHubp0DchubpCntl] ^= r->displayFlip;
         r->pauses++;
     }
     RegisterWriter writer() { return RegisterWriter{write32, pause, this}; }
@@ -1829,6 +1916,274 @@ static void testInventory16()
     CHECK(writeAllowed(kRegSdma0F32Cntl, 1, 16) && !writeAllowed(kRegIhRbCntl, 0, 16));
 }
 
+// A stage 17 rig: the stage 15 copy done on the fake engine, the fake MMHUB
+// and IH at boot 22, both work areas filled with a pattern (the snapshots).
+struct GartRig {
+    FakeRegisters r;
+    FakeMemory work, gartWork;
+    FakeWriter w{&r};
+    uint32_t display[kDisplayInventoryCount];
+    uint32_t progress = 0, ack = 0;
+    static uint32_t sdmaSnapshot[kSdmaWorkCheckSize / 4], gartSnapshot[kGartWorkCheckSize / 4];
+    GartRig()
+    {
+        r.presetBoot19();
+        r.presetBoot22();
+        r.fbOffset = 0x5c0;
+        for (uint32_t i = 0; i < kSdmaWorkCheckSize / 4; i++) work.words[i] = sdmaSnapshot[i] = 0x9E3779B9u * i;
+        for (uint32_t i = 0; i < kGartWorkCheckSize / 4; i++) gartWork.words[i] = gartSnapshot[i] = 0x7F4A7C15u * i;
+        r.sdmaWork = &work;
+        r.gartWork = &gartWork;
+        uint32_t up = 0, observed = 0;
+        CHECK(writeSdmaWork(work.reader(), work.writer(), 17) == kOK);
+        CHECK(startSdma(r.reader(), 0x80000, w.writer(), 17, &progress, &up) == kOK);
+        CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 17, 0, &observed) == kOK);
+        CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 17, 1, &observed) == kOK);
+        progress = 0;
+    }
+    // Check, both work areas, enable.
+    Status enable(bool table = true)
+    {
+        uint32_t index = 0, value = 0;
+        Status status = checkGartBoot22(r.reader(), 0x80000, 17, &index, &value);
+        if (status == kOK) status = readDisplayInventory(r.reader(), 0x80000, 17, display);
+        if (status == kOK && table) status = writeGartWork(gartWork.reader(), gartWork.writer(), 17);
+        if (status == kOK) status = writeSdmaFrame2(work.reader(), work.writer(), 17);
+        if (status == kOK) status = enableGart(r.reader(), 0x80000, w.writer(), 17, &progress, &ack);
+        return status;
+    }
+    Status submit(uint32_t *observed) { return submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 17, 2, observed); }
+    Status verify(GartReport *report)
+    {
+        return verifyGart(r.reader(), 0x80000, work.reader(), sdmaSnapshot, gartWork.reader(), gartSnapshot, display,
+                          w.writer(), 17, report);
+    }
+};
+uint32_t GartRig::sdmaSnapshot[kSdmaWorkCheckSize / 4], GartRig::gartSnapshot[kGartWorkCheckSize / 4];
+
+static void testGart()
+{
+    // The pinned values (docs/test-boot.md, stage 17).
+    CHECK(kGartWorkGpuAddress == 0xF440800000ull && kGartWorkPhysical == 0x600800000ull);
+    CHECK(kPspTmrPhysical + kPspTmrSize == kGartWorkPhysical);
+    CHECK(kGartPte0 == 0x0600000600302073ull);
+    CHECK(kGartEnable[0].value == 0x00800001u && kGartEnable[1].value == 0x6 && kGartEnable[4].value == 0x1ff);
+    CHECK(kGartEnable[6].value == 0x600801u && kGartEnable[7].value == 0 && kGartEnable[8].value == 0x600801u);
+    CHECK(kGartEnable[kGartContext0Index].offset == kRegMmhubVmContext0Cntl);
+    CHECK(kIhEnable[0].value == 0xF4408020u && kIhEnable[1].value == 0 && kIhEnable[2].offset == kRegIhRbCntl);
+    CHECK(kIhEnable[3].value == 0x40803000u && kIhEnable[4].value == 0xF4);
+    CHECK(kIhRbCntlOn == (kIhRbCntlOff | 1) && (kIhRbCntlOn & 0x20000) == 0); // ENABLE_INTR stays 0
+    CHECK(kRegVmInvalidateEng17Sem == (0x1A000 + 0x6e2) * 4 && kRegVmInvalidateEng17Req == (0x1A000 + 0x6f4) * 4);
+    CHECK(kRegVmInvalidateEng17AddrRangeLo32 == kRegVmInvalidateEng0AddrRangeLo32 + 17 * 8);
+    CHECK(kGartCheckCount == 21 + 8 + 1 + 11);
+
+    // Reads: the engine 17 range from stage 17; the semaphore never through
+    // the allowlist, only through the flush's own grant.
+    CHECK(registerAllowed(kRegVmInvalidateEng17AddrRangeHi32, 17) && !registerAllowed(kRegVmInvalidateEng17AddrRangeHi32, 16));
+    CHECK(!registerAllowed(kRegVmInvalidateEng17Sem, 17) && !registerAllowed(kRegVmInvalidateEng17Req, 17));
+    CHECK(semaphoreReadAllowed(kRegVmInvalidateEng17Sem, 17) && !semaphoreReadAllowed(kRegVmInvalidateEng17Sem, 16));
+    CHECK(!semaphoreReadAllowed(kRegVmInvalidateEng17Ack, 17));
+    // Writes: each value and its restore from stage 17 only; nothing else.
+    for (const GartWrite &g : kGartEnable)
+        CHECK(writeAllowed(g.offset, g.value, 17) && writeAllowed(g.offset, g.boot22, 17) &&
+              !writeAllowed(g.offset, g.value, 16) && !writeAllowed(g.offset, g.value ^ 0x100, 17));
+    for (const GartWrite &g : kIhEnable)
+        CHECK(writeAllowed(g.offset, g.value, 17) && writeAllowed(g.offset, g.boot22, 17) && !writeAllowed(g.offset, g.value, 16));
+    CHECK(writeAllowed(kRegIhRbCntl, kIhRbCntlOn, 17) && !writeAllowed(kRegIhRbCntl, kIhRbCntlOn | 0x20000, 17));
+    CHECK(writeAllowed(kRegVmInvalidateEng17Req, 0x007c0001u, 17) && !writeAllowed(kRegVmInvalidateEng17Req, 0x007c0002u, 17));
+    CHECK(writeAllowed(kRegVmInvalidateEng17Sem, 0, 17) && !writeAllowed(kRegVmInvalidateEng17Sem, 1, 17));
+    CHECK(writeAllowed(kRegSdma0Cntl, 3, 17) && !writeAllowed(kRegSdma0Cntl, 3, 16) && writeAllowed(kRegSdma0Cntl, 2, 17));
+    CHECK(writeAllowed(kRegSdma0GfxRbWptr, 3072, 17) && !writeAllowed(kRegSdma0GfxRbWptr, 3072, 16));
+    CHECK(!writeAllowed(kRegSdma0GfxRbWptr, 4096, 17) && !writeAllowed(kRegIhChicken, 0, 17));
+    CHECK(!writeAllowed(kRegVmL2ProtectionFaultCntl, 0x3ffffffc, 17) && !writeAllowed(kRegInterruptCntl, 0, 17));
+    // Every stage 17 register write lands in the mapped page set.
+    auto inPages = [](uint32_t offset) {
+        for (uint32_t page : kGartPages)
+            if (offset >= page && offset + 4 <= page + kPageSize) return true;
+        return false;
+    };
+    for (const GartWrite &g : kGartEnable) CHECK(inPages(g.offset));
+    for (const GartWrite &g : kIhEnable) CHECK(inPages(g.offset));
+    CHECK(inPages(kRegVmInvalidateEng17Sem) && inPages(kRegVmInvalidateEng17Req) && inPages(kRegSdma0Cntl));
+    CHECK(inPages(kRegSdma0GfxRbWptr) && inPages(kRegSdma0GfxRbWptrHi) && inPages(kRegIhRbCntl));
+    // Memory images and their allowlists.
+    const uint32_t frame[] = {1, 4095, 0, 0, 0, 0x40304000u, 0xF4, 5, 0x40301204u, 0xF4, 2, 6, 0};
+    for (uint32_t i = 0; i < 13; i++) CHECK(gartRingWord(512 + i) == frame[i]);
+    for (uint32_t i = 525; i < 1024; i++) CHECK(gartRingWord(i) == 0);
+    for (uint32_t i = 0; i < 512; i++) CHECK(gartRingWord(i) == sdmaRingWord(i));
+    CHECK(sdmaWorkWriteAllowed(512 * 4, 1, 17) && !sdmaWorkWriteAllowed(512 * 4, 1, 16) &&
+          !sdmaWorkWriteAllowed(515 * 4, 1, 17));
+    CHECK(sdmaWorkWriteAllowed(kSdmaDst2Page, 0, 17) && !sdmaWorkWriteAllowed(kSdmaDst2Page, 0, 16) &&
+          !sdmaWorkWriteAllowed(kSdmaDst2Page, 1, 17) && !sdmaWorkWriteAllowed(kGartSdmaWorkSize, 0, 17));
+    CHECK(gartWorkWord(0) == 0x00302073u && gartWorkWord(4) == 0x06000006u && gartWorkWord(8) == 0);
+    CHECK(gartWorkWriteAllowed(0, 0x00302073u, 17) && !gartWorkWriteAllowed(0, 0x00302073u, 16));
+    CHECK(!gartWorkWriteAllowed(0, 0, 17) && gartWorkWriteAllowed(kIhWbPage, 0, 17) && !gartWorkWriteAllowed(kGartWorkSize, 0, 17));
+    {
+        FakeRegisters r;
+        r.fbOffset = 0x5c0;
+        uint8_t data[20];
+        putCells(data, 0x82000024u, 0xfca00000ull, 0x80000ull);
+        Range ranges[1];
+        uint32_t count = 0;
+        MetricsTarget t;
+        CHECK(parseAssignedAddresses(data, sizeof(data), ranges, 1, &count) == kOK);
+        CHECK(checkGartWorkTarget(r.reader(), 0x80000, 17, ranges, count, &t) == kOK && t.physical == 0x600800000ull);
+        CHECK(checkGartWorkTarget(r.reader(), 0x80000, 16, ranges, count, &t) == kRegisterNotAllowed);
+    }
+
+    // The whole stage against the fakes.
+    {
+        GartRig g;
+        int before = g.w.writes;
+        CHECK(g.enable() == kOK && g.progress == 3 && g.ack == 1);
+        CHECK(g.w.writes == before + 21 + 2 + 8 + 1 + 1);
+        CHECK(g.w.offsets[before] == kRegVmContext0PageTableBaseAddrLo32 && g.w.values[before] == 0x00800001u);
+        // The flush: request while holding the semaphore, then the release.
+        CHECK(g.w.offsets[before + 21] == kRegVmInvalidateEng17Req && g.w.offsets[before + 22] == kRegVmInvalidateEng17Sem);
+        CHECK(g.r.flushes == 1 && g.r.unsafeRequests == 0 && !g.r.semHeld && g.r.semReads == 1);
+        CHECK(g.w.offsets[before + 31] == kRegIhRbCntl && g.w.values[before + 31] == kIhRbCntlOn);
+        CHECK(g.w.offsets[before + 32] == kRegSdma0Cntl && g.w.values[before + 32] == 3);
+        uint32_t observed = 0;
+        CHECK(g.submit(&observed) == kOK && observed == 2);
+        GartReport report;
+        CHECK(g.verify(&report) == kOK);
+        CHECK(report.rptr == 3072 && report.fence2 == 2 && report.faultStatus == 0 && report.sdmaTraps == 1);
+        CHECK(report.ihEntries == 1 && report.otherEntries == 0 && report.ihWriteback == 32 && report.ihWptr == 32);
+        CHECK((report.ring[0] & 0xFFFF) == 0xE008 && report.sdmaUnexpected == 0 && report.gartUnexpected == 0);
+        for (uint32_t i = 0; i < 1024; i++) CHECK(g.work.words[kSdmaDst2Page / 4 + i] == 0x5A5A0000u + i);
+        before = g.w.writes;
+        CHECK(restoreGart(g.r.reader(), 0x80000, g.w.writer(), 17, g.progress, &g.ack) == kOK);
+        CHECK(g.w.writes == before + 1 + 8 + 1 + 21 + 2);
+        CHECK(g.w.offsets[before] == kRegIhRbCntl && g.w.values[before] == kIhRbCntlOff);
+        CHECK(g.w.offsets[before + 9] == kRegSdma0Cntl && g.w.values[before + 9] == 2);
+        // VM_CONTEXT0_CNTL first among the GART registers, then a second flush.
+        CHECK(g.w.offsets[before + 10] == kRegMmhubVmContext0Cntl && g.w.values[before + 10] == 0x007ffe80u);
+        CHECK(g.r.flushes == 2 && g.r.unsafeRequests == 0 && !g.r.semHeld);
+        uint32_t index = 9, value = 9, ihWptr = 0;
+        CHECK(checkGartRestored(g.r.reader(), 0x80000, 17, &index, &value, &ihWptr) == kOK && ihWptr == 0x80000);
+        g.r.gart[kRegIhRbWptr] = 0x20; // the IH's own pointer is reported only
+        CHECK(checkGartRestored(g.r.reader(), 0x80000, 17, &index, &value, &ihWptr) == kOK && ihWptr == 0x20);
+        g.r.gart[kRegMmhubVmContext0Cntl] = 0x007ffe01u;
+        CHECK(checkGartRestored(g.r.reader(), 0x80000, 17, &index, &value, &ihWptr) == kGartNotRestored);
+        CHECK(index == kGartContext0Index && value == 0x007ffe01u);
+    }
+    {
+        // Preconditions: a changed register stops before any write; the live
+        // HUBP_IN_BLANK bit does not.
+        GartRig g;
+        uint32_t index = 0, value = 0;
+        g.r.gart[kRegHubp0DchubpCntl] |= kHubpInBlank;
+        CHECK(checkGartBoot22(g.r.reader(), 0x80000, 17, &index, &value) == kOK);
+        g.r.gart[kRegHubp0DchubpCntl] ^= 1;
+        CHECK(checkGartBoot22(g.r.reader(), 0x80000, 17, &index, &value) == kGartUnexpectedState);
+        CHECK(index == 21 + 8 + 1 + kDchubpCntlIndex);
+        g.r.gart[kRegHubp0DchubpCntl] ^= 1;
+        g.r.gart[kRegVmL2Cntl3] = 0x8014800cu;
+        CHECK(checkGartBoot22(g.r.reader(), 0x80000, 17, &index, &value) == kGartUnexpectedState);
+        CHECK(index == 14 && value == 0x8014800cu);
+        g.r.gart[kRegVmL2Cntl3] = 0x80100007u;
+        g.r.sdma[kRegSdma0Cntl] = 3;
+        CHECK(checkGartBoot22(g.r.reader(), 0x80000, 17, &index, &value) == kGartUnexpectedState && index == 29);
+        int before = g.w.writes;
+        CHECK(g.enable() == kGartUnexpectedState && g.w.writes == before && g.r.semReads == 0);
+        CHECK(checkGartBoot22(g.r.reader(), 0x80000, 16, &index, &value) == kRegisterNotAllowed);
+    }
+    {
+        // A semaphore that never frees: no request, no release.
+        GartRig g;
+        g.r.semBusy = -1;
+        int before = g.w.writes;
+        CHECK(g.enable() == kGartSemaphoreTimeout && g.progress == 1);
+        CHECK(g.w.writes == before + 21 && g.r.flushes == 0 && g.r.semReads == int(kGartPollPauses) + 1);
+        // The restore still writes everything back, and its flush times out too.
+        CHECK(restoreGart(g.r.reader(), 0x80000, g.w.writer(), 17, g.progress, &g.ack) == kGartSemaphoreTimeout);
+        CHECK(g.w.writes == before + 21 + 21);
+        for (const GartWrite &e : kGartEnable) CHECK(g.r.gart[e.offset] == e.boot22);
+    }
+    {
+        // An ACK that never comes: the semaphore is released anyway.
+        GartRig g;
+        g.r.ackDelay = -1;
+        CHECK(g.enable() == kGartAckTimeout && !g.r.semHeld);
+        CHECK(g.w.offsets[g.w.writes - 1] == kRegVmInvalidateEng17Sem && g.w.values[g.w.writes - 1] == 0);
+        // A late ACK is waited for.
+        GartRig h;
+        h.r.ackDelay = 5;
+        CHECK(h.enable() == kOK && h.ack == 1);
+    }
+    {
+        // No page table: the GART read faults.
+        GartRig g;
+        uint32_t observed = 0;
+        CHECK(g.enable(false) == kOK && g.submit(&observed) == kOK);
+        GartReport report;
+        CHECK(g.verify(&report) == kGartFault && report.faultStatus == 1);
+    }
+    {
+        // A trap that never reaches the ring is waited for, then reported.
+        GartRig g;
+        g.r.ihDropTrap = true;
+        uint32_t observed = 0;
+        CHECK(g.enable() == kOK && g.submit(&observed) == kOK);
+        int pauses = g.r.pauses;
+        GartReport report;
+        CHECK(g.verify(&report) == kIhNoTrap && g.r.pauses == pauses + int(kSdmaPollPauses));
+    }
+    {
+        // Another client's entry is recorded beside the trap.
+        GartRig g;
+        g.r.ihOtherEntry = true;
+        uint32_t observed = 0;
+        CHECK(g.enable() == kOK && g.submit(&observed) == kOK);
+        GartReport report;
+        CHECK(g.verify(&report) == kOK && report.ihEntries == 2 && report.sdmaTraps == 1 && report.otherEntries == 1);
+        CHECK(report.ring[0] == 0x1234 && (report.ring[8] & 0xFFFF) == 0xE008);
+    }
+    {
+        // A stray write to the dummy page, a changed display, and a wrong
+        // copy are each caught; the live blank bit is not.
+        GartRig g;
+        g.r.dummyStray = true;
+        g.r.displayFlip = kHubpInBlank;
+        uint32_t observed = 0;
+        CHECK(g.enable() == kOK && g.submit(&observed) == kOK);
+        GartReport report;
+        CHECK(g.verify(&report) == kGartVerifyFailed && report.gartUnexpected == 1 && report.gartFirst == kGartDummyPage);
+        CHECK(report.displayChanged == 0);
+        g.r.dummyStray = false;
+        g.gartWork.words[kGartDummyPage / 4] = 0;
+        g.r.gart[kRegHubp0DcsurfSurfaceConfig] = 0x9;
+        CHECK(g.verify(&report) == kGartVerifyFailed && report.displayChanged == 1 && report.displayFirst == 6);
+        g.r.gart[kRegHubp0DcsurfSurfaceConfig] = 0x8;
+        g.gartWork.words[(kIhRingPage + 0x800) / 4] = 5; // past the write pointer
+        CHECK(g.verify(&report) == kGartVerifyFailed && report.gartFirst == kIhRingPage + 0x800);
+        g.gartWork.words[(kIhRingPage + 0x800) / 4] = 0;
+        g.work.words[kSdmaDst2Page / 4 + 3] ^= 1;
+        CHECK(g.verify(&report) == kGartVerifyFailed && report.sdmaUnexpected == 1 &&
+              report.sdmaFirst == kSdmaDst2Page + 12);
+    }
+    {
+        // Restore by progress: GART only, then nothing.
+        GartRig g;
+        int before = g.w.writes;
+        CHECK(restoreGart(g.r.reader(), 0x80000, g.w.writer(), 17, 1, &g.ack) == kOK);
+        CHECK(g.w.writes == before + 21 + 2 && g.w.offsets[before] == kRegMmhubVmContext0Cntl);
+        before = g.w.writes;
+        CHECK(restoreGart(g.r.reader(), 0x80000, g.w.writer(), 17, 0, &g.ack) == kOK && g.w.writes == before);
+        CHECK(restoreGart(g.r.reader(), 0x80000, g.w.writer(), 16, 3, &g.ack) == kRegisterNotAllowed);
+    }
+    {
+        // Frame 2 needs stage 17, and its write pointer frame 1's.
+        GartRig g;
+        uint32_t observed = 0;
+        CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 16, 2, &observed) == kRegisterNotAllowed);
+        CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 17, 3, &observed) == kRegisterNotAllowed);
+        CHECK(writeSdmaFrame2(g.work.reader(), g.work.writer(), 16) == kRegisterNotAllowed);
+        CHECK(writeGartWork(g.gartWork.reader(), g.gartWork.writer(), 16) == kRegisterNotAllowed);
+        CHECK(enableGart(g.r.reader(), 0x80000, g.w.writer(), 16, &g.progress, &g.ack) == kRegisterNotAllowed);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -1853,6 +2208,7 @@ int main()
     testSdmaInventory();
     testSdmaCopy();
     testInventory16();
+    testGart();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

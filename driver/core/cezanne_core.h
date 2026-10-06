@@ -31,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 16;
+const uint32_t kMaxStage = 17;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -774,6 +774,110 @@ const SdmaWrite kSdmaStop[] = {
     {kRegSdma0F32Cntl, 0x00000001},
 };
 
+// Stage 17: GART (MMHUB VM context 0, one-level table) and IH ring 0, every
+// value pinned from boot 22 (docs/test-boot.md, stage 17). Offsets from
+// mmhub_1_0_offset.h (base 0x1A000); engine 17 is gmc_v9_0_flush_gpu_tlb's.
+const uint32_t kGartStage = 17;
+const uint32_t kRegVmInvalidateEng17Sem = 0x69b88; // VM_INVALIDATE_ENG17_SEM: read only inside the flush, a read acquires it
+const uint32_t kRegVmInvalidateEng17Req = 0x69bd0; // VM_INVALIDATE_ENG17_REQ: gmc_v9_0_flush_gpu_tlb, written only
+const uint32_t kRegVmInvalidateEng17AddrRangeLo32 = 0x69ca4; // VM_INVALIDATE_ENG17_ADDR_RANGE_LO32: program_invalidation
+const uint32_t kRegVmInvalidateEng17AddrRangeHi32 = 0x69ca8; // VM_INVALIDATE_ENG17_ADDR_RANGE_HI32: program_invalidation
+// Read from stage 17 on, in addition to kStage16Registers.
+const uint32_t kStage17Registers[] = {kRegVmInvalidateEng17AddrRangeLo32, kRegVmInvalidateEng17AddrRangeHi32};
+const uint32_t kStage17RegisterCount = sizeof(kStage17Registers) / sizeof(kStage17Registers[0]);
+// The GART work area: page table, dummy page, IH ring, IH write-pointer
+// write-back; just above the TMR.
+const uint64_t kGartWorkCarveoutOffset = 0x40800000ull;
+const uint64_t kGartWorkGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kGartWorkCarveoutOffset;
+const uint64_t kGartWorkPhysical = (uint64_t(kExpectedFbOffset) << 24) + kGartWorkCarveoutOffset;
+const uint32_t kGartWorkSize = 0x4000;
+const uint32_t kGartWorkCheckSize = 0x10000;
+const uint32_t kGartTablePage = 0x0000, kGartDummyPage = 0x1000, kIhRingPage = 0x2000, kIhWbPage = 0x3000;
+const uint32_t kIhRingBytes = 0x1000;  // RB_SIZE 10
+const uint32_t kIhEntryBytes = 32;     // vega10_ih_decode_iv: 8 dwords
+const uint32_t kIhWptrOverflow = 0x1;  // IH_RB_WPTR.RB_OVERFLOW
+const uint32_t kIhWptrOffsetMask = 0x3fffc; // IH_RB_WPTR.OFFSET, bytes
+// PTE 0 maps the stage 15 source page: VALID | SYSTEM | EXECUTABLE |
+// READABLE | WRITEABLE, MTYPE_UC (3) at bit 57; not SNOOPED.
+const uint64_t kGartPte0 = (kSdmaWorkPhysical + kSdmaSrcPage) | 0x73ull | (3ull << 57);
+const uint32_t kGartTableEntries = 512; // PAGE_TABLE_END_ADDR 0x1ff: 2 MiB of GART
+const uint64_t kGartTableAddress = kGartWorkPhysical + kGartTablePage;  // amdgpu_gmc_pd_addr: physical
+const uint64_t kGartDummyAddress = kGartWorkPhysical + kGartDummyPage;  // >> 12 for the default pages
+const uint64_t kIhRingGpuAddress = kGartWorkGpuAddress + kIhRingPage;
+const uint64_t kIhWbGpuAddress = kGartWorkGpuAddress + kIhWbPage;
+// The stage 15 work area grows by a second destination page and frame 2.
+const uint32_t kGartSdmaWorkSize = 0x5000;
+const uint32_t kSdmaDst2Page = 0x4000;
+const uint32_t kSdmaWbFence2 = 0x204;
+const uint64_t kGartSourceAddress = 0; // GART page 0, through PTE 0
+const uint32_t kSdmaOpTrap = 6;
+const uint32_t kSdmaFrame2Dwords = 13; // COPY 7, FENCE 4, TRAP 2
+const uint32_t kSdmaCntlTrap = 0x3;     // SDMA0_CNTL + TRAP_ENABLE (sdma_v4_0_set_trap_irq_state)
+const uint32_t kSdmaCntlBoot = 0x2;     // as kSdmaStart leaves it
+// IH entry dw0: client 8 (SOC15_IH_CLIENTID_SDMA0), source 224 (SDMA_TRAP).
+const uint32_t kIhClientSdma0 = 8, kIhSrcSdmaTrap = 224;
+// gmc_v9_0_get_invalidate_req(0, 0): VMID 0, L2 PTEs, PDE0-2, L1 PTEs.
+const uint32_t kGartInvalidateReq = 0x007c0001;
+const uint32_t kGartPollPauses = 100; // adev->usec_timeout, polled in 1 ms pauses
+struct GartWrite {
+    uint32_t offset, boot22, value;
+};
+// mmhub_v1_0_gart_enable's writes in Linux's order; restored to boot22.
+const GartWrite kGartEnable[] = {
+    {kRegVmContext0PageTableBaseAddrLo32, 0, uint32_t(kGartTableAddress | 1)},
+    {kRegVmContext0PageTableBaseAddrHi32, 0, uint32_t(kGartTableAddress >> 32)},
+    {kRegVmContext0PageTableStartAddrLo32, 0, 0},
+    {kRegVmContext0PageTableStartAddrHi32, 0, 0},
+    {kRegVmContext0PageTableEndAddrLo32, 0, kGartTableEntries - 1},
+    {kRegVmContext0PageTableEndAddrHi32, 0, 0},
+    {kRegMmhubDefaultAddrLsb, 0, uint32_t(kGartDummyAddress >> 12)},
+    {kRegMmhubDefaultAddrMsb, 0, uint32_t(kGartDummyAddress >> 44)},
+    {kRegVmL2ProtectionFaultDefaultAddrLo32, 0, uint32_t(kGartDummyAddress >> 12)},
+    {kRegVmL2ProtectionFaultDefaultAddrHi32, 0, uint32_t(kGartDummyAddress >> 44)},
+    {kRegVmL2ProtectionFaultCntl2, 0x000a0000, 0x000e0000},
+    {kRegMmhubMxL1TlbCntl, 0x00002501, 0x00003d59},
+    {kRegMmhubVmL2Cntl, 0x00080602, 0x00080603},
+    {kRegVmL2Cntl2, 0, 0x00000003},
+    {kRegVmL2Cntl3, 0x80100007, 0x8014800c},
+    {kRegVmL2Cntl4, 0x000000c1, 0x00000001},
+    {kRegMmhubVmContext0Cntl, 0x007ffe80, 0x007ffe01},
+    {kRegVmL2Context1IdentityApertureLowAddrLo32, 0, 0xffffffff},
+    {kRegVmL2Context1IdentityApertureLowAddrHi32, 0, 0x0000000f},
+    {kRegVmInvalidateEng17AddrRangeLo32, 0, 0xffffffff},
+    {kRegVmInvalidateEng17AddrRangeHi32, 0, 0x0000001f},
+};
+const uint32_t kGartEnableCount = sizeof(kGartEnable) / sizeof(kGartEnable[0]);
+const uint32_t kGartContext0Index = 16; // restored first
+// vega10_ih_enable_ring for ring 0 in Linux's order; restored to boot22.
+const GartWrite kIhEnable[] = {
+    {kRegIhRbBase, 0, uint32_t(kIhRingGpuAddress >> 8)},
+    {kRegIhRbBaseHi, 0, uint32_t(kIhRingGpuAddress >> 40) & 0xff},
+    {kRegIhRbCntl, 0x40610000, 0xc0110114},
+    {kRegIhRbWptrAddrLo, 0, uint32_t(kIhWbGpuAddress)},
+    {kRegIhRbWptrAddrHi, 0, uint32_t(kIhWbGpuAddress >> 32) & 0xffff},
+    {kRegIhRbWptr, 0x00080000, 0},
+    {kRegIhRbRptr, 0, 0},
+    {kRegIhDoorbellRptr, 0, 0},
+};
+const uint32_t kIhEnableCount = sizeof(kIhEnable) / sizeof(kIhEnable[0]);
+const uint32_t kIhRbCntlOff = 0xc0110114; // also the ring-off write that starts the restore
+const uint32_t kIhRbCntlOn = 0xc0110115;  // + RB_ENABLE; ENABLE_INTR stays 0
+// Display pipe 0 at boot 22 (kDisplayInventory's first 11). DCHUBP_CNTL's
+// HUBP_IN_BLANK (bit 3) is live and never compared.
+const uint32_t kDisplayPipe0Boot22[] = {0x80011301, 0x00000897, 0x00000464, 0x00c00840, 0x00290461, 0x000f0002,
+                                        0x00000008, 0x04380780, 0x00000780, 0x00000000, 0x000000f4};
+const uint32_t kHubpInBlank = 0x8;
+const uint32_t kDchubpCntlIndex = 5; // in each pipe's 11
+// The BAR5 pages the stage 17 operations may write: IH and SDMA0 (0x4000),
+// the MMHUB VM L2, context and engine 17 page, and the MMHUB MC page (L1
+// TLB and default address). The adapter maps these three for kGartPageSet.
+const uint32_t kGartPageSet = 0x69000;
+const uint32_t kGartPages[] = {0x4000, 0x69000, 0x6a000};
+// The precondition list: kGartEnable, kIhEnable, SDMA0_CNTL, display pipe 0.
+const uint32_t kGartCheckCount = kGartEnableCount + kIhEnableCount + 1 + 11;
+// The first IH entries reported by the verify.
+const uint32_t kIhReportEntries = 32;
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -864,6 +968,15 @@ enum Status : uint32_t {
     kSdmaUnexpectedState,
     kSdmaTimeout,
     kSdmaVerifyFailed,
+    // Stage 17.
+    kGartUnexpectedState,
+    kGartSemaphoreTimeout,
+    kGartAckTimeout,
+    kGartFault,
+    kIhNoTrap,
+    kGartVerifyFailed,
+    kGartNotRestored,
+    kGartOutOfOrder,
 };
 
 const char *statusName(Status status);
@@ -982,7 +1095,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 12;
+const uint32_t kDiagnosticVersion = 13;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -1017,11 +1130,18 @@ enum DiagnosticSelector : uint32_t {
     // Stage 15, after a LOAD_IP_FW that fenced (selector 18), in this order.
     kDiagnosticSdmaCopyCheck = 21, // out: Status, index of the first differing register, its value
     kDiagnosticSdmaStart = 22,     // out: Status, progress, PowerUpSdma response
-    kDiagnosticSdmaSubmit = 23,    // in: frame (0 ring test, 1 copy); out: Status, observed, GFX_RB_RPTR,
-                                   // GFX_RB_WPTR, F32_CNTL, STATUS_REG
+    kDiagnosticSdmaSubmit = 23,    // in: frame (0 ring test, 1 copy, 2 GART copy and trap from stage 17);
+                                   // out: Status, observed, GFX_RB_RPTR, GFX_RB_WPTR, F32_CNTL, STATUS_REG
     kDiagnosticSdmaVerify = 24,    // out: Status, GFX_RB_RPTR, unexpected words, first offset, STATUS_REG
     kDiagnosticSdmaStop = 25,      // out: Status, F32_CNTL, PowerDownSdma response, DESTROY_TMR fence, ring response
-    kDiagnosticSelectorCount = 26,
+                                   // (from stage 17 it first runs the GART restore if needed)
+    // Stage 17, after a passing stage 15 verify (selector 24), in this order;
+    // frame 2 is submitted with selector 23 between enable and verify.
+    kDiagnosticGartCheck = 26,   // out: Status, index into the precondition list, its value
+    kDiagnosticGartEnable = 27,  // out: Status, progress, ENG17_ACK
+    kDiagnosticGartVerify = 28,  // out: Status; structure: GartReport
+    kDiagnosticGartRestore = 29, // out: Status, index of the first register not restored, its value, IH_RB_WPTR
+    kDiagnosticSelectorCount = 30,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -1285,7 +1405,8 @@ uint32_t sdmaRingWord(uint32_t dword);
 // the source pattern, a zero destination.
 uint32_t sdmaWorkWord(uint32_t offset);
 
-// Work-area writes allowed from stage 15: only its own word.
+// Work-area writes allowed from stage 15: only its own word; from stage 17
+// also frame 2's words and zeros in the second destination page.
 bool sdmaWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage);
 
 // The work area and its check region: the stage 9 page checks.
@@ -1306,8 +1427,9 @@ Status startSdma(const RegisterReader &registers, uint64_t apertureLength, const
                  uint32_t stage, uint32_t *progress, uint32_t *upResponse);
 
 // Requires GFX_RB_WPTR at frame * 1024 bytes (kSdmaOutOfOrder), writes
-// (frame + 1) * 1024 and then GFX_RB_WPTR_HI 0 (the commit), and polls the frame's result word (the test value, or
-// fence 1) in the work area, up to kSdmaPollPauses (kSdmaTimeout).
+// (frame + 1) * 1024 and then GFX_RB_WPTR_HI 0 (the commit), and polls the
+// frame's result word (the test value, fence 1, or from stage 17 fence 2 for
+// frame 2) in the work area, up to kSdmaPollPauses (kSdmaTimeout).
 Status submitSdma(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                   const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *observed);
 
@@ -1323,6 +1445,95 @@ Status verifySdmaCopy(const RegisterReader &registers, uint64_t apertureLength, 
 // (progress >= 1). Attempts every step; returns the first failure.
 Status stopSdma(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                 uint32_t stage, uint32_t progress, uint32_t *downResponse);
+
+// Stage 17. VM_INVALIDATE_ENG17_SEM is never in the read allowlist: only
+// flushGart reads it, through a reader the adapter grants for the stage 17
+// page set alone.
+bool semaphoreReadAllowed(uint32_t offset, uint32_t stage);
+
+// Whether a register write is a kGartEnable or kIhEnable value or its boot
+// 22 value, the IH ring on or off, the engine 17 request or semaphore
+// release, SDMA0_CNTL with TRAP_ENABLE, or frame 2's write pointer (3072).
+bool gartWriteListed(uint32_t offset, uint32_t value);
+
+// The GART work area's word at a byte offset: PTE 0, else zero.
+uint32_t gartWorkWord(uint32_t offset);
+
+// GART work-area writes allowed from stage 17: only its own word.
+bool gartWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage);
+
+// The SDMA ring with frame 2 (COPY from GART 0 to the second destination,
+// FENCE 2, TRAP) at dwords 512..767; sdmaRingWord elsewhere.
+uint32_t gartRingWord(uint32_t dword);
+
+// The GART work area and its check region: the stage 9 page checks.
+Status checkGartWorkTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                           const Range *ranges, uint32_t rangeCount, MetricsTarget *target);
+
+// No writes. Requires every kGartEnable and kIhEnable register at its boot
+// 22 value, SDMA0_CNTL at kSdmaCntlBoot, and display pipe 0 at boot 22
+// (HUBP_IN_BLANK ignored): kGartUnexpectedState with the index into that
+// list and the value read.
+Status checkGartBoot22(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                       uint32_t *value);
+
+// Reads kDisplayInventory in order into values.
+Status readDisplayInventory(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                            uint32_t *values);
+
+// Writes the whole GART work area, then reads every word back
+// (kPspReadbackMismatch).
+Status writeGartWork(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage);
+
+// Writes frame 2 into the SDMA ring and zeroes the second destination, then
+// reads both back (kPspReadbackMismatch). work spans kGartSdmaWorkSize.
+Status writeSdmaFrame2(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage);
+
+// gmc_v9_0_flush_gpu_tlb for MMHUB engine 17: read the semaphore until it
+// reads 1 (kGartSemaphoreTimeout, nothing written), write the request, poll
+// ACK bit 0 (kGartAckTimeout), and always release the semaphore after an
+// acquire. kGartPollPauses each.
+Status flushGart(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                 uint32_t stage, uint32_t *ack);
+
+// kGartEnable, the flush, kIhEnable, the ring on, SDMA0_CNTL with
+// TRAP_ENABLE. progress: 1 once any GART register was written, 2 any IH
+// register, 3 SDMA0_CNTL.
+Status enableGart(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                  uint32_t stage, uint32_t *progress, uint32_t *ack);
+
+struct GartReport {
+    uint32_t rptr, fence2, faultStatus;
+    uint32_t ihWriteback, ihWptr, ihRptr;  // the write-back dword, IH_RB_WPTR, IH_RB_RPTR
+    uint32_t ihEntries, sdmaTraps, otherEntries;
+    uint32_t sdmaUnexpected, sdmaFirst, gartUnexpected, gartFirst;
+    uint32_t displayChanged, displayFirst; // index into kDisplayInventory
+    uint32_t ring[kIhReportEntries * kIhEntryBytes / 4];
+};
+
+// Reads only. Polls the IH write-back for an SDMA0 trap entry (up to
+// kSdmaPollPauses), then checks: GFX_RB_RPTR 3072, fence 2, no VM fault, the
+// trap, the SDMA region (stage 15 words, fence 2, both destinations equal to
+// the source, the snapshot beyond), the GART region (table and dummy page,
+// ring entries up to the write pointer and zero after it, the write-back
+// dword, the snapshot beyond), and the display inventory against display
+// (HUBP_IN_BLANK ignored). kGartFault, kIhNoTrap or kGartVerifyFailed.
+Status verifyGart(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &sdmaRegion,
+                  const uint32_t *sdmaSnapshot, const MemoryReader &gartRegion, const uint32_t *gartSnapshot,
+                  const uint32_t *display, const RegisterWriter &writer, uint32_t stage, GartReport *report);
+
+// Undoes enableGart by progress: the IH ring off and kIhEnable to boot 22
+// (progress >= 2), SDMA0_CNTL to kSdmaCntlBoot (3), then VM_CONTEXT0_CNTL
+// and the rest of kGartEnable to boot 22 and a second flush (>= 1).
+// Attempts every step; returns the first failure.
+Status restoreGart(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   uint32_t stage, uint32_t progress, uint32_t *ack);
+
+// No writes. Requires every kGartEnable and kIhEnable register and
+// SDMA0_CNTL back at boot 22 (kGartNotRestored with the index and value),
+// except IH_RB_WPTR, which the IH maintains: its value is reported.
+Status checkGartRestored(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                         uint32_t *value, uint32_t *ihWptr);
 
 } // namespace cezanne
 

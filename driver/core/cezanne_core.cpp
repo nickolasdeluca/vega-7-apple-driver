@@ -78,6 +78,14 @@ const char *statusName(Status status)
     case kSdmaUnexpectedState: return "sdma-unexpected-state";
     case kSdmaTimeout: return "sdma-timeout";
     case kSdmaVerifyFailed: return "sdma-verify-failed";
+    case kGartUnexpectedState: return "gart-unexpected-state";
+    case kGartSemaphoreTimeout: return "gart-semaphore-timeout";
+    case kGartAckTimeout: return "gart-ack-timeout";
+    case kGartFault: return "gart-fault";
+    case kIhNoTrap: return "ih-no-trap";
+    case kGartVerifyFailed: return "gart-verify-failed";
+    case kGartNotRestored: return "gart-not-restored";
+    case kGartOutOfOrder: return "gart-out-of-order";
     }
     return "unknown";
 }
@@ -167,6 +175,9 @@ bool registerAllowed(uint32_t offset, uint32_t stage)
                                   : 0;
     for (uint32_t i = 0; i < count; i++) {
         if (kStage16Registers[i] == offset) return true;
+    }
+    for (uint32_t i = 0; stage >= kGartStage && i < kStage17RegisterCount; i++) {
+        if (kStage17Registers[i] == offset) return true;
     }
     return false;
 }
@@ -431,6 +442,7 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (stage >= kScratchStage && offset == kRegScratchReg0) return true;
     if (stage < kSmuStage) return false;
     if (stage >= kSdmaCopyStage && sdmaWriteListed(offset, value)) return true;
+    if (stage >= kGartStage && gartWriteListed(offset, value)) return true;
     if (offset == kRegMp1C2PMsg90) return value == 0;
     if (offset == kRegMp1C2PMsg82)
         return value == 0 || (stage >= kMetricsStage && (value == uint32_t(kMetricsGpuAddress >> 32) ||
@@ -1201,13 +1213,16 @@ uint32_t sdmaWorkWord(uint32_t offset)
 
 bool sdmaWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
 {
-    if (stage < kSdmaCopyStage || (offset & 3) != 0 || offset >= kSdmaWorkSize) return false;
-    return value == sdmaWorkWord(offset);
+    if (stage < kSdmaCopyStage || (offset & 3) != 0) return false;
+    if (offset < kSdmaWorkSize && value == sdmaWorkWord(offset)) return true;
+    if (stage < kGartStage) return false;
+    // Stage 17: frame 2 in the ring, and the zeroed second destination.
+    if (offset >= 2 * kSdmaFrameDwords * 4 && offset < 3 * kSdmaFrameDwords * 4) return value == gartRingWord(offset / 4);
+    return offset >= kSdmaDst2Page && offset < kGartSdmaWorkSize && value == 0;
 }
 
-static Status writeSdmaWorkWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset)
+static Status writeSdmaWorkWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
 {
-    uint32_t value = sdmaWorkWord(offset);
     if (!sdmaWorkWriteAllowed(offset, value, stage)) return kRegisterNotAllowed;
     return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
 }
@@ -1246,7 +1261,7 @@ Status writeSdmaWork(const MemoryReader &work, const MemoryWriter &writer, uint3
 {
     if (stage < kSdmaCopyStage) return kRegisterNotAllowed;
     for (uint32_t offset = 0; offset < kSdmaWorkSize; offset += 4) {
-        Status status = writeSdmaWorkWord(writer, stage, offset);
+        Status status = writeSdmaWorkWord(writer, stage, offset, sdmaWorkWord(offset));
         if (status != kOK) return status;
     }
     for (uint32_t offset = 0; offset < kSdmaWorkSize; offset += 4) {
@@ -1281,7 +1296,7 @@ Status submitSdma(const RegisterReader &registers, uint64_t apertureLength, cons
                   const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *observed)
 {
     *observed = 0;
-    if (stage < kSdmaCopyStage || frame > 1) return kRegisterNotAllowed;
+    if (stage < kSdmaCopyStage || frame > 2 || (frame == 2 && stage < kGartStage)) return kRegisterNotAllowed;
     uint32_t pointer = 0;
     Status status = readRegister(registers, apertureLength, stage, kRegSdma0GfxRbWptr, &pointer);
     if (status != kOK) return status;
@@ -1291,8 +1306,8 @@ Status submitSdma(const RegisterReader &registers, uint64_t apertureLength, cons
     status = writeRegister(writer, stage, kRegSdma0GfxRbWptr, (frame + 1) * kSdmaFrameDwords * 4);
     if (status == kOK) status = writeRegister(writer, stage, kRegSdma0GfxRbWptrHi, 0);
     if (status != kOK) return status;
-    const uint32_t at = kSdmaWbPage + (frame == 0 ? kSdmaWbTest : kSdmaWbFence);
-    const uint32_t expected = frame == 0 ? kSdmaTestValue : 1;
+    const uint32_t at = kSdmaWbPage + (frame == 0 ? kSdmaWbTest : frame == 1 ? kSdmaWbFence : kSdmaWbFence2);
+    const uint32_t expected = frame == 0 ? kSdmaTestValue : frame;
     for (uint32_t i = 0; i <= kSdmaPollPauses; i++) {
         if (!work.read32(work.context, at, observed)) return kRegisterReadFailed;
         if (*observed == expected) return kOK;
@@ -1346,6 +1361,381 @@ Status stopSdma(const RegisterReader &registers, uint64_t apertureLength, const 
         Status status = sendSmuMessage(registers, apertureLength, writer, stage, kSmuMsgPowerDownSdma, 0,
                                        downResponse, nullptr);
         if (first == kOK) first = status;
+    }
+    return first;
+}
+
+bool semaphoreReadAllowed(uint32_t offset, uint32_t stage)
+{
+    return stage >= kGartStage && offset == kRegVmInvalidateEng17Sem;
+}
+
+bool gartWriteListed(uint32_t offset, uint32_t value)
+{
+    for (const GartWrite &write : kGartEnable)
+        if (write.offset == offset && (write.value == value || write.boot22 == value)) return true;
+    for (const GartWrite &write : kIhEnable)
+        if (write.offset == offset && (write.value == value || write.boot22 == value)) return true;
+    return (offset == kRegIhRbCntl && value == kIhRbCntlOn) ||
+           (offset == kRegVmInvalidateEng17Req && value == kGartInvalidateReq) ||
+           (offset == kRegVmInvalidateEng17Sem && value == 0) || (offset == kRegSdma0Cntl && value == kSdmaCntlTrap) ||
+           (offset == kRegSdma0GfxRbWptr && value == 3 * kSdmaFrameDwords * 4);
+}
+
+uint32_t gartWorkWord(uint32_t offset)
+{
+    if (offset == kGartTablePage) return uint32_t(kGartPte0);
+    if (offset == kGartTablePage + 4) return uint32_t(kGartPte0 >> 32);
+    return 0;
+}
+
+bool gartWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
+{
+    if (stage < kGartStage || (offset & 3) != 0 || offset >= kGartWorkSize) return false;
+    return value == gartWorkWord(offset);
+}
+
+static Status writeGartWorkWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset)
+{
+    uint32_t value = gartWorkWord(offset);
+    if (!gartWorkWriteAllowed(offset, value, stage)) return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+uint32_t gartRingWord(uint32_t dword)
+{
+    const uint64_t fence = kSdmaWorkGpuAddress + kSdmaWbPage + kSdmaWbFence2;
+    const uint64_t destination = kSdmaWorkGpuAddress + kSdmaDst2Page;
+    // Frame 2: sdma_v4_0_emit_copy_buffer from the GART address, then
+    // sdma_v4_0_ring_emit_fence with its TRAP (interrupt context 0).
+    const uint32_t frame[] = {kSdmaOpCopy,
+                              kSdmaCopyBytes - 1,
+                              0,
+                              uint32_t(kGartSourceAddress),
+                              uint32_t(kGartSourceAddress >> 32),
+                              uint32_t(destination),
+                              uint32_t(destination >> 32),
+                              kSdmaOpFence,
+                              uint32_t(fence),
+                              uint32_t(fence >> 32),
+                              2,
+                              kSdmaOpTrap,
+                              0};
+    const uint32_t first = 2 * kSdmaFrameDwords;
+    if (dword >= first && dword < first + kSdmaFrame2Dwords) return frame[dword - first];
+    return sdmaRingWord(dword);
+}
+
+Status checkGartWorkTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                           const Range *ranges, uint32_t rangeCount, MetricsTarget *target)
+{
+    *target = MetricsTarget();
+    if (stage < kGartStage) return kRegisterNotAllowed;
+    Status status = checkCarveoutPage(registers, apertureLength, stage, kGartWorkCarveoutOffset, kGartWorkCheckSize,
+                                      ranges, rangeCount, target);
+    if (status != kOK) return status;
+    if (target->gpuAddress != kGartWorkGpuAddress || target->physical != kGartWorkPhysical)
+        return kMetricsAddressMismatch;
+    return kOK;
+}
+
+// The precondition list's register and boot 22 value: kGartEnable,
+// kIhEnable, SDMA0_CNTL, then display pipe 0.
+static void gartCheckEntry(uint32_t i, uint32_t *offset, uint32_t *expected)
+{
+    if (i < kGartEnableCount) {
+        *offset = kGartEnable[i].offset;
+        *expected = kGartEnable[i].boot22;
+    } else if (i < kGartEnableCount + kIhEnableCount) {
+        *offset = kIhEnable[i - kGartEnableCount].offset;
+        *expected = kIhEnable[i - kGartEnableCount].boot22;
+    } else if (i == kGartEnableCount + kIhEnableCount) {
+        *offset = kRegSdma0Cntl;
+        *expected = kSdmaCntlBoot;
+    } else {
+        *offset = kDisplayInventory[i - kGartEnableCount - kIhEnableCount - 1];
+        *expected = kDisplayPipe0Boot22[i - kGartEnableCount - kIhEnableCount - 1];
+    }
+}
+
+// DCHUBP_CNTL's HUBP_IN_BLANK is live; display comparisons ignore it.
+static uint32_t displayMask(uint32_t index)
+{
+    return index < kDisplayPipes * kDisplayPipeRegisters && index % kDisplayPipeRegisters == kDchubpCntlIndex
+               ? ~kHubpInBlank
+               : 0xFFFFFFFFu;
+}
+
+Status checkGartBoot22(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                       uint32_t *value)
+{
+    *index = *value = 0;
+    if (stage < kGartStage) return kRegisterNotAllowed;
+    const uint32_t display = kGartEnableCount + kIhEnableCount + 1;
+    for (uint32_t i = 0; i < kGartCheckCount; i++) {
+        uint32_t offset = 0, expected = 0;
+        gartCheckEntry(i, &offset, &expected);
+        *index = i;
+        Status status = readRegister(registers, apertureLength, stage, offset, value);
+        if (status != kOK) return status;
+        uint32_t mask = i >= display ? displayMask(i - display) : 0xFFFFFFFFu;
+        if ((*value & mask) != (expected & mask)) return kGartUnexpectedState;
+    }
+    *index = *value = 0;
+    return kOK;
+}
+
+Status checkGartRestored(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                         uint32_t *value, uint32_t *ihWptr)
+{
+    *index = *value = *ihWptr = 0;
+    if (stage < kGartStage) return kRegisterNotAllowed;
+    for (uint32_t i = 0; i < kGartEnableCount + kIhEnableCount + 1; i++) {
+        uint32_t offset = 0, expected = 0;
+        gartCheckEntry(i, &offset, &expected);
+        *index = i;
+        Status status = readRegister(registers, apertureLength, stage, offset, value);
+        if (status != kOK) return status;
+        if (offset == kRegIhRbWptr) {
+            *ihWptr = *value; // the IH's own pointer: reported, not required
+            continue;
+        }
+        if (*value != expected) return kGartNotRestored;
+    }
+    *index = *value = 0;
+    return kOK;
+}
+
+Status readDisplayInventory(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                            uint32_t *values)
+{
+    for (uint32_t i = 0; i < kDisplayInventoryCount; i++) {
+        Status status = readRegister(registers, apertureLength, stage, kDisplayInventory[i], &values[i]);
+        if (status != kOK) return status;
+    }
+    return kOK;
+}
+
+Status writeGartWork(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage)
+{
+    if (stage < kGartStage) return kRegisterNotAllowed;
+    for (uint32_t offset = 0; offset < kGartWorkSize; offset += 4) {
+        Status status = writeGartWorkWord(writer, stage, offset);
+        if (status != kOK) return status;
+    }
+    for (uint32_t offset = 0; offset < kGartWorkSize; offset += 4) {
+        uint32_t value = 0;
+        if (!work.read32(work.context, offset, &value)) return kRegisterReadFailed;
+        if (value != gartWorkWord(offset)) return kPspReadbackMismatch;
+    }
+    return kOK;
+}
+
+// Frame 2's dwords, then the second destination page.
+static bool frame2Word(uint32_t i, uint32_t *offset, uint32_t *value)
+{
+    const uint32_t ringWords = kSdmaFrameDwords, pageWords = kPageSize / 4;
+    if (i < ringWords) {
+        *offset = (2 * kSdmaFrameDwords + i) * 4;
+        *value = gartRingWord(2 * kSdmaFrameDwords + i);
+        return true;
+    }
+    if (i < ringWords + pageWords) {
+        *offset = kSdmaDst2Page + (i - ringWords) * 4;
+        *value = 0;
+        return true;
+    }
+    return false;
+}
+
+Status writeSdmaFrame2(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage)
+{
+    if (stage < kGartStage) return kRegisterNotAllowed;
+    uint32_t offset = 0, value = 0;
+    for (uint32_t i = 0; frame2Word(i, &offset, &value); i++) {
+        Status status = writeSdmaWorkWord(writer, stage, offset, value);
+        if (status != kOK) return status;
+    }
+    for (uint32_t i = 0; frame2Word(i, &offset, &value); i++) {
+        uint32_t read = 0;
+        if (!work.read32(work.context, offset, &read)) return kRegisterReadFailed;
+        if (read != value) return kPspReadbackMismatch;
+    }
+    return kOK;
+}
+
+Status flushGart(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                 uint32_t stage, uint32_t *ack)
+{
+    *ack = 0;
+    if (!semaphoreReadAllowed(kRegVmInvalidateEng17Sem, stage)) return kRegisterNotAllowed;
+    // A read that returns 1 acquires the semaphore (boot 22).
+    for (uint32_t i = 0;; i++) {
+        uint32_t semaphore = 0;
+        if (!registers.read32(registers.context, kRegVmInvalidateEng17Sem, &semaphore)) return kRegisterReadFailed;
+        if ((semaphore & 1) != 0) break;
+        if (i == kGartPollPauses) return kGartSemaphoreTimeout;
+        writer.pause(writer.context);
+    }
+    Status status = writeRegister(writer, stage, kRegVmInvalidateEng17Req, kGartInvalidateReq);
+    for (uint32_t i = 0; status == kOK; i++) {
+        status = readRegister(registers, apertureLength, stage, kRegVmInvalidateEng17Ack, ack);
+        if (status != kOK || (*ack & 1) != 0) break;
+        if (i == kGartPollPauses) status = kGartAckTimeout;
+        else writer.pause(writer.context);
+    }
+    // Released whatever happened after the acquire.
+    Status release = writeRegister(writer, stage, kRegVmInvalidateEng17Sem, 0);
+    return status != kOK ? status : release;
+}
+
+Status enableGart(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                  uint32_t stage, uint32_t *progress, uint32_t *ack)
+{
+    *progress = *ack = 0;
+    if (stage < kGartStage) return kRegisterNotAllowed;
+    for (const GartWrite &write : kGartEnable) {
+        *progress = 1;
+        Status status = writeRegister(writer, stage, write.offset, write.value);
+        if (status != kOK) return status;
+    }
+    Status status = flushGart(registers, apertureLength, writer, stage, ack);
+    if (status != kOK) return status;
+    for (const GartWrite &write : kIhEnable) {
+        *progress = 2;
+        status = writeRegister(writer, stage, write.offset, write.value);
+        if (status != kOK) return status;
+    }
+    status = writeRegister(writer, stage, kRegIhRbCntl, kIhRbCntlOn);
+    if (status != kOK) return status;
+    *progress = 3;
+    return writeRegister(writer, stage, kRegSdma0Cntl, kSdmaCntlTrap);
+}
+
+// Reads the IH write-back and the ring entries it covers into the report.
+static Status scanIh(const MemoryReader &gart, GartReport *report, uint32_t *end, bool *wrapped)
+{
+    if (!gart.read32(gart.context, kIhWbPage, &report->ihWriteback)) return kRegisterReadFailed;
+    *end = report->ihWriteback & kIhWptrOffsetMask;
+    *wrapped = (report->ihWriteback & kIhWptrOverflow) != 0 || *end >= kIhRingBytes;
+    report->ihEntries = *wrapped ? kIhRingBytes / kIhEntryBytes : *end / kIhEntryBytes;
+    report->sdmaTraps = report->otherEntries = 0;
+    for (uint32_t entry = 0; entry < report->ihEntries; entry++) {
+        for (uint32_t word = 0; word < kIhEntryBytes / 4; word++) {
+            uint32_t value = 0;
+            if (!gart.read32(gart.context, kIhRingPage + entry * kIhEntryBytes + word * 4, &value))
+                return kRegisterReadFailed;
+            if (entry < kIhReportEntries) report->ring[entry * kIhEntryBytes / 4 + word] = value;
+            if (word != 0) continue;
+            // dw0: client_id 7:0, src_id 15:8 (vega10_ih_decode_iv).
+            if ((value & 0xFF) == kIhClientSdma0 && ((value >> 8) & 0xFF) == kIhSrcSdmaTrap) report->sdmaTraps++;
+            else report->otherEntries++;
+        }
+    }
+    return kOK;
+}
+
+Status verifyGart(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &sdmaRegion,
+                  const uint32_t *sdmaSnapshot, const MemoryReader &gartRegion, const uint32_t *gartSnapshot,
+                  const uint32_t *display, const RegisterWriter &writer, uint32_t stage, GartReport *report)
+{
+    *report = GartReport();
+    if (stage < kGartStage) return kRegisterNotAllowed;
+    // The trap's entry may follow the fence.
+    uint32_t end = 0;
+    bool wrapped = false;
+    for (uint32_t i = 0;; i++) {
+        Status status = scanIh(gartRegion, report, &end, &wrapped);
+        if (status != kOK) return status;
+        if (report->sdmaTraps != 0 || i == kSdmaPollPauses) break;
+        writer.pause(writer.context);
+    }
+    const struct {
+        uint32_t offset;
+        uint32_t *value;
+    } reads[] = {
+        {kRegSdma0GfxRbRptr, &report->rptr},
+        {kRegVmL2ProtectionFaultStatus, &report->faultStatus},
+        {kRegIhRbWptr, &report->ihWptr},
+        {kRegIhRbRptr, &report->ihRptr},
+    };
+    for (const auto &read : reads) {
+        Status status = readRegister(registers, apertureLength, stage, read.offset, read.value);
+        if (status != kOK) return status;
+    }
+    for (uint32_t offset = 0; offset < kSdmaWorkCheckSize; offset += 4) {
+        uint32_t value = 0;
+        if (!sdmaRegion.read32(sdmaRegion.context, offset, &value)) return kRegisterReadFailed;
+        bool ok;
+        if (offset < kSdmaWbPage) {
+            ok = value == gartRingWord(offset / 4);
+        } else if (offset < kSdmaSrcPage) {
+            uint32_t at = offset - kSdmaWbPage;
+            if (at == kSdmaWbFence2) report->fence2 = value;
+            ok = at == kSdmaWbRptr || at == kSdmaWbRptr + 4 ||
+                 value == (at == kSdmaWbTest     ? kSdmaTestValue
+                           : at == kSdmaWbFence  ? 1u
+                           : at == kSdmaWbFence2 ? 2u
+                                                 : 0u);
+        } else if (offset < kGartSdmaWorkSize) {
+            // The source, and both destinations holding it.
+            ok = value == sdmaWorkWord(kSdmaSrcPage + (offset & (kPageSize - 1)));
+        } else {
+            ok = value == sdmaSnapshot[offset / 4];
+        }
+        if (!ok && report->sdmaUnexpected++ == 0) report->sdmaFirst = offset;
+    }
+    for (uint32_t offset = 0; offset < kGartWorkCheckSize; offset += 4) {
+        uint32_t value = 0;
+        if (!gartRegion.read32(gartRegion.context, offset, &value)) return kRegisterReadFailed;
+        bool ok;
+        if (offset < kIhRingPage) {
+            ok = value == gartWorkWord(offset);
+        } else if (offset < kIhWbPage) {
+            ok = wrapped || offset - kIhRingPage < end || value == 0;
+        } else if (offset < kGartWorkSize) {
+            ok = offset == kIhWbPage || value == 0;
+        } else {
+            ok = value == gartSnapshot[offset / 4];
+        }
+        if (!ok && report->gartUnexpected++ == 0) report->gartFirst = offset;
+    }
+    for (uint32_t i = 0; i < kDisplayInventoryCount; i++) {
+        uint32_t value = 0;
+        Status status = readRegister(registers, apertureLength, stage, kDisplayInventory[i], &value);
+        if (status != kOK) return status;
+        if ((value & displayMask(i)) != (display[i] & displayMask(i)) && report->displayChanged++ == 0)
+            report->displayFirst = i;
+    }
+    if (report->faultStatus != 0) return kGartFault;
+    if (report->sdmaTraps == 0) return kIhNoTrap;
+    return report->rptr == 3 * kSdmaFrameDwords * 4 && report->fence2 == 2 && report->sdmaUnexpected == 0 &&
+                   report->gartUnexpected == 0 && report->displayChanged == 0
+               ? kOK
+               : kGartVerifyFailed;
+}
+
+Status restoreGart(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   uint32_t stage, uint32_t progress, uint32_t *ack)
+{
+    *ack = 0;
+    if (stage < kGartStage) return kRegisterNotAllowed;
+    Status first = kOK;
+    auto note = [&first](Status status) {
+        if (first == kOK) first = status;
+    };
+    if (progress >= 2) {
+        note(writeRegister(writer, stage, kRegIhRbCntl, kIhRbCntlOff));
+        for (const GartWrite &write : kIhEnable) note(writeRegister(writer, stage, write.offset, write.boot22));
+    }
+    if (progress >= 3) note(writeRegister(writer, stage, kRegSdma0Cntl, kSdmaCntlBoot));
+    if (progress >= 1) {
+        const GartWrite &context = kGartEnable[kGartContext0Index];
+        note(writeRegister(writer, stage, context.offset, context.boot22));
+        for (uint32_t i = 0; i < kGartEnableCount; i++) {
+            if (i != kGartContext0Index) note(writeRegister(writer, stage, kGartEnable[i].offset, kGartEnable[i].boot22));
+        }
+        note(flushGart(registers, apertureLength, writer, stage, ack));
     }
     return first;
 }
