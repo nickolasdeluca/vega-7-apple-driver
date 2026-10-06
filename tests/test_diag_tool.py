@@ -16,10 +16,10 @@ class DiagSourceTests(unittest.TestCase):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         calls = re.findall(r"IOConnect\w+\s*\(\s*connection\s*,\s*(\w+)", source)
         self.assertEqual(sorted(set(calls)),
-                         ["kDiagnosticGetInfo", "kDiagnosticMetricsRead", "kDiagnosticReadRegister",
-                          "kDiagnosticSdmaInventory", "selector"])
+                         ["kDiagnosticGartVerify", "kDiagnosticGetInfo", "kDiagnosticMetricsRead",
+                          "kDiagnosticReadRegister", "kDiagnosticSdmaInventory", "selector"])
         helper = re.findall(r"\bcall\(connection, (\w+)", source)
-        self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore", "kDiagnosticSmuCheck", "kDiagnosticSmuQuery", "kDiagnosticSmuCheck", "kDiagnosticGfxOffDisallow", "kDiagnosticMetricsCheck", "kDiagnosticMetricsTransfer", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspRingObserve", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticPspTmrObserve", "kDiagnosticPspTmrTeardown", "kDiagnosticPspTmrTeardown", "kDiagnosticSdmaStop", "kDiagnosticSdmaCopyCheck", "kDiagnosticSdmaStart", "kDiagnosticSdmaSubmit", "kDiagnosticSdmaVerify", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticSdmaLoad", "kDiagnosticSdmaObserve"])
+        self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore", "kDiagnosticSmuCheck", "kDiagnosticSmuQuery", "kDiagnosticSmuCheck", "kDiagnosticGfxOffDisallow", "kDiagnosticMetricsCheck", "kDiagnosticMetricsTransfer", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspRingObserve", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticPspTmrObserve", "kDiagnosticPspTmrTeardown", "kDiagnosticPspTmrTeardown", "kDiagnosticSdmaStop", "kDiagnosticGartCheck", "kDiagnosticGartEnable", "kDiagnosticSdmaSubmit", "kDiagnosticGartRestore", "kDiagnosticSdmaCopyCheck", "kDiagnosticSdmaStart", "kDiagnosticSdmaSubmit", "kDiagnosticSdmaVerify", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticSdmaLoad", "kDiagnosticSdmaObserve"])
 
         # The only messages the tool can ask for are the two version queries.
         self.assertEqual(re.findall(r'\{"smu \d/3 query: \w+ \(0x\d\)", (\w+)\}', source),
@@ -39,7 +39,14 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(ring\) \{[^}]*info\[1\] < kPspRingStage")
         self.assertEqual(len(re.findall(r"\bpspTmr\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(tmr\) \{[^}]*info\[1\] < kPspTmrStage")
-        self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["0", "1", "2"])
+        self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["0", "1", "2", "3"])
+        self.assertRegex(source, r"if \(gartFlag\) \{[^}]*info\[1\] < kGartStage")
+        # The GART steps run only after a passing stage 15 verify, and the
+        # restore whenever the enable was sent.
+        self.assertIn("if (ok && gart) ok = gartIh(connection);", source)
+        gart = re.search(r"bool gartIh\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(gart.index("kDiagnosticGartEnable"), gart.index("kDiagnosticGartRestore"))
+        self.assertNotRegex(gart[gart.index("kDiagnosticGartEnable"):gart.index("kDiagnosticGartRestore")], r"\breturn\b")
         self.assertRegex(source, r"if \(copy\) \{[^}]*info\[1\] < kSdmaCopyStage")
         self.assertRegex(source, r"if \(inventory16Flag\) \{[^}]*info\[1\] < kInventory16Stage")
         self.assertRegex(source, r"if \(inventory\) \{[^}]*info\[1\] < kSdmaInventoryStage")
@@ -50,11 +57,13 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(scratch\) \{[^}]*info\[1\] < kScratchStage")
         self.assertIn('std::strcmp(argv[i], "--scratch-test") == 0', source)
 
-    def test_tool_names_every_stage_16_register_in_order(self):
+    def test_tool_names_every_stage_17_register_in_order(self):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
-        listed = re.search(r"kStage16Registers\[\] = \{([^}]*)\}", header).group(1)
-        expected = [name.strip() for name in listed.split(",")]
+        expected = []
+        for name in ("kStage16Registers", "kStage17Registers"):
+            listed = re.search(r"%s\[\] = \{([^}]*)\}" % name, header).group(1)
+            expected += [entry.strip() for entry in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
 
 
