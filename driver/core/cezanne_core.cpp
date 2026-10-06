@@ -1458,11 +1458,11 @@ static void gartCheckEntry(uint32_t i, uint32_t *offset, uint32_t *expected)
     }
 }
 
-// DCHUBP_CNTL's HUBP_IN_BLANK is live; display comparisons ignore it.
+// DCHUBP_CNTL's live status bits (kHubpLiveStatus); display comparisons ignore them.
 static uint32_t displayMask(uint32_t index)
 {
     return index < kDisplayPipes * kDisplayPipeRegisters && index % kDisplayPipeRegisters == kDchubpCntlIndex
-               ? ~kHubpInBlank
+               ? ~kHubpLiveStatus
                : 0xFFFFFFFFu;
 }
 

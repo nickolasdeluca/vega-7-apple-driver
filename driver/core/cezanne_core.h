@@ -863,10 +863,12 @@ const uint32_t kIhEnableCount = sizeof(kIhEnable) / sizeof(kIhEnable[0]);
 const uint32_t kIhRbCntlOff = 0xc0110114; // also the ring-off write that starts the restore
 const uint32_t kIhRbCntlOn = 0xc0110115;  // + RB_ENABLE; ENABLE_INTR stays 0
 // Display pipe 0 at boot 22 (kDisplayInventory's first 11). DCHUBP_CNTL's
-// HUBP_IN_BLANK (bit 3) is live and never compared.
+// live status fields are never compared: HUBP_NO_OUTSTANDING_REQ (bit 1),
+// HUBP_IN_BLANK (bit 3) and HUBP_XRQ_NO_OUTSTANDING_REQ (19:16). Boot 24 read
+// 0x000e0000 against boot 22's 0x000f0002 while pipe 0 scanned out.
 const uint32_t kDisplayPipe0Boot22[] = {0x80011301, 0x00000897, 0x00000464, 0x00c00840, 0x00290461, 0x000f0002,
                                         0x00000008, 0x04380780, 0x00000780, 0x00000000, 0x000000f4};
-const uint32_t kHubpInBlank = 0x8;
+const uint32_t kHubpLiveStatus = 0x000f000a;
 const uint32_t kDchubpCntlIndex = 5; // in each pipe's 11
 // The BAR5 pages the stage 17 operations may write: IH and SDMA0 (0x4000),
 // the MMHUB VM L2, context and engine 17 page, and the MMHUB MC page (L1

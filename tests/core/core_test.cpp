@@ -2069,11 +2069,16 @@ static void testGart()
     }
     {
         // Preconditions: a changed register stops before any write; the live
-        // HUBP_IN_BLANK bit does not.
+        // HUBP status bits do not (boot 24 read 0x000e0000).
         GartRig g;
         uint32_t index = 0, value = 0;
-        g.r.gart[kRegHubp0DchubpCntl] |= kHubpInBlank;
+        g.r.gart[kRegHubp0DchubpCntl] = 0x000e0000u;
         CHECK(checkGartBoot22(g.r.reader(), 0x80000, 17, &index, &value) == kOK);
+        g.r.gart[kRegHubp0DchubpCntl] = 0x000f0002u | kHubpLiveStatus;
+        CHECK(checkGartBoot22(g.r.reader(), 0x80000, 17, &index, &value) == kOK);
+        g.r.gart[kRegHubp0DchubpCntl] = 0x100f0002u; // HUBP_UNDERFLOW_STATUS is compared
+        CHECK(checkGartBoot22(g.r.reader(), 0x80000, 17, &index, &value) == kGartUnexpectedState);
+        g.r.gart[kRegHubp0DchubpCntl] = 0x000f0002u | kHubpLiveStatus;
         g.r.gart[kRegHubp0DchubpCntl] ^= 1;
         CHECK(checkGartBoot22(g.r.reader(), 0x80000, 17, &index, &value) == kGartUnexpectedState);
         CHECK(index == 21 + 8 + 1 + kDchubpCntlIndex);
@@ -2141,10 +2146,10 @@ static void testGart()
     }
     {
         // A stray write to the dummy page, a changed display, and a wrong
-        // copy are each caught; the live blank bit is not.
+        // copy are each caught; the live HUBP status bits are not.
         GartRig g;
         g.r.dummyStray = true;
-        g.r.displayFlip = kHubpInBlank;
+        g.r.displayFlip = kHubpLiveStatus;
         uint32_t observed = 0;
         CHECK(g.enable() == kOK && g.submit(&observed) == kOK);
         GartReport report;

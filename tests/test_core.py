@@ -140,7 +140,7 @@ class CoreTests(unittest.TestCase):
                                                   "                              kSdmaOpNop,\n"),
             "kGartUnexpectedState": ("if ((*value & mask) != (expected & mask)) return kGartUnexpectedState;",
                                      "(void)mask;"),
-            "17, &index, &value) == kOK)\n": ("               ? ~kHubpInBlank\n", "               ? 0xFFFFFFFFu\n"),
+            "17, &index, &value) == kOK)\n": ("               ? ~kHubpLiveStatus\n", "               ? 0xFFFFFFFFu\n"),
             "kGartSemaphoreTimeout": ("        if ((semaphore & 1) != 0) break;\n", "        break;\n"),
             "kGartAckTimeout": ("if (i == kGartPollPauses) status = kGartAckTimeout;", "if (i == kGartPollPauses) break;"),
             "!g.r.semHeld": ("    Status release = writeRegister(writer, stage, kRegVmInvalidateEng17Sem, 0);",
