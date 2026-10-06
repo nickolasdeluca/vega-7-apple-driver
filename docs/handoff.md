@@ -133,7 +133,14 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: choose the next milestone
+## Next task: boot stage 16, then propose stage 17 (GART and interrupts)
+
+Stage 16 (a read-only inventory: display, MMHUB VM and IH/NBIO, 92
+registers) is approved and built: `out/test-efi/usb-stage16`,
+`--inventory16`. The user chose to measure all three areas first and then
+write GART and IH with pinned values in stage 17.
+
+### Earlier: choosing the next milestone
 
 **Stages 0–15 succeeded. Boot 21 completed the "verified DMA copy and
 fence" milestone.**

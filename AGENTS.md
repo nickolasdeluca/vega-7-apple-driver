@@ -51,7 +51,8 @@ Experimental booting is available only through the USB test EFI in
   load, the pinned SDMA0 image through `LOAD_IP_FW` with the engine left
   halted, on request; and stage 14, `PowerUpSdma`/`PowerDownSdma` and 25
   read-only SDMA registers, on request; and stage 15, starting SDMA0 with
-  exact register values and the first 4 KiB copy with a fence, on request).
+  exact register values and the first 4 KiB copy with a fence, on request;
+  and stage 16, 92 read-only display, memory-hub VM and interrupt registers).
   Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS

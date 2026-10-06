@@ -34,7 +34,9 @@ SDMA0 started and stopped cleanly, but the ring test timed out because the
 driver wrote only the low half of the write pointer. With that fixed,
 **boot 21 completed the first verified DMA copy and fence**: SDMA0 wrote
 `0xDEADBEEF`, copied 4 KiB exactly and signalled fence 1, and nothing else
-in the checked region changed. No later stage is authorized.
+in the checked region changed. Stage 16 (a read-only display, VM and
+interrupt inventory) is approved and built, not yet booted. No later stage
+is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -113,6 +115,10 @@ off restores the known-good boot. This is the experimental environment
      for later): stage 14 plus starting SDMA0 with exact register values, a
      ring test and the first 4 KiB copy with a fence, on request, described
      [below](#stage-15-first-sdma-copy-proposal).
+   - **Stage 16** (proposed 2026-10-06 and approved by the user the same
+     day): stage 15 plus 92 read-only display, memory-hub VM and interrupt
+     registers, read only through the diagnostic interface, described
+     [below](#stage-16-display-vm-and-interrupt-inventory-proposal).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -2555,7 +2561,22 @@ approved stage are fixed, documented and retested.
 
 ### Stage 16: display, VM and interrupt inventory (proposal)
 
-**Status: proposed 2026-10-06, not approved, not implemented.**
+**Status: proposed 2026-10-06, approved by the user the same day, and
+implemented; not yet booted.**
+
+**Implementation notes:**
+- **Core:** the 92 constants and the three group arrays were generated
+  from the headers. `kStage16Registers` extends the stage 14 list (stage 15
+  added no reads).
+- **Tool:** `--inventory16` reads the groups, re-reads the display, prints
+  changes, and decodes each pipe (OTG enable, totals, active size from the
+  blank start and end, HUBP blank, surface address, viewport, pitch,
+  format).
+- **Tests:**
+  - Prefix, uniqueness, inside BAR5, refused at stage 15, not writable,
+    not GFX-gated, and group order.
+  - `tests/test_inventory16.py` recomputes every offset from the pinned
+    headers in `out/references` (skipped when they are absent).
 
 **Purpose.** This prepares three milestones in one read-only boot: display,
 GART, and interrupts. The user chose this approach on 2026-10-06:
@@ -2735,7 +2756,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -2851,6 +2872,16 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 16 succeeds when:
+
+- the stage 15 conditions hold with `CezanneGPU stage` 16 (rerunning
+  `--sdma-copy` is optional);
+- `sudo cezanne-diag --inventory16` reads all 92 registers with 0 failed
+  reads, and prints the pipe decode;
+- the display is unaffected.
+
+A failed or hanging read is a finding: note the name on screen.
 
 Stage 15 succeeds when:
 
