@@ -136,16 +136,14 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: propose stage 18
+## Next task: approve stage 18 (interrupt delivery)
 
-**Resume here.** Stage 17 succeeded in boot 25 (2026-10-06); see the
-[test boot log](test-boot.md#test-boot-log). The next stage needs a proposal
-in [test-boot.md](test-boot.md) and the user's approval. The candidates from
-"Earlier: choosing the next milestone" that remain:
-- **Interrupt delivery:** `ENABLE_INTR`, so the IH raises an MSI that the
-  kext handles, instead of polling the ring.
-- **Display:** one connector and mode with a test pattern, starting from the
-  stage 16 DCN 2.1 inventory.
+**Resume here.** Stage 17 succeeded in boot 25 (2026-10-06). The user chose
+interrupt delivery first, then the display test pattern as stage 19. The
+[stage 18 proposal](test-boot.md#stage-18-interrupt-delivery-proposal)
+(MSI through an `IOFilterInterruptEventSource`, `ENABLE_INTR` with
+`RPTR_REARM`, frame 3 `FENCE` + `TRAP`, one acknowledgement) awaits the
+user's approval. Nothing of it is implemented.
 
 ### Earlier: booting stage 17
 

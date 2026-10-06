@@ -40,8 +40,8 @@ whose read has a side effect, now removed from the list. Stage 17 (GART and
 the interrupt ring) succeeded in boot 25: the MMHUB GART translated an SDMA
 read through a driver-built page table, the SDMA0 trap arrived in IH ring 0,
 and every register was restored. Boot 24 had stopped at the precondition
-check on a live display status bit, since fixed. No later stage is
-authorized.
+check on a live display status bit, since fixed. Stage 18 (interrupt
+delivery) is proposed and awaits approval; no later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -2977,6 +2977,157 @@ the flush.
     page is then accepted.
   - An entry from client 8, source 224 is SDMA0's trap. Any other client is
     counted and printed, not treated as a failure.
+
+### Stage 18: interrupt delivery (proposal)
+
+**Status: proposed 2026-10-06; awaiting the user's approval.** The display
+test pattern follows as stage 19, proposed after this stage boots.
+
+**Purpose.** Stage 17 put SDMA0's trap into IH ring 0 but kept CPU delivery
+off. Stage 18 turns it on: the IH raises an MSI, and the kext counts it.
+This is the kext's first interrupt handler. Everything is undone before the
+stage 17 restore and the stage 15 stop.
+
+**It builds on stage 17.** `sudo cezanne-diag --ih-intr` runs the stage 17
+flow unchanged through its verify (stage 15 copy, GART and IH enable,
+frame 2, verify). Then it runs the steps below, then the stage 17 restore
+and the stage 15 stop.
+
+**The vector.** The host baseline's registry ([hardware-baseline.md](hardware-baseline.md), 2026-10-02, NootedRed loaded)
+lists two interrupt specifiers on the GPU's `IOPCIDevice`:
+- index 0: `io-apic-1` (the legacy line);
+- index 1: `IOPCIMessagedInterruptController`, one MSI vector
+  (`IOPCIMSIMode` true).
+
+On the test EFI no driver has registered either. The check finds the index
+whose `getInterruptType` reports `kIOInterruptTypePCIMessaged`. With none,
+it stops before any write (`intr-no-msi`). The legacy line is never used.
+Linux also asks for one MSI vector (`amdgpu_irq_init`,
+`pci_alloc_irq_vectors(…, 1, 1, PCI_IRQ_MSI | PCI_IRQ_MSIX)`).
+
+**The handler.** It is an `IOFilterInterruptEventSource` on the kext's work
+loop, for that index:
+- **The filter** runs in primary interrupt context. It only increments a
+  counter and records `mach_absolute_time()` of the first and last
+  interrupt. It takes no lock, logs nothing and touches no register. It
+  returns `false`, so no work-loop action is scheduled.
+- **Acknowledging** (consuming entries and writing `IH_RB_RPTR`) is done
+  by a diagnostic selector under `lock_`, not by the handler.
+- **Storm bound:** with `RPTR_REARM` set, as Linux sets it with MSI
+  (`vega10_ih_enable_ring`), the IH sends no further MSI until
+  `IH_RB_RPTR` is written. MSI is edge-triggered, so nothing re-fires on
+  its own. The verify measures this rather than assuming it.
+
+**Sequence** (Linux `vega10_ih_irq_init` order, from the stage 17 state:
+ring 0 on with 1 entry, `ENABLE_INTR` 0):
+
+| Step | Register or action | Value | Linux |
+| --- | --- | --- | --- |
+| 1 | `IH_RB_CNTL` | `0xc0110114` | ring off (`toggle_interrupts(false)`); the stage 17 off value |
+| 2 | `IH_RB_RPTR`, `IH_RB_WPTR` | 0, 0 | reset by the toggle |
+| 3 | CPU | zero the ring page and the write-back page | |
+| 4 | `INTERRUPT_CNTL2` | `0x06008010` | `nbio_v7_0_ih_control`: dummy page `>> 8`, the stage 17 dummy page `0x600801000` |
+| — | `INTERRUPT_CNTL` | stays 0 | Linux sets `IH_DUMMY_RD_OVERRIDE` 0 and `IH_REQ_NONSNOOP_EN` 0; boot 22 already reads 0 |
+| 5 | `IH_RB_CNTL` | `0xc0310114` | `vega10_ih_enable_ring`: + `RPTR_REARM` (`msi_enabled`) |
+| 6 | `IH_RB_WPTR`, `IH_RB_RPTR` | 0, 0 | ring reset |
+| 7 | kext | create, add and enable the event source (macOS programs and enables the MSI capability) | `pci_alloc_irq_vectors`, `request_irq` |
+| 8 | `IH_RB_CNTL` | `0xc0330195` | `toggle_interrupts(true)`: + `RB_ENABLE`, `RB_GPU_TS_ENABLE`, `ENABLE_INTR` |
+
+The handler is enabled (step 7) before the IH may interrupt (step 8).
+- **Left out:** `IH_CHICKEN` (`MC_SPACE_GPA_ENABLE` only matters for a
+  bus-address ring), the doorbell (`BIF_IH_DOORBELL_RANGE` stays 0, as
+  Linux writes it with no doorbell), rings 1 and 2, and `pci_set_master`:
+  the command register already reads `0x0006`, bus master on.
+- **`IH_RB_CNTL` fields** (`osssys_4_0_sh_mask.h`): `RB_GPU_TS_ENABLE`
+  bit 7, `ENABLE_INTR` bit 17, `RPTR_REARM` bit 21.
+
+**Frame 3.** The last quarter of the SDMA ring (dwords 768–1023):
+- `FENCE` 3 at write-back `+0x208`;
+- `TRAP` (context 0);
+- NOP padding.
+
+Then `GFX_RB_WPTR` ← 4096, `_HI` ← 0. Like Linux (`sdma_v4_0_ring_set_wptr`),
+the write pointer is not masked to the 4 KiB ring, so 4096 is the end of
+the ring. `GFX_RB_RPTR` afterwards (4096 or 0) is recorded, not required.
+
+**Verify** (reads, then one acknowledgement):
+1. Poll for up to 100 ms: fence 3, and the MSI count reaching 1.
+2. Read the IH write-back: `0x20`, one entry from client 8, source 224.
+   Any other entry is recorded.
+3. Record the MSI count, and the time from the `WPTR` write to the first
+   interrupt.
+4. **Acknowledge:** `IH_RB_RPTR` ← the write pointer (`0x20`), as
+   `amdgpu_ih_process` does.
+5. Wait 100 ms. The MSI count must still be 1 and the IH write pointer
+   unchanged: no re-fire and no flood.
+6. `VM_L2_PROTECTION_FAULT_STATUS` 0, both 64 KiB regions clean, and
+   display pipe 0 unchanged (as in stage 17).
+
+**PCI MSI capability**, read only, from configuration space: message control,
+address and data. They are read at the check, after step 7 and after the
+restore, and printed. macOS writes them in step 7; this stage reads them to
+record what it wrote.
+
+**Restore** (before the stage 17 restore):
+1. `IH_RB_CNTL` ← `0xc0310114` (`ENABLE_INTR` and `RB_ENABLE` off), then
+   `IH_RB_RPTR`, `IH_RB_WPTR` ← 0. Wait 1 ms (`vega10_ih_irq_disable`).
+2. Disable the event source, remove it from the work loop and release it.
+3. `INTERRUPT_CNTL2` ← 0 (boot 22).
+4. Then the stage 17 restore, which starts with `IH_RB_CNTL` ← `0xc0110114`
+   and returns every IH and GART register to boot 22.
+
+The stage 15 stop runs this first if the tool exits early. The kext's `stop`
+also removes the event source if it is still registered.
+
+**Preconditions:**
+- the stage 17 verify passed on this connection;
+- `INTERRUPT_CNTL`, `INTERRUPT_CNTL2` and `BIF_IH_DOORBELL_RANGE` read
+  their boot 22 values (0);
+- an MSI index exists, and no event source is registered.
+
+**New writes:**
+- **Registers:**
+  - `IH_RB_CNTL` ← `0xc0310114` and `0xc0330195`;
+  - `IH_RB_RPTR` ← `0x20` (the acknowledgement);
+  - `INTERRUPT_CNTL2` ← `0x06008010` and 0, on a new BAR5 page, `0x3000`;
+  - `GFX_RB_WPTR` ← 4096.
+
+  The other values (`0xc0110114`, `IH_RB_RPTR`/`WPTR` ← 0) are stage 17's.
+- **Memory:** frame 3's words in the SDMA ring, and zeroing the IH ring and
+  write-back pages (already zero at stage 17's enable).
+- **Through macOS:** the device's MSI capability (address, data, enable),
+  written by `IOPCIFamily` when the source is enabled.
+
+**Risks:**
+- **This is the first code that runs in interrupt context.** A fault there
+  panics the kernel. The filter is a few lines with no locks, and the core
+  tests cover the counting. If the machine panics, power off and record the
+  panic log from the next normal boot.
+- **Other IH clients may now interrupt too.** Stage 17 saw none during its
+  window, and with `RPTR_REARM` each one can raise at most one MSI before
+  the acknowledgement.
+- **MSI not delivered** (count 0 with the entry in the ring) is a finding.
+  The restore still runs.
+- Make a Time Machine backup before this boot.
+
+**Expected:**
+- Every stage 17 result again.
+- Fence 3, one SDMA0 trap entry, exactly one MSI, and no further MSI after
+  the acknowledgement.
+- Every register back at its boot 22 value and the event source removed.
+
+**Stage 18 succeeds when:**
+- `sudo cezanne-diag --gfxoff-disallow --ih-intr --psp-state` reports `ok`
+  for every stage 17 step up to the verify, then for:
+  - the check, naming the MSI index;
+  - the enable;
+  - frame 3: fence 3;
+  - the verify: MSI count 1 after the trap, still 1 after the
+    acknowledgement and 100 ms, one SDMA0 trap entry, no VM fault, regions
+    and display unchanged;
+  - the restore, then the stage 17 restore and the stage 15 stop;
+- the final register dump shows the boot 22 values;
+- the machine stays up and the display is unchanged.
 
 ## Build the test EFIs
 
