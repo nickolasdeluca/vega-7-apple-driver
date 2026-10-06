@@ -41,7 +41,8 @@ the interrupt ring) succeeded in boot 25: the MMHUB GART translated an SDMA
 read through a driver-built page table, the SDMA0 trap arrived in IH ring 0,
 and every register was restored. Boot 24 had stopped at the precondition
 check on a live display status bit, since fixed. Stage 18 (interrupt
-delivery) is proposed and awaits approval; no later stage is authorized.
+delivery) is approved and built (`usb-stage18`), and waits for its first
+boot; no later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -2980,8 +2981,10 @@ the flush.
 
 ### Stage 18: interrupt delivery (proposal)
 
-**Status: proposed 2026-10-06; awaiting the user's approval.** The display
-test pattern follows as stage 19, proposed after this stage boots.
+**Status: proposed 2026-10-06 and approved by the user the same day;
+implemented and built (`out/test-efi/usb-stage18`) the same day. Not yet
+booted.** The display test pattern follows as stage 19, proposed after this
+stage boots.
 
 **Purpose.** Stage 17 put SDMA0's trap into IH ring 0 but kept CPU delivery
 off. Stage 18 turns it on: the IH raises an MSI, and the kext counts it.
@@ -3129,6 +3132,43 @@ also removes the event source if it is still registered.
 - the final register dump shows the boot 22 values;
 - the machine stays up and the display is unchanged.
 
+**Implementation** (2026-10-06). Diagnostic interface version 14, selectors
+30–34, and selector 23 with frame 3:
+
+| Step | Selector | What it does |
+| --- | --- | --- |
+| check | 30 `IntrCheck` | Only after a passing stage 17 verify on the same connection. Finds the first interrupt index whose type has `kIOInterruptTypePCIMessaged` (indexes 0–7), reads the MSI capability, then reads `INTERRUPT_CNTL`, `INTERRUPT_CNTL2` and `BIF_IH_DOORBELL_RANGE`. No write. |
+| enable | 31 `IntrEnable` | Writes frame 3 into the SDMA ring (read back). Steps 1–6 of the sequence, with the ring and write-back pages zeroed and read back (progress 1). Then the handler: a new `IOWorkLoop`, an `IOFilterInterruptEventSource` on the MSI index, added and enabled. Then step 8 (progress 2). Reports the MSI capability afterwards. |
+| frame 3 | 23 `SdmaSubmit`, frame 3 | `GFX_RB_WPTR` 3072 → 4096, then `_HI` ← 0; polls fence 3 for 100 ms. The kext notes the time just before. |
+| verify | 32 `IntrVerify` | Reads only. Polls for up to 100 ms until fence 3, the trap entry and an MSI have all arrived, then returns an `IntrReport`: MSI count, microseconds from the submit to the first MSI, fence, pointers, `IH_RB_CNTL`, fault status, IH counts and the first 32 entries, unexpected words, display changes. |
+| acknowledge | 33 `IntrAck` | Once, after a passing verify. `IH_RB_RPTR` ← the write-back offset, 100 pauses, then the MSI count and the write-back again. |
+| restore | 34 `IntrRestore` | Steps 1–3 of the restore with a check of the three registers. The stage 17 restore (selector 29) runs it first if needed, and so does the stage 15 stop, so a closed or abandoned connection is covered. `stop()` also removes a handler that is still registered. |
+
+- **Register writes** go through a fourth BAR5 page set, `kIntrPages`:
+  `0x3000` (NBIO, `INTERRUPT_CNTL2`) and `0x4000` (IH).
+- **The handler:** the filter increments an atomic counter and records
+  `mach_absolute_time()` for the first interrupt, then returns `false`. The
+  work-loop action is empty and never scheduled. A structural test checks
+  that the filter has no lock, log, register or memory access. It is the
+  only interrupt registration, and the enable is the only caller, between
+  the arm and `ENABLE_INTR`.
+- **The kext's libraries** gain `com.apple.kpi.mach`
+  (`mach_absolute_time`, `absolutetime_to_nanoseconds`).
+
+**Choices not fixed by the proposal:**
+- **The acknowledgement's value** is the write-back's offset, not a fixed
+  `0x20`. The allowlist accepts any 32-byte entry boundary inside the 4 KiB
+  ring, so that another client's entry before the trap does not block the
+  acknowledgement. With only the trap, the value is `0x20`.
+- **The verify requires exactly one MSI,** and `kIntrNotDelivered` is kept
+  apart from other failures. It does not require exactly one IH entry:
+  another client's entry is recorded, and can take the one MSI instead.
+- **`GFX_RB_RPTR` after frame 3** is reported, not required (4096 or 0).
+- **The restore's ring-off value** is `0xc0310114` (`RPTR_REARM` kept,
+  `RB_GPU_TS_ENABLE` cleared). Linux's toggle keeps `RB_GPU_TS_ENABLE` set;
+  the stage 17 restore that follows writes `0xc0110114` and then boot 22
+  anyway.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -3140,7 +3180,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate

@@ -55,7 +55,9 @@ Experimental booting is available only through the USB test EFI in
   and stage 16, 92 read-only display, memory-hub VM and interrupt registers;
   and stage 17, GART (MMHUB context 0) and IH ring 0 with values pinned from
   boot 22, an SDMA copy through GART with a fence and a trap, then a restore
-  of every register, on request).
+  of every register, on request; and stage 18, IH interrupt delivery through
+  the GPU's MSI vector to one counting handler, a fence and a trap, one
+  acknowledgement, then a restore, on request).
   Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS

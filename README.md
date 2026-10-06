@@ -91,7 +91,9 @@ power-up and a read-only register inventory; `--sdma-copy` (stage 15) runs
 the first SDMA copy and fence; `--inventory16` (stage 16, reads only)
 surveys the display, memory-hub VM and interrupt registers; `--gart-ih`
 (stage 17) enables GART and the interrupt ring, copies through GART with a
-fence and a trap, and restores every register. Building the kext needs that firmware in ignored
+fence and a trap, and restores every register; `--ih-intr` (stage 18) adds
+MSI delivery of that trap to a counting handler, one acknowledgement, and a
+restore. Building the kext needs that firmware in ignored
 `out/firmware-provenance/fw/` (see
 [firmware provenance](docs/firmware-provenance.md)).
 
