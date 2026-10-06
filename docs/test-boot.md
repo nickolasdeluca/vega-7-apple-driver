@@ -2144,6 +2144,15 @@ ditto --norsrc --noextattr out/test-efi/usb-stage1/EFI /Volumes/CZTEST/EFI
 python3 tools/test_efi.py verify --manifest out/test-efi/usb-stage1/manifest.json --side test /Volumes/CZTEST/EFI
 ```
 
+`tools/update_stick.sh N` does the same three steps for stage N.
+
+- **Before removing anything**, it refuses unless `out/test-efi/usb-stageN`
+  has an `EFI` folder and a manifest, and `/Volumes/CZTEST` is mounted at
+  exactly that path, named `CZTEST`, and on an external disk (`diskutil
+  info`: `Internal` false, `RemovableMediaOrExternalDevice` true).
+- It exits non-zero if `verify` does not report a match.
+- The user runs it, as with every disk step.
+
 ## Before the first test boot
 
 - Make a Time Machine (or equivalent) backup. A panic during a disk write can

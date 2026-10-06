@@ -74,6 +74,8 @@ read. Keep firmware under ignored `out/`; see
 build --stage N` derives a USB test EFI for an authorized stage from a copy of
 the known-good OpenCore EFI, rejecting any change beyond the intended ones. Neither writes to
 disks, NVRAM or EFI partitions. Follow [the test boot procedure](docs/test-boot.md);
+`tools/update_stick.sh N` replaces the stick's EFI with stage N's test EFI
+and verifies it;
 experiments run only from that USB EFI. `tools/diag/build.sh` builds
 `cezanne-diag`, which re-reads the driver's allowlisted registers through its
 root-only diagnostic interface during a stage 4 or later test boot;
