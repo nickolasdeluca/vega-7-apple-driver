@@ -53,16 +53,18 @@ def strip_comments(source):
 # workWrite; firmwareWrite), and the six non-const volatile pointers that
 # carry them.
 SCRATCH_MAP = "pageMemory->map(kIOMapInhibitCache)"
-SCRATCH_STORE = "page->base[(offset - page->pageOffset) / 4] = value;"
+SCRATCH_STORE = "page->base[i][(offset - page->pageOffset[i]) / 4] = value;"
 WORK_MAP = "workMemory->map(kIOMapInhibitCache)"
 WORK_STORE = "work->base[offset / 4] = value;"
 FIRMWARE_MAP = "firmwareMemory->map(kIOMapInhibitCache)"
 FIRMWARE_STORE = "firmware->base[offset / 4] = value;"
-ALLOWED_MAPS = (SCRATCH_MAP, WORK_MAP, FIRMWARE_MAP)
-ALLOWED_STORES = (SCRATCH_STORE, WORK_STORE, FIRMWARE_STORE)
+SDMA_WORK_MAP = "sdmaWorkMemory->map(kIOMapInhibitCache)"
+SDMA_WORK_STORE = "sdmaWork->base[offset / 4] = value;"
+ALLOWED_MAPS = (SCRATCH_MAP, WORK_MAP, FIRMWARE_MAP, SDMA_WORK_MAP)
+ALLOWED_STORES = (SCRATCH_STORE, WORK_STORE, FIRMWARE_STORE, SDMA_WORK_STORE)
 ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize", "cezanne::kPspWorkSize",
-                       "cezanne::kSdmaFwBufferSize", "length")
-ALLOWED_VOLATILE = 6
+                       "cezanne::kSdmaFwBufferSize", "cezanne::kSdmaWorkSize", "length")
+ALLOWED_VOLATILE = 8
 SDMA_FIRMWARE = ROOT / "out" / "firmware-provenance" / "fw" / "green_sardine_sdma.bin"
 
 
@@ -81,7 +83,7 @@ def hardware_calls(source):
     found += ["unbounded range" for args in ranges if not args.strip().endswith(ALLOWED_RANGE_SIZES)]
     if len(re.findall(r"(?<!const )\bvolatile\b", code)) > ALLOWED_VOLATILE:
         found.append("non-const volatile")
-    stores = re.findall(r"\w+->base\s*\[[^\]]*\]\s*=[^=][^;]*;", code)
+    stores = re.findall(r"\w+->base\s*(?:\[[^\]]*\])+\s*=[^=][^;]*;", code)
     if [store for store in stores if store not in ALLOWED_STORES] or len(stores) > len(ALLOWED_STORES):
         found.append("register store")
     return found
@@ -123,6 +125,7 @@ void f(IOPCIDevice *p, Aperture *a) {
     m->map(kIOMapInhibitCache);
     volatile UInt32 *w = nullptr;
     a->base[0] = 1;
+    p->base[0][1] = 2;
 } // setBusMaster
 """
         self.assertEqual(hardware_calls(planted),
@@ -137,6 +140,16 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertEqual(source.count(WORK_STORE), 1)
         self.assertEqual(source.count(FIRMWARE_MAP), 1)
         self.assertEqual(source.count(FIRMWARE_STORE), 1)
+        self.assertEqual(source.count(SDMA_WORK_MAP), 1)
+        self.assertEqual(source.count(SDMA_WORK_STORE), 1)
+        sdma = re.search(r"static bool sdmaWorkWrite\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(sdma.index("sdmaWorkWriteAllowed(offset, value, sdmaWork->stage)"), sdma.index(SDMA_WORK_STORE))
+        self.assertIn("IODeviceMemory::withRange(cezanne::kSdmaWorkPhysical, cezanne::kSdmaWorkSize)", source)
+        # The SDMA register page set: only these operations, only these pages.
+        self.assertEqual(sorted(re.findall(r"accessDevice\(cezanne::kSdmaPageSet, (\w+)", source)),
+                         ["copyStartOperation", "copyStopOperation", "copySubmitOperation"])
+        header = (CORE / "cezanne_core.h").read_text()
+        self.assertIn("const uint32_t kSdmaPages[] = {0x4000, 0x5000, 0x58000};", header)
         firmware = re.search(r"static bool firmwareWrite\(.*?\n}\n", source, re.S).group(0)
         self.assertLess(firmware.index("sdmaFirmwareWriteAllowed(kCezanneSdmaImage, offset, value, firmware->stage)"),
                         firmware.index(FIRMWARE_STORE))
@@ -167,28 +180,31 @@ void f(IOPCIDevice *p, Aperture *a) {
                                     ("cezanne::kSmuPageOffset", "tmrSubmitOperation"),
                                     ("cezanne::kSmuPageOffset", "tmrTeardownOperation")])
         self.assertEqual(sorted(re.findall(r"accessDevice\(0, (\w+)", source)),
-                         ["metricsCheckOperation", "metricsReadOperation", "pspCheckOperation", "pspObserveOperation",
+                         ["copyCheckOperation", "copyVerifyOperation",
+                          "metricsCheckOperation", "metricsReadOperation", "pspCheckOperation", "pspObserveOperation",
                           "readOperation", "scratchCheckOperation", "sdmaObserveOperation", "smuCheckOperation",
                           "tmrObserveOperation"])
         # Carveout memory: only the metrics page's and the PSP ring page's
         # ranges, read-only, at their check sizes or one page.
         self.assertEqual(re.findall(r"IODeviceMemory::withRange\((\w+), length\)", source), ["physical"])
         self.assertIn("if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical &&\n"
-                      "        physical != cezanne::kPspTmrPhysical && physical != cezanne::kSdmaFwPhysical) {", source)
+                      "        physical != cezanne::kPspTmrPhysical && physical != cezanne::kSdmaFwPhysical &&\n"
+                      "        physical != cezanne::kSdmaWorkPhysical) {", source)
         self.assertEqual(sorted(re.findall(r"withCarveoutMemory\(cezanne::(\w+), cezanne::(\w+),", source)),
                          [("kMetricsPhysical", "kMetricsCheckSize"), ("kMetricsPhysical", "kPageSize"),
                           ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
                           ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
                           ("kPspTmrPhysical", "kPspTmrSize"), ("kSdmaFwPhysical", "kSdmaFwCheckSize"),
-                          ("kSdmaFwPhysical", "kSdmaFwCheckSize")])
+                          ("kSdmaFwPhysical", "kSdmaFwCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"),
+                          ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize")])
         # A PSP ring created by a connection is destroyed if it closes early.
         abandon = re.search(r"void CezanneGPU::scratchAbandon\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("pspDestroyLocked(&response, &mailbox)", abandon)
         self.assertIn("memory->map(kIOMapReadOnly | kIOMapInhibitCache)", source)
         self.assertIn("writablePage != 0 && writablePage != cezanne::kScratchPageOffset && "
-                      "writablePage != cezanne::kSmuPageOffset", source)
-        page = re.search(r"IODeviceMemory::withRange\(\(state\.bar5 & ~0xFull\) \+ writablePage, cezanne::kPageSize\)",
-                         source)
+                      "writablePage != cezanne::kSmuPageOffset &&\n        writablePage != cezanne::kSdmaPageSet", source)
+        page = re.search(r"IODeviceMemory::withRange\(\(state\.bar5 & ~0xFull\) \+ page\.pageOffset\[i\], "
+                         r"cezanne::kPageSize\)", source)
         self.assertIsNotNone(page)
         # An SMU query needs a passing check by the same connection.
         self.assertEqual(source.count("if (smuChecked_ && smuOwner_ == owner) {"), 2)  # query and GFXOFF
@@ -207,7 +223,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 14;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 15;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")

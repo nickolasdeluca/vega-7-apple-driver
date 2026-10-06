@@ -60,7 +60,13 @@
 //   Stage 14: after that load, read 31 SDMA registers, send PowerUpSdma,
 //            read them, send PowerDownSdma, read them again. No SDMA
 //            register is written.
-//            Apart from the stage 6 to 14 tests, nothing is written to
+//   Stage 15: after that load, check SDMA0 still holds its boot 19 values,
+//            write the copy work area (the third writable memory mapping),
+//            power SDMA up, apply the golden settings and the start writes
+//            (exact values), run the ring test and one 4 KiB copy with a
+//            fence, verify, then halt, power down and tear down (also on an
+//            abandoned connection after the start).
+//            Apart from the stage 6 to 15 tests, nothing is written to
 //            configuration space, registers or memory, and every mapping and
 //            the provider are released before start() returns.
 //
@@ -92,9 +98,12 @@ struct Aperture {
 
 // The writable 4 KiB BAR5 page of a stage 6 or 7 test: SCRATCH_REG0's or the
 // SMU mailbox's.
+// Up to three writable BAR5 pages: one for a stage 6 to 14 test, the
+// kSdmaPages set for stage 15.
 struct WritePage {
-    volatile UInt32 *base;
-    uint32_t pageOffset;
+    volatile UInt32 *base[3];
+    uint32_t pageOffset[3];
+    uint32_t count;
     UInt32 stage;
 };
 
@@ -146,6 +155,13 @@ public:
                                 uint32_t *f32Cntl);
     cezanne::Status sdmaInventory(const void *owner, cezanne::SdmaInventory *inventory, uint32_t *upResponse,
                                   uint32_t *downResponse);
+    cezanne::Status sdmaCopyCheck(const void *owner, uint32_t *index, uint32_t *value);
+    cezanne::Status sdmaStart(const void *owner, uint32_t *progress, uint32_t *upResponse);
+    cezanne::Status sdmaSubmit(const void *owner, uint32_t frame, uint32_t *observed, uint32_t *rptr, uint32_t *wptr);
+    cezanne::Status sdmaVerify(const void *owner, uint32_t *rptr, uint32_t *unexpected, uint32_t *firstOffset,
+                               uint32_t *status);
+    cezanne::Status sdmaStop(const void *owner, uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence,
+                             uint32_t *ringResponse);
 
 private:
     enum ScratchState { kScratchIdle, kScratchChecked, kScratchWritten };
@@ -177,6 +193,13 @@ private:
     uint32_t pspFrames_ = 0;     // frames whose write pointer was written
     bool pspLastFenced_ = false; // the last of them fenced
     uint32_t sdmaSnapshot_[cezanne::kSdmaFwCheckSize / 4];
+    // Stage 15: the copy's steps on this connection, and how far the start
+    // got (0 nothing, 1 powered up, 2 registers written).
+    enum CopyState { kCopyIdle, kCopyChecked, kCopyStarted, kCopyTested, kCopySubmitted };
+    CopyState copyState_ = kCopyIdle;
+    uint32_t sdmaProgress_ = 0;
+    uint32_t sdmaWorkSnapshot_[cezanne::kSdmaWorkCheckSize / 4];
+    cezanne::Status sdmaStopLocked(uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence, uint32_t *ringResponse);
     cezanne::Status pspTeardownLocked(uint32_t *fence, uint32_t *tmrStatus, uint32_t *ringResponse,
                                       cezanne::PspMailbox *mailbox);
     const void *pspOwner_ = nullptr;
@@ -249,12 +272,16 @@ static bool registerWrite(void *context, uint32_t offset, uint32_t value)
 {
     WritePage *page = static_cast<WritePage *>(context);
     // The core already checks this; the adapter refuses independently.
-    if (!cezanne::writeAllowed(offset, value, page->stage) || offset < page->pageOffset ||
-        offset + 4ull > uint64_t(page->pageOffset) + cezanne::kPageSize) {
+    if (!cezanne::writeAllowed(offset, value, page->stage)) {
         return false;
     }
-    page->base[(offset - page->pageOffset) / 4] = value;
-    return true;
+    for (uint32_t i = 0; i < page->count; i++) {
+        if (offset >= page->pageOffset[i] && offset + 4ull <= uint64_t(page->pageOffset[i]) + cezanne::kPageSize) {
+            page->base[i][(offset - page->pageOffset[i]) / 4] = value;
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool refuseWrite(void *, uint32_t, uint32_t)
@@ -536,7 +563,8 @@ void CezanneGPU::free()
 cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation operation, void *argument)
 {
     // Caller holds lock_.
-    if (writablePage != 0 && writablePage != cezanne::kScratchPageOffset && writablePage != cezanne::kSmuPageOffset) {
+    if (writablePage != 0 && writablePage != cezanne::kScratchPageOffset && writablePage != cezanne::kSmuPageOffset &&
+        writablePage != cezanne::kSdmaPageSet) {
         return cezanne::kRegisterNotAllowed;
     }
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, getProvider());
@@ -561,17 +589,29 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
         aperture.length = map->getLength();
         status = cezanne::checkAperture(state, map->getPhysicalAddress(), aperture.length);
     }
-    IODeviceMemory *pageMemory = nullptr;
-    IOMemoryMap *pageMap = nullptr;
-    WritePage page = {nullptr, writablePage, stage_};
-    if (status == cezanne::kOK && writablePage != 0) {
-        // The only writable mapping: one page of BAR5, for a stage 6 or 7 test.
-        pageMemory = IODeviceMemory::withRange((state.bar5 & ~0xFull) + writablePage, cezanne::kPageSize);
-        pageMap = pageMemory != nullptr ? pageMemory->map(kIOMapInhibitCache) : nullptr;
+    IODeviceMemory *pageMemories[3] = {nullptr, nullptr, nullptr};
+    IOMemoryMap *pageMaps[3] = {nullptr, nullptr, nullptr};
+    WritePage page = {{nullptr, nullptr, nullptr}, {0, 0, 0}, 0, stage_};
+    if (writablePage == cezanne::kSdmaPageSet) {
+        page.count = 3;
+        for (uint32_t i = 0; i < 3; i++) {
+            page.pageOffset[i] = cezanne::kSdmaPages[i];
+        }
+    } else if (writablePage != 0) {
+        page.count = 1;
+        page.pageOffset[0] = writablePage;
+    }
+    for (uint32_t i = 0; status == cezanne::kOK && i < page.count; i++) {
+        // The only writable register mappings: these pages of BAR5.
+        IODeviceMemory *pageMemory =
+            IODeviceMemory::withRange((state.bar5 & ~0xFull) + page.pageOffset[i], cezanne::kPageSize);
+        pageMemories[i] = pageMemory;
+        IOMemoryMap *pageMap = pageMemory != nullptr ? pageMemory->map(kIOMapInhibitCache) : nullptr;
+        pageMaps[i] = pageMap;
         if (pageMap == nullptr || pageMap->getLength() < cezanne::kPageSize) {
             status = cezanne::kApertureUnavailable;
         } else {
-            page.base = reinterpret_cast<volatile UInt32 *>(pageMap->getVirtualAddress());
+            page.base[i] = reinterpret_cast<volatile UInt32 *>(pageMap->getVirtualAddress());
         }
     }
     if (status == cezanne::kOK) {
@@ -579,11 +619,13 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
         cezanne::RegisterWriter writer = {writablePage != 0 ? registerWrite : refuseWrite, pauseOneMillisecond, &page};
         status = operation(stage_, registers, aperture.length, &writer, argument);
     }
-    if (pageMap != nullptr) {
-        pageMap->release();
-    }
-    if (pageMemory != nullptr) {
-        pageMemory->release();
+    for (uint32_t i = 0; i < 3; i++) {
+        if (pageMaps[i] != nullptr) {
+            pageMaps[i]->release();
+        }
+        if (pageMemories[i] != nullptr) {
+            pageMemories[i]->release();
+        }
     }
     if (map != nullptr) {
         map->release();
@@ -787,7 +829,8 @@ static bool memoryRead(void *context, uint32_t offset, uint32_t *value)
 template <typename Check> static cezanne::Status withCarveoutMemory(UInt64 physical, UInt32 length, Check check)
 {
     if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical &&
-        physical != cezanne::kPspTmrPhysical && physical != cezanne::kSdmaFwPhysical) {
+        physical != cezanne::kPspTmrPhysical && physical != cezanne::kSdmaFwPhysical &&
+        physical != cezanne::kSdmaWorkPhysical) {
         return cezanne::kRegisterNotAllowed;
     }
     IODeviceMemory *memory = IODeviceMemory::withRange(physical, length);
@@ -911,6 +954,58 @@ template <typename Use> static cezanne::Status withSdmaFirmware(UInt32 stage, Us
         firmwareMap->release();
     }
     firmwareMemory->release();
+    return status;
+}
+
+// The stage 15 copy work area: ring, write-back, source and destination.
+struct SdmaWorkWindow {
+    volatile UInt32 *base;
+    UInt32 stage;
+};
+
+static bool sdmaWorkRead(void *context, uint32_t offset, uint32_t *value)
+{
+    const SdmaWorkWindow *sdmaWork = static_cast<const SdmaWorkWindow *>(context);
+    if ((offset & 3) != 0 || offset + 4ull > cezanne::kSdmaWorkSize) {
+        return false;
+    }
+    *value = sdmaWork->base[offset / 4];
+    return true;
+}
+
+static bool sdmaWorkWrite(void *context, uint32_t offset, uint32_t value)
+{
+    SdmaWorkWindow *sdmaWork = static_cast<SdmaWorkWindow *>(context);
+    // The core already checks this; the adapter refuses independently.
+    if (!cezanne::sdmaWorkWriteAllowed(offset, value, sdmaWork->stage)) {
+        return false;
+    }
+    sdmaWork->base[offset / 4] = value;
+    return true;
+}
+
+// Maps the copy work area writable and uncached, runs use, and releases it.
+template <typename Use> static cezanne::Status withSdmaWork(UInt32 stage, Use use)
+{
+    if (stage < cezanne::kSdmaCopyStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IODeviceMemory *sdmaWorkMemory = IODeviceMemory::withRange(cezanne::kSdmaWorkPhysical, cezanne::kSdmaWorkSize);
+    if (sdmaWorkMemory == nullptr) {
+        return cezanne::kApertureUnavailable;
+    }
+    IOMemoryMap *sdmaWorkMap = sdmaWorkMemory->map(kIOMapInhibitCache);
+    cezanne::Status status = cezanne::kApertureUnavailable;
+    if (sdmaWorkMap != nullptr && sdmaWorkMap->getLength() >= cezanne::kSdmaWorkSize) {
+        SdmaWorkWindow window = {reinterpret_cast<volatile UInt32 *>(sdmaWorkMap->getVirtualAddress()), stage};
+        cezanne::MemoryReader reader = {sdmaWorkRead, &window};
+        cezanne::MemoryWriter writer = {sdmaWorkWrite, &window};
+        status = use(reader, writer);
+    }
+    if (sdmaWorkMap != nullptr) {
+        sdmaWorkMap->release();
+    }
+    sdmaWorkMemory->release();
     return status;
 }
 
@@ -1358,7 +1453,7 @@ cezanne::Status CezanneGPU::pspTmrTeardown(const void *owner, uint32_t *fence, u
     cezanne::Status status = cezanne::kPspOutOfOrder;
     if ((pspState_ == kPspTmrSubmitted || pspState_ == kPspTmrObserved || pspState_ == kPspSdmaLoaded ||
          pspState_ == kPspSdmaObserved) &&
-        pspOwner_ == owner) {
+        pspOwner_ == owner && copyState_ == kCopyIdle) {
         status = pspTeardownLocked(fence, tmrStatus, ringResponse, mailbox);
     }
     IOLockUnlock(lock_);
@@ -1510,6 +1605,194 @@ cezanne::Status CezanneGPU::sdmaInventory(const void *owner, cezanne::SdmaInvent
     return status;
 }
 
+struct CopyArgument {
+    const cezanne::Range *ranges;
+    uint32_t rangeCount;
+    uint32_t *snapshot;
+    uint32_t *a, *b, *c, *d; // per-step outputs
+    uint32_t frame, progress;
+    bool fenced;
+};
+
+static cezanne::Status copyCheckOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                          const cezanne::RegisterWriter *writer, void *argument)
+{
+    CopyArgument *copy = static_cast<CopyArgument *>(argument);
+    cezanne::Status status = cezanne::checkSdmaBoot19(registers, length, stage, copy->a, copy->b);
+    cezanne::MetricsTarget target;
+    if (status == cezanne::kOK) {
+        status = cezanne::checkSdmaWorkTarget(registers, length, stage, copy->ranges, copy->rangeCount, &target);
+    }
+    if (status == cezanne::kOK) {
+        uint32_t *snapshot = copy->snapshot;
+        status = withCarveoutMemory(cezanne::kSdmaWorkPhysical, cezanne::kSdmaWorkCheckSize,
+                                    [writer, snapshot](const cezanne::MemoryReader &memory) {
+            return cezanne::checkRegionStable(memory, cezanne::kSdmaWorkCheckSize, *writer,
+                                              cezanne::kMetricsStablePauses, snapshot);
+        });
+    }
+    return status;
+}
+
+static cezanne::Status copyStartOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                          const cezanne::RegisterWriter *writer, void *argument)
+{
+    CopyArgument *copy = static_cast<CopyArgument *>(argument);
+    cezanne::Status status = withSdmaWork(stage, [&](const cezanne::MemoryReader &work,
+                                                     const cezanne::MemoryWriter &memory) {
+        return cezanne::writeSdmaWork(work, memory, stage);
+    });
+    if (status == cezanne::kOK) {
+        status = cezanne::startSdma(registers, length, *writer, stage, copy->a, copy->b);
+    }
+    return status;
+}
+
+static cezanne::Status copySubmitOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                           const cezanne::RegisterWriter *writer, void *argument)
+{
+    CopyArgument *copy = static_cast<CopyArgument *>(argument);
+    cezanne::Status status = withCarveoutMemory(cezanne::kSdmaWorkPhysical, cezanne::kSdmaWorkCheckSize,
+                                                [&](const cezanne::MemoryReader &work) {
+        return cezanne::submitSdma(registers, length, *writer, work, stage, copy->frame, copy->a);
+    });
+    cezanne::readDiagnosticRegister(registers, length, stage, cezanne::kRegSdma0GfxRbRptr, copy->b);
+    cezanne::readDiagnosticRegister(registers, length, stage, cezanne::kRegSdma0GfxRbWptr, copy->c);
+    return status;
+}
+
+static cezanne::Status copyVerifyOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                           const cezanne::RegisterWriter *, void *argument)
+{
+    CopyArgument *copy = static_cast<CopyArgument *>(argument);
+    cezanne::Status status = withCarveoutMemory(cezanne::kSdmaWorkPhysical, cezanne::kSdmaWorkCheckSize,
+                                                [&](const cezanne::MemoryReader &region) {
+        return cezanne::verifySdmaCopy(registers, length, region, copy->snapshot, stage, copy->a, copy->b, copy->c);
+    });
+    cezanne::readDiagnosticRegister(registers, length, stage, cezanne::kRegSdma0StatusReg, copy->d);
+    return status;
+}
+
+static cezanne::Status copyStopOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                         const cezanne::RegisterWriter *writer, void *argument)
+{
+    CopyArgument *copy = static_cast<CopyArgument *>(argument);
+    cezanne::Status status = cezanne::stopSdma(registers, length, *writer, stage, copy->progress, copy->b);
+    cezanne::readDiagnosticRegister(registers, length, stage, cezanne::kRegSdma0F32Cntl, copy->a);
+    return status;
+}
+
+cezanne::Status CezanneGPU::sdmaCopyCheck(const void *owner, uint32_t *index, uint32_t *value)
+{
+    *index = *value = 0;
+    if (!diagnosticsReady_ || stage_ < cezanne::kSdmaCopyStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, getProvider());
+    OSData *assigned = pci != nullptr ? OSDynamicCast(OSData, pci->getProperty("assigned-addresses")) : nullptr;
+    cezanne::Range ranges[8];
+    uint32_t count = 0;
+    cezanne::Status status = cezanne::parseAssignedAddresses(
+        assigned != nullptr ? static_cast<const uint8_t *>(assigned->getBytesNoCopy()) : nullptr,
+        assigned != nullptr ? assigned->getLength() : 0, ranges, 8, &count);
+    if (status != cezanne::kOK) {
+        return status;
+    }
+    IOLockLock(lock_);
+    status = cezanne::kSdmaOutOfOrder;
+    // With the firmware loaded on this connection (LOAD_IP_FW fenced) and no copy under way.
+    if ((pspState_ == kPspSdmaLoaded || pspState_ == kPspSdmaObserved) && pspFrames_ == 2 && pspLastFenced_ &&
+        pspOwner_ == owner && copyState_ == kCopyIdle) {
+        CopyArgument copy = {ranges, count, sdmaWorkSnapshot_, index, value, nullptr, nullptr, 0, 0, false};
+        status = accessDevice(0, copyCheckOperation, &copy);
+        copyState_ = status == cezanne::kOK ? kCopyChecked : kCopyIdle;
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::sdmaStart(const void *owner, uint32_t *progress, uint32_t *upResponse)
+{
+    *progress = *upResponse = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kSdmaOutOfOrder;
+    if (copyState_ == kCopyChecked && pspOwner_ == owner) {
+        CopyArgument copy = {nullptr, 0, nullptr, progress, upResponse, nullptr, nullptr, 0, 0, false};
+        status = accessDevice(cezanne::kSdmaPageSet, copyStartOperation, &copy);
+        sdmaProgress_ = *progress;
+        copyState_ = status == cezanne::kOK ? kCopyStarted : kCopyChecked;
+        IOLog(LOG_PREFIX "SDMA start: %s, progress %u, PowerUpSdma 0x%x\n", cezanne::statusName(status), *progress,
+              *upResponse);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::sdmaSubmit(const void *owner, uint32_t frame, uint32_t *observed, uint32_t *rptr,
+                                       uint32_t *wptr)
+{
+    *observed = *rptr = *wptr = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kSdmaOutOfOrder;
+    bool next = (frame == 0 && copyState_ == kCopyStarted) || (frame == 1 && copyState_ == kCopyTested);
+    if (next && pspOwner_ == owner) {
+        CopyArgument copy = {nullptr, 0, nullptr, observed, rptr, wptr, nullptr, frame, 0, false};
+        status = accessDevice(cezanne::kSdmaPageSet, copySubmitOperation, &copy);
+        if (status == cezanne::kOK) {
+            copyState_ = frame == 0 ? kCopyTested : kCopySubmitted;
+        }
+        IOLog(LOG_PREFIX "SDMA frame %u: %s, observed 0x%08x, RPTR %u, WPTR %u\n", frame, cezanne::statusName(status),
+              *observed, *rptr, *wptr);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::sdmaVerify(const void *owner, uint32_t *rptr, uint32_t *unexpected,
+                                       uint32_t *firstOffset, uint32_t *status)
+{
+    *rptr = *unexpected = *firstOffset = *status = 0;
+    IOLockLock(lock_);
+    cezanne::Status result = cezanne::kSdmaOutOfOrder;
+    if (copyState_ == kCopySubmitted && pspOwner_ == owner) {
+        CopyArgument copy = {nullptr, 0, sdmaWorkSnapshot_, rptr, unexpected, firstOffset, status, 0, 0, false};
+        result = accessDevice(0, copyVerifyOperation, &copy);
+        IOLog(LOG_PREFIX "SDMA verify: %s, RPTR %u, %u unexpected words, first at 0x%x\n",
+              cezanne::statusName(result), *rptr, *unexpected, *firstOffset);
+    }
+    IOLockUnlock(lock_);
+    return result;
+}
+
+cezanne::Status CezanneGPU::sdmaStopLocked(uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence,
+                                           uint32_t *ringResponse)
+{
+    // Caller holds lock_: halt and power down by progress, then the stage 13 teardown.
+    CopyArgument copy = {nullptr, 0, nullptr, f32Cntl, downResponse, nullptr, nullptr, 0, sdmaProgress_, false};
+    cezanne::Status status = accessDevice(cezanne::kSdmaPageSet, copyStopOperation, &copy);
+    uint32_t tmrStatus = 0;
+    cezanne::PspMailbox mailbox;
+    cezanne::Status teardown = pspTeardownLocked(fence, &tmrStatus, ringResponse, &mailbox);
+    copyState_ = kCopyIdle;
+    sdmaProgress_ = 0;
+    IOLog(LOG_PREFIX "SDMA stop: %s, F32_CNTL 0x%08x, PowerDownSdma 0x%x; teardown %s\n", cezanne::statusName(status),
+          *f32Cntl, *downResponse, cezanne::statusName(teardown));
+    return status != cezanne::kOK ? status : teardown;
+}
+
+cezanne::Status CezanneGPU::sdmaStop(const void *owner, uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence,
+                                     uint32_t *ringResponse)
+{
+    *f32Cntl = *downResponse = *fence = *ringResponse = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kSdmaOutOfOrder;
+    if (copyState_ != kCopyIdle && pspOwner_ == owner) {
+        status = sdmaStopLocked(f32Cntl, downResponse, fence, ringResponse);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
 void CezanneGPU::scratchAbandon(const void *owner)
 {
     if (lock_ == nullptr) {
@@ -1523,6 +1806,12 @@ void CezanneGPU::scratchAbandon(const void *owner)
     if (metricsOwner_ == owner) {
         metricsState_ = kMetricsIdle;
         metricsOwner_ = nullptr;
+    }
+    if (pspOwner_ == owner && copyState_ != kCopyIdle) {
+        uint32_t f32 = 0, down = 0, fence = 0, ring = 0;
+        cezanne::Status status = sdmaStopLocked(&f32, &down, &fence, &ring);
+        IOLog(LOG_PREFIX "SDMA copy abandoned; stop and teardown: %s\n", cezanne::statusName(status));
+        setProperty("CezanneGPU SDMA copy abandoned stop", cezanne::statusName(status));
     }
     if (pspOwner_ == owner && (pspState_ == kPspTmrSubmitted || pspState_ == kPspTmrObserved ||
                                pspState_ == kPspSdmaLoaded || pspState_ == kPspSdmaObserved)) {
@@ -1589,6 +1878,11 @@ private:
     static IOReturn sdmaLoad(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn sdmaObserve(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn sdmaInventory(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn sdmaCopyCheck(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn sdmaStart(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn sdmaSubmit(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn sdmaVerify(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn sdmaStop(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPUUserClient, IOUserClient)
@@ -1864,6 +2158,56 @@ IOReturn CezanneGPUUserClient::sdmaInventory(OSObject *target, void *, IOExterna
     return kIOReturnSuccess;
 }
 
+static IOReturn putScalars(IOExternalMethodArguments *arguments, cezanne::Status status, const uint32_t *values,
+                           uint32_t count)
+{
+    arguments->scalarOutput[0] = status;
+    for (uint32_t i = 0; i < count; i++) {
+        arguments->scalarOutput[i + 1] = values[i];
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn CezanneGPUUserClient::sdmaCopyCheck(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[2] = {};
+    return putScalars(arguments, self->gpu_->sdmaCopyCheck(self, &v[0], &v[1]), v, 2);
+}
+
+IOReturn CezanneGPUUserClient::sdmaStart(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[2] = {};
+    return putScalars(arguments, self->gpu_->sdmaStart(self, &v[0], &v[1]), v, 2);
+}
+
+IOReturn CezanneGPUUserClient::sdmaSubmit(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint64_t frame = arguments->scalarInput[0];
+    if (frame > 1) {
+        return kIOReturnBadArgument;
+    }
+    uint32_t v[3] = {};
+    return putScalars(arguments, self->gpu_->sdmaSubmit(self, static_cast<uint32_t>(frame), &v[0], &v[1], &v[2]), v,
+                      3);
+}
+
+IOReturn CezanneGPUUserClient::sdmaVerify(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[4] = {};
+    return putScalars(arguments, self->gpu_->sdmaVerify(self, &v[0], &v[1], &v[2], &v[3]), v, 4);
+}
+
+IOReturn CezanneGPUUserClient::sdmaStop(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[4] = {};
+    return putScalars(arguments, self->gpu_->sdmaStop(self, &v[0], &v[1], &v[2], &v[3]), v, 4);
+}
+
 IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                               IOExternalMethodDispatch *, OSObject *, void *reference)
 {
@@ -1890,6 +2234,11 @@ IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMetho
         {sdmaLoad, 0, 0, 6, 0},       // kDiagnosticSdmaLoad
         {sdmaObserve, 0, 0, 7, 0},    // kDiagnosticSdmaObserve
         {sdmaInventory, 0, 0, 3, sizeof(cezanne::SdmaInventory)}, // kDiagnosticSdmaInventory
+        {sdmaCopyCheck, 0, 0, 3, 0}, // kDiagnosticSdmaCopyCheck
+        {sdmaStart, 0, 0, 3, 0},     // kDiagnosticSdmaStart
+        {sdmaSubmit, 1, 0, 4, 0},    // kDiagnosticSdmaSubmit
+        {sdmaVerify, 0, 0, 5, 0},    // kDiagnosticSdmaVerify
+        {sdmaStop, 0, 0, 5, 0},      // kDiagnosticSdmaStop
     };
     if (selector >= cezanne::kDiagnosticSelectorCount) {
         return kIOReturnUnsupported;
