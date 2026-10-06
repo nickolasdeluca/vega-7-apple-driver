@@ -133,7 +133,18 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 15, the first SDMA copy
+## Next task: approve the stage 15 write-pointer revision
+
+Boot 20 showed the following:
+- SDMA0 started with every exact value and stopped cleanly.
+- The ring test timed out, with `GFX_RB_WPTR` reading 0 after a write
+  of 1024: `submitSdma` omitted the `GFX_RB_WPTR_HI` write that Linux's
+  `sdma_v4_0_ring_set_wptr` makes after the low dword.
+
+The [proposed revision](test-boot.md#revision-stage-15-write-pointer-commit-proposal)
+adds it. It needs approval, a rebuild and a cold boot.
+
+### Earlier: booting stage 15
 
 Stage 15 is approved and built: `out/test-efi/usb-stage15`, `--sdma-copy`.
 It applies the golden `GB_ADDR_CONFIG` and leaves the default page for

@@ -29,8 +29,10 @@ Stage 12 succeeded in boot 17: the first ring frames, `SETUP_TMR` and
 the PSP accepted and loaded the SDMA0 firmware (`SDMA0_UCODE_CHECKSUM` 0 →
 `0x25a1ba79`) with the engine left halted. Stage 14 succeeded in boot 19:
 `PowerUpSdma`/`PowerDownSdma` answered `0x01`, and the 31-register SDMA
-inventory is recorded. Stage 15 (the first SDMA copy) is approved and
-built, not yet booted. No later stage is authorized.
+inventory is recorded. Stage 15 (the first SDMA copy) ran in boot 20:
+SDMA0 started and stopped cleanly, but the ring test timed out because the
+driver wrote only the low half of the write pointer. A one-line revision is
+proposed. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -2486,6 +2488,42 @@ rest of the 64 KiB must match the snapshot afterwards.
 - Unexpected words outside the work area mean: power off at once.
 - Make a Time Machine backup before this boot.
 
+### Revision: stage 15 write-pointer commit (proposal)
+
+**Status: proposed 2026-10-06 after boot 20, not approved, not
+implemented.**
+
+**What boot 20 showed.**
+- The load, the copy check and the start all passed: progress 2,
+  `PowerUpSdma` `0x01`, and every golden and start value read back as
+  written.
+- The ring test then timed out: `observed` 0, `GFX_RB_RPTR` 0, and
+  **`GFX_RB_WPTR` read 0 after the driver wrote 1024**.
+- The stop halted SDMA0 (`F32_CNTL` 1) and powered it down (`0x01`); the
+  teardown fenced 3.
+
+**Cause (a defect in stage 15 as built).** Linux's non-doorbell path,
+`sdma_v4_0_ring_set_wptr`, writes `GFX_RB_WPTR` (low dword) **and then
+`GFX_RB_WPTR_HI`**. `gfx_resume` does the same.
+- `submitSdma` wrote only the low dword.
+- The low register reading back 0 fits a write pointer that the hardware
+  commits only when the high half is written.
+- The engine therefore never saw new work. That is consistent with the
+  read pointer staying 0 and nothing changing in memory.
+
+**Proposed change.**
+- `submitSdma` writes `GFX_RB_WPTR` ← 1024 (then 2048), followed by
+  `GFX_RB_WPTR_HI` ← 0, exactly as Linux does. `GFX_RB_WPTR_HI` ← 0 is
+  already in the approved stage 15 table, so no new value is added.
+- For the record, the submit step also returns `F32_CNTL` and `STATUS_REG`
+  read after the poll.
+- **Tests:**
+  - The submit's exact two-write sequence.
+  - The fake engine commits the write pointer only on the `_HI` write,
+    modelling what boot 20 showed.
+  - One weakened core (the `_HI` write removed) must fail.
+- Nothing else changes.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -3384,6 +3422,36 @@ with `tools/update_stick.sh 14`; cold boot, kernel up 09:56:34 local).
   `out/test-efi/boot-19-stage14/`.
 - Result: **stage 14 succeeded.** Every value stage 15 needs is now
   measured.
+
+**Boot 20, 2026-10-06, stage 15** (`out/test-efi/usb-stage15/`, written
+with `tools/update_stick.sh 15`; cold boot, kernel up 10:16:21 local).
+
+- `CezanneGPU stage` 15, diagnostics v11; stages 1–3 `ok`.
+- **The stage 13 load** repeated boot 19: fences 1 and 2, status 0, 0
+  unexpected words, checksum `0x25a1ba79`.
+- **Copy check:** `ok`. All 30 pinned SDMA registers read their boot 19
+  values, and the work area was stable.
+- **Start:** `ok`, progress 2, `PowerUpSdma` `0x01`. Afterwards every golden
+  and start register reads its table value:
+  - `CLK_CTRL` `0x3f000100`, `POWER_CNTL` `0x40000051`, `CHICKEN_BITS`
+    `0x02831f07`, `GB_ADDR_CONFIG`/`_READ` `0x00000002`, `UTCL1_WATERMK`
+    `0x03fbe1fe`, the poll controls `0x00403000`;
+  - `GFX_RB_BASE` `0xf4403000`, the read-pointer address
+    `0xf4`/`0x40301000`, the poll address `0xf4`/`0x40301008`.
+- **Ring test:** `sdma-timeout`. Observed 0, `GFX_RB_RPTR` 0, and
+  **`GFX_RB_WPTR` 0 after writing 1024.** The copy and fence were not
+  submitted.
+- **Stop:** `ok`. `F32_CNTL` `0x00000001` (halted), `GFX_RB_CNTL`
+  `0x00041014`, `PowerDownSdma` `0x01`. Then `DESTROY_TMR` fence 3, and the
+  ring destroy `0x80030000`. The machine stayed as before.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-20-stage15/`.
+- Result: **stopped safely: the engine started but never received work.**
+  `submitSdma` wrote only the low half of the write pointer, while Linux
+  also writes `GFX_RB_WPTR_HI`. See the
+  [proposed revision](#revision-stage-15-write-pointer-commit-proposal).
+- **Every SDMA register write was verified on hardware**, and so was the
+  full start and stop path.
 
 ## Unknowns and limits
 
