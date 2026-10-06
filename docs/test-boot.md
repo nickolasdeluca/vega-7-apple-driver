@@ -2765,6 +2765,162 @@ boot the known-good EFI.
   (a semaphore, an acknowledge, a data port) can act on a read. Check how
   Linux reads it, not only that it does.
 
+### Stage 17: GART and the interrupt ring (proposal)
+
+**Status: proposed 2026-10-06, not approved, not implemented.**
+
+**Purpose.** Turn on the two remaining memory and interrupt foundations,
+with every value pinned from boot 22:
+- **GART:** MMHUB VM context 0 with a one-level page table. It also
+  replaces the zero default page found in boot 14.
+- **The IH ring:** where engines post interrupts.
+
+SDMA0 proves both in one frame: a copy whose source is a GART address,
+followed by a fence and a `TRAP` that must appear in the IH ring. CPU
+interrupt delivery stays off, since macOS has no handler for this device.
+Everything written is restored to its boot 22 value before the stage 15
+stop and teardown.
+
+**It builds on stage 15.** `sudo cezanne-diag --gart-ih` first runs the
+stage 15 flow unchanged up to its verify: load, check, start, ring test,
+copy and fence. Then it runs the steps below, and ends with the stage 15
+stop.
+
+**A new work area** at carveout `0x40800000` (GPU `0xF440800000`, physical
+`0x600800000`), just above the TMR, 64 KiB checked and snapshotted:
+
+| Page | Offset | Contents |
+| --- | --- | --- |
+| GART page table | `+0x0000` | 512 PTEs (2 MiB of GART); PTE 0 maps the stage 15 source page, the rest are 0 (invalid) |
+| Dummy/default page | `+0x1000` | zero; the new system-aperture default page and VM fault default page |
+| IH ring 0 | `+0x2000` | 4 KiB, zeroed |
+| IH write-pointer write-back | `+0x3000` | zeroed |
+
+The stage 15 work area grows by one page: a second destination at `+0x4000`
+(zeroed), plus SDMA frame 2.
+
+**GART** (Linux v6.12 `mmhub_v1_0_gart_enable`; GC 9.3 sets
+`translate_further`, `gmc_v9_0_sw_init`):
+
+| Register | Boot 22 | Write | Linux |
+| --- | --- | --- | --- |
+| `VM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32`/`HI32` | 0/0 | `0x00800001`/`0x6` | `amdgpu_gmc_pd_addr`: table physical address (`vram_mc2pa`) \| VALID |
+| `VM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32`/`HI32` | 0/0 | `0`/`0` | GART at MC 0, as `amdgpu_gmc_gart_location` best fit places it on this host |
+| `VM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32`/`HI32` | 0/0 | `0x1ff`/`0` | 2 MiB here; Linux uses 1 GiB for GC 9.3 |
+| `MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB`/`MSB` | 0/0 | `0x600801`/`0` | `init_system_aperture_regs`: scratch page physical `>> 12` |
+| `VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32`/`HI32` | 0/0 | `0x600801`/`0` | dummy page `>> 12` |
+| `VM_L2_PROTECTION_FAULT_CNTL2` | `0x000a0000` | `0x000e0000` | + `ACTIVE_PAGE_MIGRATION_PTE_READ_RETRY` |
+| `MC_VM_MX_L1_TLB_CNTL` | `0x00002501` | `0x00003d59` | `init_tlb_regs`: `SYSTEM_ACCESS_MODE` 3, advanced driver model, `MTYPE` UC |
+| `VM_L2_CNTL` | `0x00080602` | `0x00080603` | `init_cache_regs`: + `ENABLE_L2_CACHE` |
+| `VM_L2_CNTL2` | `0` | `0x00000003` | invalidate all L1 TLBs and the L2 cache |
+| `VM_L2_CNTL3` | `0x80100007` | `0x8014800c` | `BANK_SELECT` 12, `BIGK` 9 (`translate_further`) |
+| `VM_L2_CNTL4` | `0x000000c1` | `0x00000001` | PDE and PTE requests not physical |
+| `VM_CONTEXT0_CNTL` | `0x007ffe80` | `0x007ffe01` | `enable_system_domain`: enable, depth 0, no retry |
+| `VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32`/`HI32` | 0/0 | `0xffffffff`/`0xf` | `disable_identity_aperture` |
+| `VM_INVALIDATE_ENG17_ADDR_RANGE_LO32`/`HI32` | 0/0 | `0xffffffff`/`0x1f` | `program_invalidation`, engine 17 only |
+
+Then the TLB flush (`gmc_v9_0_flush_gpu_tlb`, MMHUB, engine 17, with the
+semaphore):
+1. Read `VM_INVALIDATE_ENG17_SEM` until it reads 1 (acquired).
+2. Write `VM_INVALIDATE_ENG17_REQ` ← `0x007c0001`: VMID 0, flush type 0,
+   L2 PTEs, PDE0–2 and L1 PTEs.
+3. Poll `VM_INVALIDATE_ENG17_ACK` bit 0.
+4. Release the semaphore: `SEM` ← 0.
+
+**PTE 0** is `0x0600000600302073`: the source page's physical address
+`0x600302000`, plus `VALID`, `SYSTEM`, `EXECUTABLE`, `READABLE` and
+`WRITEABLE`, and `MTYPE_UC` (3, `vega10_enum.h`) at bit 57. There is no
+`SNOOPED`, because the CPU maps the page uncached
+(`amdgpu_ttm_tt_pte_flags`).
+- **Left out:** contexts 1–15 (`setup_vmid_config`), the other 17
+  invalidation engines, GFXHUB (SDMA uses MMHUB), AGP and the system
+  aperture bounds. The firmware's system aperture is unchanged, so FB
+  addresses, including the display's, still bypass the page table.
+
+**IH ring 0** (`vega10_ih_enable_ring`, `vega10_ih_rb_cntl`):
+
+| Register | Boot 22 | Write | Linux |
+| --- | --- | --- | --- |
+| `IH_RB_BASE`/`_BASE_HI` | 0/0 | `0xF4408020`/`0x00` | ring GPU address `>> 8`, `>> 40` |
+| `IH_RB_CNTL` | `0x40610000` | `0xc0110114`, then `0xc0110115` | see below; then `RB_ENABLE` |
+| `IH_RB_WPTR_ADDR_LO`/`_HI` | 0/0 | `0x40803000`/`0xf4` | write-pointer write-back |
+| `IH_RB_WPTR`, `IH_RB_RPTR` | `0x00080000`, 0 | 0, 0 | ring reset |
+| `IH_DOORBELL_RPTR` | 0 | 0 | no doorbell |
+
+`IH_RB_CNTL` has the following fields:
+- `MC_SPACE` 4: the MC address space. Linux uses 4 for rings it places in
+  VRAM; ring 0 on Renoir uses a bus address (`use_bus_addr`, `MC_SPACE` 1
+  with `IH_CHICKEN.MC_SPACE_GPA_ENABLE`). We use a carveout MC address, so
+  `IH_CHICKEN` stays 0.
+- `RB_SIZE` 10 (4 KiB), write-back on, `WPTR_OVERFLOW_ENABLE` and
+  `_CLEAR`, `MC_SNOOP` 1, `MC_RO` 0, VMID 0.
+- `RPTR_REARM` 0: there is no MSI.
+- **`ENABLE_INTR` stays 0:** no CPU interrupt. `vega10_ih_toggle_interrupts`
+  would set it.
+- **Left out:** the NBIO `ih_control` and doorbell range, which only
+  matter for CPU delivery and doorbells, and rings 1 and 2.
+
+**SDMA interrupt.** `SDMA0_CNTL` ← `0x00000003` (`TRAP_ENABLE`, as
+`sdma_v4_0_set_trap_irq_state` sets). Frame 2 of the SDMA ring (dwords
+512–767), then `GFX_RB_WPTR` ← 3072 and `_HI` ← 0:
+- `COPY_LINEAR` 4 KiB from **GART address `0x0`** (PTE 0, the source
+  page) to the second destination, `0xF440304000`;
+- `FENCE` 2 at write-back `+0x204`;
+- `TRAP` (`0x00000006`, context 0).
+
+**Verify** (no writes):
+- the second destination equals the source;
+- fence 2 arrived;
+- `GFX_RB_RPTR` is 3072;
+- `VM_L2_PROTECTION_FAULT_STATUS` is 0 (no VM fault);
+- the IH write-back pointer advanced, and the ring holds an entry from
+  client 8 (`SOC15_IH_CLIENTID_SDMA0`) with source 224
+  (`SDMA0_4_0__SRCID__SDMA_TRAP`); other clients' entries are recorded;
+- the display inventory (stage 16) is unchanged, apart from the live
+  `HUBP_IN_BLANK` bit;
+- the two 64 KiB regions hold only expected words.
+
+**Restore** (before the stage 15 stop):
+- `IH_RB_CNTL` ← `0xc0110114` (ring off), then every IH register back to
+  its boot 22 value.
+- `SDMA0_CNTL` ← `0x00000002`.
+- Every GART register back to its boot 22 value, `VM_CONTEXT0_CNTL` first,
+  then a second engine 17 flush.
+- If the tool exits early, the driver does the same.
+
+**Preconditions.** Every register written must read its boot 22 value, and
+display pipe 0 must match boot 22. The semaphore is acquired only inside
+the flush.
+
+**New writes:**
+- **Registers:** the GART and IH registers above, with exactly those values
+  and their boot 22 restore values. Also `VM_INVALIDATE_ENG17_REQ` ←
+  `0x007c0001`, `VM_INVALIDATE_ENG17_SEM` ← 0, `SDMA0_CNTL` ← `0x3`, and
+  `GFX_RB_WPTR` ← 3072.
+- **Memory:** the new work area's four pages (one non-zero word in the page
+  table, everything else zero), the second destination page (zero), and
+  SDMA frame 2's words.
+
+**Risks:**
+- **These are the first writes that change settings shared by every MMHUB
+  client, including the display's scanout.** They are `MC_VM_MX_L1_TLB_CNTL`
+  (`SYSTEM_ACCESS_MODE` 0 → 3) and `VM_L2_CNTL` (L2 cache on). Linux makes
+  exactly these writes while the GOP framebuffer is on screen. The display
+  uses FB addresses inside the unchanged system aperture, which bypass the
+  page table.
+- **If the screen glitches or goes black:** the restore runs at the end
+  anyway. If the machine hangs, power off; a cold boot resets everything.
+- **A VM fault now goes to the dummy page,** not physical 0.
+- **No CPU interrupt can fire** (`ENABLE_INTR` 0, and MSI is not set up).
+- Make a Time Machine backup before this boot.
+
+**Expected:**
+- Every stage 15 result again.
+- Fence 2, destination 2 equal to the source, no VM fault.
+- One or more IH entries, including SDMA0's trap.
+- The display unchanged, and every register back at its boot 22 value
+  after the restore.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
