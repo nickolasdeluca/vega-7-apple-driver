@@ -107,6 +107,9 @@ class CoreTests(unittest.TestCase):
                 "if (stage < kPspSdmaStage || (offset & 3) != 0) return false;"),
             "!writeAllowed(kRegMp0C2PMsg67, 64, 13)": ("(stage >= kPspSdmaStage && value == 3 * kPspFrameDwords);",
                                                        "(stage >= kPspSdmaStage && value >= 3 * kPspFrameDwords);"),
+            "!smuArgumentAllowed(kSmuMsgPowerUpSdma, 1, 14)": (
+                "case kSmuMsgPowerDownSdma: return stage >= kSdmaInventoryStage && argument == 0;",
+                "case kSmuMsgPowerDownSdma: return stage >= kSdmaInventoryStage;"),
             "gfxGated(kRegGcApertureHigh)": ("if (kStage10GfxGatedRegisters[i] == offset) return true;", "(void)0;"),
             "registerAllowed(kRegGrbmGfxIndex, 2)": ("stage == 2 ? kStage2RegisterCount",
                                                      "stage == 2 ? kStage3RegisterCount"),

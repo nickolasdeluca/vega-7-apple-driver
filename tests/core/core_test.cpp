@@ -1534,6 +1534,49 @@ static void testSdmaLoad()
     }
 }
 
+static void testSdmaInventory()
+{
+    CHECK(kRegSdma0Cntl == 0x49f0 && kRegSdma0GfxRbBase == 0x4b84 && kRegSdma0GfxDoorbellOffset == 0x4c2c);
+    CHECK(kRegSdma0Rlc1RbWptrPollCntl == 0x501c && kSdmaInventoryCount == 31);
+    CHECK(kStage14RegisterCount == kStage13RegisterCount + 25);
+    for (uint32_t i = 0; i < kStage13RegisterCount; i++) CHECK(kStage14Registers[i] == kStage13Registers[i]);
+    for (uint32_t i = 0; i < kStage14RegisterCount; i++) {
+        CHECK(kStage14Registers[i] % 4 == 0 && kStage14Registers[i] + 4 <= 0x80000);
+        for (uint32_t j = i + 1; j < kStage14RegisterCount; j++) CHECK(kStage14Registers[i] != kStage14Registers[j]);
+    }
+    for (uint32_t i = kStage13RegisterCount; i < kStage14RegisterCount; i++) {
+        CHECK(registerAllowed(kStage14Registers[i], 14) && !registerAllowed(kStage14Registers[i], 13));
+        CHECK(!writeAllowed(kStage14Registers[i], 0, 14) && !gfxGated(kStage14Registers[i]));
+    }
+    for (uint32_t i = 0; i < kSdmaInventoryCount; i++) CHECK(registerAllowed(kSdmaInventory[i], 14));
+    // The two SMU messages, with argument 0 only, from stage 14.
+    CHECK(writeAllowed(kRegMp1C2PMsg66, kSmuMsgPowerUpSdma, 14) && !writeAllowed(kRegMp1C2PMsg66, kSmuMsgPowerUpSdma, 13));
+    CHECK(writeAllowed(kRegMp1C2PMsg66, kSmuMsgPowerDownSdma, 14) && !writeAllowed(kRegMp1C2PMsg66, 0xF, 14));
+    CHECK(smuArgumentAllowed(kSmuMsgPowerUpSdma, 0, 14) && smuArgumentAllowed(kSmuMsgPowerDownSdma, 0, 14));
+    CHECK(!smuArgumentAllowed(kSmuMsgPowerUpSdma, 1, 14));
+    CHECK(!smuArgumentAllowed(kSmuMsgPowerDownSdma, 0, 13));
+
+    SdmaInventory inventory;
+    uint32_t up = 0, down = 0;
+    {
+        FakeRegisters r;
+        FakeWriter w(&r);
+        CHECK(runSdmaInventory(r.reader(), 0x80000, w.writer(), 14, &inventory, &up, &down) == kOK);
+        CHECK(up == 1 && down == 1 && w.writes == 6);
+        const uint32_t values[] = {0, 0, kSmuMsgPowerUpSdma, 0, 0, kSmuMsgPowerDownSdma};
+        for (int i = 0; i < 6; i++) CHECK(w.values[i] == values[i]);
+        CHECK(inventory.loaded[0] == 0xDEADBEEF && inventory.gated[30] == 0xDEADBEEF);
+        CHECK(runSdmaInventory(r.reader(), 0x80000, w.writer(), 13, &inventory, &up, &down) == kRegisterNotAllowed);
+    }
+    {
+        FakeRegisters r;
+        r.smuReply = 0xFE;
+        FakeWriter w(&r);
+        CHECK(runSdmaInventory(r.reader(), 0x80000, w.writer(), 14, &inventory, &up, &down) == kSmuResponseNotOk);
+        CHECK(up == 0xFE && w.writes == 3);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -1555,6 +1598,7 @@ int main()
     testPspRing();
     testPspTmr();
     testSdmaLoad();
+    testSdmaInventory();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

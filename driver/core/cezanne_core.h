@@ -31,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 13;
+const uint32_t kMaxStage = 14;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -410,6 +410,68 @@ const uint32_t kStage13RegisterCount = sizeof(kStage13Registers) / sizeof(kStage
 const uint32_t kSdmaF32Halt = 0x1; // SDMA0_F32_CNTL.HALT
 const uint32_t kPspSdmaStage = 13;
 
+// Stage 14: the SDMA registers sdma_v4_0_hw_init / _start / golden settings
+// (golden_settings_sdma_4_3) touch, read only, with SDMA powered up by the
+// SMU as Linux does on APUs (smu_v12_0_powergate_sdma; smu_v12_0_ppsmc.h).
+// Offsets: sdma0_4_0_offset.h, SDMA0 base 0x1260.
+const uint32_t kRegSdma0Cntl = (0x1260 + 0x001c) * 4;
+const uint32_t kRegSdma0ChickenBits = (0x1260 + 0x001d) * 4;
+const uint32_t kRegSdma0GbAddrConfig = (0x1260 + 0x001e) * 4;
+const uint32_t kRegSdma0GbAddrConfigRead = (0x1260 + 0x001f) * 4;
+const uint32_t kRegSdma0SemWaitFailTimerCntl = (0x1260 + 0x0021) * 4;
+const uint32_t kRegSdma0Utcl1Watermk = (0x1260 + 0x003d) * 4;
+const uint32_t kRegSdma0Utcl1Timeout = (0x1260 + 0x0047) * 4;
+const uint32_t kRegSdma0Utcl1Page = (0x1260 + 0x0048) * 4;
+const uint32_t kRegSdma0GfxRbBase = (0x1260 + 0x0081) * 4;
+const uint32_t kRegSdma0GfxRbBaseHi = (0x1260 + 0x0082) * 4;
+const uint32_t kRegSdma0GfxRbRptr = (0x1260 + 0x0083) * 4;
+const uint32_t kRegSdma0GfxRbRptrHi = (0x1260 + 0x0084) * 4;
+const uint32_t kRegSdma0GfxRbWptr = (0x1260 + 0x0085) * 4;
+const uint32_t kRegSdma0GfxRbWptrHi = (0x1260 + 0x0086) * 4;
+const uint32_t kRegSdma0GfxRbWptrPollCntl = (0x1260 + 0x0087) * 4;
+const uint32_t kRegSdma0GfxRbRptrAddrHi = (0x1260 + 0x0088) * 4;
+const uint32_t kRegSdma0GfxRbRptrAddrLo = (0x1260 + 0x0089) * 4;
+const uint32_t kRegSdma0GfxIbCntl = (0x1260 + 0x008a) * 4;
+const uint32_t kRegSdma0GfxDoorbell = (0x1260 + 0x0092) * 4;
+const uint32_t kRegSdma0GfxDoorbellOffset = (0x1260 + 0x00ab) * 4;
+const uint32_t kRegSdma0GfxRbWptrPollAddrHi = (0x1260 + 0x00b2) * 4;
+const uint32_t kRegSdma0GfxRbWptrPollAddrLo = (0x1260 + 0x00b3) * 4;
+const uint32_t kRegSdma0GfxMinorPtrUpdate = (0x1260 + 0x00b5) * 4;
+const uint32_t kRegSdma0Rlc0RbWptrPollCntl = (0x1260 + 0x0147) * 4;
+const uint32_t kRegSdma0Rlc1RbWptrPollCntl = (0x1260 + 0x01a7) * 4;
+const uint32_t kStage14Registers[] = {kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset, kRegGrbmStatus,
+                                      kRegGrbmGfxIndex, kRegCcShaderArrayConfig, kRegUserShaderArrayConfig,
+                                      kRegCcRbBackendDisable, kRegUserRbBackendDisable, kRegGbAddrConfig,
+                                      kRegSmuioGfxMiscCntl, kRegMp1C2PMsg66, kRegMp1C2PMsg82,
+                                      kRegMp1C2PMsg90, kRegMp0C2PMsg35, kRegMp0C2PMsg81,
+                                      kRegRlcCgttMgcgOverride, kRegRlcCgcgCglsCtrl,
+                                      kRegRlcCgcgCglsCtrl3d, kRegRlcMemSlpCntl, kRegCpMemSlpCntl,
+                                      kRegRlcPgCntl, kRegGrbmStatus2, kRegGrbmStatusSe0,
+                                      kRegCpBusyStat, kRegCpCpfStatus, kRegCpMeCntl, kRegCpMecCntl,
+                                      kRegRlcCntl, kRegRlcStat, kRegCpPfpInstrPntr, kRegCpMeInstrPntr,
+                                      kRegCpMec1InstrPntr, kRegSdma0ClkCtrl, kRegSdma0PowerCntl,
+                                      kRegSdma0F32Cntl, kRegSdma0StatusReg, kRegSdma0GfxRbCntl,
+                                      kRegHdpMemPowerLs, kRegAthubMiscCntl, kRegAtcL2MiscCg,
+                                      kRegDagb0CntlMisc2, kRegMmhubFbLocationBase, kRegMmhubFbLocationTop,
+                                      kRegMmhubVmL2Cntl, kRegMmhubVmContext0Cntl, kRegMmhubMxL1TlbCntl,
+                                      kRegIhRbCntl, kRegScratchReg0, kRegMp0C2PMsg36, kRegMp0C2PMsg64,
+                                      kRegMp0C2PMsg67, kRegMp0C2PMsg69, kRegMp0C2PMsg70, kRegMp0C2PMsg71,
+                                      kRegMmhubFbOffset, kRegMmhubDefaultAddrLsb, kRegMmhubDefaultAddrMsb,
+                                      kRegMmhubAgpTop, kRegMmhubAgpBot, kRegMmhubAgpBase,
+                                      kRegMmhubApertureLow, kRegMmhubApertureHigh, kRegGcFbLocationBase,
+                                      kRegGcFbLocationTop, kRegGcAgpTop, kRegGcAgpBot, kRegGcAgpBase,
+                                      kRegGcApertureLow, kRegGcApertureHigh, kRegSdma0UcodeChecksum,
+                                      kRegSdma0Cntl, kRegSdma0ChickenBits, kRegSdma0GbAddrConfig, kRegSdma0GbAddrConfigRead, kRegSdma0SemWaitFailTimerCntl, kRegSdma0Utcl1Watermk, kRegSdma0Utcl1Timeout, kRegSdma0Utcl1Page, kRegSdma0GfxRbBase, kRegSdma0GfxRbBaseHi, kRegSdma0GfxRbRptr, kRegSdma0GfxRbRptrHi, kRegSdma0GfxRbWptr, kRegSdma0GfxRbWptrHi, kRegSdma0GfxRbWptrPollCntl, kRegSdma0GfxRbRptrAddrHi, kRegSdma0GfxRbRptrAddrLo, kRegSdma0GfxIbCntl, kRegSdma0GfxDoorbell, kRegSdma0GfxDoorbellOffset, kRegSdma0GfxRbWptrPollAddrHi, kRegSdma0GfxRbWptrPollAddrLo, kRegSdma0GfxMinorPtrUpdate, kRegSdma0Rlc0RbWptrPollCntl, kRegSdma0Rlc1RbWptrPollCntl};
+const uint32_t kStage14RegisterCount = sizeof(kStage14Registers) / sizeof(kStage14Registers[0]);
+// The 31 registers read three times: six known from stages 5 and 13, then
+// the 25 above.
+const uint32_t kSdmaInventory[] = {kRegSdma0F32Cntl, kRegSdma0ClkCtrl, kRegSdma0PowerCntl, kRegSdma0StatusReg,
+                                   kRegSdma0GfxRbCntl, kRegSdma0UcodeChecksum, kRegSdma0Cntl, kRegSdma0ChickenBits, kRegSdma0GbAddrConfig, kRegSdma0GbAddrConfigRead, kRegSdma0SemWaitFailTimerCntl, kRegSdma0Utcl1Watermk, kRegSdma0Utcl1Timeout, kRegSdma0Utcl1Page, kRegSdma0GfxRbBase, kRegSdma0GfxRbBaseHi, kRegSdma0GfxRbRptr, kRegSdma0GfxRbRptrHi, kRegSdma0GfxRbWptr, kRegSdma0GfxRbWptrHi, kRegSdma0GfxRbWptrPollCntl, kRegSdma0GfxRbRptrAddrHi, kRegSdma0GfxRbRptrAddrLo, kRegSdma0GfxIbCntl, kRegSdma0GfxDoorbell, kRegSdma0GfxDoorbellOffset, kRegSdma0GfxRbWptrPollAddrHi, kRegSdma0GfxRbWptrPollAddrLo, kRegSdma0GfxMinorPtrUpdate, kRegSdma0Rlc0RbWptrPollCntl, kRegSdma0Rlc1RbWptrPollCntl};
+const uint32_t kSdmaInventoryCount = sizeof(kSdmaInventory) / sizeof(kSdmaInventory[0]);
+const uint32_t kSmuMsgPowerDownSdma = 0xD;
+const uint32_t kSmuMsgPowerUpSdma = 0xE;
+const uint32_t kSdmaInventoryStage = 14;
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -494,6 +556,8 @@ enum Status : uint32_t {
     // Stage 13.
     kSdmaImageInvalid,
     kSdmaNotHalted,
+    // Stage 14.
+    kSdmaOutOfOrder,
 };
 
 const char *statusName(Status status);
@@ -612,7 +676,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 9;
+const uint32_t kDiagnosticVersion = 10;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -641,7 +705,10 @@ enum DiagnosticSelector : uint32_t {
     // Stage 13, after a SETUP_TMR submit (selector 15) that fenced with status 0.
     kDiagnosticSdmaLoad = 18,    // out: Status, fence, response status, fw_addr lo, hi, C2PMSG_67
     kDiagnosticSdmaObserve = 19, // out: Status, work unexpected, first; firmware unexpected, first; checksum, F32_CNTL
-    kDiagnosticSelectorCount = 20,
+    // Stage 14, after a LOAD_IP_FW that fenced (selector 18).
+    kDiagnosticSdmaInventory = 20, // out: Status, PowerUpSdma response, PowerDownSdma response;
+                                   // structure: SdmaInventory
+    kDiagnosticSelectorCount = 21,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -877,6 +944,21 @@ Status writeSdmaFirmware(const uint8_t *image, uint32_t length, const MemoryRead
 // image's words, the rest the snapshot. kPspRegionChanged if any differ.
 Status verifySdmaFirmwareRegion(const MemoryReader &region, const uint32_t *snapshot, const uint8_t *image,
                                 uint32_t *unexpected, uint32_t *firstOffset);
+
+// Stage 14. Three readings of kSdmaInventory: loaded (gated), after
+// PowerUpSdma, after PowerDownSdma.
+struct SdmaInventory {
+    uint32_t loaded[kSdmaInventoryCount], powered[kSdmaInventoryCount], gated[kSdmaInventoryCount];
+};
+
+// Reads kSdmaInventory in order into values.
+Status readSdmaInventory(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *values);
+
+// Reads, sends PowerUpSdma, reads, sends PowerDownSdma, reads (the stage 7
+// send-and-poll for each message, argument 0). PowerDownSdma is sent
+// whenever PowerUpSdma was answered OK, even if the second reading fails.
+Status runSdmaInventory(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                        uint32_t stage, SdmaInventory *inventory, uint32_t *upResponse, uint32_t *downResponse);
 
 } // namespace cezanne
 

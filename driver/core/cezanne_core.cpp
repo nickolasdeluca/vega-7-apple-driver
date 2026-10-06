@@ -74,6 +74,7 @@ const char *statusName(Status status)
     case kPspCommandFailed: return "psp-command-failed";
     case kSdmaImageInvalid: return "sdma-image-invalid";
     case kSdmaNotHalted: return "sdma-not-halted";
+    case kSdmaOutOfOrder: return "sdma-out-of-order";
     }
     return "unknown";
 }
@@ -150,8 +151,9 @@ Status checkAperture(const PciState &state, uint64_t physical, uint64_t length)
 bool registerAllowed(uint32_t offset, uint32_t stage)
 {
     // Each stage's list extends the previous one (checked by the tests), so a
-    // prefix of the stage 13 list is the list for any stage.
-    uint32_t count = stage >= 13  ? kStage13RegisterCount
+    // prefix of the stage 14 list is the list for any stage.
+    uint32_t count = stage >= 14  ? kStage14RegisterCount
+                     : stage >= 13 ? kStage13RegisterCount
                      : stage >= 10 ? kStage10RegisterCount
                      : stage >= 6 ? kStage6RegisterCount
                      : stage == 5 ? kStage5RegisterCount
@@ -160,7 +162,7 @@ bool registerAllowed(uint32_t offset, uint32_t stage)
                      : stage == 1 ? kStage1RegisterCount
                                   : 0;
     for (uint32_t i = 0; i < count; i++) {
-        if (kStage13Registers[i] == offset) return true;
+        if (kStage14Registers[i] == offset) return true;
     }
     return false;
 }
@@ -434,7 +436,8 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
                (stage >= kGfxOffStage && value == kSmuMsgDisableGfxOff) ||
                (stage >= kMetricsStage && (value == kSmuMsgSetDriverDramAddrHigh ||
                                            value == kSmuMsgSetDriverDramAddrLow ||
-                                           value == kSmuMsgTransferTableSmu2Dram));
+                                           value == kSmuMsgTransferTableSmu2Dram)) ||
+               (stage >= kSdmaInventoryStage && (value == kSmuMsgPowerUpSdma || value == kSmuMsgPowerDownSdma));
     if (stage < kPspRingStage) return false;
     if (offset == kRegMp0C2PMsg64) return value == kPspCmdInitGpcomRing || value == kPspCmdDestroyRings;
     if (offset == kRegMp0C2PMsg69) return value == uint32_t(kPspRingGpuAddress);
@@ -456,6 +459,8 @@ bool smuArgumentAllowed(uint32_t message, uint32_t argument, uint32_t stage)
     case kSmuMsgSetDriverDramAddrHigh: return stage >= kMetricsStage && argument == uint32_t(kMetricsGpuAddress >> 32);
     case kSmuMsgSetDriverDramAddrLow: return stage >= kMetricsStage && argument == uint32_t(kMetricsGpuAddress);
     case kSmuMsgTransferTableSmu2Dram: return stage >= kMetricsStage && argument == kTableSmuMetrics;
+    case kSmuMsgPowerUpSdma:
+    case kSmuMsgPowerDownSdma: return stage >= kSdmaInventoryStage && argument == 0;
     default: return false;
     }
 }
@@ -1116,6 +1121,35 @@ Status verifySdmaFirmwareRegion(const MemoryReader &region, const uint32_t *snap
         if (value != expected && (*unexpected)++ == 0) *firstOffset = offset;
     }
     return *unexpected == 0 ? kOK : kPspRegionChanged;
+}
+
+Status readSdmaInventory(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *values)
+{
+    for (uint32_t i = 0; i < kSdmaInventoryCount; i++) values[i] = 0;
+    if (stage < kSdmaInventoryStage) return kRegisterNotAllowed;
+    for (uint32_t i = 0; i < kSdmaInventoryCount; i++) {
+        Status status = readRegister(registers, apertureLength, stage, kSdmaInventory[i], &values[i]);
+        if (status != kOK) return status;
+    }
+    return kOK;
+}
+
+Status runSdmaInventory(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                        uint32_t stage, SdmaInventory *inventory, uint32_t *upResponse, uint32_t *downResponse)
+{
+    *inventory = SdmaInventory();
+    *upResponse = *downResponse = 0;
+    if (stage < kSdmaInventoryStage) return kRegisterNotAllowed;
+    Status status = readSdmaInventory(registers, apertureLength, stage, inventory->loaded);
+    if (status != kOK) return status;
+    status = sendSmuMessage(registers, apertureLength, writer, stage, kSmuMsgPowerUpSdma, 0, upResponse, nullptr);
+    if (status != kOK) return status;
+    Status powered = readSdmaInventory(registers, apertureLength, stage, inventory->powered);
+    // Power SDMA back down whatever the reading found.
+    status = sendSmuMessage(registers, apertureLength, writer, stage, kSmuMsgPowerDownSdma, 0, downResponse, nullptr);
+    if (status != kOK) return status;
+    if (powered != kOK) return powered;
+    return readSdmaInventory(registers, apertureLength, stage, inventory->gated);
 }
 
 } // namespace cezanne
