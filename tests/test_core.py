@@ -118,6 +118,8 @@ class CoreTests(unittest.TestCase):
             "sdmaRingWord(261) == 0x40303000u": ("uint32_t(destination),", "uint32_t(destination + kSdmaWorkCheckSize),"),
             "r.sdma[kRegSdma0F32Cntl] == 1": ("    if (progress >= 2) {\n        for (const SdmaWrite &write : kSdmaStop)",
                                               "    if (progress >= 3) {\n        for (const SdmaWrite &write : kSdmaStop)"),
+            "observed == 0xDEADBEEFu": ("    if (status == kOK) status = writeRegister(writer, stage, kRegSdma0GfxRbWptrHi, 0);\n",
+                                        ""),
             "gfxGated(kRegGcApertureHigh)": ("if (kStage10GfxGatedRegisters[i] == offset) return true;", "(void)0;"),
             "registerAllowed(kRegGrbmGfxIndex, 2)": ("stage == 2 ? kStage2RegisterCount",
                                                      "stage == 2 ? kStage3RegisterCount"),
@@ -148,7 +150,7 @@ class CoreTests(unittest.TestCase):
         self.assertLess(body.index("writeAllowed"), body.index("write32"))
         # Scratch pattern and restore; SMU response, argument and message; PSP
         # arguments (C2PMSG_69, _70, _71) and command; the ring write pointer.
-        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 14)
+        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 15)
         allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
         self.assertEqual(allow.count("return"), 14)
         self.assertIn("if (stage >= kScratchStage && offset == kRegScratchReg0) return true;", allow)

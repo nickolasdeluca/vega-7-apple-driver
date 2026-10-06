@@ -678,16 +678,18 @@ bool sdmaCopy(io_connect_t connection, bool *stopped)
                     static_cast<unsigned long long>(start[1]), static_cast<unsigned long long>(start[2]));
         ok = start[0] == kOK;
     }
-    const char *frames[] = {"copy 3/6 ring test: WRITE_LINEAR 0xDEADBEEF, GFX_RB_WPTR <- 1024",
-                            "copy 4/6 copy: COPY_LINEAR 4 KiB and FENCE 1, GFX_RB_WPTR <- 2048"};
+    const char *frames[] = {"copy 3/6 ring test: WRITE_LINEAR 0xDEADBEEF, GFX_RB_WPTR <- 1024, _HI <- 0",
+                            "copy 4/6 copy: COPY_LINEAR 4 KiB and FENCE 1, GFX_RB_WPTR <- 2048, _HI <- 0"};
     for (uint64_t frame = 0; ok && frame < 2; frame++) {
-        uint64_t out[4] = {};
+        uint64_t out[6] = {};
         step(frames[frame]);
-        ok = call(connection, kDiagnosticSdmaSubmit, out, 4, &frame, 1);
+        ok = call(connection, kDiagnosticSdmaSubmit, out, 6, &frame, 1);
         if (ok) {
-            std::printf("%s, observed 0x%08llx, GFX_RB_RPTR %llu, GFX_RB_WPTR %llu\n",
+            std::printf("%s, observed 0x%08llx, GFX_RB_RPTR %llu, GFX_RB_WPTR %llu\n"
+                        "  SDMA0_F32_CNTL 0x%08llx, SDMA0_STATUS_REG 0x%08llx\n",
                         statusName(static_cast<Status>(out[0])), static_cast<unsigned long long>(out[1]),
-                        static_cast<unsigned long long>(out[2]), static_cast<unsigned long long>(out[3]));
+                        static_cast<unsigned long long>(out[2]), static_cast<unsigned long long>(out[3]),
+                        static_cast<unsigned long long>(out[4]), static_cast<unsigned long long>(out[5]));
             ok = out[0] == kOK;
         }
     }

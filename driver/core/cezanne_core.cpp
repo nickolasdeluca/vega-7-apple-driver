@@ -1285,7 +1285,10 @@ Status submitSdma(const RegisterReader &registers, uint64_t apertureLength, cons
     Status status = readRegister(registers, apertureLength, stage, kRegSdma0GfxRbWptr, &pointer);
     if (status != kOK) return status;
     if (pointer != frame * kSdmaFrameDwords * 4) return kSdmaOutOfOrder;
+    // sdma_v4_0_ring_set_wptr: low dword, then the high dword, which
+    // commits it (boot 20: the low write alone left GFX_RB_WPTR at 0).
     status = writeRegister(writer, stage, kRegSdma0GfxRbWptr, (frame + 1) * kSdmaFrameDwords * 4);
+    if (status == kOK) status = writeRegister(writer, stage, kRegSdma0GfxRbWptrHi, 0);
     if (status != kOK) return status;
     const uint32_t at = kSdmaWbPage + (frame == 0 ? kSdmaWbTest : kSdmaWbFence);
     const uint32_t expected = frame == 0 ? kSdmaTestValue : 1;

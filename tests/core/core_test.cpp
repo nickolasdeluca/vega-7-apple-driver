@@ -120,6 +120,7 @@ struct FakeRegisters {
     std::map<uint32_t, uint32_t> sdma;
     FakeMemory *sdmaWork = nullptr;
     bool sdmaCorruptCopy = false, sdmaStray = false;
+    uint32_t sdmaPendingWptr = 0; // the low dword, committed by the _HI write (boot 20)
     int pauses = 0;
     void presetBoot19()
     {
@@ -709,14 +710,14 @@ struct FakeWriter {
     FakeRegisters *registers;
     bool fail = false;
     uint32_t pauseWrites = 0; // non-zero: value something else writes during the pause
-    uint32_t offsets[32], values[32];
+    uint32_t offsets[64], values[64];
     int writes = 0;
 
     explicit FakeWriter(FakeRegisters *r) : registers(r) {}
     static bool write32(void *context, uint32_t offset, uint32_t value)
     {
         FakeWriter *self = static_cast<FakeWriter *>(context);
-        if (self->writes < 32) {
+        if (self->writes < 64) {
             self->offsets[self->writes] = offset;
             self->values[self->writes] = value;
         }
@@ -735,9 +736,16 @@ struct FakeWriter {
         if (offset == kRegMp0C2PMsg70) r->psp70 = value;
         if (offset == kRegMp0C2PMsg71) r->psp71 = value;
         if (!r->sdma.empty() && offset >= kRegSdma0PowerCntl && offset <= kRegSdma0Rlc1RbWptrPollCntl) {
-            uint32_t old = r->sdma[offset];
-            r->sdma[offset] = value;
-            if (offset == kRegSdma0GfxRbWptr) runSdma(r, old, value);
+            if (offset == kRegSdma0GfxRbWptr) {
+                r->sdmaPendingWptr = value; // reads keep the committed value
+            } else {
+                r->sdma[offset] = value;
+            }
+            if (offset == kRegSdma0GfxRbWptrHi) {
+                uint32_t old = r->sdma[kRegSdma0GfxRbWptr];
+                r->sdma[kRegSdma0GfxRbWptr] = r->sdmaPendingWptr;
+                runSdma(r, old, r->sdmaPendingWptr);
+            }
         }
         if (offset == kRegMp0C2PMsg67) {
             r->frameStart = r->psp67;
@@ -1734,8 +1742,13 @@ static void testSdmaCopy()
         CHECK(w.writes == 3 + 10 + 24 && w.values[2] == kSmuMsgPowerUpSdma && w.offsets[3] == kRegSdma0ChickenBits);
         CHECK(r.sdma[kRegSdma0F32Cntl] == 0 && r.sdma[kRegSdma0GfxRbCntl] == 0x00041015u);
         CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 15, 1, &observed) == kSdmaOutOfOrder);
+        int beforeSubmit = w.writes;
         CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 15, 0, &observed) == kOK);
         CHECK(observed == 0xDEADBEEFu);
+        // The write pointer, then its commit (sdma_v4_0_ring_set_wptr).
+        CHECK(w.writes == beforeSubmit + 2 && w.offsets[beforeSubmit] == kRegSdma0GfxRbWptr &&
+              w.values[beforeSubmit] == 1024 && w.offsets[beforeSubmit + 1] == kRegSdma0GfxRbWptrHi &&
+              w.values[beforeSubmit + 1] == 0);
         CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 15, 1, &observed) == kOK && observed == 1);
         uint32_t rptr = 0, unexpected = 9, first = 9;
         CHECK(verifySdmaCopy(r.reader(), 0x80000, work.reader(), snapshot, 15, &rptr, &unexpected, &first) == kOK);

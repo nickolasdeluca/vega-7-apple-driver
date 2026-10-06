@@ -757,7 +757,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 11;
+const uint32_t kDiagnosticVersion = 12;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -792,7 +792,8 @@ enum DiagnosticSelector : uint32_t {
     // Stage 15, after a LOAD_IP_FW that fenced (selector 18), in this order.
     kDiagnosticSdmaCopyCheck = 21, // out: Status, index of the first differing register, its value
     kDiagnosticSdmaStart = 22,     // out: Status, progress, PowerUpSdma response
-    kDiagnosticSdmaSubmit = 23,    // in: frame (0 ring test, 1 copy); out: Status, observed, GFX_RB_RPTR, GFX_RB_WPTR
+    kDiagnosticSdmaSubmit = 23,    // in: frame (0 ring test, 1 copy); out: Status, observed, GFX_RB_RPTR,
+                                   // GFX_RB_WPTR, F32_CNTL, STATUS_REG
     kDiagnosticSdmaVerify = 24,    // out: Status, GFX_RB_RPTR, unexpected words, first offset, STATUS_REG
     kDiagnosticSdmaStop = 25,      // out: Status, F32_CNTL, PowerDownSdma response, DESTROY_TMR fence, ring response
     kDiagnosticSelectorCount = 26,
@@ -1080,7 +1081,7 @@ Status startSdma(const RegisterReader &registers, uint64_t apertureLength, const
                  uint32_t stage, uint32_t *progress, uint32_t *upResponse);
 
 // Requires GFX_RB_WPTR at frame * 1024 bytes (kSdmaOutOfOrder), writes
-// (frame + 1) * 1024, and polls the frame's result word (the test value, or
+// (frame + 1) * 1024 and then GFX_RB_WPTR_HI 0 (the commit), and polls the frame's result word (the test value, or
 // fence 1) in the work area, up to kSdmaPollPauses (kSdmaTimeout).
 Status submitSdma(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                   const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *observed);
