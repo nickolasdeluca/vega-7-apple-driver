@@ -137,11 +137,9 @@ binaries are observation references and remain excluded from the finished stack.
 **Resume here.** Stage 17 is implemented and built; it has not been booted.
 The user is on the known-good EFI. Steps:
 
-1. The user makes a Time Machine backup, runs `tools/update_stick.sh 17`,
-   cold boots the stick, and runs
-   `sudo out/diag/cezanne-diag --gfxoff-disallow --gart-ih --psp-state | tee out/test-efi/boot-24-stage17/diag.txt`
-   (after `mkdir -p out/test-efi/boot-24-stage17`), plus the usual `ioreg`
-   capture.
+1. The user makes a Time Machine backup, runs `tools/update_stick.sh 17`
+   (done 2026-10-06: the stick matched), cold boots the stick, and runs
+   `tools/capture_boot.sh boot-24-stage17 --gfxoff-disallow --gart-ih --psp-state`.
 2. Read the output against "Stage 17 succeeds when" in
    [test-boot.md](test-boot.md) and record boot 24 in the log. Follow the
    [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)

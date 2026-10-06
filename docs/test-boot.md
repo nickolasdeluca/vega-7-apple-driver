@@ -3066,6 +3066,22 @@ sudo dmesg | grep 'CezanneGPU:'                    # kernel buffer; wraps within
 
 Use `/usr/bin/log`: in zsh, a bare `log` is a shell builtin.
 
+`tools/capture_boot.sh NAME [cezanne-diag flags...]` collects one boot's
+evidence in one command.
+- **What it saves,** into a new `out/test-efi/NAME`:
+  - `bootargs.txt`, with a warning if `cezanne-stage` is missing;
+  - the matching `kmutil` lines;
+  - `sudo out/diag/cezanne-diag` with the given flags, shown as it runs and
+    saved to `diag.txt`, with its exit status in `diag-exit.txt`;
+  - `ioreg.plist`.
+- **What it refuses:** a name that is not `boot-N-stageM`, and an existing
+  folder, so earlier captures are never overwritten.
+- **What it leaves out:** the `log show` and `dmesg` lines above, which the
+  user runs only when needed.
+
+For example:
+`tools/capture_boot.sh boot-24-stage17 --gfxoff-disallow --gart-ih --psp-state`.
+
 Stage 0 succeeds when:
 
 - `org.cezanne-driver.gpu` is loaded and NootedRed is not.
