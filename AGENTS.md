@@ -44,7 +44,8 @@ Experimental booting is available only through the USB test EFI in
   stage 8, `DisallowGfxOff` sent on request; and stage 9, the SMU metrics
   table written to one checked carveout page on request; and stage 10, 21
   more read-only PSP mailbox and aperture registers through the diagnostic
-  interface). Advancing
+  interface; and stage 11, the first PSP commands, creating and destroying
+  the kernel-mode ring at one checked carveout page on request). Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS
   volume, or load it with `kmutil`. The user performs disk, EFI and reboot steps.

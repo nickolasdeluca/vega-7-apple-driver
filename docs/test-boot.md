@@ -19,8 +19,9 @@ another attempt. The [SysReport dump boot](#sysreport-dump-boot) gave the
 VBIOS: the firmware reserves no carveout memory. With the
 [revised check](#revision-stage-9-free-page-check), stage 9 read the SMU
 metrics table in boot 13. Stage 10 (boot 14) found the PSP ready with no
-ring, and both memory hubs mapping the carveout identically. No later stage
-is authorized.
+ring, and both memory hubs mapping the carveout identically. Stage 11 (the
+first PSP commands: create and destroy a ring) is approved and built, not
+yet booted. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -78,6 +79,10 @@ off restores the known-good boot. This is the experimental environment
      day): stage 9 plus 21 read-only PSP mailbox and memory-aperture
      registers, read only through the diagnostic interface, described
      [below](#stage-10-psp-and-memory-aperture-state-proposal). No new write.
+   - **Stage 11** (proposed 2026-10-06 and approved by the user the same
+     day): stage 10 plus the first PSP commands, creating and destroying the
+     kernel-mode ring at one checked carveout page on request, described
+     [below](#stage-11-create-and-destroy-a-psp-ring-proposal).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -1353,7 +1358,9 @@ written.
 
 ### Stage 11: create and destroy a PSP ring (proposal)
 
-**Status: proposed 2026-10-06, not approved, not implemented.**
+**Status: proposed 2026-10-06, approved by the user the same day, and
+implemented; not yet booted.** The proposal is kept as approved. The
+implementation notes follow it.
 
 **Purpose.** The first commands to the PSP, and the first step of the route
 by which Linux loads all engine firmware. Stage 11 creates the PSP's
@@ -1498,6 +1505,51 @@ its arguments:
 sends no TMR, firmware load or mode 1 reset. It makes no IH, GART or default
 page change.
 
+**Implementation notes:**
+
+- **Core:**
+  - `pspCommandAllowed` holds the pairs. `sendPspCommand` checks the pair,
+    reads `C2PMSG_64` (it must be exactly ready), writes the arguments
+    (`69`/`70`, and `71` for the create; none for the destroy), then the
+    command.
+  - It then pauses 20 times and polls up to 100 times in 1 ms pauses for
+    bit 31 (`psp-timeout`). The response must be exactly `0x80000000`
+    (`psp-response-not-ok`).
+  - `createPspRing` re-checks the idle mailbox before the first command.
+  - `destroyPspRing` refuses unless told a ring was created
+    (`psp-out-of-order`).
+  - `compareRegion` counts changed words in the ring page and in the 60 KiB
+    after it.
+  - The stage 9 page checks are shared (`checkCarveoutPage`), so a failed
+    address or range check reports `metrics-address-mismatch` or
+    `metrics-target-invalid`. An unstable region reports
+    `table-region-in-use`.
+- **Adapter:**
+  - Selectors 11–14 (check, create, observe, destroy). Diagnostics version
+    6.
+  - Create needs a passing check on the same connection, and observe needs
+    a create.
+  - Destroy is accepted after a create, with or without observe, so a
+    failed observe cannot block it.
+  - A new check is refused while a ring this driver created exists.
+  - Closing the connection after a create sends the destroy and publishes
+    `CezanneGPU PSP ring abandoned destroy`.
+  - Carveout memory is mapped read-only only at the metrics or ring page,
+    `withCarveoutMemory`.
+- **Tool:** `--psp-ring` prints each step first and then the mailbox
+  values. It sends the destroy after any successful create, even if the
+  observe step fails.
+- **Tests:**
+  - Exact write sequences (10 writes for the create, 1 for the destroy) and
+    the settle pause count.
+  - A stop on status 5 after one command, a timeout after 20 + 100 pauses,
+    and a refused create when a ring address is set.
+  - `not-ready` before a destroy, the pairs, the values and their stages,
+    and the compare counts.
+  - Five more weakened cores must fail: an unpaired create, the ready check
+    removed, the timeout removed, the destroy order check removed, and the
+    ring-exists check removed.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -1509,7 +1561,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -1616,6 +1668,22 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 11 succeeds when:
+
+- the stage 10 conditions hold with `CezanneGPU stage` 11;
+- `sudo cezanne-diag --gfxoff-disallow --psp-ring --psp-state` reports `ok`
+  for the check, the create (three responses `0x80000000`), the observe
+  (0 changed words in and after the page) and the destroy (response
+  `0x80000000`);
+- the final `--psp-state` and register dump are recorded;
+- the machine stays as before: display, fans, temperatures.
+
+A stop at the check is a finding with nothing sent. `psp-response-not-ok`
+or `psp-timeout` during the create is a finding: do not retry. Shut down
+fully and boot the known-good EFI. Changed words outside the ring page mean
+a misdirected write: power off at once. Make a Time Machine backup before
+this boot. Save the output with `tee` in an ignored directory.
 
 Stage 10 succeeds when:
 

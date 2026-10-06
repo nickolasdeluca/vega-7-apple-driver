@@ -81,7 +81,8 @@ root-only diagnostic interface during a stage 4 or later test boot;
 stage 7 SMU version queries, `--gfxoff-disallow` the stage 8
 `DisallowGfxOff` message and `--smu-metrics` the stage 9 metrics table;
 `--psp-state` (stage 10, reads only) decodes the PSP ring mailbox and the
-memory-hub apertures.
+memory-hub apertures; `--psp-ring` (stage 11) creates and destroys the PSP
+kernel-mode ring.
 
 ## Verify
 

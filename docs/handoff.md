@@ -133,7 +133,18 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: propose stage 11, the first PSP ring
+## Next task: boot stage 11, then plan the TMR
+
+Stage 11 (IH reroute, then creating and destroying the PSP kernel-mode
+ring at GPU `0xF440100000`, no frames) is approved and built:
+`out/test-efi/usb-stage11`, `out/diag/cezanne-diag --psp-ring`. Next: the
+user copies it to the stick and boots it, after a Time Machine backup;
+record the boot in the test boot log. If it succeeds, the next proposal is
+the first ring frame: the TMR setup command (`psp_tmr_init`,
+`psp_tmr_load`), which needs a command buffer, a fence buffer and a TMR
+region in the carveout.
+
+### Earlier: stage 10
 
 Stage 10 succeeded in boot 14. The PSP is ready (`C2PMSG_64`
 `0x80000000`) with no ring after a cold boot. Both hubs map FB
