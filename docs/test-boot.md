@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-06: **stages 0 to 10 succeeded** (see
+Status, 2026-10-06: **stages 0 to 11 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -22,9 +22,9 @@ metrics table in boot 13. Stage 10 (boot 14) found the PSP ready with no
 ring, and both memory hubs mapping the carveout identically. Stage 11 (the
 first PSP commands: create and destroy a ring) stopped safely in boot 15:
 the PSP answered its first command, `GBR_IH_SET`, with "unknown command". A
-revised stage 11 (masked responses, no reroute, ring tracked from the create
-write) is approved and built, not yet booted. No later stage is
-authorized.
+revised stage 11 succeeded in boot 16: the PSP created (`0x80020000`) and
+destroyed (`0x80030000`) a kernel-mode ring without touching its memory. No
+later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -1362,7 +1362,8 @@ written.
 ### Stage 11: create and destroy a PSP ring (proposal)
 
 **Status: proposed 2026-10-06, approved by the user the same day, and
-implemented; not yet booted.** The proposal is kept as approved. The
+implemented. The first build stopped safely in boot 15. Revised, it
+succeeded in boot 16.** The proposal is kept as approved. The
 implementation notes follow it.
 
 **Purpose.** The first commands to the PSP, and the first step of the route
@@ -1556,7 +1557,7 @@ page change.
 ### Revision: stage 11 PSP responses (proposal)
 
 **Status: proposed 2026-10-06 after boot 15, approved by the user the same
-day, and implemented; not yet booted.** The heading keeps "proposal" so
+day, and implemented; succeeded in boot 16.** The heading keeps "proposal" so
 links stay stable.
 
 **One deliberate difference from the text below.** Before each command, the
@@ -2303,6 +2304,38 @@ kernel up 08:31:23 local).
   not implement `GBR_IH_SET`. The response check is stricter than Linux's
   (it does not mask the echoed command ID). See the
   [proposed revision](#revision-stage-11-psp-responses-proposal).
+
+**Boot 16, 2026-10-06, revised stage 11** (`out/test-efi/usb-stage11/`;
+cold boot, kernel up 08:44:13 local).
+
+- `CezanneGPU stage` 11, diagnostics v7; stages 1–3 `ok`.
+- `sudo cezanne-diag --gfxoff-disallow --psp-ring --psp-state`:
+  - **DisallowGfxOff:** `ok`, response `0x01`.
+  - **Check:** `ok`. `C2PMSG_64` `0x80000000` (clean after the cold boot,
+    so boot 15's rejected command did not persist), no ring, and the 64 KiB
+    at the ring page stable.
+  - **Create:** `ok`, response **`0x80020000`**: answered, create ID 2
+    echoed, status 0. This confirms the echo boot 15 revealed. The first
+    stage 11 build would have called this a failure.
+  - **Observe:** `ok`. `C2PMSG_69`/`70`/`71` = `0x40100000`/`0xf4`/`0x1000`
+    and `C2PMSG_67` 0. **0 changed words** in the ring page and in the 60 KiB
+    after it: the PSP did not write the ring memory.
+  - **Destroy:** `ok`, response **`0x80030000`** (destroy ID 3 echoed,
+    status 0).
+- **Finding: the argument registers are not ring state.** After the destroy,
+  `C2PMSG_69`/`70`/`71` still hold the ring's address and size. They are
+  plain mailbox arguments that the PSP leaves as written. So:
+  - the `--psp-state` summary's "address or size set" does not mean a ring
+    exists;
+  - stage 11's no-ring check would refuse a second create in the same boot.
+  - Neither matters for a cold-booted test.
+- The rest of the dump equals boot 14, except the PSP counter (`C2PMSG_81`).
+  The machine stayed as before.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-16-stage11/`.
+- Result: **stage 11 succeeded.** This is the first PSP command accepted
+  from this driver: a kernel-mode ring at GPU `0xF440100000`, created and
+  destroyed, with no frame and no memory change.
 
 ## Unknowns and limits
 

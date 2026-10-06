@@ -133,7 +133,20 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot the revised stage 11
+## Next task: propose stage 12, the first PSP ring frame
+
+Stages 0–11 succeeded. In boot 16 the PSP created (`0x80020000`) and
+destroyed (`0x80030000`) a kernel-mode ring at GPU `0xF440100000`, writing
+nothing to its memory. `C2PMSG_69`/`70`/`71` keep their values after the
+destroy (they are arguments, not ring state). The next proposal is the
+first frame submitted through the ring, the TMR setup (`psp_tmr_init`,
+`psp_tmr_load`), which needs:
+- a command buffer, a fence buffer and a TMR region at checked carveout
+  pages;
+- `psp_gfx_cmd_resp` layouts from `psp_gfx_if.h`;
+- the write-pointer protocol (`C2PMSG_67`, `psp_ring_cmd_submit`).
+
+### Earlier: the revised stage 11
 
 Boot 15 stopped after the PSP answered `GBR_IH_SET` with
 `PSP_ERR_UNKNOWN_COMMAND` (`0x80080100`; the command ID is echoed in bits
