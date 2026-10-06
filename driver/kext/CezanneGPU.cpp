@@ -39,6 +39,8 @@
 //            it, give the SMU its GPU address and ask it to write its metrics
 //            table there, then read the page back through a read-only mapping
 //            and verify only the table bytes changed.
+//   Stage 10: 21 more read-only diagnostic registers (PSP mailbox, memory
+//            hub and GC hub apertures); nothing else changes.
 //            Apart from the stage 6 to 9 tests, nothing is written to
 //            configuration space, registers or memory, and every mapping and
 //            the provider are released before start() returns.
