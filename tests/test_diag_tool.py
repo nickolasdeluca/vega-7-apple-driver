@@ -16,7 +16,8 @@ class DiagSourceTests(unittest.TestCase):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         calls = re.findall(r"IOConnect\w+\s*\(\s*connection\s*,\s*(\w+)", source)
         self.assertEqual(sorted(set(calls)),
-                         ["kDiagnosticGetInfo", "kDiagnosticMetricsRead", "kDiagnosticReadRegister", "selector"])
+                         ["kDiagnosticGetInfo", "kDiagnosticMetricsRead", "kDiagnosticReadRegister",
+                          "kDiagnosticSdmaInventory", "selector"])
         helper = re.findall(r"\bcall\(connection, (\w+)", source)
         self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore",
                                   "kDiagnosticSmuCheck", "kDiagnosticSmuQuery", "kDiagnosticSmuCheck",
@@ -45,7 +46,8 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(ring\) \{[^}]*info\[1\] < kPspRingStage")
         self.assertEqual(len(re.findall(r"\bpspTmr\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(tmr\) \{[^}]*info\[1\] < kPspTmrStage")
-        self.assertEqual(len(re.findall(r"\bpspSdma\(connection\)", source)), 1)
+        self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["false", "true"])
+        self.assertRegex(source, r"if \(inventory\) \{[^}]*info\[1\] < kSdmaInventoryStage")
         self.assertRegex(source, r"if \(sdma\) \{[^}]*info\[1\] < kPspSdmaStage")
         self.assertEqual(len(re.findall(r"\bpspState\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(psp\) \{[^}]*info\[1\] < kPspStateStage")
@@ -53,10 +55,10 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(scratch\) \{[^}]*info\[1\] < kScratchStage")
         self.assertIn('std::strcmp(argv[i], "--scratch-test") == 0', source)
 
-    def test_tool_names_every_stage_13_register_in_order(self):
+    def test_tool_names_every_stage_14_register_in_order(self):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
-        listed = re.search(r"kStage13Registers\[\] = \{([^}]*)\}", header).group(1)
+        listed = re.search(r"kStage14Registers\[\] = \{([^}]*)\}", header).group(1)
         expected = [name.strip() for name in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
 

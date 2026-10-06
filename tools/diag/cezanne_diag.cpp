@@ -6,10 +6,12 @@
 // the stage 9 metrics-table transfer (--smu-metrics) and the stage 11 PSP
 // ring create and destroy (--psp-ring) and the stage 12 TMR setup and
 // teardown through the ring (--psp-tmr) and the stage 13 SDMA0 firmware load
-// (--psp-sdma). --psp-state (stage 10) only reads.
+// (--psp-sdma), and the stage 14 SDMA power-up register inventory
+// (--sdma-inventory). --psp-state (stage 10) only reads.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
-//                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--psp-state]
+//                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--sdma-inventory]
+//                          [--psp-state]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -29,7 +31,7 @@ struct Named {
     uint32_t offset;
 };
 
-// Every register the driver allows at stage 13, in its list order; earlier
+// Every register the driver allows at stage 14, in its list order; earlier
 // stages allow a prefix.
 const Named kRegisters[] = {
     {"MP0_SMN_C2PMSG_33", kRegC2PMsg33},
@@ -107,14 +109,48 @@ const Named kRegisters[] = {
     {"MC_VM_SYS_APR_HIGH_GC", kRegGcApertureHigh},
     // Stage 13.
     {"SDMA0_UCODE_CHECKSUM", kRegSdma0UcodeChecksum},
+    // Stage 14.
+    {"SDMA0_CNTL", kRegSdma0Cntl},
+    {"SDMA0_CHICKEN_BITS", kRegSdma0ChickenBits},
+    {"SDMA0_GB_ADDR_CONFIG", kRegSdma0GbAddrConfig},
+    {"SDMA0_GB_ADDR_CONFIG_READ", kRegSdma0GbAddrConfigRead},
+    {"SDMA0_SEM_WAIT_FAIL_TIMER_CNTL", kRegSdma0SemWaitFailTimerCntl},
+    {"SDMA0_UTCL1_WATERMK", kRegSdma0Utcl1Watermk},
+    {"SDMA0_UTCL1_TIMEOUT", kRegSdma0Utcl1Timeout},
+    {"SDMA0_UTCL1_PAGE", kRegSdma0Utcl1Page},
+    {"SDMA0_GFX_RB_BASE", kRegSdma0GfxRbBase},
+    {"SDMA0_GFX_RB_BASE_HI", kRegSdma0GfxRbBaseHi},
+    {"SDMA0_GFX_RB_RPTR", kRegSdma0GfxRbRptr},
+    {"SDMA0_GFX_RB_RPTR_HI", kRegSdma0GfxRbRptrHi},
+    {"SDMA0_GFX_RB_WPTR", kRegSdma0GfxRbWptr},
+    {"SDMA0_GFX_RB_WPTR_HI", kRegSdma0GfxRbWptrHi},
+    {"SDMA0_GFX_RB_WPTR_POLL_CNTL", kRegSdma0GfxRbWptrPollCntl},
+    {"SDMA0_GFX_RB_RPTR_ADDR_HI", kRegSdma0GfxRbRptrAddrHi},
+    {"SDMA0_GFX_RB_RPTR_ADDR_LO", kRegSdma0GfxRbRptrAddrLo},
+    {"SDMA0_GFX_IB_CNTL", kRegSdma0GfxIbCntl},
+    {"SDMA0_GFX_DOORBELL", kRegSdma0GfxDoorbell},
+    {"SDMA0_GFX_DOORBELL_OFFSET", kRegSdma0GfxDoorbellOffset},
+    {"SDMA0_GFX_RB_WPTR_POLL_ADDR_HI", kRegSdma0GfxRbWptrPollAddrHi},
+    {"SDMA0_GFX_RB_WPTR_POLL_ADDR_LO", kRegSdma0GfxRbWptrPollAddrLo},
+    {"SDMA0_GFX_MINOR_PTR_UPDATE", kRegSdma0GfxMinorPtrUpdate},
+    {"SDMA0_RLC0_RB_WPTR_POLL_CNTL", kRegSdma0Rlc0RbWptrPollCntl},
+    {"SDMA0_RLC1_RB_WPTR_POLL_CNTL", kRegSdma0Rlc1RbWptrPollCntl},
 };
-static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage13RegisterCount, "one name per register");
+static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage14RegisterCount, "one name per register");
+
+const char *registerName(uint32_t offset)
+{
+    for (const Named &reg : kRegisters) {
+        if (reg.offset == offset) return reg.name;
+    }
+    return "?";
+}
 
 void usage(FILE *out)
 {
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
-                      "                         [--psp-sdma] [--psp-state]\n"
+                      "                         [--psp-sdma] [--sdma-inventory] [--psp-state]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
@@ -128,6 +164,8 @@ void usage(FILE *out)
                       "it, then sends DESTROY_TMR and destroys the ring.\n"
                       "--psp-sdma does the same with the SDMA0 firmware load (LOAD_IP_FW) between SETUP_TMR\n"
                       "and DESTROY_TMR; SDMA0 stays halted.\n"
+                      "--sdma-inventory does --psp-sdma, then reads 31 SDMA registers before PowerUpSdma, after\n"
+                      "it and after PowerDownSdma, before the teardown.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n");
 }
 
@@ -569,7 +607,36 @@ bool tmrTeardown(io_connect_t connection, const char *text)
 // The stage 13 SDMA0 load: check, create, SETUP_TMR, firmware copy and
 // LOAD_IP_FW, observe, teardown. Every created ring gets a destroy; the
 // driver also tears down if this exits in between.
-bool pspSdma(io_connect_t connection)
+// The stage 14 inventory: three readings of the 31 SDMA registers around
+// PowerUpSdma and PowerDownSdma.
+bool sdmaInventory(io_connect_t connection)
+{
+    step("inventory: read 31 SDMA registers, PowerUpSdma (0xE), read, PowerDownSdma (0xD), read");
+    uint64_t scalars[3] = {};
+    uint32_t scalarCount = 3;
+    SdmaInventory inventory = {};
+    size_t size = sizeof(inventory);
+    kern_return_t result = IOConnectCallMethod(connection, kDiagnosticSdmaInventory, nullptr, 0, nullptr, 0, scalars,
+                                               &scalarCount, &inventory, &size);
+    if (result != KERN_SUCCESS || scalarCount != 3 || size != sizeof(inventory)) {
+        std::printf("call failed 0x%08x\n", result);
+        return false;
+    }
+    std::printf("%s, PowerUpSdma response 0x%02llx, PowerDownSdma response 0x%02llx\n",
+                statusName(static_cast<Status>(scalars[0])), static_cast<unsigned long long>(scalars[1]),
+                static_cast<unsigned long long>(scalars[2]));
+    std::printf("  %-32s %-8s %-10s %-10s %-10s\n", "register", "offset", "loaded", "powered", "gated");
+    for (uint32_t i = 0; i < kSdmaInventoryCount; i++) {
+        std::printf("  %-32s 0x%05x 0x%08x 0x%08x 0x%08x%s\n", registerName(kSdmaInventory[i]), kSdmaInventory[i],
+                    inventory.loaded[i], inventory.powered[i], inventory.gated[i],
+                    inventory.loaded[i] != inventory.powered[i] || inventory.powered[i] != inventory.gated[i]
+                        ? "  *"
+                        : "");
+    }
+    return scalars[0] == kOK;
+}
+
+bool pspSdma(io_connect_t connection, bool inventory)
 {
     uint64_t check[7] = {};
     step("sdma 1/6 check: PSP, ring, TMR and firmware-buffer regions; embedded SDMA0 image header");
@@ -645,16 +712,26 @@ bool pspSdma(io_connect_t connection)
         std::printf("sdma 5/6 observe: skipped, LOAD_IP_FW was not submitted\n");
     }
 
+    bool inventoried = true;
+    if (inventory) {
+        // Only with the firmware loaded: LOAD_IP_FW fenced.
+        if (loadedCall && loaded[1] == 2) {
+            inventoried = sdmaInventory(connection);
+        } else {
+            std::printf("inventory: skipped, LOAD_IP_FW did not fence\n");
+            inventoried = false;
+        }
+    }
     bool torn = tmrTeardown(connection, "sdma 6/6 teardown: DESTROY_TMR as the next frame if the last fenced, "
                                         "then DESTROY_RINGS");
-    return loadedCall && loaded[0] == kOK && observedCall && observed[0] == kOK && torn;
+    return loadedCall && loaded[0] == kOK && observedCall && observed[0] == kOK && inventoried && torn;
 }
 
 int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
     bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
-         psp = false;
+         inventory = false, psp = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -682,6 +759,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--psp-sdma") == 0) {
             sdma = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--sdma-inventory") == 0) {
+            inventory = true;
             continue;
         }
         if (std::strcmp(argv[i], "--psp-state") == 0) {
@@ -732,7 +813,8 @@ int main(int argc, char **argv)
     std::printf("CezanneGPU diagnostics v%llu, driver stage %llu\n", static_cast<unsigned long long>(info[0]),
                 static_cast<unsigned long long>(info[1]));
 
-    const uint32_t count = info[1] >= 13  ? kStage13RegisterCount
+    const uint32_t count = info[1] >= 14  ? kStage14RegisterCount
+                           : info[1] >= 13 ? kStage13RegisterCount
                            : info[1] >= 10 ? kStage10RegisterCount
                            : info[1] >= 6 ? kStage6RegisterCount
                            : info[1] == 5 ? kStage5RegisterCount
@@ -792,7 +874,15 @@ int main(int argc, char **argv)
             IOServiceClose(connection);
             return 1;
         }
-        if (!pspSdma(connection)) failures++;
+        if (!pspSdma(connection, false)) failures++;
+    }
+    if (inventory) {
+        if (info[1] < kSdmaInventoryStage) {
+            std::fprintf(stderr, "cezanne-diag: --sdma-inventory needs driver stage %u\n", kSdmaInventoryStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspSdma(connection, true)) failures++;
     }
     if (psp) {
         if (info[1] < kPspStateStage) {
