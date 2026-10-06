@@ -154,8 +154,9 @@ Status checkAperture(const PciState &state, uint64_t physical, uint64_t length)
 bool registerAllowed(uint32_t offset, uint32_t stage)
 {
     // Each stage's list extends the previous one (checked by the tests), so a
-    // prefix of the stage 14 list is the list for any stage.
-    uint32_t count = stage >= 14  ? kStage14RegisterCount
+    // prefix of the stage 16 list is the list for any stage.
+    uint32_t count = stage >= 16  ? kStage16RegisterCount
+                     : stage >= 14 ? kStage14RegisterCount
                      : stage >= 13 ? kStage13RegisterCount
                      : stage >= 10 ? kStage10RegisterCount
                      : stage >= 6 ? kStage6RegisterCount
@@ -165,7 +166,7 @@ bool registerAllowed(uint32_t offset, uint32_t stage)
                      : stage == 1 ? kStage1RegisterCount
                                   : 0;
     for (uint32_t i = 0; i < count; i++) {
-        if (kStage14Registers[i] == offset) return true;
+        if (kStage16Registers[i] == offset) return true;
     }
     return false;
 }

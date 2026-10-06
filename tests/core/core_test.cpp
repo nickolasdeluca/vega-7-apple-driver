@@ -1803,6 +1803,32 @@ static void testSdmaCopy()
     }
 }
 
+static void testInventory16()
+{
+    CHECK(kDisplayInventoryCount == 55 && kVmInventoryCount == 24 && kIhInventoryCount == 13);
+    CHECK(kStage16RegisterCount == kStage14RegisterCount + 92);
+    CHECK(kDisplayInventoryCount == kDisplayPipes * kDisplayPipeRegisters + 11);
+    for (uint32_t i = 0; i < kStage14RegisterCount; i++) CHECK(kStage16Registers[i] == kStage14Registers[i]);
+    for (uint32_t i = 0; i < kStage16RegisterCount; i++) {
+        CHECK(kStage16Registers[i] % 4 == 0 && kStage16Registers[i] + 4 <= 0x80000);
+        for (uint32_t j = i + 1; j < kStage16RegisterCount; j++) CHECK(kStage16Registers[i] != kStage16Registers[j]);
+    }
+    for (uint32_t i = kStage14RegisterCount; i < kStage16RegisterCount; i++) {
+        CHECK(registerAllowed(kStage16Registers[i], 16) && !registerAllowed(kStage16Registers[i], 15));
+        CHECK(!gfxGated(kStage16Registers[i]));
+        for (uint32_t value : {0u, 1u, 0xFFFFFFFFu}) CHECK(!writeAllowed(kStage16Registers[i], value, 16));
+    }
+    // The three groups are exactly the new registers, in list order.
+    uint32_t at = kStage14RegisterCount;
+    for (uint32_t i = 0; i < kDisplayInventoryCount; i++) CHECK(kStage16Registers[at++] == kDisplayInventory[i]);
+    for (uint32_t i = 0; i < kVmInventoryCount; i++) CHECK(kStage16Registers[at++] == kVmInventory[i]);
+    for (uint32_t i = 0; i < kIhInventoryCount; i++) CHECK(kStage16Registers[at++] == kIhInventory[i]);
+    // Spot checks from the headers: OTG0_OTG_CONTROL (0x34C0 + 0x1b41) * 4, IH_RB_BASE (0x10A0 + 0x81) * 4.
+    CHECK(kDisplayInventory[0] == (0x34C0 + 0x1b41) * 4 && kRegIhRbBase == (0x10A0 + 0x81) * 4);
+    // Stage 15 writes are still the only SDMA writes at stage 16.
+    CHECK(writeAllowed(kRegSdma0F32Cntl, 1, 16) && !writeAllowed(kRegIhRbCntl, 0, 16));
+}
+
 int main()
 {
     testValidDevice();
@@ -1826,6 +1852,7 @@ int main()
     testSdmaLoad();
     testSdmaInventory();
     testSdmaCopy();
+    testInventory16();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

@@ -31,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 15;
+const uint32_t kMaxStage = 16;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -471,6 +471,231 @@ const uint32_t kSdmaInventoryCount = sizeof(kSdmaInventory) / sizeof(kSdmaInvent
 const uint32_t kSmuMsgPowerDownSdma = 0xD;
 const uint32_t kSmuMsgPowerUpSdma = 0xE;
 const uint32_t kSdmaInventoryStage = 14;
+
+// Stage 16: a read-only inventory for the display, GART and interrupt
+// milestones. Byte offsets from dcn_2_1_0_offset.h (DMU bases 0xC0/0x34C0),
+// mmhub_1_0_offset.h (0x1A000), osssys_4_0_offset.h (0x10A0) and
+// nbio_7_0_offset.h (NBIF 0x14/0xD20/0x10400), bases as measured in the
+// stage 2 discovery table; each register is one Linux v6.12 reads.
+const uint32_t kRegOtg0OtgControl = 0x14004; // OTG0_OTG_CONTROL: optc1_read_otg_state
+const uint32_t kRegOtg0OtgHTotal = 0x13fa8; // OTG0_OTG_H_TOTAL: optc1_read_otg_state
+const uint32_t kRegOtg0OtgVTotal = 0x13fbc; // OTG0_OTG_V_TOTAL: optc1_read_otg_state
+const uint32_t kRegOtg0OtgHBlankStartEnd = 0x13fac; // OTG0_OTG_H_BLANK_START_END: optc1_read_otg_state
+const uint32_t kRegOtg0OtgVBlankStartEnd = 0x13fd8; // OTG0_OTG_V_BLANK_START_END: optc1_read_otg_state
+const uint32_t kRegHubp0DchubpCntl = 0x0eacc; // HUBP0_DCHUBP_CNTL: hubp2_read_state
+const uint32_t kRegHubp0DcsurfSurfaceConfig = 0x0ea94; // HUBP0_DCSURF_SURFACE_CONFIG: hubp2_read_state
+const uint32_t kRegHubp0DcsurfPriViewportDimension = 0x0eaa8; // HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION: hubp2_read_state
+const uint32_t kRegHubpreq0DcsurfSurfacePitch = 0x0eb1c; // HUBPREQ0_DCSURF_SURFACE_PITCH: hubp2_read_state
+const uint32_t kRegHubpreq0DcsurfPrimarySurfaceAddress = 0x0eb28; // HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS: hubp2_read_state
+const uint32_t kRegHubpreq0DcsurfPrimarySurfaceAddressHigh = 0x0eb2c; // HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH: hubp2_read_state
+const uint32_t kRegOtg1OtgControl = 0x14204; // OTG1_OTG_CONTROL: optc1_read_otg_state
+const uint32_t kRegOtg1OtgHTotal = 0x141a8; // OTG1_OTG_H_TOTAL: optc1_read_otg_state
+const uint32_t kRegOtg1OtgVTotal = 0x141bc; // OTG1_OTG_V_TOTAL: optc1_read_otg_state
+const uint32_t kRegOtg1OtgHBlankStartEnd = 0x141ac; // OTG1_OTG_H_BLANK_START_END: optc1_read_otg_state
+const uint32_t kRegOtg1OtgVBlankStartEnd = 0x141d8; // OTG1_OTG_V_BLANK_START_END: optc1_read_otg_state
+const uint32_t kRegHubp1DchubpCntl = 0x0ee3c; // HUBP1_DCHUBP_CNTL: hubp2_read_state
+const uint32_t kRegHubp1DcsurfSurfaceConfig = 0x0ee04; // HUBP1_DCSURF_SURFACE_CONFIG: hubp2_read_state
+const uint32_t kRegHubp1DcsurfPriViewportDimension = 0x0ee18; // HUBP1_DCSURF_PRI_VIEWPORT_DIMENSION: hubp2_read_state
+const uint32_t kRegHubpreq1DcsurfSurfacePitch = 0x0ee8c; // HUBPREQ1_DCSURF_SURFACE_PITCH: hubp2_read_state
+const uint32_t kRegHubpreq1DcsurfPrimarySurfaceAddress = 0x0ee98; // HUBPREQ1_DCSURF_PRIMARY_SURFACE_ADDRESS: hubp2_read_state
+const uint32_t kRegHubpreq1DcsurfPrimarySurfaceAddressHigh = 0x0ee9c; // HUBPREQ1_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH: hubp2_read_state
+const uint32_t kRegOtg2OtgControl = 0x14404; // OTG2_OTG_CONTROL: optc1_read_otg_state
+const uint32_t kRegOtg2OtgHTotal = 0x143a8; // OTG2_OTG_H_TOTAL: optc1_read_otg_state
+const uint32_t kRegOtg2OtgVTotal = 0x143bc; // OTG2_OTG_V_TOTAL: optc1_read_otg_state
+const uint32_t kRegOtg2OtgHBlankStartEnd = 0x143ac; // OTG2_OTG_H_BLANK_START_END: optc1_read_otg_state
+const uint32_t kRegOtg2OtgVBlankStartEnd = 0x143d8; // OTG2_OTG_V_BLANK_START_END: optc1_read_otg_state
+const uint32_t kRegHubp2DchubpCntl = 0x0f1ac; // HUBP2_DCHUBP_CNTL: hubp2_read_state
+const uint32_t kRegHubp2DcsurfSurfaceConfig = 0x0f174; // HUBP2_DCSURF_SURFACE_CONFIG: hubp2_read_state
+const uint32_t kRegHubp2DcsurfPriViewportDimension = 0x0f188; // HUBP2_DCSURF_PRI_VIEWPORT_DIMENSION: hubp2_read_state
+const uint32_t kRegHubpreq2DcsurfSurfacePitch = 0x0f1fc; // HUBPREQ2_DCSURF_SURFACE_PITCH: hubp2_read_state
+const uint32_t kRegHubpreq2DcsurfPrimarySurfaceAddress = 0x0f208; // HUBPREQ2_DCSURF_PRIMARY_SURFACE_ADDRESS: hubp2_read_state
+const uint32_t kRegHubpreq2DcsurfPrimarySurfaceAddressHigh = 0x0f20c; // HUBPREQ2_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH: hubp2_read_state
+const uint32_t kRegOtg3OtgControl = 0x14604; // OTG3_OTG_CONTROL: optc1_read_otg_state
+const uint32_t kRegOtg3OtgHTotal = 0x145a8; // OTG3_OTG_H_TOTAL: optc1_read_otg_state
+const uint32_t kRegOtg3OtgVTotal = 0x145bc; // OTG3_OTG_V_TOTAL: optc1_read_otg_state
+const uint32_t kRegOtg3OtgHBlankStartEnd = 0x145ac; // OTG3_OTG_H_BLANK_START_END: optc1_read_otg_state
+const uint32_t kRegOtg3OtgVBlankStartEnd = 0x145d8; // OTG3_OTG_V_BLANK_START_END: optc1_read_otg_state
+const uint32_t kRegHubp3DchubpCntl = 0x0f51c; // HUBP3_DCHUBP_CNTL: hubp2_read_state
+const uint32_t kRegHubp3DcsurfSurfaceConfig = 0x0f4e4; // HUBP3_DCSURF_SURFACE_CONFIG: hubp2_read_state
+const uint32_t kRegHubp3DcsurfPriViewportDimension = 0x0f4f8; // HUBP3_DCSURF_PRI_VIEWPORT_DIMENSION: hubp2_read_state
+const uint32_t kRegHubpreq3DcsurfSurfacePitch = 0x0f56c; // HUBPREQ3_DCSURF_SURFACE_PITCH: hubp2_read_state
+const uint32_t kRegHubpreq3DcsurfPrimarySurfaceAddress = 0x0f578; // HUBPREQ3_DCSURF_PRIMARY_SURFACE_ADDRESS: hubp2_read_state
+const uint32_t kRegHubpreq3DcsurfPrimarySurfaceAddressHigh = 0x0f57c; // HUBPREQ3_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH: hubp2_read_state
+const uint32_t kRegDcnVmFbLocationBase = 0x0e54c; // DCN_VM_FB_LOCATION_BASE: hubbub21_init_dchub
+const uint32_t kRegDcnVmFbLocationTop = 0x0e550; // DCN_VM_FB_LOCATION_TOP: hubbub21_init_dchub
+const uint32_t kRegDcnVmFbOffset = 0x0e554; // DCN_VM_FB_OFFSET: hubbub21_init_dchub
+const uint32_t kRegDcnVmAgpBase = 0x0e560; // DCN_VM_AGP_BASE: hubbub21_init_dchub
+const uint32_t kRegDcnVmAgpBot = 0x0e558; // DCN_VM_AGP_BOT: hubbub21_init_dchub
+const uint32_t kRegDcnVmAgpTop = 0x0e55c; // DCN_VM_AGP_TOP: hubbub21_init_dchub
+const uint32_t kRegDig0DigBeCntl = 0x155bc; // DIG0_DIG_BE_CNTL: dcn10 link encoder state
+const uint32_t kRegDig1DigBeCntl = 0x159bc; // DIG1_DIG_BE_CNTL: dcn10 link encoder state
+const uint32_t kRegDig2DigBeCntl = 0x15dbc; // DIG2_DIG_BE_CNTL: dcn10 link encoder state
+const uint32_t kRegDig3DigBeCntl = 0x161bc; // DIG3_DIG_BE_CNTL: dcn10 link encoder state
+const uint32_t kRegDig4DigBeCntl = 0x165bc; // DIG4_DIG_BE_CNTL: dcn10 link encoder state
+const uint32_t kRegVmContext0PageTableBaseAddrLo32 = 0x69cac; // VM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32: init_gart_aperture_regs
+const uint32_t kRegVmContext0PageTableBaseAddrHi32 = 0x69cb0; // VM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32: init_gart_aperture_regs
+const uint32_t kRegVmContext0PageTableStartAddrLo32 = 0x69d2c; // VM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32: init_gart_aperture_regs
+const uint32_t kRegVmContext0PageTableStartAddrHi32 = 0x69d30; // VM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32: init_gart_aperture_regs
+const uint32_t kRegVmContext0PageTableEndAddrLo32 = 0x69dac; // VM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32: init_gart_aperture_regs
+const uint32_t kRegVmContext0PageTableEndAddrHi32 = 0x69db0; // VM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32: init_gart_aperture_regs
+const uint32_t kRegVmL2ProtectionFaultDefaultAddrLo32 = 0x69a38; // VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32: init_system_aperture_regs
+const uint32_t kRegVmL2ProtectionFaultDefaultAddrHi32 = 0x69a3c; // VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32: init_system_aperture_regs
+const uint32_t kRegVmL2ProtectionFaultCntl = 0x69a1c; // VM_L2_PROTECTION_FAULT_CNTL: mmhub_v1_0_set_fault_enable_default
+const uint32_t kRegVmL2ProtectionFaultCntl2 = 0x69a20; // VM_L2_PROTECTION_FAULT_CNTL2: init_system_aperture_regs
+const uint32_t kRegVmL2ProtectionFaultStatus = 0x69a2c; // VM_L2_PROTECTION_FAULT_STATUS: gmc_v9_0_process_interrupt
+const uint32_t kRegVmL2Cntl2 = 0x69a04; // VM_L2_CNTL2: init_cache_regs
+const uint32_t kRegVmL2Cntl3 = 0x69a08; // VM_L2_CNTL3: init_cache_regs
+const uint32_t kRegVmL2Cntl4 = 0x69a5c; // VM_L2_CNTL4: init_cache_regs
+const uint32_t kRegVmL2Context1IdentityApertureLowAddrLo32 = 0x69a44; // VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32: disable_identity_aperture
+const uint32_t kRegVmL2Context1IdentityApertureLowAddrHi32 = 0x69a48; // VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_HI32: disable_identity_aperture
+const uint32_t kRegVmL2Context1IdentityApertureHighAddrLo32 = 0x69a4c; // VM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32: disable_identity_aperture
+const uint32_t kRegVmL2Context1IdentityApertureHighAddrHi32 = 0x69a50; // VM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_HI32: disable_identity_aperture
+const uint32_t kRegVmL2ContextIdentityPhysicalOffsetLo32 = 0x69a54; // VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32: disable_identity_aperture
+const uint32_t kRegVmL2ContextIdentityPhysicalOffsetHi32 = 0x69a58; // VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_HI32: disable_identity_aperture
+const uint32_t kRegVmInvalidateEng17Ack = 0x69c18; // VM_INVALIDATE_ENG17_ACK: gmc_v9_0_flush_gpu_tlb (engine 17 via vm_inv_eng0_ack + eng_distance)
+const uint32_t kRegVmInvalidateEng17Sem = 0x69b88; // VM_INVALIDATE_ENG17_SEM: gmc_v9_0_flush_gpu_tlb (engine 17 semaphore)
+const uint32_t kRegVmInvalidateEng0AddrRangeLo32 = 0x69c1c; // VM_INVALIDATE_ENG0_ADDR_RANGE_LO32: program_invalidation
+const uint32_t kRegVmInvalidateEng0AddrRangeHi32 = 0x69c20; // VM_INVALIDATE_ENG0_ADDR_RANGE_HI32: program_invalidation
+const uint32_t kRegIhRbBase = 0x04484; // IH_RB_BASE: vega10_ih_enable_ring
+const uint32_t kRegIhRbBaseHi = 0x04488; // IH_RB_BASE_HI: vega10_ih_enable_ring
+const uint32_t kRegIhRbWptr = 0x04490; // IH_RB_WPTR: enable_ring
+const uint32_t kRegIhRbRptr = 0x0448c; // IH_RB_RPTR: enable_ring
+const uint32_t kRegIhRbWptrAddrLo = 0x04498; // IH_RB_WPTR_ADDR_LO: enable_ring
+const uint32_t kRegIhRbWptrAddrHi = 0x04494; // IH_RB_WPTR_ADDR_HI: enable_ring
+const uint32_t kRegIhDoorbellRptr = 0x0449c; // IH_DOORBELL_RPTR: enable_ring
+const uint32_t kRegIhChicken = 0x048b0; // IH_CHICKEN: vega10_ih_irq_init (Renoir)
+const uint32_t kRegIhRbCntlRing1 = 0x044a0; // IH_RB_CNTL_RING1: toggle_interrupts
+const uint32_t kRegIhRbCntlRing2 = 0x044c0; // IH_RB_CNTL_RING2: toggle_interrupts
+const uint32_t kRegInterruptCntl = 0x03844; // INTERRUPT_CNTL: nbio_v7_0_ih_control
+const uint32_t kRegInterruptCntl2 = 0x03848; // INTERRUPT_CNTL2: nbio_v7_0_ih_control
+const uint32_t kRegBifIhDoorbellRange = 0x03bc8; // BIF_IH_DOORBELL_RANGE: nbio_v7_0_ih_doorbell_range
+const uint32_t kDisplayInventory[] = {kRegOtg0OtgControl, kRegOtg0OtgHTotal, kRegOtg0OtgVTotal, kRegOtg0OtgHBlankStartEnd, kRegOtg0OtgVBlankStartEnd, kRegHubp0DchubpCntl, kRegHubp0DcsurfSurfaceConfig, kRegHubp0DcsurfPriViewportDimension, kRegHubpreq0DcsurfSurfacePitch, kRegHubpreq0DcsurfPrimarySurfaceAddress, kRegHubpreq0DcsurfPrimarySurfaceAddressHigh, kRegOtg1OtgControl, kRegOtg1OtgHTotal, kRegOtg1OtgVTotal, kRegOtg1OtgHBlankStartEnd, kRegOtg1OtgVBlankStartEnd, kRegHubp1DchubpCntl, kRegHubp1DcsurfSurfaceConfig, kRegHubp1DcsurfPriViewportDimension, kRegHubpreq1DcsurfSurfacePitch, kRegHubpreq1DcsurfPrimarySurfaceAddress, kRegHubpreq1DcsurfPrimarySurfaceAddressHigh, kRegOtg2OtgControl, kRegOtg2OtgHTotal, kRegOtg2OtgVTotal, kRegOtg2OtgHBlankStartEnd, kRegOtg2OtgVBlankStartEnd, kRegHubp2DchubpCntl, kRegHubp2DcsurfSurfaceConfig, kRegHubp2DcsurfPriViewportDimension, kRegHubpreq2DcsurfSurfacePitch, kRegHubpreq2DcsurfPrimarySurfaceAddress, kRegHubpreq2DcsurfPrimarySurfaceAddressHigh, kRegOtg3OtgControl, kRegOtg3OtgHTotal, kRegOtg3OtgVTotal, kRegOtg3OtgHBlankStartEnd, kRegOtg3OtgVBlankStartEnd, kRegHubp3DchubpCntl, kRegHubp3DcsurfSurfaceConfig, kRegHubp3DcsurfPriViewportDimension, kRegHubpreq3DcsurfSurfacePitch, kRegHubpreq3DcsurfPrimarySurfaceAddress, kRegHubpreq3DcsurfPrimarySurfaceAddressHigh, kRegDcnVmFbLocationBase, kRegDcnVmFbLocationTop, kRegDcnVmFbOffset, kRegDcnVmAgpBase, kRegDcnVmAgpBot, kRegDcnVmAgpTop, kRegDig0DigBeCntl, kRegDig1DigBeCntl, kRegDig2DigBeCntl, kRegDig3DigBeCntl, kRegDig4DigBeCntl};
+const uint32_t kVmInventory[] = {kRegVmContext0PageTableBaseAddrLo32, kRegVmContext0PageTableBaseAddrHi32, kRegVmContext0PageTableStartAddrLo32, kRegVmContext0PageTableStartAddrHi32, kRegVmContext0PageTableEndAddrLo32, kRegVmContext0PageTableEndAddrHi32, kRegVmL2ProtectionFaultDefaultAddrLo32, kRegVmL2ProtectionFaultDefaultAddrHi32, kRegVmL2ProtectionFaultCntl, kRegVmL2ProtectionFaultCntl2, kRegVmL2ProtectionFaultStatus, kRegVmL2Cntl2, kRegVmL2Cntl3, kRegVmL2Cntl4, kRegVmL2Context1IdentityApertureLowAddrLo32, kRegVmL2Context1IdentityApertureLowAddrHi32, kRegVmL2Context1IdentityApertureHighAddrLo32, kRegVmL2Context1IdentityApertureHighAddrHi32, kRegVmL2ContextIdentityPhysicalOffsetLo32, kRegVmL2ContextIdentityPhysicalOffsetHi32, kRegVmInvalidateEng17Ack, kRegVmInvalidateEng17Sem, kRegVmInvalidateEng0AddrRangeLo32, kRegVmInvalidateEng0AddrRangeHi32};
+const uint32_t kIhInventory[] = {kRegIhRbBase, kRegIhRbBaseHi, kRegIhRbWptr, kRegIhRbRptr, kRegIhRbWptrAddrLo, kRegIhRbWptrAddrHi, kRegIhDoorbellRptr, kRegIhChicken, kRegIhRbCntlRing1, kRegIhRbCntlRing2, kRegInterruptCntl, kRegInterruptCntl2, kRegBifIhDoorbellRange};
+const uint32_t kDisplayInventoryCount = sizeof(kDisplayInventory) / sizeof(kDisplayInventory[0]);
+const uint32_t kVmInventoryCount = sizeof(kVmInventory) / sizeof(kVmInventory[0]);
+const uint32_t kIhInventoryCount = sizeof(kIhInventory) / sizeof(kIhInventory[0]);
+// Per pipe in kDisplayInventory: 5 OTG then 6 HUBP registers, 11 per pipe,
+// 4 pipes, then DCN_VM (6) and DIG_BE_CNTL (5).
+const uint32_t kDisplayPipeRegisters = 11, kDisplayPipes = 4;
+const uint32_t kOtgMasterEn = 0x1;
+const uint32_t kInventory16Stage = 16;
+const uint32_t kStage16Registers[] = {kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset, kRegGrbmStatus,
+                                      kRegGrbmGfxIndex, kRegCcShaderArrayConfig, kRegUserShaderArrayConfig,
+                                      kRegCcRbBackendDisable, kRegUserRbBackendDisable, kRegGbAddrConfig,
+                                      kRegSmuioGfxMiscCntl, kRegMp1C2PMsg66, kRegMp1C2PMsg82,
+                                      kRegMp1C2PMsg90, kRegMp0C2PMsg35, kRegMp0C2PMsg81,
+                                      kRegRlcCgttMgcgOverride, kRegRlcCgcgCglsCtrl,
+                                      kRegRlcCgcgCglsCtrl3d, kRegRlcMemSlpCntl, kRegCpMemSlpCntl,
+                                      kRegRlcPgCntl, kRegGrbmStatus2, kRegGrbmStatusSe0,
+                                      kRegCpBusyStat, kRegCpCpfStatus, kRegCpMeCntl, kRegCpMecCntl,
+                                      kRegRlcCntl, kRegRlcStat, kRegCpPfpInstrPntr, kRegCpMeInstrPntr,
+                                      kRegCpMec1InstrPntr, kRegSdma0ClkCtrl, kRegSdma0PowerCntl,
+                                      kRegSdma0F32Cntl, kRegSdma0StatusReg, kRegSdma0GfxRbCntl,
+                                      kRegHdpMemPowerLs, kRegAthubMiscCntl, kRegAtcL2MiscCg,
+                                      kRegDagb0CntlMisc2, kRegMmhubFbLocationBase, kRegMmhubFbLocationTop,
+                                      kRegMmhubVmL2Cntl, kRegMmhubVmContext0Cntl, kRegMmhubMxL1TlbCntl,
+                                      kRegIhRbCntl, kRegScratchReg0, kRegMp0C2PMsg36, kRegMp0C2PMsg64,
+                                      kRegMp0C2PMsg67, kRegMp0C2PMsg69, kRegMp0C2PMsg70, kRegMp0C2PMsg71,
+                                      kRegMmhubFbOffset, kRegMmhubDefaultAddrLsb, kRegMmhubDefaultAddrMsb,
+                                      kRegMmhubAgpTop, kRegMmhubAgpBot, kRegMmhubAgpBase,
+                                      kRegMmhubApertureLow, kRegMmhubApertureHigh, kRegGcFbLocationBase,
+                                      kRegGcFbLocationTop, kRegGcAgpTop, kRegGcAgpBot, kRegGcAgpBase,
+                                      kRegGcApertureLow, kRegGcApertureHigh, kRegSdma0UcodeChecksum,
+                                      kRegSdma0Cntl, kRegSdma0ChickenBits, kRegSdma0GbAddrConfig, kRegSdma0GbAddrConfigRead, kRegSdma0SemWaitFailTimerCntl, kRegSdma0Utcl1Watermk, kRegSdma0Utcl1Timeout, kRegSdma0Utcl1Page, kRegSdma0GfxRbBase, kRegSdma0GfxRbBaseHi, kRegSdma0GfxRbRptr, kRegSdma0GfxRbRptrHi, kRegSdma0GfxRbWptr, kRegSdma0GfxRbWptrHi, kRegSdma0GfxRbWptrPollCntl, kRegSdma0GfxRbRptrAddrHi, kRegSdma0GfxRbRptrAddrLo, kRegSdma0GfxIbCntl, kRegSdma0GfxDoorbell, kRegSdma0GfxDoorbellOffset, kRegSdma0GfxRbWptrPollAddrHi, kRegSdma0GfxRbWptrPollAddrLo, kRegSdma0GfxMinorPtrUpdate, kRegSdma0Rlc0RbWptrPollCntl, kRegSdma0Rlc1RbWptrPollCntl,
+                                      kRegOtg0OtgControl,
+                                      kRegOtg0OtgHTotal,
+                                      kRegOtg0OtgVTotal,
+                                      kRegOtg0OtgHBlankStartEnd,
+                                      kRegOtg0OtgVBlankStartEnd,
+                                      kRegHubp0DchubpCntl,
+                                      kRegHubp0DcsurfSurfaceConfig,
+                                      kRegHubp0DcsurfPriViewportDimension,
+                                      kRegHubpreq0DcsurfSurfacePitch,
+                                      kRegHubpreq0DcsurfPrimarySurfaceAddress,
+                                      kRegHubpreq0DcsurfPrimarySurfaceAddressHigh,
+                                      kRegOtg1OtgControl,
+                                      kRegOtg1OtgHTotal,
+                                      kRegOtg1OtgVTotal,
+                                      kRegOtg1OtgHBlankStartEnd,
+                                      kRegOtg1OtgVBlankStartEnd,
+                                      kRegHubp1DchubpCntl,
+                                      kRegHubp1DcsurfSurfaceConfig,
+                                      kRegHubp1DcsurfPriViewportDimension,
+                                      kRegHubpreq1DcsurfSurfacePitch,
+                                      kRegHubpreq1DcsurfPrimarySurfaceAddress,
+                                      kRegHubpreq1DcsurfPrimarySurfaceAddressHigh,
+                                      kRegOtg2OtgControl,
+                                      kRegOtg2OtgHTotal,
+                                      kRegOtg2OtgVTotal,
+                                      kRegOtg2OtgHBlankStartEnd,
+                                      kRegOtg2OtgVBlankStartEnd,
+                                      kRegHubp2DchubpCntl,
+                                      kRegHubp2DcsurfSurfaceConfig,
+                                      kRegHubp2DcsurfPriViewportDimension,
+                                      kRegHubpreq2DcsurfSurfacePitch,
+                                      kRegHubpreq2DcsurfPrimarySurfaceAddress,
+                                      kRegHubpreq2DcsurfPrimarySurfaceAddressHigh,
+                                      kRegOtg3OtgControl,
+                                      kRegOtg3OtgHTotal,
+                                      kRegOtg3OtgVTotal,
+                                      kRegOtg3OtgHBlankStartEnd,
+                                      kRegOtg3OtgVBlankStartEnd,
+                                      kRegHubp3DchubpCntl,
+                                      kRegHubp3DcsurfSurfaceConfig,
+                                      kRegHubp3DcsurfPriViewportDimension,
+                                      kRegHubpreq3DcsurfSurfacePitch,
+                                      kRegHubpreq3DcsurfPrimarySurfaceAddress,
+                                      kRegHubpreq3DcsurfPrimarySurfaceAddressHigh,
+                                      kRegDcnVmFbLocationBase,
+                                      kRegDcnVmFbLocationTop,
+                                      kRegDcnVmFbOffset,
+                                      kRegDcnVmAgpBase,
+                                      kRegDcnVmAgpBot,
+                                      kRegDcnVmAgpTop,
+                                      kRegDig0DigBeCntl,
+                                      kRegDig1DigBeCntl,
+                                      kRegDig2DigBeCntl,
+                                      kRegDig3DigBeCntl,
+                                      kRegDig4DigBeCntl,
+                                      kRegVmContext0PageTableBaseAddrLo32,
+                                      kRegVmContext0PageTableBaseAddrHi32,
+                                      kRegVmContext0PageTableStartAddrLo32,
+                                      kRegVmContext0PageTableStartAddrHi32,
+                                      kRegVmContext0PageTableEndAddrLo32,
+                                      kRegVmContext0PageTableEndAddrHi32,
+                                      kRegVmL2ProtectionFaultDefaultAddrLo32,
+                                      kRegVmL2ProtectionFaultDefaultAddrHi32,
+                                      kRegVmL2ProtectionFaultCntl,
+                                      kRegVmL2ProtectionFaultCntl2,
+                                      kRegVmL2ProtectionFaultStatus,
+                                      kRegVmL2Cntl2,
+                                      kRegVmL2Cntl3,
+                                      kRegVmL2Cntl4,
+                                      kRegVmL2Context1IdentityApertureLowAddrLo32,
+                                      kRegVmL2Context1IdentityApertureLowAddrHi32,
+                                      kRegVmL2Context1IdentityApertureHighAddrLo32,
+                                      kRegVmL2Context1IdentityApertureHighAddrHi32,
+                                      kRegVmL2ContextIdentityPhysicalOffsetLo32,
+                                      kRegVmL2ContextIdentityPhysicalOffsetHi32,
+                                      kRegVmInvalidateEng17Ack,
+                                      kRegVmInvalidateEng17Sem,
+                                      kRegVmInvalidateEng0AddrRangeLo32,
+                                      kRegVmInvalidateEng0AddrRangeHi32,
+                                      kRegIhRbBase,
+                                      kRegIhRbBaseHi,
+                                      kRegIhRbWptr,
+                                      kRegIhRbRptr,
+                                      kRegIhRbWptrAddrLo,
+                                      kRegIhRbWptrAddrHi,
+                                      kRegIhDoorbellRptr,
+                                      kRegIhChicken,
+                                      kRegIhRbCntlRing1,
+                                      kRegIhRbCntlRing2,
+                                      kRegInterruptCntl,
+                                      kRegInterruptCntl2,
+                                      kRegBifIhDoorbellRange};
+const uint32_t kStage16RegisterCount = sizeof(kStage16Registers) / sizeof(kStage16Registers[0]);
 
 // Stage 15: the first SDMA copy. Values are what Linux v6.12 computes from
 // the registers boot 19 measured; the check requires those values first.
