@@ -1351,6 +1351,153 @@ clear-on-read counter. A read that hangs freezes the machine with the
 register's name on screen; power off and boot the known-good EFI. Nothing is
 written.
 
+### Stage 11: create and destroy a PSP ring (proposal)
+
+**Status: proposed 2026-10-06, not approved, not implemented.**
+
+**Purpose.** The first commands to the PSP, and the first step of the route
+by which Linux loads all engine firmware. Stage 11 creates the PSP's
+kernel-mode command ring in one checked carveout page, confirms the PSP
+accepted it, and destroys it again. It submits no ring frame and loads no
+firmware. A later stage (TMR setup, then SDMA firmware) needs a working ring.
+Stage 10 (boot 14) showed the starting state: the PSP is ready
+(`C2PMSG_64` `0x80000000`) and no ring exists.
+
+**Linux v6.12:**
+
+- `psp_v12_0_ring_create` (non-SR-IOV path), called from `psp_hw_start`
+  once `C2PMSG_81` shows the secure OS running:
+  1. **`psp_v12_0_reroute_ih`**: two `GFX_CTRL_CMD_ID_GBR_IH_SET`
+     (`0x00080000`, `psp_gfx_if.h`) commands. For each, it writes the client
+     to `C2PMSG_69` and an `IH_CLIENT_CFG_DATA` value to `C2PMSG_70`, writes
+     the command to `C2PMSG_64`, waits 20 ms, then polls `C2PMSG_64` until
+     `(value & 0x8000FFFF) == 0x80000000`:
+     - VMC: client 3, value `0x0015244b` (credit return address `0x1244b`,
+       client type 1, ring ID 1; field shifts from `osssys_4_0_sh_mask.h`);
+     - UMC: client 4, value `0x0011216b` (`0x1216b`, ring ID 1).
+     Linux ignores both results.
+  2. **Ring create.** Ring address low to `C2PMSG_69`, high to `C2PMSG_70`,
+     size to `C2PMSG_71`, and `PSP_RING_TYPE__KM << 16` = `0x00020000`
+     (`GFX_CTRL_CMD_ID_INIT_GPCOM_RING`) to `C2PMSG_64`. Then 20 ms and the
+     same poll.
+- `psp_ring_init`: the ring is one 4 KiB page (`ring_size = 0x1000`) of
+  VRAM, page-aligned.
+- `psp_v12_0_ring_stop`: `GFX_CTRL_CMD_ID_DESTROY_RINGS` (`0x00030000`) to
+  `C2PMSG_64`, 20 ms, then poll for bit 31 alone.
+- `psp_wait_for` polls every 1 µs for `adev->usec_timeout`, which is
+  `AMDGPU_MAX_USEC_TIMEOUT` = 100 ms (`amdgpu.h`).
+- The write pointer (`C2PMSG_67`) changes only when a frame is submitted
+  (`psp_ring_cmd_submit`). Stage 11 never writes it.
+
+**Where the ring goes.** It goes at carveout offset `0x40100000`: GPU
+`0xF440100000`, physical `0x600100000`.
+
+- This is 1 MiB above the stage 9 metrics page and inside the checked
+  middle of the carveout, far from the boot framebuffer at offset 0 and the
+  firmware, PSP and discovery regions at the top.
+- Both hubs map it (boot 14: FB and system aperture `0xF400000000`–
+  `0xF47FFFFFFF`).
+- The CPU never writes the page. It is checked like the stage 9 page: the
+  64 KiB at it must read the same twice about 1 s apart, and a snapshot is
+  kept.
+
+**Steps** (on request only, `sudo cezanne-diag --psp-ring`, each printed
+before it runs; ordered selectors as in stage 9):
+
+1. **Check (no writes).** Stop with a named status unless all of these hold:
+   - `C2PMSG_81` is non-zero;
+   - `C2PMSG_64` is exactly `0x80000000`;
+   - `C2PMSG_67`, `69`, `70` and `71` are 0;
+   - the stage 9 FB checks hold (MMHUB FB base `0xf400`, FB offset `0x5c0`),
+     the page is inside the carveout away from its reserved ends, and it
+     overlaps no device range;
+   - the 64 KiB is stable over about 1 s.
+2. **IH reroute.** Two `GBR_IH_SET` commands with Linux's exact values, each
+   followed by a 20 ms sleep and a poll of up to 100 ms in 1 ms sleeps.
+   Stop unless each response is exactly `0x80000000` (flag set, status 0).
+   Unlike Linux, which ignores the result, any other value is a stop.
+3. **Create.** `C2PMSG_69` ← `0x40100000`, `C2PMSG_70` ← `0xF4`,
+   `C2PMSG_71` ← `0x1000`, `C2PMSG_64` ← `0x00020000`, then 20 ms and the
+   same poll. It is ok only on exactly `0x80000000`.
+4. **Observe (no writes).** Read `C2PMSG_64`, `67`, `69`, `70` and `71`.
+   Compare the page and the rest of its 64 KiB with the snapshot through a
+   read-only mapping, and report which bytes changed. A change outside the
+   ring page is a finding, as is any change in the page: the PSP is not
+   expected to write the ring until a frame is submitted.
+5. **Destroy.** `C2PMSG_64` ← `0x00030000`, then 20 ms and a poll for bit 31
+   of up to 100 ms. Report the final `C2PMSG_64`, `67`, `69`, `70` and `71`.
+
+If the tool exits, or the connection closes, after a successful create but
+before destroy, the driver sends the destroy itself, as stage 6 restores the
+scratch register. If step 2 or 3 fails, nothing more is sent. The ring may
+then be half-configured until the next cold boot; that is recorded as a
+finding.
+
+**Write allowlist additions** (stage 11 and up). Every write goes to the
+MP0 mailbox, in the BAR5 page `0x58000` already used for the SMU, so no new
+writable mapping is needed.
+
+| Register | Values |
+| --- | --- |
+| `C2PMSG_64` | `0x00080000`, `0x00020000`, `0x00030000` |
+| `C2PMSG_69` | `3`, `4`, `0x40100000` |
+| `C2PMSG_70` | `0x0015244b`, `0x0011216b`, `0xF4` |
+| `C2PMSG_71` | `0x1000` |
+
+A pairing check, like stage 9's `smuArgumentAllowed`, ties each command to
+its arguments:
+- `GBR_IH_SET` is allowed only with (3, `0x15244b`) or (4, `0x11216b`) in
+  `69`/`70`;
+- `INIT_GPCOM_RING` only with (`0x40100000`, `0xF4`, `0x1000`);
+- `DESTROY_RINGS` only after a successful create on the same connection.
+
+**Changes:**
+
+- **Core:**
+  - `kMaxStage` 11, plus the ring constants.
+  - The allowlist and pairing check; `checkPspRing`, `pspReroute`,
+    `pspCreateRing` and `pspDestroyRing`.
+  - A poll helper with a 20 ms settle time and a 100-pause limit.
+  - The page compare reuses the stage 9 snapshot code.
+- **Adapter:** four selectors (check, reroute plus create, observe, destroy),
+  accepted only in order per connection, and the destroy on abandon.
+  Read-only carveout mapping at the ring page only. Diagnostics version 6.
+- **Tool:** `--psp-ring`, which prints each step and the mailbox values.
+- **Tests:**
+  - Exact write sequences against a fake PSP, including every value and
+    order.
+  - A stop at each check and after a non-ok or timed-out response.
+  - The destroy on abandon only after a create.
+  - The pairing check: a create with a reroute argument, a reroute with ring
+    arguments, a destroy without a create.
+  - Weakened cores that must fail: an unpaired create, a removed ready
+    check, a removed timeout, a destroy without a create.
+  - Stage 12 rejected.
+
+**Expected values.**
+- Responses of `0x80000000` for both reroutes, the create and the destroy.
+- After create: `C2PMSG_69`/`70`/`71` hold whatever the PSP leaves there (no
+  prediction), and `C2PMSG_67` is 0.
+- No change in the 64 KiB region.
+
+**Risks.**
+
+- These are the first writes to the PSP, the security processor. A PSP that
+  hangs or rejects commands could stop the GPU working until a cold boot.
+  The display is still the firmware's framebuffer and does not depend on the
+  PSP, but that is untested.
+- An unexpected response stops the sequence. A poll that times out after
+  step 2 or 3 leaves the PSP in an unknown state: shut down fully and boot
+  the known-good EFI.
+- If the PSP wrote somewhere other than the page, the compare in step 4
+  could catch it only inside the 64 KiB. Treat any change outside the ring
+  page as a misdirected write: power off at once.
+- Make a Time Machine backup before this boot, as for stage 9.
+
+**What it does not do.** It writes no ring frame and no write pointer. It
+sends no TMR, firmware load or mode 1 reset. It makes no IH, GART or default
+page change.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
