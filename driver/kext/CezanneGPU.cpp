@@ -42,10 +42,10 @@
 //   Stage 10: 21 more read-only diagnostic registers (PSP mailbox, memory
 //            hub and GC hub apertures); nothing else changes.
 //   Stage 11: on request, in ordered steps, check the PSP is ready with no
-//            ring and one fixed carveout page is not being written, reroute
-//            IH and create the PSP kernel-mode ring at that page, compare the
-//            page region with its snapshot, and destroy the ring (also on an
-//            abandoned connection after a create). No frame is submitted.
+//            ring and one fixed carveout page is not being written, create
+//            the PSP kernel-mode ring at that page, compare the page region
+//            with its snapshot, and destroy the ring (also on an abandoned
+//            connection after any create attempt). No frame is submitted.
 //            Apart from the stage 6 to 11 tests, nothing is written to
 //            configuration space, registers or memory, and every mapping and
 //            the provider are released before start() returns.
@@ -112,7 +112,7 @@ public:
     cezanne::Status metricsTransfer(const void *owner, uint32_t responses[3]);
     cezanne::Status metricsRead(const void *owner, cezanne::SmuMetrics *metrics);
     cezanne::Status pspRingCheck(const void *owner, cezanne::PspMailbox *mailbox);
-    cezanne::Status pspRingCreate(const void *owner, uint32_t responses[3]);
+    cezanne::Status pspRingCreate(const void *owner, uint32_t *response, bool *written);
     cezanne::Status pspRingObserve(const void *owner, cezanne::PspMailbox *mailbox, uint32_t *changedInPage,
                                    uint32_t *changedOutside);
     cezanne::Status pspRingDestroy(const void *owner, uint32_t *response, cezanne::PspMailbox *mailbox);
@@ -129,7 +129,8 @@ private:
     const void *metricsOwner_ = nullptr;
     // The check region as read before the transfer; too large for the stack.
     uint32_t metricsSnapshot_[cezanne::kMetricsCheckSize / 4];
-    // Stage 11: a ring exists from a successful create until the destroy.
+    // Stage 11: a ring may exist from the create command's write until the
+    // destroy, whatever the create's response.
     enum PspState { kPspIdle, kPspChecked, kPspCreated, kPspObserved };
     PspState pspState_ = kPspIdle;
     const void *pspOwner_ = nullptr;
@@ -887,7 +888,8 @@ struct PspArgument {
     const cezanne::Range *ranges;
     uint32_t rangeCount;
     cezanne::PspMailbox *mailbox;
-    uint32_t *responses; // create: three; destroy: one
+    uint32_t *response;
+    bool *written;
     uint32_t *snapshot;
     uint32_t *changedInPage, *changedOutside;
 };
@@ -913,7 +915,8 @@ static cezanne::Status pspCheckOperation(UInt32 stage, const cezanne::RegisterRe
 static cezanne::Status pspCreateOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
                                           const cezanne::RegisterWriter *writer, void *argument)
 {
-    return cezanne::createPspRing(registers, length, *writer, stage, static_cast<PspArgument *>(argument)->responses);
+    PspArgument *psp = static_cast<PspArgument *>(argument);
+    return cezanne::createPspRing(registers, length, *writer, stage, psp->response, psp->written);
 }
 
 static cezanne::Status pspObserveOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
@@ -936,7 +939,7 @@ static cezanne::Status pspDestroyOperation(UInt32 stage, const cezanne::Register
 {
     PspArgument *psp = static_cast<PspArgument *>(argument);
     // Only reached with a ring created by this driver (pspState_).
-    cezanne::Status status = cezanne::destroyPspRing(registers, length, *writer, stage, true, psp->responses);
+    cezanne::Status status = cezanne::destroyPspRing(registers, length, *writer, stage, true, psp->response);
     cezanne::Status mailbox = cezanne::readPspMailbox(registers, length, stage, psp->mailbox);
     return status != cezanne::kOK ? status : mailbox;
 }
@@ -962,7 +965,7 @@ cezanne::Status CezanneGPU::pspRingCheck(const void *owner, cezanne::PspMailbox 
     if (pspState_ == kPspCreated || pspState_ == kPspObserved) {
         status = cezanne::kPspOutOfOrder;
     } else {
-        PspArgument psp = {ranges, count, mailbox, nullptr, pspSnapshot_, nullptr, nullptr};
+        PspArgument psp = {ranges, count, mailbox, nullptr, nullptr, pspSnapshot_, nullptr, nullptr};
         status = accessDevice(0, pspCheckOperation, &psp);
         pspState_ = status == cezanne::kOK ? kPspChecked : kPspIdle;
         pspOwner_ = owner;
@@ -971,17 +974,19 @@ cezanne::Status CezanneGPU::pspRingCheck(const void *owner, cezanne::PspMailbox 
     return status;
 }
 
-cezanne::Status CezanneGPU::pspRingCreate(const void *owner, uint32_t responses[3])
+cezanne::Status CezanneGPU::pspRingCreate(const void *owner, uint32_t *response, bool *written)
 {
-    responses[0] = responses[1] = responses[2] = 0;
+    *response = 0;
+    *written = false;
     IOLockLock(lock_);
     cezanne::Status status = cezanne::kPspOutOfOrder;
     if (pspState_ == kPspChecked && pspOwner_ == owner) {
-        PspArgument psp = {nullptr, 0, nullptr, responses, nullptr, nullptr, nullptr};
+        PspArgument psp = {nullptr, 0, nullptr, response, written, nullptr, nullptr, nullptr};
         status = accessDevice(cezanne::kSmuPageOffset, pspCreateOperation, &psp);
-        pspState_ = status == cezanne::kOK ? kPspCreated : kPspIdle;
-        IOLog(LOG_PREFIX "PSP ring create: %s, responses 0x%08x 0x%08x 0x%08x\n", cezanne::statusName(status),
-              responses[0], responses[1], responses[2]);
+        // Once the command is written a ring may exist, even after an error.
+        pspState_ = *written ? kPspCreated : kPspIdle;
+        IOLog(LOG_PREFIX "PSP ring create: %s, response 0x%08x, written %d\n", cezanne::statusName(status),
+              *response, *written ? 1 : 0);
     }
     IOLockUnlock(lock_);
     return status;
@@ -995,7 +1000,7 @@ cezanne::Status CezanneGPU::pspRingObserve(const void *owner, cezanne::PspMailbo
     IOLockLock(lock_);
     cezanne::Status status = cezanne::kPspOutOfOrder;
     if (pspState_ == kPspCreated && pspOwner_ == owner) {
-        PspArgument psp = {nullptr, 0, mailbox, nullptr, pspSnapshot_, changedInPage, changedOutside};
+        PspArgument psp = {nullptr, 0, mailbox, nullptr, nullptr, pspSnapshot_, changedInPage, changedOutside};
         status = accessDevice(0, pspObserveOperation, &psp);
         // The ring still exists whatever the comparison found.
         pspState_ = kPspObserved;
@@ -1009,7 +1014,7 @@ cezanne::Status CezanneGPU::pspRingObserve(const void *owner, cezanne::PspMailbo
 cezanne::Status CezanneGPU::pspDestroyLocked(uint32_t *response, cezanne::PspMailbox *mailbox)
 {
     // Caller holds lock_ and pspState_ shows a created ring.
-    PspArgument psp = {nullptr, 0, mailbox, response, nullptr, nullptr, nullptr};
+    PspArgument psp = {nullptr, 0, mailbox, response, nullptr, nullptr, nullptr, nullptr};
     cezanne::Status status = accessDevice(cezanne::kSmuPageOffset, pspDestroyOperation, &psp);
     pspState_ = kPspIdle;
     pspOwner_ = nullptr;
@@ -1050,7 +1055,7 @@ void CezanneGPU::scratchAbandon(const void *owner)
             uint32_t response = 0;
             cezanne::PspMailbox mailbox;
             cezanne::Status status = pspDestroyLocked(&response, &mailbox);
-            IOLog(LOG_PREFIX "PSP ring abandoned after the create; destroy: %s\n", cezanne::statusName(status));
+            IOLog(LOG_PREFIX "PSP ring abandoned after a create attempt; destroy: %s\n", cezanne::statusName(status));
             setProperty("CezanneGPU PSP ring abandoned destroy", cezanne::statusName(status));
         }
         pspState_ = kPspIdle;
@@ -1260,11 +1265,11 @@ IOReturn CezanneGPUUserClient::pspRingCheck(OSObject *target, void *, IOExternal
 IOReturn CezanneGPUUserClient::pspRingCreate(OSObject *target, void *, IOExternalMethodArguments *arguments)
 {
     CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
-    uint32_t responses[3];
-    arguments->scalarOutput[0] = self->gpu_->pspRingCreate(self, responses);
-    for (uint32_t i = 0; i < 3; i++) {
-        arguments->scalarOutput[i + 1] = responses[i];
-    }
+    uint32_t response = 0;
+    bool written = false;
+    arguments->scalarOutput[0] = self->gpu_->pspRingCreate(self, &response, &written);
+    arguments->scalarOutput[1] = response;
+    arguments->scalarOutput[2] = written ? 1 : 0;
     return kIOReturnSuccess;
 }
 
@@ -1308,7 +1313,7 @@ IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMetho
         {metricsTransfer, 0, 0, 4, 0}, // kDiagnosticMetricsTransfer
         {metricsRead, 0, 0, 1, sizeof(cezanne::SmuMetrics)}, // kDiagnosticMetricsRead
         {pspRingCheck, 0, 0, 7, 0},   // kDiagnosticPspRingCheck
-        {pspRingCreate, 0, 0, 4, 0},  // kDiagnosticPspRingCreate
+        {pspRingCreate, 0, 0, 3, 0},  // kDiagnosticPspRingCreate
         {pspRingObserve, 0, 0, 8, 0}, // kDiagnosticPspRingObserve
         {pspRingDestroy, 0, 0, 7, 0}, // kDiagnosticPspRingDestroy
     };
