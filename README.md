@@ -82,7 +82,8 @@ stage 7 SMU version queries, `--gfxoff-disallow` the stage 8
 `DisallowGfxOff` message and `--smu-metrics` the stage 9 metrics table;
 `--psp-state` (stage 10, reads only) decodes the PSP ring mailbox and the
 memory-hub apertures; `--psp-ring` (stage 11) creates and destroys the PSP
-kernel-mode ring.
+kernel-mode ring; `--psp-tmr` (stage 12) submits `SETUP_TMR` and
+`DESTROY_TMR` through it.
 
 ## Verify
 

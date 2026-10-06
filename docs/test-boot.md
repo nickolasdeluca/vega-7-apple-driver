@@ -23,8 +23,9 @@ ring, and both memory hubs mapping the carveout identically. Stage 11 (the
 first PSP commands: create and destroy a ring) stopped safely in boot 15:
 the PSP answered its first command, `GBR_IH_SET`, with "unknown command". A
 revised stage 11 succeeded in boot 16: the PSP created (`0x80020000`) and
-destroyed (`0x80030000`) a kernel-mode ring without touching its memory. No
-later stage is authorized.
+destroyed (`0x80030000`) a kernel-mode ring without touching its memory.
+Stage 12 (the first ring frame: `SETUP_TMR`, then `DESTROY_TMR`) is approved
+and built, not yet booted. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -86,6 +87,10 @@ off restores the known-good boot. This is the experimental environment
      day): stage 10 plus the first PSP commands, creating and destroying the
      kernel-mode ring at one checked carveout page on request, described
      [below](#stage-11-create-and-destroy-a-psp-ring-proposal).
+   - **Stage 12** (proposed 2026-10-06 and approved by the user the same
+     day): stage 11 plus the first CPU writes to carveout memory and the
+     first ring frame, `SETUP_TMR` then `DESTROY_TMR`, on request, described
+     [below](#stage-12-first-psp-ring-frame-tmr-setup-proposal).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -1656,7 +1661,9 @@ the PSP starts from the boot 14 state, not boot 15's rejected command.
 
 ### Stage 12: first PSP ring frame, TMR setup (proposal)
 
-**Status: proposed 2026-10-06, not approved, not implemented.**
+**Status: proposed 2026-10-06, approved by the user the same day, and
+implemented; not yet booted.** The proposal is kept as approved. The
+implementation notes follow it.
 
 **Purpose.** Submit the first command through the ring stage 11 proved: set
 up the PSP's trusted memory region (TMR). Linux v6.12 does this right after
@@ -1815,6 +1822,56 @@ Everything else (the ring create and destroy values) is stage 11's.
 stage), and no TOC, ASD or TA. It makes no IH, GART or default-page
 change. It sends no second command while the first is unfenced.
 
+**Implementation notes:**
+
+- **Core:**
+  - `pspCommandWord` and `pspFrameWord` give the exact words.
+  - `pspWorkWriteAllowed` allows only those words or 0, only in the command
+    and fence pages and frames 0 and 1.
+  - `writeWork` is the only memory write site; it checks the allowlist
+    first.
+  - `writePspCommand` writes the whole command page, the fence page (setup
+    only) and the frame, then reads every written word back
+    (`psp-readback-mismatch`).
+  - `submitPspFrame` requires `C2PMSG_67` = frame × 16 (`psp-out-of-order`),
+    writes 16 or 32 (the only allowed values, from stage 12), and polls the
+    fence (`psp-fence-timeout`).
+  - `readPspResponse` returns `psp-command-failed` on a non-zero status.
+  - `verifyPspWorkArea` checks all 64 KiB:
+    - the frames and the command page hold the driver's words, except the
+      96-byte response area;
+    - the fence dword holds the fence value and the rest of its page is 0;
+    - everything else matches the snapshot.
+  - `checkPspTmrTarget` and `checkRegionChecksum` check the TMR placement
+    and its stability (a position-dependent sum, read twice about 1 s
+    apart).
+- **Adapter:**
+  - The stage 11 check also checks the TMR at stage 12.
+  - Selectors 15–17: submit, observe, teardown. Diagnostics version 8.
+  - Submit needs a create answered with status 0.
+  - A submit counts as sent once `C2PMSG_67` reads 16.
+  - Teardown sends `DESTROY_TMR` only if `SETUP_TMR` fenced, then always
+    destroys the ring.
+  - Abandon after a submit runs the teardown.
+  - The work area is the only writable carveout mapping, created only inside
+    the submit and teardown operations.
+  - The TMR is mapped read-only only for the check.
+- **Tool:** `--psp-tmr` runs check, create, submit, observe and teardown. It
+  destroys the ring through the stage 11 selector if the frame never
+  reached the PSP.
+- **Tests:**
+  - The page images against the `psp_gfx_if.h` offsets.
+  - The allowlist, including frame 2, wrong words, offsets past the work
+    area and stage 11.
+  - A full fake-PSP run: SETUP_TMR, fence 1, response, verify, then
+    DESTROY_TMR, fence 2, verify.
+  - A stray write in the fence page and beyond the work area, a fence
+    timeout, a failed status, lost writes, and an out-of-order submit.
+  - Four more weakened cores must fail.
+  - The kext tests now name both writable mappings and both stores. Their
+    mapping regex was tightened: before, it did not match the stage 6
+    page's `map` call at all.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -1826,7 +1883,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10 11; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -1933,6 +1990,26 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 12 succeeds when:
+
+- the stage 11 conditions hold with `CezanneGPU stage` 12;
+- `sudo cezanne-diag --gfxoff-disallow --psp-tmr --psp-state` reports
+  `ok` for:
+  - the check (now with the TMR);
+  - the create;
+  - the submit: fence 1, response status 0, `C2PMSG_67` 16;
+  - the observe: 0 unexpected words;
+  - the teardown: `DESTROY_TMR` fence 2 with status 0, then the ring
+    destroy;
+- the machine stays as before.
+
+**On failure:**
+- A non-zero response status is a finding to record; do not retry.
+- A fence timeout, or unexpected words outside the command and fence pages,
+  means: shut down fully. Unexpected words beyond the work area mean a
+  misdirected write: power off at once.
+- Make a Time Machine backup before this boot. Save the output with `tee`.
 
 Stage 11 succeeds when:
 

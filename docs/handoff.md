@@ -133,7 +133,16 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: propose stage 12, the first PSP ring frame
+## Next task: boot stage 12
+
+Stage 12 (the first ring frame: `SETUP_TMR` through the ring, then
+`DESTROY_TMR` and the ring destroy) is approved and built:
+`out/test-efi/usb-stage12`, `out/diag/cezanne-diag --psp-tmr`. Next: a cold
+boot after a Time Machine backup, then record the result. If it succeeds,
+the next proposal is the first firmware load (`LOAD_IP_FW`, SDMA0) into the
+TMR.
+
+### Earlier: proposing stage 12
 
 Stages 0–11 succeeded. In boot 16 the PSP created (`0x80020000`) and
 destroyed (`0x80030000`) a kernel-mode ring at GPU `0xF440100000`, writing
