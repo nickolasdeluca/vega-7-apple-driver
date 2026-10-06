@@ -1240,6 +1240,109 @@ the kernel. Reads happen while the system runs, still with no graphics
 driver; the per-read checks stop on a device that left D0 or stopped decoding.
 Do not sleep the machine.
 
+### Stage 10: PSP and memory-aperture state (proposal)
+
+**Status: proposed 2026-10-06, not approved, not implemented.**
+
+**Purpose.** Prepare the first firmware load. Linux v6.12 loads every
+Renoir/Green Sardine engine firmware (SDMA, CP, RLC, …) through the PSP
+(`amdgpu_ucode_get_load_type`: the default `-1` gives `AMDGPU_FW_LOAD_PSP`).
+The first useful engine is SDMA, which gives the "verified DMA copy and
+fence" milestone. Before any PSP write, stage 10 reads the PSP mailbox
+registers that the PSP route writes. It also reads the address apertures that
+decide which GPU addresses the PSP and engines can reach. Like stage 5, it
+only reads.
+
+**The PSP route in Linux v6.12** (`amdgpu_psp.c` `psp_hw_start`,
+`psp_v12_0.c`), for orientation only. Each step will get its own proposal:
+
+1. The bootloader steps are skipped: `C2PMSG_81` is non-zero (stage 5:
+   the secure OS is already running).
+2. `psp_v12_0_ring_create` first sends two `GFX_CTRL_CMD_ID_GBR_IH_SET`
+   commands (`C2PMSG_69`/`70`, then `C2PMSG_64`). It then creates the
+   kernel-mode ring: its GPU address goes in `C2PMSG_69`/`70`, its size in
+   `C2PMSG_71`, and the command in `C2PMSG_64`. It waits for bit 31 of
+   `C2PMSG_64`. The write pointer is `C2PMSG_67`.
+3. A trusted memory region (TMR) is reserved in VRAM and handed to the PSP
+   with a ring command (`psp_tmr_init`, `psp_tmr_load`).
+4. Each firmware image is copied to a 1 MiB buffer and loaded with a ring
+   command (`psp_load_non_psp_fw`). SDMA would come first.
+
+Stage 10 tells us whether step 2 starts from a clean mailbox. It also shows
+whether something (firmware, GOP) already created a ring after a cold boot.
+
+**Registers.** These are read only on demand through `cezanne-diag`, never
+at boot. Offsets come from `mp_12_0_0_offset.h`, `mmhub_1_0_offset.h` and
+`gc_9_0_offset.h`, with the measured bases (MP0 `0x16000`, MMHUB `0x1A000`,
+GC `0x2000`). All lie inside BAR5.
+
+| Register | BAR5 byte offset | Linux v6.12 use |
+| --- | --- | --- |
+| `MP0_SMN_C2PMSG_36` | `0x58190` | psp_v12_0 bootloader: firmware address |
+| `MP0_SMN_C2PMSG_64` | `0x58200` | psp_v12_0 ring command and response (bit 31 ready) |
+| `MP0_SMN_C2PMSG_67` | `0x5820c` | psp_v12_0 ring write pointer |
+| `MP0_SMN_C2PMSG_69` | `0x58214` | psp_v12_0 ring address low / IH reroute argument |
+| `MP0_SMN_C2PMSG_70` | `0x58218` | psp_v12_0 ring address high / IH reroute argument |
+| `MP0_SMN_C2PMSG_71` | `0x5821c` | psp_v12_0 ring size |
+| `MC_VM_FB_OFFSET (MMHUB)` | `0x6a05c` | mmhub_v1_0 (compare with GC hub, stage 2) |
+| `MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB (MMHUB)` | `0x6a060` | mmhub_v1_0_init_system_aperture_regs |
+| `MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB (MMHUB)` | `0x6a064` | mmhub_v1_0_init_system_aperture_regs |
+| `MC_VM_AGP_TOP (MMHUB)` | `0x6a0b8` | mmhub_v1_0_init_system_aperture_regs |
+| `MC_VM_AGP_BOT (MMHUB)` | `0x6a0bc` | mmhub_v1_0_init_system_aperture_regs |
+| `MC_VM_AGP_BASE (MMHUB)` | `0x6a0c0` | mmhub_v1_0_init_system_aperture_regs |
+| `MC_VM_SYSTEM_APERTURE_LOW_ADDR (MMHUB)` | `0x6a0c4` | mmhub_v1_0_init_system_aperture_regs |
+| `MC_VM_SYSTEM_APERTURE_HIGH_ADDR (MMHUB)` | `0x6a0c8` | mmhub_v1_0_init_system_aperture_regs (Renoir/Green Sardine +1 workaround) |
+| `MC_VM_FB_LOCATION_BASE (GC)` | `0x0a600` | gfxhub_v1_0 (GFX-gated) |
+| `MC_VM_FB_LOCATION_TOP (GC)` | `0x0a604` | gfxhub_v1_0 (GFX-gated) |
+| `MC_VM_AGP_TOP (GC)` | `0x0a608` | gfxhub_v1_0_init_system_aperture_regs (GFX-gated) |
+| `MC_VM_AGP_BOT (GC)` | `0x0a60c` | gfxhub_v1_0_init_system_aperture_regs (GFX-gated) |
+| `MC_VM_AGP_BASE (GC)` | `0x0a610` | gfxhub_v1_0_init_system_aperture_regs (GFX-gated) |
+| `MC_VM_SYSTEM_APERTURE_LOW_ADDR (GC)` | `0x0a614` | gfxhub_v1_0_init_system_aperture_regs (GFX-gated) |
+| `MC_VM_SYSTEM_APERTURE_HIGH_ADDR (GC)` | `0x0a618` | gfxhub_v1_0_init_system_aperture_regs (GFX-gated) |
+
+The GC-hub registers use the stage 5 GFX gate (read only while
+`PWR_GFXOFF_STATUS` is 2). Stage 8's `DisallowGfxOff` keeps GFX on if run
+first.
+
+**Changes:**
+
+- **Core.** `kMaxStage` 10. A stage 10 list that extends the stage 6 list by
+  these 21 registers. The 7 GC-hub registers are added to the GFX-gated set.
+  No write, message or memory access changes; the write allowlist is
+  unchanged.
+- **Adapter.** None beyond the stage limit. The boot runs stages 1–3 as
+  before.
+- **Tool.** `cezanne-diag` names the new registers. A `--psp-state` summary
+  decodes `C2PMSG_64` (bit 31 ready, low 16 bits status) and whether a ring
+  address or size is set. It also shows the MMHUB and GC apertures as GPU
+  address ranges.
+- **Tests.** The stage 10 list is a prefix-extension of the stage 6 list;
+  offsets are aligned, unique and inside BAR5. The new registers are refused
+  at stage 9. The GC-hub registers are gated and the others are not. Stage
+  11 is rejected. Two weakened cores must fail: stage 10 registers allowed at
+  stage 9, and the GC-hub gate removed.
+
+**Expected values.** Stages 1–9 as in boot 13.
+
+- `C2PMSG_64`: bit 31 set with status 0, meaning the secure OS accepts ring
+  commands (Linux `psp_v12_0_mode1_reset` waits for exactly that).
+- `C2PMSG_69`/`70`/`71`/`67`: no prediction. Zero would mean no ring.
+- MMHUB FB offset `0x5c0`, the same as the GC hub.
+- The system aperture should cover the FB range `0xF400000000`–`0xF47FFFFFFF`.
+  The SMU metrics write in boot 13 suggests the MMHUB does.
+
+**What the values decide.** If the mailbox is idle and no ring exists, the
+next proposal (stage 11) would be the two IH reroute commands plus creating
+and destroying a kernel-mode ring in one fixed carveout page, with no
+firmware loaded. A ring that already exists, or a status other than ready,
+means stage 11 must be designed around that state first.
+
+**Risks.** As in stage 5: every register is a mailbox or configuration
+register that Linux reads or polls. None is a FIFO, data port or
+clear-on-read counter. A read that hangs freezes the machine with the
+register's name on screen; power off and boot the known-good EFI. Nothing is
+written.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
