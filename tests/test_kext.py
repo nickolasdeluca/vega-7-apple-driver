@@ -2,6 +2,7 @@
 
 Builds only; never loads it.
 """
+import os
 import plistlib
 import re
 import shutil
@@ -45,18 +46,24 @@ def strip_comments(source):
     return re.sub(r"//[^\n]*|/\*.*?\*/", "", source, flags=re.S)
 
 
-# The register write path (stage 6 on) and the work-area write path (stage
-# 12), and the only writable constructs allowed: one writable map each (the
-# test's BAR5 page; the three work-area pages), one store each (registerWrite;
-# workWrite), and the four non-const volatile pointers that carry them.
+# The register write path (stage 6 on), the work-area write path (stage 12)
+# and the firmware-buffer write path (stage 13), and the only writable
+# constructs allowed: one writable map each (the test's BAR5 page; the three
+# work-area pages; the five firmware pages), one store each (registerWrite;
+# workWrite; firmwareWrite), and the six non-const volatile pointers that
+# carry them.
 SCRATCH_MAP = "pageMemory->map(kIOMapInhibitCache)"
 SCRATCH_STORE = "page->base[(offset - page->pageOffset) / 4] = value;"
 WORK_MAP = "workMemory->map(kIOMapInhibitCache)"
 WORK_STORE = "work->base[offset / 4] = value;"
-ALLOWED_MAPS = (SCRATCH_MAP, WORK_MAP)
-ALLOWED_STORES = (SCRATCH_STORE, WORK_STORE)
-ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize", "cezanne::kPspWorkSize", "length")
-ALLOWED_VOLATILE = 4
+FIRMWARE_MAP = "firmwareMemory->map(kIOMapInhibitCache)"
+FIRMWARE_STORE = "firmware->base[offset / 4] = value;"
+ALLOWED_MAPS = (SCRATCH_MAP, WORK_MAP, FIRMWARE_MAP)
+ALLOWED_STORES = (SCRATCH_STORE, WORK_STORE, FIRMWARE_STORE)
+ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize", "cezanne::kPspWorkSize",
+                       "cezanne::kSdmaFwBufferSize", "length")
+ALLOWED_VOLATILE = 6
+SDMA_FIRMWARE = ROOT / "out" / "firmware-provenance" / "fw" / "green_sardine_sdma.bin"
 
 
 def hardware_calls(source):
@@ -128,6 +135,12 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertEqual(source.count(SCRATCH_STORE), 1)
         self.assertEqual(source.count(WORK_MAP), 1)
         self.assertEqual(source.count(WORK_STORE), 1)
+        self.assertEqual(source.count(FIRMWARE_MAP), 1)
+        self.assertEqual(source.count(FIRMWARE_STORE), 1)
+        firmware = re.search(r"static bool firmwareWrite\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(firmware.index("sdmaFirmwareWriteAllowed(kCezanneSdmaImage, offset, value, firmware->stage)"),
+                        firmware.index(FIRMWARE_STORE))
+        self.assertIn("IODeviceMemory::withRange(cezanne::kSdmaFwPhysical, cezanne::kSdmaFwBufferSize)", source)
         # The work area: only its fixed range, written only after the core's
         # allowlist, from stage 12.
         work = re.search(r"static bool workWrite\(.*?\n}\n", source, re.S).group(0)
@@ -148,21 +161,25 @@ void f(IOPCIDevice *p, Aperture *a) {
                                     ("cezanne::kSmuPageOffset", "metricsTransferOperation"),
                                     ("cezanne::kSmuPageOffset", "pspCreateOperation"),
                                     ("cezanne::kSmuPageOffset", "pspDestroyOperation"),
+                                    ("cezanne::kSmuPageOffset", "sdmaLoadOperation"),
                                     ("cezanne::kSmuPageOffset", "smuQueryOperation"),
                                     ("cezanne::kSmuPageOffset", "tmrSubmitOperation"),
                                     ("cezanne::kSmuPageOffset", "tmrTeardownOperation")])
         self.assertEqual(sorted(re.findall(r"accessDevice\(0, (\w+)", source)),
                          ["metricsCheckOperation", "metricsReadOperation", "pspCheckOperation", "pspObserveOperation",
-                          "readOperation", "scratchCheckOperation", "smuCheckOperation", "tmrObserveOperation"])
+                          "readOperation", "scratchCheckOperation", "sdmaObserveOperation", "smuCheckOperation",
+                          "tmrObserveOperation"])
         # Carveout memory: only the metrics page's and the PSP ring page's
         # ranges, read-only, at their check sizes or one page.
         self.assertEqual(re.findall(r"IODeviceMemory::withRange\((\w+), length\)", source), ["physical"])
         self.assertIn("if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical &&\n"
-                      "        physical != cezanne::kPspTmrPhysical) {", source)
+                      "        physical != cezanne::kPspTmrPhysical && physical != cezanne::kSdmaFwPhysical) {", source)
         self.assertEqual(sorted(re.findall(r"withCarveoutMemory\(cezanne::(\w+), cezanne::(\w+),", source)),
                          [("kMetricsPhysical", "kMetricsCheckSize"), ("kMetricsPhysical", "kPageSize"),
                           ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
-                          ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspTmrPhysical", "kPspTmrSize")])
+                          ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
+                          ("kPspTmrPhysical", "kPspTmrSize"), ("kSdmaFwPhysical", "kSdmaFwCheckSize"),
+                          ("kSdmaFwPhysical", "kSdmaFwCheckSize")])
         # A PSP ring created by a connection is destroyed if it closes early.
         abandon = re.search(r"void CezanneGPU::scratchAbandon\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("pspDestroyLocked(&response, &mailbox)", abandon)
@@ -189,14 +206,26 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 12;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 13;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
         self.assertRegex(header, r"kStage3Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset, kRegGrbmStatus,")
 
 
+class FirmwareTrackingTests(unittest.TestCase):
+    def test_no_firmware_is_tracked(self):
+        tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, timeout=30)
+        self.assertEqual(tracked.returncode, 0, tracked.stderr)
+        names = tracked.stdout.split()
+        self.assertEqual([n for n in names if n.endswith(".bin") or "sdma_image" in n], [])
+        build = (KEXT / "build.sh").read_text()
+        self.assertIn("cba8658ea950a99115ca46ee88c9622240632a0ca1731abbcd18b6d9be9e09de", build)
+        self.assertIn('> "$out/obj/sdma_image.cpp"', build)
+
+
 @unittest.skipUnless(sys.platform == "darwin" and shutil.which("xcrun"), "macOS SDK required")
+@unittest.skipUnless(SDMA_FIRMWARE.is_file(), "pinned SDMA firmware not in out/ (docs/firmware-provenance.md)")
 class KextBuildTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -219,6 +248,18 @@ class KextBuildTests(unittest.TestCase):
                                text=True, timeout=30)
         self.assertEqual(again.returncode, 1)
         self.assertIn("refusing to overwrite", again.stderr)
+
+    def test_build_refuses_firmware_with_a_wrong_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wrong = Path(tmp) / "green_sardine_sdma.bin"
+            data = bytearray(SDMA_FIRMWARE.read_bytes())
+            data[-1] ^= 1
+            wrong.write_bytes(bytes(data))
+            env = dict(os.environ, CEZANNE_SDMA_FW=str(wrong))
+            run = subprocess.run([str(KEXT / "build.sh"), str(Path(tmp) / "build")], capture_output=True, text=True,
+                                 timeout=180, env=env)
+            self.assertEqual(run.returncode, 1)
+            self.assertIn("SHA-256 mismatch", run.stderr)
 
     def test_binary_is_x86_64_kext_with_matching_executable(self):
         info = plistlib.loads((self.kext / "Contents" / "Info.plist").read_bytes())
