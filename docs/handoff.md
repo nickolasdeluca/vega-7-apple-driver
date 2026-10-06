@@ -133,7 +133,19 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 16, then propose stage 17 (GART and interrupts)
+## Next task: propose stage 17 (GART and interrupts)
+
+Stage 16 succeeded in boot 22. The display, MMHUB VM and IH/NBIO values are
+measured (see the [log](test-boot.md#test-boot-log)).
+- **Display:** pipe 0 shows 1080p60 from the GOP framebuffer at
+  `0xF400000000`.
+- **VM:** context 0 is unprogrammed.
+- **IH:** ring 0 is off.
+
+`VM_INVALIDATE_ENG17_SEM` turned out to acquire on read. It is removed from
+the list, and stage 17 must use Linux's acquire and release protocol.
+
+### Earlier: booting stage 16
 
 Stage 16 (a read-only inventory: display, MMHUB VM and IH/NBIO, 92
 registers) is approved and built: `out/test-efi/usb-stage16`,

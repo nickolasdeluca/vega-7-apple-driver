@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-06: **stages 0 to 15 succeeded** (see
+Status, 2026-10-06: **stages 0 to 16 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -35,8 +35,9 @@ driver wrote only the low half of the write pointer. With that fixed,
 **boot 21 completed the first verified DMA copy and fence**: SDMA0 wrote
 `0xDEADBEEF`, copied 4 KiB exactly and signalled fence 1, and nothing else
 in the checked region changed. Stage 16 (a read-only display, VM and
-interrupt inventory) is approved and built, not yet booted. No later stage
-is authorized.
+interrupt inventory) succeeded in boot 22, apart from one semaphore register
+whose read has a side effect, now removed from the list. No later stage is
+authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -2561,8 +2562,10 @@ approved stage are fixed, documented and retested.
 
 ### Stage 16: display, VM and interrupt inventory (proposal)
 
-**Status: proposed 2026-10-06, approved by the user the same day, and
-implemented; not yet booted.**
+**Status: proposed 2026-10-06, approved by the user the same day,
+implemented, and succeeded in boot 22.** The `VM_INVALIDATE_ENG17_SEM` read
+had a side effect and that register was removed afterwards; see the
+revision.
 
 **Implementation notes:**
 - **Core:** the 92 constants and the three group arrays were generated
@@ -2744,6 +2747,23 @@ configuration register that Linux reads, and none is clear-on-read. DCN is
 active and driving the screen; reading its registers does not change the
 display. If a read hangs, the printed name identifies it: power off and
 boot the known-good EFI.
+
+### Revision: stage 16 semaphore read
+
+**Status: fixed 2026-10-06 after boot 22 (fix-within-a-stage rule).**
+
+- **Change:** `VM_INVALIDATE_ENG17_SEM` is removed from the inventory (now
+  91 registers, 23 for MMHUB). The header and test record why: a read
+  acquires the semaphore.
+- **Tests:**
+  - The count changed.
+  - `test_inventory16.py` asserts the register is absent.
+  - The core tests check the new group size.
+- **Rebuilt:** the first build is kept as `superseded-*-stage16-sem`.
+- **Lesson for reviews:** "status or configuration register that Linux
+  reads" is not enough. A register Linux reads only as part of a protocol
+  (a semaphore, an acknowledge, a data port) can act on a read. Check how
+  Linux reads it, not only that it does.
 
 ## Build the test EFIs
 
@@ -3717,6 +3737,61 @@ boot, kernel up 10:26:47 local).
   - it wrote memory (`0xDEADBEEF`), copied 4 KiB, and signalled a fence;
   - nothing else in the checked region changed.
   - Boot 20's missing `GFX_RB_WPTR_HI` write was the only defect.
+
+**Boot 22, 2026-10-06, stage 16** (`out/test-efi/usb-stage16/`, written
+with `tools/update_stick.sh 16`; cold boot, kernel up 10:39:35 local).
+
+- `CezanneGPU stage` 16, diagnostics v12; stages 1–3 `ok`.
+  `sudo cezanne-diag --inventory16`: **all 92 reads succeeded**, and the
+  display re-read showed no changes.
+- **Display (DCN 2.1).** One pipe drives the screen.
+  - **Pipe 0:**
+    - **OTG:** `OTG_CONTROL` `0x80011301`, master enable on. Totals
+      `0x897`/`0x464` give 2200 × 1125, and active is 1920 × 1080: the
+      CEA-861 1080p60 timing (148.5 MHz pixel clock).
+    - **HUBP0:** unblanked (`DCHUBP_CNTL` `0x000f0002`). The surface is
+      **`0xF400000000`, the GOP framebuffer at carveout offset 0**.
+      Viewport 1920 × 1080, pixel format 8 (`ARGB8888`).
+    - **Pitch:** `DCSURF_SURFACE_PITCH` reads `0x780` (1920). Linux programs
+      pitch − 1 (`hubp1_program_size`), so the GOP's value is one higher
+      than Linux would write for a 1920-pixel surface. The tool decodes it
+      the Linux way and prints 1921. This is recorded as an open
+      observation, since the framebuffer is exactly 1920 × 1080 × 4 bytes
+      (boot 12).
+  - **Pipes 1–3:** OTG off (`0x80000300`), HUBP blanked, no surface.
+  - **Connector:** `DIG0_DIG_BE_CNTL` `0x00020100`: front-end source 1,
+    `DIG_MODE` 2. DIG1–4 read `0x00010000`.
+  - **DCN's view of memory** matches MMHUB: `DCN_VM_FB_LOCATION`
+    `0xf400`–`0xf47f`, offset `0x5c0`, AGP 0.
+- **Memory hub VM (GART path).**
+  - The context 0 page-table base, start and end are all 0.
+  - The protection-fault default address is 0.
+  - `VM_L2_PROTECTION_FAULT_CNTL` `0x3ffffffc`, `_CNTL2` `0x000a0000`,
+    `_STATUS` 0.
+  - `VM_L2_CNTL2` 0, `VM_L2_CNTL3` `0x80100007`, `VM_L2_CNTL4` `0x000000c1`.
+  - The identity aperture and physical-offset registers are all 0.
+  - `VM_INVALIDATE_ENG17_ACK` 0, and the engine 0 address range is 0.
+- **Interrupts.**
+  - `IH_RB_BASE`/`_HI` 0, `IH_RB_RPTR` 0, write-back address 0, doorbell
+    0, `IH_CHICKEN` 0.
+  - `IH_RB_WPTR` `0x00080000`: only `RB_MAY_OVERFLOW` set, offset 0.
+  - Rings 1 and 2 `IH_RB_CNTL` 0.
+  - NBIO `INTERRUPT_CNTL`, `INTERRUPT_CNTL2` and `BIF_IH_DOORBELL_RANGE` all
+    0.
+- **Finding: `VM_INVALIDATE_ENG17_SEM` is not side-effect free.** It read 1.
+  - In `gmc_v9_0_flush_gpu_tlb`, "a read return value of 1 means semaphore
+    acquire", and a write of 0 releases it. Linux uses that semaphore for
+    MMHUB on this GC 9.3 APU (`gmc_v9_0_use_invalidate_semaphore`).
+  - So the inventory's read acquired engine 17's semaphore and left it
+    held until the next cold boot.
+  - Nothing used it in this boot. The register was a defect in the stage
+    16 list; see the [revision](#revision-stage-16-semaphore-read).
+  - Stage 17 must acquire and release it exactly as Linux does, and must
+    not assume it is free if anything has read it.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-22-stage16/`.
+- Result: **stage 16 succeeded**, apart from the semaphore read, which is
+  fixed. Every value stage 17 needs is measured.
 
 ## Unknowns and limits
 
