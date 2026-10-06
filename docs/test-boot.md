@@ -44,8 +44,9 @@ check on a live display status bit, since fixed. Stage 18 (interrupt
 delivery) succeeded in boot 27: SDMA0's trap reached the kext's handler as
 an MSI 31 µs after the write pointer, the acknowledgement caused no re-fire,
 and everything was restored. Boot 26 had counted an extra MSI at the
-`ENABLE_INTR` write; the verify now counts only MSIs after the submit. No
-later stage is authorized.
+`ENABLE_INTR` write; the verify now counts only MSIs after the submit.
+Stage 19 (a display test pattern) is proposed and awaits approval; no later
+stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -3173,6 +3174,122 @@ also removes the event source if it is still registered.
   `RB_GPU_TS_ENABLE` cleared). Linux's toggle keeps `RB_GPU_TS_ENABLE` set;
   the stage 17 restore that follows writes `0xc0110114` and then boot 22
   anyway.
+
+### Stage 19: display test pattern (proposal)
+
+**Status: proposed 2026-10-06; awaiting the user's approval.**
+
+**Purpose.** The first write that changes what is on screen. Pipe 0 keeps
+the firmware's mode and everything else it set up. Only its surface address
+moves, from the GOP framebuffer to a test pattern the driver draws in the
+carveout. The pattern stays up for 5 seconds, then the address goes back.
+Two things are proved:
+- the driver can flip pipe 0's surface, as Linux does
+  (`hubp21_program_surface_flip_and_addr`);
+- the GOP framebuffer's pitch, an open observation since boot 22 (see
+  below).
+
+**It stands alone.** `sudo cezanne-diag --display-pattern` needs no SDMA,
+PSP, GART or interrupt step, and no GFX register. The macOS boot framebuffer
+at `0xF400000000` is never written: whatever macOS draws there reappears at
+the restore.
+
+**The pattern surface** is at carveout `0x41000000` (GPU `0xF441000000`,
+physical `0x601000000`), 8 MiB, inside DCN's FB aperture
+(`0xf400`–`0xf47f`, so no page table is involved). It uses the stage 9
+placement checks. A checksum is read twice, 1 s apart, and must match (the
+TMR's method, as 8 MiB is too large to snapshot). The pattern is 1920 × 1080
+ARGB8888, linear, 1920 pixels (7680 bytes) per line, the same format as the
+GOP surface:
+- **8 horizontal bands** of 135 lines: white `0xFFFFFFFF`, yellow
+  `0xFFFFFF00`, cyan `0xFF00FFFF`, green `0xFF00FF00`, magenta
+  `0xFFFF00FF`, red `0xFFFF0000`, blue `0xFF0000FF`, black `0xFF000000`;
+- **9 vertical grey lines** (`0xFF808080`), 2 pixels wide, at x = 0, 240,
+  …, 1680 and at x = 1918;
+- the rest of the 8 MiB is zero.
+
+**What the pitch decides.** `DCSURF_SURFACE_PITCH` reads `0x780`. Linux
+programs pitch − 1, which would make the GOP surface 1921 pixels wide; the
+GOP's framebuffer is exactly 1920 × 1080 × 4 bytes. The pattern is written
+at 1920 per line. If the hardware uses 1920, the grey lines are straight
+and vertical. If it uses 1921, every line starts one pixel later, and the
+lines lean visibly (1080 pixels over the height of the screen). Either way
+the bands are horizontal. **You report which you see.**
+
+**New reads**, HUBPREQ0/HUBP0 and OTG0, from `dcn_2_1_0_offset.h`, none
+measured yet. The check requires the values marked; the others are
+recorded:
+
+| Register | Offset | Expected | Linux |
+| --- | --- | --- | --- |
+| `DCSURF_FLIP_CONTROL` | `0x0eb6c` | `SURFACE_UPDATE_LOCK` 0, `SURFACE_FLIP_TYPE` 0 (at vsync), `SURFACE_FLIP_PENDING` 0 | `hubp2_is_flip_pending` |
+| `DCSURF_SURFACE_EARLIEST_INUSE`/`_HIGH` | `0x0eb94`/`0x0eb98` | `0x00000000`/`0xf4` (the GOP surface) | `hubp2_is_flip_pending` |
+| `DCSURF_TILING_CONFIG` | `0x0ea9c` | `SW_MODE` 0 (linear) | `hubp2_read_state` |
+| `DCSURF_SURFACE_CONTROL` | `0x0eb68` | 0 (no DCC, no TMZ) | `program_surface_flip_and_addr` |
+| `DCSURF_PRIMARY_META_SURFACE_ADDRESS`/`_HIGH` | `0x0eb48`/`0x0eb4c` | 0/0 (no metadata) | same |
+| `VMID_SETTINGS_0` | `0x0eb24` | 0 | same |
+| `OTG_STATUS_FRAME_COUNT` | `0x14030` | recorded; must advance | `optc1_get_vblank_counter` |
+
+Display pipe 0's stage 16 registers must also match boot 22, with the live
+`DCHUBP_CNTL` status bits ignored (stage 17's check).
+
+**The flip** writes two registers, in `program_surface_flip_and_addr`'s
+order. Every other register that function writes already holds the value
+it would write, which the check confirms:
+
+| Step | Register | Value |
+| --- | --- | --- |
+| 1 | `DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH` (`0x0eb2c`) | `0x000000f4` (unchanged) |
+| 2 | `DCSURF_PRIMARY_SURFACE_ADDRESS` (`0x0eb28`) | `0x41000000` |
+
+The low write latches the flip at the next vertical sync. The step then polls
+for up to 100 ms (about 6 frames) for `SURFACE_FLIP_PENDING` 0 and
+`EARLIEST_INUSE` = `0xF441000000`.
+
+**Hold and verify** (reads only): the tool waits 5 s. Then:
+- `EARLIEST_INUSE` is still the pattern;
+- the frame count advanced (about 300 at 60 Hz), so scanout continued;
+- pipe 0's registers are unchanged apart from the address (the underflow
+  status included);
+- the pattern region reads back as written.
+
+**Restore:** the same two writes with `0xf4` and `0x00000000`, then the
+same poll for `EARLIEST_INUSE` = `0xF400000000`. A closed or abandoned
+connection runs it, and so does the kext's `stop()` if needed.
+
+**New writes:**
+- **Registers:** `DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH` ← `0xf4`, and
+  `DCSURF_PRIMARY_SURFACE_ADDRESS` ← `0x41000000` or `0x00000000`, on BAR5
+  page `0xe000`. Nothing else in DCN.
+- **Memory:** the 8 MiB pattern region, written once and read back.
+
+**Risks:**
+- **The screen changes:** that is the point. If it shows anything other
+  than the pattern, or goes black, let the tool finish; the restore runs
+  after 5 s. If the screen stays wrong after the tool ends, shut down fully:
+  a cold boot resets the display.
+- **Underflow or corruption** if DCN reads the new surface differently from
+  the old one. The check confirms both are linear ARGB8888 at the same
+  pitch, without DCC.
+- **The region's previous contents are overwritten.** It sits in the
+  GPU-only carveout, which nothing else on this host uses: the stability
+  check guards against an active user, and the old checksum is recorded.
+- Make a Time Machine backup before this boot.
+
+**Expected:**
+- The pattern on screen for 5 seconds, then the macOS desktop back exactly
+  as before.
+- The flip landing within 100 ms each way, and the frame count advancing.
+- The answer to the pitch question.
+
+**Stage 19 succeeds when:**
+- `sudo cezanne-diag --display-pattern --psp-state` reports `ok` for the
+  check, the pattern write, the flip, the verify after 5 s, and the
+  restore;
+- you saw eight horizontal colour bands and grey lines (straight or
+  leaning: either is an answer, not a failure);
+- the desktop came back unchanged, and the final register dump shows pipe 0
+  at boot 22 again.
 
 ## Build the test EFIs
 

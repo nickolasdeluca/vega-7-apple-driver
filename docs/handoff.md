@@ -140,13 +140,16 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: propose stage 19 (display test pattern)
+## Next task: approve stage 19 (display test pattern)
 
 **Resume here.** Stage 18 succeeded in boot 27 (2026-10-06). The user chose
 the display test pattern as stage 19: point pipe 0's surface at a pattern in
 the carveout for a few seconds, on the firmware's mode, then restore the
-surface address to the GOP framebuffer `0xF400000000`. It needs a proposal in
-[test-boot.md](test-boot.md) and the user's approval.
+surface address to the GOP framebuffer `0xF400000000`. The
+[proposal](test-boot.md#stage-19-display-test-pattern-proposal) (two
+register writes per flip, an 8 MiB pattern at carveout `0x41000000`, a 5 s
+hold, and a pattern that settles the pitch question) awaits the user's
+approval. Nothing of it is implemented.
 
 ### Earlier: booting stage 18
 
