@@ -131,9 +131,9 @@ class TestEfiTests(unittest.TestCase):
         with (self.output / "EFI" / "OC" / "Config.plist").open("rb") as handle:
             self.assertTrue(plistlib.load(handle)["NVRAM"]["Add"][GUID]["boot-args"].endswith(" cezanne-stage=0"))
         self.output = self.root / "usb2"
-        code, out = self.build("14")
+        code, out = self.build("15")
         self.assertEqual(code, 2)
-        self.assertIn("stage 14 is not authorized", json.loads(out)["rejected"])
+        self.assertIn("stage 15 is not authorized", json.loads(out)["rejected"])
         self.assertFalse(self.output.exists())
 
     def test_authorized_stages_do_not_exceed_the_driver(self):
