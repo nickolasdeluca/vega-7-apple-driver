@@ -2553,6 +2553,177 @@ approved stage are fixed, documented and retested.
   - One weakened core (the `_HI` write removed) must fail.
 - Nothing else changes.
 
+### Stage 16: display, VM and interrupt inventory (proposal)
+
+**Status: proposed 2026-10-06, not approved, not implemented.**
+
+**Purpose.** This prepares three milestones in one read-only boot: display,
+GART, and interrupts. The user chose this approach on 2026-10-06:
+- **Measure now:** stage 16 measures everything the next writes depend on,
+  in one boot.
+- **Write next:** stage 17 turns on GART and the IH ring with values pinned
+  from these readings, as stages 14 and 15 did for SDMA.
+- **Why measure first:** Linux's GART enable (`mmhub_v1_0_gart_enable`, about
+  30 writes) and IH setup (`vega10_ih_irq_init`, about 15) are mostly
+  read-modify-write, and most of those registers have never been read on
+  this host.
+- **No writes:** stage 16 adds no write, message or memory access.
+
+**Bases.** The DMU bases measured in the stage 2 discovery capture (DMU
+2.1.0: `0x12`, `0xC0`, `0x34C0`, `0x9000`, `0x2403C00`) and NBIF (2.5.0:
+`0x0`, `0x14`, `0xD20`, `0x10400`, …) equal `renoir_ip_offset.h`. MMHUB
+(`0x1A000`) and OSSSYS (`0x10A0`) are as before. Every offset below is
+inside BAR5.
+
+**A. Display (DCN 2.1), 55 registers**, from `dcn_2_1_0_offset.h`. These
+are what the display code reads to reconstruct the state the firmware (GOP)
+left. Pipe 0 is shown; pipes 1–3 repeat the same eleven registers at the
+header's instance offsets.
+
+| Register | BAR5 byte offset | Linux v6.12 use |
+| --- | --- | --- |
+| `OTG0_OTG_CONTROL` | `0x14004` | optc1_read_otg_state |
+| `OTG0_OTG_H_TOTAL` | `0x13fa8` | optc1_read_otg_state |
+| `OTG0_OTG_V_TOTAL` | `0x13fbc` | optc1_read_otg_state |
+| `OTG0_OTG_H_BLANK_START_END` | `0x13fac` | optc1_read_otg_state |
+| `OTG0_OTG_V_BLANK_START_END` | `0x13fd8` | optc1_read_otg_state |
+| `HUBP0_DCHUBP_CNTL` | `0x0eacc` | hubp2_read_state |
+| `HUBP0_DCSURF_SURFACE_CONFIG` | `0x0ea94` | hubp2_read_state |
+| `HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION` | `0x0eaa8` | hubp2_read_state |
+| `HUBPREQ0_DCSURF_SURFACE_PITCH` | `0x0eb1c` | hubp2_read_state |
+| `HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS` | `0x0eb28` | hubp2_read_state |
+| `HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH` | `0x0eb2c` | hubp2_read_state |
+| `DCN_VM_FB_LOCATION_BASE` | `0x0e54c` | hubbub21_init_dchub |
+| `DCN_VM_FB_LOCATION_TOP` | `0x0e550` | hubbub21_init_dchub |
+| `DCN_VM_FB_OFFSET` | `0x0e554` | hubbub21_init_dchub |
+| `DCN_VM_AGP_BASE` | `0x0e560` | hubbub21_init_dchub |
+| `DCN_VM_AGP_BOT` | `0x0e558` | hubbub21_init_dchub |
+| `DCN_VM_AGP_TOP` | `0x0e55c` | hubbub21_init_dchub |
+| `DIG0_DIG_BE_CNTL` | `0x155bc` | dcn10 link encoder state |
+| `DIG1_DIG_BE_CNTL` | `0x159bc` | dcn10 link encoder state |
+| `DIG2_DIG_BE_CNTL` | `0x15dbc` | dcn10 link encoder state |
+| `DIG3_DIG_BE_CNTL` | `0x161bc` | dcn10 link encoder state |
+| `DIG4_DIG_BE_CNTL` | `0x165bc` | dcn10 link encoder state |
+
+The questions they answer:
+- **Pipes and timing:** which of the four OTG/HUBP pipes is enabled, and
+  the timing (total, blank start and end) of the active mode.
+- **Scanout surface:** where the scanout surface is (primary surface
+  address, which should be the GOP framebuffer, carveout offset 0) and its
+  pitch, format and viewport.
+- **Display addressing:** how DCN's own view of FB and AGP is set (the
+  `DCN_VM_*` registers).
+- **Connector:** which DIG back end (connector) is in use.
+
+**B. Memory hub VM (GART path), 25 registers**, from `mmhub_1_0_offset.h`
+(base `0x1A000`). These add to the MMHUB registers read since stages 5
+and 10.
+
+| Register | BAR5 byte offset | Linux v6.12 use |
+| --- | --- | --- |
+| `VM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32` | `0x69cac` | init_gart_aperture_regs |
+| `VM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32` | `0x69cb0` | init_gart_aperture_regs |
+| `VM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32` | `0x69d2c` | init_gart_aperture_regs |
+| `VM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32` | `0x69d30` | init_gart_aperture_regs |
+| `VM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32` | `0x69dac` | init_gart_aperture_regs |
+| `VM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32` | `0x69db0` | init_gart_aperture_regs |
+| `VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32` | `0x69a38` | init_system_aperture_regs |
+| `VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32` | `0x69a3c` | init_system_aperture_regs |
+| `VM_L2_PROTECTION_FAULT_CNTL` | `0x69a1c` | mmhub_v1_0_set_fault_enable_default |
+| `VM_L2_PROTECTION_FAULT_CNTL2` | `0x69a20` | init_system_aperture_regs |
+| `VM_L2_PROTECTION_FAULT_STATUS` | `0x69a2c` | gmc_v9_0_process_interrupt |
+| `VM_L2_CNTL2` | `0x69a04` | init_cache_regs |
+| `VM_L2_CNTL3` | `0x69a08` | init_cache_regs |
+| `VM_L2_CNTL4` | `0x69a5c` | init_cache_regs |
+| `VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32` | `0x69a44` | disable_identity_aperture |
+| `VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_HI32` | `0x69a48` | disable_identity_aperture |
+| `VM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32` | `0x69a4c` | disable_identity_aperture |
+| `VM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_HI32` | `0x69a50` | disable_identity_aperture |
+| `VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32` | `0x69a54` | disable_identity_aperture |
+| `VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_HI32` | `0x69a58` | disable_identity_aperture |
+| `VM_INVALIDATE_ENG17_ACK` | `0x69c18` | gmc_v9_0_flush_gpu_tlb (engine 17 via vm_inv_eng0_ack + eng_distance) |
+| `VM_INVALIDATE_ENG17_SEM` | `0x69b88` | gmc_v9_0_flush_gpu_tlb (engine 17 semaphore) |
+| `VM_INVALIDATE_ENG0_ADDR_RANGE_LO32` | `0x69c1c` | program_invalidation |
+| `VM_INVALIDATE_ENG0_ADDR_RANGE_HI32` | `0x69c20` | program_invalidation |
+
+**C. Interrupts (IH ring and NBIO), 13 registers**, from
+`osssys_4_0_offset.h` (OSSSYS base `0x10A0`) and `nbio_7_0_offset.h`. This
+host uses NBIO 2.5.0, which is `nbio_v7_0_funcs` in `amdgpu_discovery.c`.
+
+| Register | BAR5 byte offset | Linux v6.12 use |
+| --- | --- | --- |
+| `IH_RB_BASE` | `0x04484` | vega10_ih_enable_ring |
+| `IH_RB_BASE_HI` | `0x04488` | vega10_ih_enable_ring |
+| `IH_RB_WPTR` | `0x04490` | enable_ring |
+| `IH_RB_RPTR` | `0x0448c` | enable_ring |
+| `IH_RB_WPTR_ADDR_LO` | `0x04498` | enable_ring |
+| `IH_RB_WPTR_ADDR_HI` | `0x04494` | enable_ring |
+| `IH_DOORBELL_RPTR` | `0x0449c` | enable_ring |
+| `IH_CHICKEN` | `0x048b0` | vega10_ih_irq_init (Renoir) |
+| `IH_RB_CNTL_RING1` | `0x044a0` | toggle_interrupts |
+| `IH_RB_CNTL_RING2` | `0x044c0` | toggle_interrupts |
+| `INTERRUPT_CNTL` | `0x03844` | nbio_v7_0_ih_control |
+| `INTERRUPT_CNTL2` | `0x03848` | nbio_v7_0_ih_control |
+| `BIF_IH_DOORBELL_RANGE` | `0x03bc8` | nbio_v7_0_ih_doorbell_range |
+
+Left out on purpose:
+- **Write-triggered or indexed registers:** `VM_INVALIDATE_ENG*_REQ`,
+  `SYSHUB_INDEX`/`_DATA`.
+- **Registers Linux does not use for this IP:** `IH_CNTL`,
+  `IH_STORM_CLIENT_LIST_CNTL`, `IH_INT_FLOOD_CNTL`,
+  `VM_L2_PROTECTION_FAULT_ADDR_*`.
+
+**How.** On request only, `sudo cezanne-diag --inventory16`. It reads A,
+then B, then C, then A again. The second display pass shows whether
+anything changed while the machine was running. The tool prints each
+register's name before reading it.
+
+**Changes:**
+- **Core:** a stage 16 register list extending stage 15's by these 93
+  registers. Display, MMHUB and IH registers are not GFX-gated. No write
+  allowlist change.
+- **Adapter:** none beyond the stage limit (the plain diagnostic read).
+- **Tool:** `--inventory16`:
+  - prints the three groups;
+  - decodes the active pipe (OTG enable, H/V totals and blanking,
+    surface address, pitch);
+  - shows whether the surface address equals the GOP framebuffer
+    (`0xF400000000` + 0);
+  - marks registers that differ between the two display passes.
+- **Tests:**
+  - Every offset is recomputed from the headers in the test, unique and
+    inside BAR5.
+  - Refused at stage 15, and not writable.
+  - The tool names every register in list order.
+
+**Expected.**
+- One OTG enabled, with 1920×1080 timing.
+- One HUBP scanning out at the GOP framebuffer address with a 1920-pixel
+  pitch (boot 12: 1920×1080×4).
+- `DCN_VM_FB_*` matching the MMHUB FB location (`0xf400`–`0xf47f`, offset
+  `0x5c0`).
+- `VM_CONTEXT0_*` page-table registers 0 or stale.
+- IH ring 0 is off (`IH_RB_CNTL` `0x40610000`, boot 7).
+
+**What stage 17 will then do** (its own proposal, with pinned values):
+- **GART:** program MMHUB context 0 with a one-level page table in a
+  checked carveout page. Point the protection-fault default page at a
+  scratch page, which also fixes the boot 14 zero default page. Enable the
+  context, then flush the TLB through invalidation engine 17. Prove it by
+  having SDMA copy through a GART address that maps a carveout page.
+- **Interrupts:** program IH ring 0 in the carveout with write-pointer
+  write-back, keep `ENABLE_INTR` (CPU delivery) off, set `TRAP_ENABLE` in
+  `SDMA0_CNTL`, add the `TRAP` after the fence, and confirm an IH entry
+  from SDMA0 (client 8, `src_id` 224) appears in the ring.
+- **Undo:** both are turned off again before the existing stop and
+  teardown.
+
+**Risks.** As in stages 5 and 10. Every register is a status or
+configuration register that Linux reads, and none is clear-on-read. DCN is
+active and driving the screen; reading its registers does not change the
+display. If a read hangs, the printed name identifies it: power off and
+boot the known-good EFI.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
