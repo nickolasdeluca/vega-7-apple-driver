@@ -133,14 +133,17 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: approve and build the stage 11 revision
+## Next task: boot the revised stage 11
 
 Boot 15 stopped after the PSP answered `GBR_IH_SET` with
 `PSP_ERR_UNKNOWN_COMMAND` (`0x80080100`; the command ID is echoed in bits
-19:16). No ring was created. The
-[proposed revision](test-boot.md#revision-stage-11-psp-responses-proposal)
-masks responses like Linux (`0x8000FFFF`), drops the reroute, and tracks
-the ring from the create write. It needs the user's approval.
+19:16). No ring was created. The approved
+[revision](test-boot.md#revision-stage-11-psp-responses-proposal) masks
+responses like Linux (`0x8000FFFF`), drops the reroute, and tracks the ring
+from the create write. It is built as `out/test-efi/usb-stage11`, and the
+first build is kept as `superseded-*-stage11-reroute`. Next: a cold boot
+of it, then record the result. If the ring is created and destroyed
+cleanly, the next proposal is the first ring frame (TMR setup).
 
 ### Earlier: stage 11 build
 

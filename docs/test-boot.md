@@ -22,7 +22,9 @@ metrics table in boot 13. Stage 10 (boot 14) found the PSP ready with no
 ring, and both memory hubs mapping the carveout identically. Stage 11 (the
 first PSP commands: create and destroy a ring) stopped safely in boot 15:
 the PSP answered its first command, `GBR_IH_SET`, with "unknown command". A
-revision is proposed. No later stage is authorized.
+revised stage 11 (masked responses, no reroute, ring tracked from the create
+write) is approved and built, not yet booted. No later stage is
+authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -1553,8 +1555,39 @@ page change.
 
 ### Revision: stage 11 PSP responses (proposal)
 
-**Status: proposed 2026-10-06 after boot 15, not approved, not
-implemented.**
+**Status: proposed 2026-10-06 after boot 15, approved by the user the same
+day, and implemented; not yet booted.** The heading keeps "proposal" so
+links stay stable.
+
+**One deliberate difference from the text below.** Before each command, the
+ready check requires only bit 31 (the PSP has answered its previous
+command), whatever that answer's status. Requiring status 0 there would
+block the destroy after a create the PSP rejected, which this revision
+exists to guarantee. Linux checks nothing before writing. The clean-start
+check before the create still requires
+`(C2PMSG_64 & 0x8000FFFF) == 0x80000000`.
+
+**Implementation notes:**
+
+- **Core:**
+  - `createPspRing` sends only `INIT_GPCOM_RING` and reports `written`.
+  - Responses are judged with `kPspResponseMask` (`0x8000FFFF`).
+  - `GBR_IH_SET` and the IH values are gone from `pspCommandAllowed` and
+    `writeAllowed`.
+- **Adapter:**
+  - It tracks the ring from `written`. The create selector returns status,
+    response and written.
+  - Diagnostics version 7.
+- **Tool:** after a written create it always runs the destroy. It skips
+  observe if the create was not ok.
+- **Tests:**
+  - A create answered `0x80020000` is ok. `0x80020100` is not ok, but is
+    written and still destroyed.
+  - A timeout is still written.
+  - The ready check accepts an echoed ID with status 0 and refuses
+    `0x80080100` at the clean-start check.
+  - Two new weakened cores fail: an exact-match response, and `written`
+    never set.
 
 **What boot 15 showed.** The first `GBR_IH_SET` (VMC) was answered
 `0x80080100`:
