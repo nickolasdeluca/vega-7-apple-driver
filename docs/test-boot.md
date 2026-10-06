@@ -27,7 +27,9 @@ destroyed (`0x80030000`) a kernel-mode ring without touching its memory.
 Stage 12 succeeded in boot 17: the first ring frames, `SETUP_TMR` and
 `DESTROY_TMR`, both fenced with status 0. Stage 13 succeeded in boot 18:
 the PSP accepted and loaded the SDMA0 firmware (`SDMA0_UCODE_CHECKSUM` 0 →
-`0x25a1ba79`) with the engine left halted. No later stage is authorized.
+`0x25a1ba79`) with the engine left halted. Stage 14 (SDMA power-up and a
+read-only register inventory) is approved and built, not yet booted. No
+later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -97,6 +99,10 @@ off restores the known-good boot. This is the experimental environment
      day): stage 12 plus the first firmware load, the pinned SDMA0 image
      through `LOAD_IP_FW`, on request, with SDMA0 left halted, described
      [below](#stage-13-first-firmware-load-sdma0-proposal).
+   - **Stage 14** (proposed 2026-10-06 and approved by the user the same
+     day): stage 13 plus `PowerUpSdma`/`PowerDownSdma` and 25 read-only SDMA
+     registers, read three times on request, described
+     [below](#stage-14-sdma0-power-up-and-register-inventory-proposal).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -2095,7 +2101,30 @@ makes no IH, GART or default-page change.
 
 ### Stage 14: SDMA0 power-up and register inventory (proposal)
 
-**Status: proposed 2026-10-06, not approved, not implemented.**
+**Status: proposed 2026-10-06, approved by the user the same day, and
+implemented; not yet booted.**
+
+**Implementation notes:**
+
+- **Core:**
+  - `kStage14Registers` extends the stage 13 list by the 25 registers.
+  - `kSdmaInventory` names the 31 read in each pass.
+  - `writeAllowed` and `smuArgumentAllowed` accept `0xE`/`0xD` with
+    argument 0 from stage 14.
+  - `runSdmaInventory` reads, sends up, reads, sends down, then reads. It
+    always sends `PowerDownSdma` after an OK `PowerUpSdma`, even if the
+    middle reading fails.
+- **Adapter:** selector 20, accepted only after a `LOAD_IP_FW` that fenced
+  on the same connection. It returns the three readings as one structure.
+  Diagnostics version 10.
+- **Tool:** `--sdma-inventory` runs the stage 13 flow and the inventory
+  before the teardown. It marks rows that changed between readings with
+  `*`.
+- **Tests:**
+  - Offsets, prefix, uniqueness, not-writable.
+  - The exact six mailbox writes.
+  - A stop after a non-`0x01` response.
+  - One more weakened core must fail.
 
 **Purpose.** Prepare the first DMA copy (stage 15). Linux starts SDMA0 by
 writing about 25 SDMA registers, most of them read-modify-write. The values
@@ -2250,7 +2279,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -2366,6 +2395,19 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 14 succeeds when:
+
+- the stage 13 conditions hold with `CezanneGPU stage` 14;
+- `sudo cezanne-diag --gfxoff-disallow --sdma-inventory --psp-state`:
+  - reports the stage 13 steps `ok`;
+  - reports both SMU responses `0x01`;
+  - prints all three columns;
+  - shows `SDMA0_F32_CNTL` halted throughout;
+- the machine stays as before.
+
+A non-`0x01` response is a finding; do not retry. Save the output with
+`tee`. Make a Time Machine backup first.
 
 Stage 13 succeeds when:
 

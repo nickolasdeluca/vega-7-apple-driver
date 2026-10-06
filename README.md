@@ -86,7 +86,8 @@ stage 7 SMU version queries, `--gfxoff-disallow` the stage 8
 memory-hub apertures; `--psp-ring` (stage 11) creates and destroys the PSP
 kernel-mode ring; `--psp-tmr` (stage 12) submits `SETUP_TMR` and
 `DESTROY_TMR` through it; `--psp-sdma` (stage 13) loads the pinned SDMA0
-firmware between them. Building the kext needs that firmware in ignored
+firmware between them; `--sdma-inventory` (stage 14) adds the SDMA
+power-up and a read-only register inventory. Building the kext needs that firmware in ignored
 `out/firmware-provenance/fw/` (see
 [firmware provenance](docs/firmware-provenance.md)).
 

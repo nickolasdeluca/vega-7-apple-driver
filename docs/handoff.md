@@ -133,7 +133,14 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: propose stage 14, starting SDMA0 and a first verified copy
+## Next task: boot stage 14, then propose stage 15 (the first copy)
+
+Stage 14 (SDMA power-up through the SMU and a three-pass read-only inventory
+of 31 SDMA registers) is approved and built: `out/test-efi/usb-stage14`,
+`--sdma-inventory`. Next: a cold boot, then record the values; they pin
+stage 15's exact write values.
+
+### Earlier: planning the first copy
 
 Stages 0–13 succeeded. In boot 18 the PSP accepted the pinned SDMA0 image:
 - `LOAD_IP_FW` fenced 2 with status 0;
