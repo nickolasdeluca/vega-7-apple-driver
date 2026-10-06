@@ -133,7 +133,7 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: approve the stage 15 write-pointer revision
+## Next task: retest stage 15 with the write-pointer fix
 
 Boot 20 showed the following:
 - SDMA0 started with every exact value and stopped cleanly.
@@ -141,8 +141,11 @@ Boot 20 showed the following:
   of 1024: `submitSdma` omitted the `GFX_RB_WPTR_HI` write that Linux's
   `sdma_v4_0_ring_set_wptr` makes after the low dword.
 
-The [proposed revision](test-boot.md#revision-stage-15-write-pointer-commit-proposal)
-adds it. It needs approval, a rebuild and a cold boot.
+[Fixed](test-boot.md#revision-stage-15-write-pointer-commit) and rebuilt
+(`out/test-efi/usb-stage15`). Next: `tools/update_stick.sh 15` and a cold
+boot. Defects found while testing an approved stage are fixed directly
+and documented. Only new stages need a proposal
+([rule](test-boot.md#fixing-defects-inside-a-stage)).
 
 ### Earlier: booting stage 15
 

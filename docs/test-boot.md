@@ -31,8 +31,9 @@ the PSP accepted and loaded the SDMA0 firmware (`SDMA0_UCODE_CHECKSUM` 0 →
 `PowerUpSdma`/`PowerDownSdma` answered `0x01`, and the 31-register SDMA
 inventory is recorded. Stage 15 (the first SDMA copy) ran in boot 20:
 SDMA0 started and stopped cleanly, but the ring test timed out because the
-driver wrote only the low half of the write pointer. A one-line revision is
-proposed. No later stage is authorized.
+driver wrote only the low half of the write pointer. That is fixed (it
+now also writes `GFX_RB_WPTR_HI`, as Linux does) and rebuilt, not yet
+booted. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -121,6 +122,17 @@ off restores the known-good boot. This is the experimental environment
 6. Record every test boot: date, stage, build, test EFI manifest time, what was
    chosen at each menu, what the screen showed, and the commands and outputs
    listed below. Preserve failures.
+
+### Fixing defects inside a stage
+
+Set by the user on 2026-10-06:
+- **Fix, document, retest.** When a test boot of an approved stage exposes
+  a defect in its implementation, fix it, rebuild, document the finding and
+  the fix here (the boot log entry plus a "Revision" note), and ask for
+  another test boot. No proposal or separate approval is needed.
+- **Stay within scope.** A fix must stay inside the approved stage: its
+  registers, values, messages and memory. Anything beyond that is a new
+  stage and still needs a proposal.
 
 ## What the test EFI changes
 
@@ -2488,10 +2500,26 @@ rest of the 64 KiB must match the snapshot afterwards.
 - Unexpected words outside the work area mean: power off at once.
 - Make a Time Machine backup before this boot.
 
-### Revision: stage 15 write-pointer commit (proposal)
+### Revision: stage 15 write-pointer commit
 
-**Status: proposed 2026-10-06 after boot 20, not approved, not
-implemented.**
+**Status: fixed 2026-10-06 after boot 20, rebuilt, not yet booted.** It
+was written as a proposal, then applied directly under the rule the user
+set the same day (see [Rules](#rules)): defects found while testing an
+approved stage are fixed, documented and retested.
+
+**As implemented:**
+- `submitSdma` writes `GFX_RB_WPTR`, then `GFX_RB_WPTR_HI` ← 0.
+- The submit selector also returns `F32_CNTL` and `STATUS_REG`.
+  Diagnostics version 12.
+- **Tests:**
+  - The fake SDMA engine commits the write pointer only on the `_HI`
+    write.
+  - The test checks the exact two-write order.
+  - A weakened core without the `_HI` write fails.
+  - The fake writer's log grew from 32 to 64 entries, after the sanitizer
+    caught a test reading past it.
+- The first stage 15 build is kept as `superseded-*-stage15-wptr-lo` in
+  `out/test-efi/`.
 
 **What boot 20 showed.**
 - The load, the copy check and the start all passed: progress 2,
@@ -3448,8 +3476,8 @@ with `tools/update_stick.sh 15`; cold boot, kernel up 10:16:21 local).
   `out/test-efi/boot-20-stage15/`.
 - Result: **stopped safely: the engine started but never received work.**
   `submitSdma` wrote only the low half of the write pointer, while Linux
-  also writes `GFX_RB_WPTR_HI`. See the
-  [proposed revision](#revision-stage-15-write-pointer-commit-proposal).
+  also writes `GFX_RB_WPTR_HI`. Fixed; see the
+  [revision](#revision-stage-15-write-pointer-commit).
 - **Every SDMA register write was verified on hardware**, and so was the
   full start and stop path.
 
