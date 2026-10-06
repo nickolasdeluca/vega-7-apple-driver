@@ -2615,7 +2615,7 @@ The questions they answer:
   `DCN_VM_*` registers).
 - **Connector:** which DIG back end (connector) is in use.
 
-**B. Memory hub VM (GART path), 25 registers**, from `mmhub_1_0_offset.h`
+**B. Memory hub VM (GART path), 24 registers**, from `mmhub_1_0_offset.h`
 (base `0x1A000`). These add to the MMHUB registers read since stages 5
 and 10.
 
@@ -2679,7 +2679,7 @@ anything changed while the machine was running. The tool prints each
 register's name before reading it.
 
 **Changes:**
-- **Core:** a stage 16 register list extending stage 15's by these 93
+- **Core:** a stage 16 register list extending stage 15's by these 92
   registers. Display, MMHUB and IH registers are not GFX-gated. No write
   allowlist change.
 - **Adapter:** none beyond the stage limit (the plain diagnostic read).
