@@ -120,6 +120,11 @@ off restores the known-good boot. This is the experimental environment
      day): stage 15 plus 92 read-only display, memory-hub VM and interrupt
      registers, read only through the diagnostic interface, described
      [below](#stage-16-display-vm-and-interrupt-inventory-proposal).
+   - **Stage 17** (proposed 2026-10-06 and approved by the user the same
+     day; not yet implemented): stage 16 plus GART (MMHUB context 0) and IH
+     ring 0 with values pinned from boot 22, proven by an SDMA copy through
+     GART with a fence and a trap, then restored. Described
+     [below](#stage-17-gart-and-the-interrupt-ring-proposal).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -2767,7 +2772,9 @@ boot the known-good EFI.
 
 ### Stage 17: GART and the interrupt ring (proposal)
 
-**Status: proposed 2026-10-06, not approved, not implemented.**
+**Status: proposed 2026-10-06 and approved by the user the same day. Not
+yet implemented: implementation and the test boot were deferred to the next
+session.**
 
 **Purpose.** Turn on the two remaining memory and interrupt foundations,
 with every value pinned from boot 22:

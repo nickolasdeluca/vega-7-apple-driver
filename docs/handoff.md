@@ -6,21 +6,20 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current checkpoint: driver stages 0 and 1 built into USB test EFIs,
-2026-10-05, on branch `cezanne-discovery`, extending `14c14ca`.
-This handoff is committed
-with the continuation; check Git history for its commit rather than assuming a
-recorded hash is HEAD.
-The project remains in **discovery and specification**, with driver
-implementation started: `CezanneGPU.kext` (stage 0 passive attach, stage 1
-read-only device access) and USB test EFIs for both stages are prepared and
-verified offline but not yet booted; no independent driver has been loaded.
+Current checkpoint, 2026-10-06, branch `cezanne-discovery`: **driver stages
+0–16 succeeded on the USB test EFI** (boots 1–23; see the
+[test boot log](test-boot.md#test-boot-log)). The driver can do the
+following:
+- read the GPU, the discovery table and the engine state;
+- talk to the SMU (version, GFXOFF, metrics, SDMA power);
+- run PSP ring commands (TMR setup, firmware load);
+- load SDMA0 firmware;
+- run a verified SDMA copy and fence (boot 21);
+- read the display, MMHUB VM and IH state (boot 22).
 
-Initial target and observed host: PCI `1002:1638`, revision `c9`, reported Ryzen
-5 5600GT, macOS 26.4.1 build 25E253. SDK observations used 26.5 on x86_64; do not
-silently equate SDK definitions with the runtime's private kernel contract.
-The kernel reports `xnu-12377.101.15~1/RELEASE_X86_64`; the generic source study
-uses pinned public `xnu-12377.1.9`. Their implementation agreement is unverified.
+Stage 17 (GART and the IH ring) is approved and not yet built; see "Next
+task" below. The sections that follow are the earlier discovery record and
+still apply.
 
 Completed work:
 
@@ -133,7 +132,42 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: propose stage 17 (GART and interrupts)
+## Next task: implement and boot stage 17 (approved 2026-10-06)
+
+**Resume here.** Stage 17 was approved on 2026-10-06 but not built. The
+user is on the known-good EFI. Steps:
+
+1. Read the [stage 17 section](test-boot.md#stage-17-gart-and-the-interrupt-ring-proposal).
+   Every register, value, address and step is pinned there from boot 22.
+2. Implement it in the usual batches:
+   - **Core:** tables plus `writeAllowed`/memory allowlists, the GART and
+     IH sequences, the flush with semaphore acquire and release, SDMA
+     frame 2 with `TRAP`, verify, and restore.
+   - **Kext:** selectors and restore on abandon.
+   - **Tool:** `--gart-ih`.
+   - **`test_efi`:** stage 17.
+   - **Tests:** a fake MMHUB that translates through PTE 0, a fake IH that
+     posts the trap entry, and weakened cores.
+   - **Docs.**
+   Follow the [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
+   for defects found while testing.
+3. Build `out/test-efi/usb-stage17` and `out/diag`, then have the user run
+   `tools/update_stick.sh 17`, cold boot, and run
+   `sudo out/diag/cezanne-diag --gfxoff-disallow --gart-ih --psp-state`,
+   saved to `out/test-efi/boot-24-stage17/`. They should make a Time
+   Machine backup first.
+
+**Implementation details to remember:**
+- **Semaphore:** `VM_INVALIDATE_ENG17_SEM` acquires on read (boot 22). Read
+  it only inside the flush, and always release it by writing 0.
+- **Display check:** compare the stage 16 display inventory before and
+  after, ignoring `HUBP_IN_BLANK` (bit 3 of `DCHUBP_CNTL`), which is live.
+- **Write pointer:** commit SDMA's write pointer with `GFX_RB_WPTR_HI`
+  after the low dword (boot 20).
+- **Restore everything to boot 22 values**, `VM_CONTEXT0_CNTL` first, then
+  flush again before the stage 15 stop.
+
+### Earlier: proposing stage 17
 
 Stage 16 succeeded in boot 22. The display, MMHUB VM and IH/NBIO values are
 measured (see the [log](test-boot.md#test-boot-log)).
