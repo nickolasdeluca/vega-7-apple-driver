@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-05: **stages 0 to 9 succeeded** (see
+Status, 2026-10-06: **stages 0 to 10 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -18,8 +18,9 @@ so no SMU message was sent. Its check needs a better criterion before
 another attempt. The [SysReport dump boot](#sysreport-dump-boot) gave the
 VBIOS: the firmware reserves no carveout memory. With the
 [revised check](#revision-stage-9-free-page-check), stage 9 read the SMU
-metrics table in boot 13. Stage 10 (read-only PSP and aperture state) is
-approved and built, not yet booted. No later stage is authorized.
+metrics table in boot 13. Stage 10 (boot 14) found the PSP ready with no
+ring, and both memory hubs mapping the carveout identically. No later stage
+is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -1248,7 +1249,7 @@ Do not sleep the machine.
 ### Stage 10: PSP and memory-aperture state (proposal)
 
 **Status: proposed 2026-10-06, approved by the user the same day, and
-implemented as proposed; not yet booted.** The heading keeps "proposal" so
+implemented as proposed; succeeded in boot 14.** The heading keeps "proposal" so
 links stay stable.
 
 **Purpose.** Prepare the first firmware load. Linux v6.12 loads every
@@ -1927,6 +1928,38 @@ kernel up 16:06:52).
 - Captures (`diag.txt`, `ioreg.plist`) are in ignored
   `out/test-efi/boot-13-stage9/`.
 - Result: stage 9 succeeded.
+
+**Boot 14, 2026-10-06, stage 10** (`out/test-efi/usb-stage10/`; cold boot,
+kernel up 08:13:53 local).
+
+- `CezanneGPU stage` 10; stages 1–3 `ok`.
+- `sudo cezanne-diag --gfxoff-disallow --psp-state`, run about 2 minutes
+  after boot:
+  - **DisallowGfxOff:** check `ok`, response `0x01`, `PWR_GFXOFF_STATUS` 2,
+    so the GC-hub registers were readable.
+  - **PSP ring mailbox:** `C2PMSG_64` `0x80000000`: response flag set,
+    status 0, so the secure OS is **ready** for ring commands. `C2PMSG_67`,
+    `69`, `70` and `71` are all 0, so **no ring exists** after a cold boot.
+    `C2PMSG_36` reads `0xffffffff` (bootloader argument, unused while the
+    secure OS runs; same pattern as `C2PMSG_35`).
+  - **MMHUB and GC hub are programmed identically:**
+    - FB `0xF400000000`–`0xF47FFFFFFF` maps to physical `0x5C0000000`, and
+      both hubs read FB offset `0x5c0`.
+    - The system aperture is `0xF400000000`–`0xF48003FFFF`. Its high
+      register, `0x3d2000`, is `(fb_end >> 18) + 1`: the Renoir/Green
+      Sardine workaround in `mmhub_v1_0_init_system_aperture_regs`, already
+      set by firmware.
+    - AGP is unused (base, bottom and top all 0).
+    - The system-aperture default page is 0 (LSB and MSB). Linux points it at
+      a scratch page. Here, a stray access inside the aperture that misses FB
+      would go to physical 0. **This is a finding to handle before any
+      engine runs its own memory accesses.**
+- The stage 9 register dump is unchanged from boot 13, except the mailbox
+  (`0x8`/`0`/`0x1` from `DisallowGfxOff`) and the PSP counter.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-14-stage10/`.
+- Result: stage 10 succeeded. The PSP starts clean, which is the case the
+  stage 10 section names for proposing stage 11.
 
 ## Unknowns and limits
 

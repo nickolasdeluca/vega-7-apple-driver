@@ -133,17 +133,23 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 10, then propose stage 11
+## Next task: propose stage 11, the first PSP ring
 
-Stage 10 (read-only PSP mailbox and memory-aperture state, the step before
-the first PSP write) is approved and built: `out/test-efi/usb-stage10`,
-`out/diag/cezanne-diag --psp-state`. Next: the user copies it to the stick
-and boots it; record the boot in the test boot log; then, if the PSP is
-ready and no ring exists, propose stage 11 (IH reroute and creating and
-destroying a kernel-mode PSP ring, no firmware), as the stage 10 section
-describes.
+Stage 10 succeeded in boot 14. The PSP is ready (`C2PMSG_64`
+`0x80000000`) with no ring after a cold boot. Both hubs map FB
+`0xF400000000`–`0xF47FFFFFFF` to physical `0x5C0000000`. The system aperture
+already has the Renoir +1 workaround. AGP is unused, and the default page is
+0, which needs handling before engines access memory.
 
-Stages 0–9 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
+Next, write the stage 11 proposal in test-boot.md, following the stage 10
+section's outline:
+- the two `GBR_IH_SET` commands;
+- create the kernel-mode ring in one checked carveout page, then destroy it;
+- load no firmware.
+
+It needs the user's approval before it is built.
+
+Stages 0–10 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
 
 - **The metrics table.** Stage 9 had the SMU write its 148-byte metrics table
   to a checked carveout page, giving live clocks, power and temperatures:
