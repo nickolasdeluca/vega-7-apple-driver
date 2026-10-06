@@ -30,7 +30,7 @@ APPLE_BOOT_GUID = "7C436110-AB2A-4BBB-A880-FE41995C9F82"
 # driver's stage selector. Without cezanne-stage the driver declines to attach.
 BASE_BOOT_ARGS = "-v keepsyms=1 debug=0x100 msgbuf=1048576"
 # Stages docs/test-boot.md authorizes; must not exceed the driver's kMaxStage.
-AUTHORIZED_STAGES = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
+AUTHORIZED_STAGES = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
 # Kexts that claim or read the Cezanne GPU; none may run beside the driver.
 REMOVED_KEXTS = {
     "NootedRed.kext": "drives the Cezanne iGPU through Apple's AMD kexts",
