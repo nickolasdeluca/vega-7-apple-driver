@@ -36,14 +36,16 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(gfxoff\) \{[^}]*info\[1\] < kGfxOffStage")
         self.assertEqual(len(re.findall(r"\bsmuMetrics\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(metrics\) \{[^}]*info\[1\] < kMetricsStage")
+        self.assertEqual(len(re.findall(r"\bpspState\(connection\)", source)), 1)
+        self.assertRegex(source, r"if \(psp\) \{[^}]*info\[1\] < kPspStateStage")
         self.assertEqual(len(re.findall(r"\bscratchTest\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(scratch\) \{[^}]*info\[1\] < kScratchStage")
         self.assertIn('std::strcmp(argv[i], "--scratch-test") == 0', source)
 
-    def test_tool_names_every_stage_6_register_in_order(self):
+    def test_tool_names_every_stage_10_register_in_order(self):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
-        listed = re.search(r"kStage6Registers\[\] = \{([^}]*)\}", header).group(1)
+        listed = re.search(r"kStage10Registers\[\] = \{([^}]*)\}", header).group(1)
         expected = [name.strip() for name in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
 

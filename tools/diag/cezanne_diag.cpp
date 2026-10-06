@@ -3,10 +3,11 @@
 // the register BAR read-only for every read. The only writes it can request
 // are the stage 6 scratch test (--scratch-test), the stage 7 SMU version
 // queries (--smu-query), the stage 8 DisallowGfxOff (--gfxoff-disallow) and
-// the stage 9 metrics-table transfer (--smu-metrics).
+// the stage 9 metrics-table transfer (--smu-metrics). --psp-state (stage 10)
+// only reads.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
-//                          [--smu-metrics]
+//                          [--smu-metrics] [--psp-state]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -26,7 +27,7 @@ struct Named {
     uint32_t offset;
 };
 
-// Every register the driver allows at stage 6, in its list order; earlier
+// Every register the driver allows at stage 10, in its list order; earlier
 // stages allow a prefix.
 const Named kRegisters[] = {
     {"MP0_SMN_C2PMSG_33", kRegC2PMsg33},
@@ -80,20 +81,43 @@ const Named kRegisters[] = {
     {"IH_RB_CNTL", kRegIhRbCntl},
     // Stage 6.
     {"SCRATCH_REG0", kRegScratchReg0},
+    // Stage 10.
+    {"MP0_SMN_C2PMSG_36", kRegMp0C2PMsg36},
+    {"MP0_SMN_C2PMSG_64", kRegMp0C2PMsg64},
+    {"MP0_SMN_C2PMSG_67", kRegMp0C2PMsg67},
+    {"MP0_SMN_C2PMSG_69", kRegMp0C2PMsg69},
+    {"MP0_SMN_C2PMSG_70", kRegMp0C2PMsg70},
+    {"MP0_SMN_C2PMSG_71", kRegMp0C2PMsg71},
+    {"MC_VM_FB_OFFSET_MMHUB", kRegMmhubFbOffset},
+    {"MC_VM_SYS_APR_DEFAULT_LSB_MMHUB", kRegMmhubDefaultAddrLsb},
+    {"MC_VM_SYS_APR_DEFAULT_MSB_MMHUB", kRegMmhubDefaultAddrMsb},
+    {"MC_VM_AGP_TOP_MMHUB", kRegMmhubAgpTop},
+    {"MC_VM_AGP_BOT_MMHUB", kRegMmhubAgpBot},
+    {"MC_VM_AGP_BASE_MMHUB", kRegMmhubAgpBase},
+    {"MC_VM_SYS_APR_LOW_MMHUB", kRegMmhubApertureLow},
+    {"MC_VM_SYS_APR_HIGH_MMHUB", kRegMmhubApertureHigh},
+    {"MC_VM_FB_LOCATION_BASE_GC", kRegGcFbLocationBase},
+    {"MC_VM_FB_LOCATION_TOP_GC", kRegGcFbLocationTop},
+    {"MC_VM_AGP_TOP_GC", kRegGcAgpTop},
+    {"MC_VM_AGP_BOT_GC", kRegGcAgpBot},
+    {"MC_VM_AGP_BASE_GC", kRegGcAgpBase},
+    {"MC_VM_SYS_APR_LOW_GC", kRegGcApertureLow},
+    {"MC_VM_SYS_APR_HIGH_GC", kRegGcApertureHigh},
 };
-static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage6RegisterCount, "one name per register");
+static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage10RegisterCount, "one name per register");
 
 void usage(FILE *out)
 {
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
-                      "                         [--gfxoff-disallow] [--smu-metrics]\n"
+                      "                         [--gfxoff-disallow] [--smu-metrics] [--psp-state]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
                       "--smu-query first asks the SMU for its driver-interface and firmware versions.\n"
                       "--gfxoff-disallow first sends DisallowGfxOff and waits for GFX to report on.\n"
                       "--smu-metrics first has the SMU write its metrics table to the checked carveout page\n"
-                      "and prints it.\n");
+                      "and prints it.\n"
+                      "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n");
 }
 
 bool parseCount(const char *text, unsigned long max, unsigned long *value)
@@ -288,10 +312,104 @@ bool smuMetrics(io_connect_t connection)
 
 } // namespace
 
+// Reads one register through the driver, printing its name first. Returns
+// false (and prints the status) unless the read returned ok.
+bool readNamed(io_connect_t connection, const char *name, uint32_t offset, uint32_t *value)
+{
+    std::printf("  %-32s ", name);
+    std::fflush(stdout);
+    uint64_t input = offset;
+    uint64_t output[2] = {0, 0};
+    uint32_t outputCount = 2;
+    kern_return_t result =
+        IOConnectCallScalarMethod(connection, kDiagnosticReadRegister, &input, 1, output, &outputCount);
+    if (result != KERN_SUCCESS || outputCount != 2) {
+        std::printf("call failed 0x%08x\n", result);
+        return false;
+    }
+    if (output[0] != kOK) {
+        std::printf("%s\n", statusName(static_cast<Status>(output[0])));
+        return false;
+    }
+    *value = static_cast<uint32_t>(output[1]);
+    std::printf("0x%08x\n", *value);
+    return true;
+}
+
+// One hub's apertures as GPU address ranges (mmhub_v1_0/gfxhub_v1_0
+// init_system_aperture_regs: FB and AGP in 16 MiB units, system aperture in
+// 256 KiB units).
+struct Hub {
+    const char *name;
+    uint32_t fbBase, fbTop, fbOffset, agpBase, agpBot, agpTop, low, high;
+};
+
+bool showHub(io_connect_t connection, const Hub &hub)
+{
+    std::printf("%s hub:\n", hub.name);
+    uint32_t v[8] = {};
+    const uint32_t offsets[8] = {hub.fbBase, hub.fbTop, hub.fbOffset, hub.agpBase,
+                                 hub.agpBot, hub.agpTop, hub.low,    hub.high};
+    const char *names[8] = {"MC_VM_FB_LOCATION_BASE", "MC_VM_FB_LOCATION_TOP", "MC_VM_FB_OFFSET",
+                            "MC_VM_AGP_BASE",         "MC_VM_AGP_BOT",         "MC_VM_AGP_TOP",
+                            "MC_VM_SYSTEM_APERTURE_LOW", "MC_VM_SYSTEM_APERTURE_HIGH"};
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!readNamed(connection, names[i], offsets[i], &v[i])) return false;
+    }
+    std::printf("  FB          0x%010llx-0x%010llx -> physical 0x%010llx\n",
+                static_cast<unsigned long long>(uint64_t(v[0] & 0xFFFFFF) << 24),
+                static_cast<unsigned long long>((uint64_t(v[1] & 0xFFFFFF) << 24) | 0xFFFFFF),
+                static_cast<unsigned long long>(uint64_t(v[2] & 0xFFFFFF) << 24));
+    std::printf("  AGP         0x%010llx-0x%010llx base 0x%010llx\n",
+                static_cast<unsigned long long>(uint64_t(v[4] & 0xFFFFFF) << 24),
+                static_cast<unsigned long long>((uint64_t(v[5] & 0xFFFFFF) << 24) | 0xFFFFFF),
+                static_cast<unsigned long long>(uint64_t(v[3] & 0xFFFFFF) << 24));
+    std::printf("  system      0x%010llx-0x%010llx\n",
+                static_cast<unsigned long long>(uint64_t(v[6] & 0x3FFFFFFF) << 18),
+                static_cast<unsigned long long>((uint64_t(v[7] & 0x3FFFFFFF) << 18) | 0x3FFFF));
+    return true;
+}
+
+// The stage 10 summary: the PSP ring mailbox and both hubs' apertures.
+// Reads only.
+bool pspState(io_connect_t connection)
+{
+    std::printf("PSP ring mailbox:\n");
+    uint32_t c2p64 = 0, c2p67 = 0, c2p69 = 0, c2p70 = 0, c2p71 = 0;
+    if (!readNamed(connection, "MP0_SMN_C2PMSG_64 (command)", kRegMp0C2PMsg64, &c2p64) ||
+        !readNamed(connection, "MP0_SMN_C2PMSG_67 (write ptr)", kRegMp0C2PMsg67, &c2p67) ||
+        !readNamed(connection, "MP0_SMN_C2PMSG_69 (addr low)", kRegMp0C2PMsg69, &c2p69) ||
+        !readNamed(connection, "MP0_SMN_C2PMSG_70 (addr high)", kRegMp0C2PMsg70, &c2p70) ||
+        !readNamed(connection, "MP0_SMN_C2PMSG_71 (size)", kRegMp0C2PMsg71, &c2p71))
+        return false;
+    std::printf("  response flag %s, status 0x%04x, command field 0x%02x -> %s\n",
+                (c2p64 & kPspResponseFlag) ? "set" : "clear", c2p64 & kPspStatusMask, (c2p64 >> 16) & 0xFF,
+                (c2p64 & (kPspResponseFlag | kPspStatusMask)) == kPspResponseFlag ? "ready" : "not ready");
+    std::printf("  ring: %s (address 0x%08x%08x, size 0x%x, write pointer 0x%x)\n",
+                (c2p69 | c2p70 | c2p71) == 0 ? "none set" : "address or size set", c2p70, c2p69, c2p71, c2p67);
+
+    uint32_t lsb = 0, msb = 0;
+    std::printf("MMHUB default page:\n");
+    if (!readNamed(connection, "MC_VM_SYS_APR_DEFAULT_LSB", kRegMmhubDefaultAddrLsb, &lsb) ||
+        !readNamed(connection, "MC_VM_SYS_APR_DEFAULT_MSB", kRegMmhubDefaultAddrMsb, &msb))
+        return false;
+    std::printf("  physical 0x%010llx\n",
+                static_cast<unsigned long long>((uint64_t(lsb) << 12) | (uint64_t(msb & 0xF) << 44)));
+
+    const Hub mmhub = {"MMHUB",          kRegMmhubFbLocationBase, kRegMmhubFbLocationTop, kRegMmhubFbOffset,
+                       kRegMmhubAgpBase, kRegMmhubAgpBot,         kRegMmhubAgpTop,        kRegMmhubApertureLow,
+                       kRegMmhubApertureHigh};
+    const Hub gc = {"GC (GFX-gated)", kRegGcFbLocationBase, kRegGcFbLocationTop, kRegMcVmFbOffset, kRegGcAgpBase,
+                    kRegGcAgpBot,     kRegGcAgpTop,         kRegGcApertureLow,  kRegGcApertureHigh};
+    bool mmhubOk = showHub(connection, mmhub);
+    bool gcOk = showHub(connection, gc);
+    return mmhubOk && gcOk;
+}
+
 int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
-    bool scratch = false, smu = false, gfxoff = false, metrics = false;
+    bool scratch = false, smu = false, gfxoff = false, metrics = false, psp = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -307,6 +425,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--smu-metrics") == 0) {
             metrics = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--psp-state") == 0) {
+            psp = true;
             continue;
         }
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -353,7 +475,8 @@ int main(int argc, char **argv)
     std::printf("CezanneGPU diagnostics v%llu, driver stage %llu\n", static_cast<unsigned long long>(info[0]),
                 static_cast<unsigned long long>(info[1]));
 
-    const uint32_t count = info[1] >= 6   ? kStage6RegisterCount
+    const uint32_t count = info[1] >= 10  ? kStage10RegisterCount
+                           : info[1] >= 6 ? kStage6RegisterCount
                            : info[1] == 5 ? kStage5RegisterCount
                                           : kStage3RegisterCount;
     int failures = 0;
@@ -388,6 +511,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!smuMetrics(connection)) failures++;
+    }
+    if (psp) {
+        if (info[1] < kPspStateStage) {
+            std::fprintf(stderr, "cezanne-diag: --psp-state needs driver stage %u\n", kPspStateStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspState(connection)) failures++;
     }
     for (unsigned long pass = 0; pass < repeat; pass++) {
         if (pass > 0) usleep(static_cast<useconds_t>(interval * 1000));
