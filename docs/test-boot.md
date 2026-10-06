@@ -2268,6 +2268,174 @@ proposal with the measured values):
   reads hang after power changes, power off.
 - Make a Time Machine backup before this boot.
 
+### Stage 15: first SDMA copy (proposal)
+
+**Status: proposed 2026-10-06, not approved, not implemented.**
+
+**Purpose.** This is the "verified DMA copy and fence" milestone: SDMA0, running
+the firmware stage 13 loaded, copies 4 KiB from one checked carveout page to
+another and writes a fence. Every SDMA register write has the exact value
+Linux v6.12 computes from the registers boot 19 measured. The check refuses
+to start if any of those registers reads differently.
+
+**Sequence** (on request only, `sudo cezanne-diag --sdma-copy`; each step
+printed first). Linux functions are in `sdma_v4_0.c` unless noted.
+
+1. **Stage 13 up to the load.** Check, create, `SETUP_TMR`, firmware copy,
+   `LOAD_IP_FW` as in boot 19, but **no teardown**: the TMR and firmware
+   stay for the copy. The check also requires:
+   - the 31 boot 19 SDMA values exactly;
+   - the 64 KiB at the copy work area (below) stable, snapshotted.
+2. **`PowerUpSdma`** (SMU `0xE`, stage 14). This is `sdma_v4_0_hw_init` on
+   APUs.
+3. **Golden settings** (`golden_settings_sdma_4_3`, exact results from boot
+   19):
+
+   | Register | Write |
+   | --- | --- |
+   | `CHICKEN_BITS` | `0x02831f07` |
+   | `CLK_CTRL` | `0x3f000100` |
+   | `GB_ADDR_CONFIG` | `0x00000002` |
+   | `GB_ADDR_CONFIG_READ` | `0x00000002` |
+   | `GFX_RB_WPTR_POLL_CNTL` | `0x00403000` |
+   | `POWER_CNTL` | `0x40000051` |
+   | `RLC0_RB_WPTR_POLL_CNTL` | `0x00403000` |
+   | `RLC1_RB_WPTR_POLL_CNTL` | `0x00403000` |
+   | `UTCL1_PAGE` | `0x000003e0` (unchanged; Linux writes it anyway) |
+   | `UTCL1_WATERMK` | `0x03fbe1fe` |
+
+   **The `GB_ADDR_CONFIG` decision.** Recommended: apply the golden value
+   as Linux does for this IP (4.1.2). The field (`NUM_PIPES` and related)
+   only affects tiled addressing, so a linear copy does not depend on it
+   either way. The alternative, keeping the firmware's `0x00100012`, would
+   deviate from the configuration Linux runs on this chip.
+4. **`sdma_v4_0_start` and `sdma_v4_0_gfx_resume`** (no doorbell, so the
+   write pointer goes through registers, `sdma_v4_0_ring_set_wptr`):
+
+   | # | Register | Write | Linux |
+   | --- | --- | --- | --- |
+   | 1 | `F32_CNTL` | `0x00000000` | `sdma_v4_0_enable(true)`: HALT 0 |
+   | 2 | `SEM_WAIT_FAIL_TIMER_CNTL` | `0` | `_start` |
+   | 3 | `GFX_RB_CNTL` | `0x00040014` | `RB_SIZE` = log2(1024 dwords) = 10 |
+   | 4 | `GFX_RB_RPTR`, `_HI`, `GFX_RB_WPTR`, `_HI` | `0` each | pointers 0 |
+   | 5 | `GFX_RB_RPTR_ADDR_HI` / `_LO` | `0xF4` / `0x40301000` | read-pointer write-back |
+   | 6 | `GFX_RB_BASE` / `_HI` | `0xF4403000` / `0x0` | ring at `0xF440300000`, `>> 8` and `>> 40` |
+   | 7 | `GFX_MINOR_PTR_UPDATE` | `1` | before the pointer write |
+   | 8 | `GFX_DOORBELL` / `_OFFSET` | `0` / `0` | doorbell off |
+   | 9 | `GFX_RB_WPTR`, `_HI` | `0`, `0` | `ring_set_wptr` |
+   | 10 | `GFX_MINOR_PTR_UPDATE` | `0` | after |
+   | 11 | `GFX_RB_WPTR_POLL_ADDR_LO` / `_HI` | `0x40301008` / `0xF4` | poll address (polling stays off) |
+   | 12 | `GFX_RB_WPTR_POLL_CNTL` | `0x00403000` | `F32_POLL_ENABLE` 0 |
+   | 13 | `GFX_RB_CNTL` | `0x00041015` | + `RPTR_WRITEBACK_ENABLE`, `RB_ENABLE` |
+   | 14 | `GFX_IB_CNTL` | `0x00000101` | + `IB_ENABLE` |
+   | 15 | `CNTL` | `0x00000002` | `UTC_L1_ENABLE` (already 1) |
+   | 16 | `F32_CNTL` | `0x00000000` | unhalt |
+
+   **Left out, on purpose:**
+   - `sdma_v4_0_ctx_switch_enable`: `AUTO_CTXSW_ENABLE`, the phase quantum
+     and `UTCL1_TIMEOUT`. They only matter with several queues; this stage
+     has one.
+   - `sdma_v4_1_init_power_gating`.
+   - The page queue: unused on 4.1.2.
+5. **Ring test** (`sdma_v4_0_ring_test_ring`). Frame 0 of the SDMA ring is
+   `WRITE_LINEAR` (`0x00000002`), `0x40301100`, `0xF4`, count 0, then
+   `0xDEADBEEF`, padded with plain NOPs (`0x00000000`) to 256 dwords
+   (`align_mask` `0xff`). Then `GFX_RB_WPTR` ← `1024` (bytes), and poll the
+   write-back dword for `0xDEADBEEF`, up to 100 × 1 ms.
+6. **Copy and fence.** Frame 1 (dwords 256–511):
+   - `COPY_LINEAR` (`0x00000001`), `4095`, `0`, source `0x40302000`/`0xF4`,
+     destination `0x40303000`/`0xF4` (`sdma_v4_0_emit_copy_buffer`).
+   - `FENCE` (`0x00000005`), `0x40301200`, `0xF4`, `1`
+     (`sdma_v4_0_ring_emit_fence`, without the `TRAP`: no interrupts are
+     set up).
+   - Plain NOPs to 512 dwords.
+
+   Then `GFX_RB_WPTR` ← `2048` and poll the fence for 1, up to 100 × 1 ms.
+7. **Verify (no writes):**
+   - `GFX_RB_RPTR` equals 2048;
+   - the destination page equals the source page byte for byte;
+   - the source page is unchanged;
+   - the 64 KiB region holds only the expected words (below);
+   - `STATUS_REG` is recorded.
+8. **Teardown** (`sdma_v4_0_hw_fini`, then stage 13):
+   - `GFX_RB_CNTL` ← `0x00041014` and `GFX_IB_CNTL` ← `0x00000100`
+     (`gfx_enable(false)`);
+   - `F32_CNTL` ← `0x00000001` (halt);
+   - `PowerDownSdma`, `DESTROY_TMR`, then the ring destroy.
+   - Abandon after step 4 does the same.
+
+**The copy work area** (carveout `0x40300000`, GPU `0xF440300000`, physical
+`0x600300000`; between the firmware buffer's check region and the TMR):
+
+| Page | Offset | CPU writes | SDMA writes |
+| --- | --- | --- | --- |
+| Ring | `+0x0000` | frames 0 and 1 exactly, rest of page 0 | none (it reads) |
+| Write-back | `+0x1000` | all 0 | read pointer at `+0x000` (8 bytes), `0xDEADBEEF` at `+0x100`, fence 1 at `+0x200` |
+| Source | `+0x2000` | a fixed pattern: word *i* = `0x5A5A0000 + i` | none |
+| Destination | `+0x3000` | all 0 | the 4 KiB copy |
+
+The CPU writes are read back before the first write-pointer write. The
+rest of the 64 KiB must match the snapshot afterwards.
+
+**Addressing and the default page.**
+- SDMA uses MMHUB, VMID 0 (`ring->vm_hub`). Context 0 is disabled (boot
+  14), so these addresses resolve through the FB aperture, like the SMU's
+  and PSP's writes in stages 9 to 13.
+- The zero default page (boot 14) applies only to system-aperture
+  addresses outside FB, the last 256 KiB above `0xF47FFFFFFF`. No packet
+  names such an address; the packets are exact and read back before they
+  run.
+- Recommended: leave the default page for the GART stage rather than add
+  MMHUB writes now.
+
+**New writes:**
+- **SDMA registers:** the 26 named above, only with the listed values, from
+  stage 15. Each is pinned by the boot 19 precondition.
+- **Memory:** the four work-area pages, only with the words above.
+- **Messages:** none beyond stages 13 and 14.
+
+**Changes:**
+- **Core:**
+  - `SdmaStart`, a table of `{register, value}` in order, with the
+    allowlist derived from it.
+  - Packet builders and an exact ring image, and the work-area images and
+    allowlist.
+  - `startSdma`, `submitSdma` (write pointer, poll), `verifySdmaCopy`,
+    `stopSdma`.
+  - A precondition check against the boot 19 values.
+- **Adapter:**
+  - Selectors for start, ring test, copy and stop. Diagnostics version 11.
+  - A third writable carveout mapping (the four pages), only during the
+    write steps.
+  - The full teardown on abandon.
+- **Tool:** `--sdma-copy`: each step, read pointer, fence, compare results.
+- **Tests:**
+  - Exact register sequences and packet images, cross-checked against
+    `vega10_sdma_pkt_open.h`.
+  - A fake SDMA engine that executes WRITE, COPY and FENCE from the fake
+    ring.
+  - A stop at each precondition, timeouts, a corrupted copy and a stray
+    write.
+  - Weakened cores that must fail: an unpinned precondition, a register
+    value outside the table, a packet address outside the work area, and a
+    missing halt in the teardown.
+
+**Expected:**
+- Write-back `0xDEADBEEF`, then fence 1.
+- `GFX_RB_RPTR` 2048, the destination equal to the source, 0 unexpected
+  words.
+- SDMA halted again after the teardown.
+
+**Risks:**
+- This is the first time a GPU engine executes commands the driver wrote.
+  A malformed packet could make SDMA read or write the wrong memory. That
+  is mitigated by exact images, readback before the pointer write, and
+  addresses confined to one checked 64 KiB region.
+- A hang (no write-back or fence within 100 ms) leaves SDMA running. The
+  teardown halts it. If that also fails, shut down fully.
+- Unexpected words outside the work area mean: power off at once.
+- Make a Time Machine backup before this boot.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
