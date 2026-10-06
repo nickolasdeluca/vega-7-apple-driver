@@ -139,6 +139,10 @@ struct FakeRegisters {
     bool tlbValid = false;
     bool ihDropTrap = false, ihOtherEntry = false, dummyStray = false;
     uint32_t displayFlip = 0; // XORed into pipe 0's DCHUBP_CNTL on each pause
+    // MSI delivery (stage 18): ENABLE_INTR raises one per entry; with
+    // RPTR_REARM, none again until IH_RB_RPTR is written.
+    uint32_t msiCount = 0;
+    bool msiArmed = true, msiDrop = false, msiRefire = false;
     void presetBoot22()
     {
         for (const GartWrite &w : kGartEnable) gart[w.offset] = w.boot22;
@@ -146,6 +150,7 @@ struct FakeRegisters {
         for (uint32_t i = 0; i < 11; i++) gart[kDisplayInventory[i]] = kDisplayPipe0Boot22[i];
         gart[kRegVmInvalidateEng17Ack] = 0;
         gart[kRegVmL2ProtectionFaultStatus] = 0;
+        gart[kRegInterruptCntl] = gart[kRegInterruptCntl2] = gart[kRegBifIhDoorbellRange] = 0;
     }
     bool fail = false;
     uint32_t order[32];
@@ -834,6 +839,7 @@ struct FakeWriter {
             return;
         }
         r->gart[offset] = value;
+        if (offset == kRegIhRbRptr) r->msiArmed = true;
         if (offset == kRegIhRbCntl && (value & 1) != 0 && r->ihOtherEntry) postIh(r, 0x1234);
     }
     // Writes one IH entry at the write pointer and the pointer's write-back.
@@ -845,6 +851,11 @@ struct FakeWriter {
         wptr = (wptr + kIhEntryBytes) & kIhWptrOffsetMask;
         r->gart[kRegIhRbWptr] = wptr;
         r->gartWork->words[kIhWbPage / 4] = wptr;
+        uint32_t cntl = r->gart[kRegIhRbCntl];
+        if ((cntl & (1u << 17)) != 0 && r->msiArmed && !r->msiDrop) {
+            r->msiCount++;
+            if ((cntl & (1u << 21)) != 0) r->msiArmed = false;
+        }
     }
     // Executes the SDMA ring between two write pointers (bytes) if the
     // engine is unhalted with its ring enabled: WRITE, COPY, FENCE, TRAP and
@@ -924,6 +935,7 @@ struct FakeWriter {
         if (r->mutateOnPause != nullptr) r->mutateOnPause->words[100] ^= 1;
         if (r->ackPending > 0 && --r->ackPending == 0) r->gart[kRegVmInvalidateEng17Ack] = 1;
         if (r->displayFlip != 0) r->gart[kRegHubp0DchubpCntl] ^= r->displayFlip;
+        if (r->msiRefire) r->msiCount++;
         r->pauses++;
     }
     RegisterWriter writer() { return RegisterWriter{write32, pause, this}; }
@@ -2189,6 +2201,209 @@ static void testGart()
     }
 }
 
+// A stage 18 rig: the stage 17 flow through a passing verify on the fakes.
+struct IntrRig : GartRig {
+    uint32_t intrProgress = 0;
+    InterruptCounter counter{[](void *c) { return static_cast<FakeRegisters *>(c)->msiCount; }, &r};
+    IntrRig()
+    {
+        uint32_t observed = 0;
+        GartReport report;
+        CHECK(enable() == kOK && submit(&observed) == kOK && verify(&report) == kOK);
+    }
+    // Check, frame 3, arm, start, submit.
+    Status run(uint32_t *observed)
+    {
+        uint32_t index = 0, value = 0;
+        Status status = checkIntrBoot22(r.reader(), 0x80000, 18, &index, &value);
+        if (status == kOK) status = writeSdmaFrame3(work.reader(), work.writer(), 18);
+        if (status == kOK) status = armIntr(gartWork.reader(), gartWork.writer(), w.writer(), 18, &intrProgress);
+        if (status == kOK) status = startIntr(w.writer(), 18, &intrProgress);
+        if (status == kOK) status = submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 18, 3, observed);
+        return status;
+    }
+    Status verify18(IntrReport *report)
+    {
+        return verifyIntr(r.reader(), 0x80000, work.reader(), sdmaSnapshot, gartWork.reader(), gartSnapshot, display,
+                          w.writer(), counter, 18, report);
+    }
+};
+
+static void testIntr()
+{
+    // The pinned values (docs/test-boot.md, stage 18).
+    CHECK(kInterruptCntl2Dummy == 0x06008010u);
+    CHECK(kIhRbCntlRearm == 0xc0310114u && kIhRbCntlIntr == 0xc0330195u);
+    CHECK(kSdmaRingDwords * 4 == 4096 && kSdmaWbFence3 == kSdmaWbFence2 + 4);
+    CHECK(kIntrCheck[0] == 0x03844 && kIntrCheck[1] == 0x03848 && kIntrCheck[2] == 0x03bc8);
+
+    // Writes: each stage 18 value from stage 18 only; nothing else.
+    CHECK(writeAllowed(kRegInterruptCntl2, kInterruptCntl2Dummy, 18) && writeAllowed(kRegInterruptCntl2, 0, 18));
+    CHECK(!writeAllowed(kRegInterruptCntl2, kInterruptCntl2Dummy, 17) && !writeAllowed(kRegInterruptCntl2, 1, 18));
+    CHECK(writeAllowed(kRegIhRbCntl, kIhRbCntlRearm, 18) && writeAllowed(kRegIhRbCntl, kIhRbCntlIntr, 18));
+    CHECK(!writeAllowed(kRegIhRbCntl, kIhRbCntlIntr, 17) && !writeAllowed(kRegIhRbCntl, kIhRbCntlIntr | 0x200, 18));
+    CHECK(writeAllowed(kRegIhRbRptr, 0x20, 18) && writeAllowed(kRegIhRbRptr, 0xfe0, 18));
+    CHECK(!writeAllowed(kRegIhRbRptr, 0x20, 17) && !writeAllowed(kRegIhRbRptr, 0x22, 18) &&
+          !writeAllowed(kRegIhRbRptr, 0x1000, 18));
+    CHECK(writeAllowed(kRegSdma0GfxRbWptr, 4096, 18) && !writeAllowed(kRegSdma0GfxRbWptr, 5120, 18));
+    CHECK(!writeAllowed(kRegInterruptCntl, 0, 18) && !writeAllowed(kRegBifIhDoorbellRange, 0, 18));
+    CHECK(!writeAllowed(kRegIhRbWptr, 0x20, 18) && !writeAllowed(kRegIhChicken, 0, 18));
+    // Every stage 18 register write lands in the mapped page set.
+    auto inPages = [](uint32_t offset) {
+        for (uint32_t page : kIntrPages)
+            if (offset >= page && offset + 4 <= page + kPageSize) return true;
+        return false;
+    };
+    CHECK(inPages(kRegInterruptCntl2) && inPages(kRegIhRbCntl) && inPages(kRegIhRbRptr) && inPages(kRegIhRbWptr));
+    // Frame 3 in the ring.
+    const uint32_t frame[] = {5, 0x40301208u, 0xF4, 3, 6, 0};
+    for (uint32_t i = 0; i < 6; i++) CHECK(intrRingWord(768 + i) == frame[i]);
+    for (uint32_t i = 774; i < 1024; i++) CHECK(intrRingWord(i) == 0);
+    for (uint32_t i = 0; i < 768; i++) CHECK(intrRingWord(i) == gartRingWord(i));
+    CHECK(sdmaWorkWriteAllowed(768 * 4, 5, 18) && !sdmaWorkWriteAllowed(768 * 4, 5, 17) &&
+          !sdmaWorkWriteAllowed(768 * 4, 6, 18));
+
+    // The MSI capability: 64-bit, 32-bit, absent.
+    {
+        FakeConfig c;
+        c.put(0x64, 2, 0xA010); // PCI Express, next 0xA0
+        c.put(0xA0, 2, 0x0005);
+        c.put(0xA2, 2, 0x0081); // 64-bit, enabled
+        c.put(0xA4, 4, 0xFEE00000u);
+        c.put(0xA8, 4, 0x1);
+        c.put(0xAC, 2, 0x4021);
+        MsiCapability msi;
+        CHECK(readMsiCapability(c.reader(), &msi) == kOK && msi.offset == 0xA0 && msi.control == 0x81);
+        CHECK(msi.addressLo == 0xFEE00000u && msi.addressHi == 1 && msi.data == 0x4021);
+        c.put(0xA2, 2, 0x0001); // 32-bit: the data follows the low dword
+        c.put(0xA8, 4, 0x4022);
+        CHECK(readMsiCapability(c.reader(), &msi) == kOK && msi.addressHi == 0 && msi.data == 0x4022);
+        FakeConfig none;
+        CHECK(readMsiCapability(none.reader(), &msi) == kIntrNoMsi && msi.offset == 0);
+    }
+
+    // The whole stage against the fakes.
+    {
+        IntrRig g;
+        uint32_t index = 9, value = 9;
+        CHECK(checkIntrBoot22(g.r.reader(), 0x80000, 18, &index, &value) == kOK && index == 0 && value == 0);
+        CHECK(writeSdmaFrame3(g.work.reader(), g.work.writer(), 18) == kOK);
+        int before = g.w.writes;
+        CHECK(armIntr(g.gartWork.reader(), g.gartWork.writer(), g.w.writer(), 18, &g.intrProgress) == kOK);
+        CHECK(g.intrProgress == 1 && g.w.writes == before + 7 && g.r.msiCount == 0);
+        CHECK(g.w.offsets[before] == kRegIhRbCntl && g.w.values[before] == kIhRbCntlOff);
+        CHECK(g.w.offsets[before + 3] == kRegInterruptCntl2 && g.w.values[before + 3] == 0x06008010u);
+        CHECK(g.w.offsets[before + 4] == kRegIhRbCntl && g.w.values[before + 4] == kIhRbCntlRearm);
+        CHECK(g.gartWork.words[kIhRingPage / 4] == 0 && g.gartWork.words[kIhWbPage / 4] == 0);
+        CHECK(startIntr(g.w.writer(), 18, &g.intrProgress) == kOK && g.intrProgress == 2);
+        CHECK(g.r.gart[kRegIhRbCntl] == kIhRbCntlIntr && g.r.msiCount == 0);
+        uint32_t observed = 0;
+        CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 18, 3, &observed) == kOK && observed == 3);
+        CHECK(g.r.msiCount == 1 && !g.r.msiArmed);
+        IntrReport report;
+        CHECK(g.verify18(&report) == kOK);
+        CHECK(report.msiCount == 1 && report.fence3 == 3 && report.sdmaTraps == 1 && report.ihEntries == 1);
+        CHECK(report.ihWriteback == 32 && report.ihRbCntl == kIhRbCntlIntr && report.rptr == 4096);
+        CHECK(report.sdmaUnexpected == 0 && report.gartUnexpected == 0 && (report.ring[0] & 0xFFFF) == 0xE008);
+        uint32_t rptr = 0, countBefore = 0, countAfter = 0, writeback = 0;
+        before = g.r.pauses;
+        CHECK(ackIntr(g.gartWork.reader(), g.w.writer(), g.counter, 18, &rptr, &countBefore, &countAfter, &writeback) ==
+              kOK);
+        CHECK(rptr == 32 && countBefore == 1 && countAfter == 1 && writeback == 32 && g.r.pauses == before + 100);
+        CHECK(g.r.gart[kRegIhRbRptr] == 32 && g.r.msiArmed);
+        before = g.w.writes;
+        CHECK(quiesceIntr(g.w.writer(), 18) == kOK && g.w.writes == before + 3);
+        CHECK(g.r.gart[kRegIhRbCntl] == kIhRbCntlRearm && g.r.gart[kRegIhRbRptr] == 0 && g.r.gart[kRegIhRbWptr] == 0);
+        CHECK(restoreIntr(g.r.reader(), 0x80000, g.w.writer(), 18, &index, &value) == kOK);
+        CHECK(g.r.gart[kRegInterruptCntl2] == 0);
+        // The stage 17 restore then returns every IH and GART register.
+        CHECK(restoreGart(g.r.reader(), 0x80000, g.w.writer(), 18, 3, &g.ack) == kOK);
+        uint32_t ihWptr = 0;
+        CHECK(checkGartRestored(g.r.reader(), 0x80000, 18, &index, &value, &ihWptr) == kOK);
+        CHECK(g.r.flushes == 2 && g.r.unsafeRequests == 0 && !g.r.semHeld);
+    }
+    {
+        // The MSI never arrives: the entry and fence do.
+        IntrRig g;
+        g.r.msiDrop = true;
+        uint32_t observed = 0;
+        CHECK(g.run(&observed) == kOK);
+        IntrReport report;
+        int pauses = g.r.pauses;
+        CHECK(g.verify18(&report) == kIntrNotDelivered && report.sdmaTraps == 1 && report.fence3 == 3);
+        CHECK(g.r.pauses == pauses + 100);
+    }
+    {
+        // Two MSIs, then a re-fire after the acknowledgement.
+        IntrRig g;
+        uint32_t observed = 0;
+        CHECK(g.run(&observed) == kOK);
+        g.r.msiCount = 2;
+        IntrReport report;
+        CHECK(g.verify18(&report) == kIntrVerifyFailed && report.msiCount == 2);
+        g.r.msiCount = 1;
+        CHECK(g.verify18(&report) == kOK);
+        g.r.msiRefire = true;
+        uint32_t rptr = 0, countBefore = 0, countAfter = 0, writeback = 0;
+        CHECK(ackIntr(g.gartWork.reader(), g.w.writer(), g.counter, 18, &rptr, &countBefore, &countAfter, &writeback) ==
+              kIntrRefired);
+        CHECK(countBefore == 1 && countAfter == 101);
+    }
+    {
+        // No trap; a fence 3 that never comes; another client's entry first.
+        IntrRig g;
+        g.r.ihDropTrap = true;
+        uint32_t observed = 0;
+        CHECK(g.run(&observed) == kOK);
+        IntrReport report;
+        CHECK(g.verify18(&report) == kIhNoTrap && report.msiCount == 0);
+    }
+    {
+        IntrRig g;
+        g.r.ihOtherEntry = true;
+        uint32_t observed = 0;
+        CHECK(g.run(&observed) == kOK);
+        IntrReport report;
+        // The other entry took the one MSI; the trap is in the ring.
+        CHECK(g.verify18(&report) == kOK && report.otherEntries == 1 && report.sdmaTraps == 1 && report.msiCount == 1);
+    }
+    {
+        // Preconditions and order.
+        IntrRig g;
+        uint32_t index = 0, value = 0;
+        g.r.gart[kRegInterruptCntl2] = 5;
+        CHECK(checkIntrBoot22(g.r.reader(), 0x80000, 18, &index, &value) == kIntrUnexpectedState);
+        CHECK(index == 1 && value == 5);
+        CHECK(checkIntrBoot22(g.r.reader(), 0x80000, 17, &index, &value) == kRegisterNotAllowed);
+        g.r.gart[kRegInterruptCntl2] = 0;
+        uint32_t observed = 0;
+        CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 17, 3, &observed) == kRegisterNotAllowed);
+        CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 18, 4, &observed) == kRegisterNotAllowed);
+        CHECK(writeSdmaFrame3(g.work.reader(), g.work.writer(), 17) == kRegisterNotAllowed);
+        CHECK(armIntr(g.gartWork.reader(), g.gartWork.writer(), g.w.writer(), 17, &g.intrProgress) == kRegisterNotAllowed);
+        CHECK(g.intrProgress == 0);
+        CHECK(startIntr(g.w.writer(), 17, &g.intrProgress) == kRegisterNotAllowed && g.intrProgress == 0);
+        CHECK(quiesceIntr(g.w.writer(), 17) == kRegisterNotAllowed);
+        // Frame 3 needs frame 2's write pointer.
+        g.r.sdma[kRegSdma0GfxRbWptr] = 2048;
+        CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 18, 3, &observed) == kSdmaOutOfOrder);
+    }
+    {
+        // A restore that cannot write still checks, and reports the register.
+        IntrRig g;
+        uint32_t observed = 0, index = 0, value = 0;
+        CHECK(g.run(&observed) == kOK);
+        g.r.gart[kRegInterruptCntl2] = kInterruptCntl2Dummy;
+        g.w.fail = true;
+        CHECK(quiesceIntr(g.w.writer(), 18) == kRegisterWriteFailed);
+        CHECK(restoreIntr(g.r.reader(), 0x80000, g.w.writer(), 18, &index, &value) == kRegisterWriteFailed);
+        g.w.fail = false;
+        g.r.gart[kRegBifIhDoorbellRange] = 7; // something else changed it
+        CHECK(restoreIntr(g.r.reader(), 0x80000, g.w.writer(), 18, &index, &value) == kIntrNotRestored);
+        CHECK(index == 2 && value == 7 && g.r.gart[kRegInterruptCntl2] == 0);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -2214,6 +2429,7 @@ int main()
     testSdmaCopy();
     testInventory16();
     testGart();
+    testIntr();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

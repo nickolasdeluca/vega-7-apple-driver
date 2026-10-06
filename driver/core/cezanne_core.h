@@ -31,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 17;
+const uint32_t kMaxStage = 18;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -880,6 +880,32 @@ const uint32_t kGartCheckCount = kGartEnableCount + kIhEnableCount + 1 + 11;
 // The first IH entries reported by the verify.
 const uint32_t kIhReportEntries = 32;
 
+// Stage 18: IH interrupt delivery through MSI (docs/test-boot.md, stage 18),
+// after a passing stage 17 verify and undone before its restore. The kext
+// owns the MSI handler; the core writes only the registers below.
+const uint32_t kIntrStage = 18;
+// nbio_v7_0_ih_control: INTERRUPT_CNTL2 <- the dummy page >> 8.
+const uint32_t kInterruptCntl2Dummy = uint32_t(kGartDummyAddress >> 8);
+// vega10_ih_enable_ring with MSI: + RPTR_REARM (bit 21); then
+// vega10_ih_toggle_interrupts(true): + RB_ENABLE, RB_GPU_TS_ENABLE (bit 7)
+// and ENABLE_INTR (bit 17). kIhRbCntlRearm is also the restore's ring-off.
+const uint32_t kIhRbCntlRearm = kIhRbCntlOff | (1u << 21);
+const uint32_t kIhRbCntlIntr = kIhRbCntlRearm | 1u | (1u << 7) | (1u << 17);
+// Frame 3, the ring's last quarter: FENCE 3 and TRAP; the write pointer
+// reaches the ring's end (4096 bytes), unmasked as sdma_v4_0_ring_set_wptr.
+const uint32_t kSdmaWbFence3 = 0x208;
+const uint32_t kSdmaFrame3Dwords = 6; // FENCE 4, TRAP 2
+const uint32_t kIntrSettlePauses = 100; // the wait after the acknowledgement
+// The precondition registers, all 0 at boot 22.
+const uint32_t kIntrCheck[] = {kRegInterruptCntl, kRegInterruptCntl2, kRegBifIhDoorbellRange};
+const uint32_t kIntrCheckCount = sizeof(kIntrCheck) / sizeof(kIntrCheck[0]);
+// The BAR5 pages the stage 18 operations may write: NBIO (INTERRUPT_CNTL2)
+// and IH. The adapter maps these two for kIntrPageSet.
+const uint32_t kIntrPageSet = 0x3000;
+const uint32_t kIntrPages[] = {0x3000, 0x4000};
+// PCI configuration space: the MSI capability, read only.
+const uint8_t kCapabilityMsi = 0x05;
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -979,6 +1005,15 @@ enum Status : uint32_t {
     kGartVerifyFailed,
     kGartNotRestored,
     kGartOutOfOrder,
+    // Stage 18.
+    kIntrNoMsi,
+    kIntrUnexpectedState,
+    kIntrSourceFailed,
+    kIntrNotDelivered,
+    kIntrVerifyFailed,
+    kIntrRefired,
+    kIntrNotRestored,
+    kIntrOutOfOrder,
 };
 
 const char *statusName(Status status);
@@ -1097,7 +1132,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 13;
+const uint32_t kDiagnosticVersion = 14;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -1132,7 +1167,8 @@ enum DiagnosticSelector : uint32_t {
     // Stage 15, after a LOAD_IP_FW that fenced (selector 18), in this order.
     kDiagnosticSdmaCopyCheck = 21, // out: Status, index of the first differing register, its value
     kDiagnosticSdmaStart = 22,     // out: Status, progress, PowerUpSdma response
-    kDiagnosticSdmaSubmit = 23,    // in: frame (0 ring test, 1 copy, 2 GART copy and trap from stage 17);
+    kDiagnosticSdmaSubmit = 23,    // in: frame (0 ring test, 1 copy, 2 GART copy and trap from stage 17,
+                                   // 3 fence and trap from stage 18);
                                    // out: Status, observed, GFX_RB_RPTR, GFX_RB_WPTR, F32_CNTL, STATUS_REG
     kDiagnosticSdmaVerify = 24,    // out: Status, GFX_RB_RPTR, unexpected words, first offset, STATUS_REG
     kDiagnosticSdmaStop = 25,      // out: Status, F32_CNTL, PowerDownSdma response, DESTROY_TMR fence, ring response
@@ -1143,7 +1179,15 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticGartEnable = 27,  // out: Status, progress, ENG17_ACK
     kDiagnosticGartVerify = 28,  // out: Status; structure: GartReport
     kDiagnosticGartRestore = 29, // out: Status, index of the first register not restored, its value, IH_RB_WPTR
-    kDiagnosticSelectorCount = 30,
+                                 // (from stage 18 it first runs the interrupt restore if needed)
+    // Stage 18, after a passing stage 17 verify (selector 28), in this order;
+    // frame 3 is submitted with selector 23 between enable and verify.
+    kDiagnosticIntrCheck = 30,   // out: Status, index, value, MSI index, MSI control, address lo, hi, data
+    kDiagnosticIntrEnable = 31,  // out: Status, progress, MSI control, address lo, hi, data
+    kDiagnosticIntrVerify = 32,  // out: Status; structure: IntrReport
+    kDiagnosticIntrAck = 33,     // out: Status, IH_RB_RPTR written, MSI count before, after, write-back after
+    kDiagnosticIntrRestore = 34, // out: Status, index, value, MSI control, address lo, hi, data
+    kDiagnosticSelectorCount = 35,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -1536,6 +1580,88 @@ Status restoreGart(const RegisterReader &registers, uint64_t apertureLength, con
 // except IH_RB_WPTR, which the IH maintains: its value is reported.
 Status checkGartRestored(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
                          uint32_t *value, uint32_t *ihWptr);
+
+// Stage 18. The MSI capability as configuration space holds it (read only).
+struct MsiCapability {
+    uint8_t offset; // 0 when absent
+    uint16_t control;
+    uint32_t addressLo, addressHi; // addressHi 0 without 64-bit addressing
+    uint16_t data;
+};
+
+// Walks the capability list as readPciState does and reads the MSI
+// capability; kIntrNoMsi if there is none.
+Status readMsiCapability(const ConfigReader &config, MsiCapability *msi);
+
+// Whether a register write is a stage 18 value: INTERRUPT_CNTL2 to the dummy
+// page or back to 0, IH_RB_CNTL with RPTR_REARM (off) or with ENABLE_INTR
+// (on), IH_RB_RPTR to a 32-byte entry boundary inside the ring (the
+// acknowledgement), or frame 3's write pointer (4096).
+bool intrWriteListed(uint32_t offset, uint32_t value);
+
+// The SDMA ring with frame 3 (FENCE 3, TRAP) at dwords 768..1023;
+// gartRingWord elsewhere.
+uint32_t intrRingWord(uint32_t dword);
+
+// No writes. Requires kIntrCheck at boot 22 (kIntrUnexpectedState with the
+// index and value).
+Status checkIntrBoot22(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                       uint32_t *value);
+
+// Writes frame 3 into the SDMA ring and reads it back (kPspReadbackMismatch).
+Status writeSdmaFrame3(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage);
+
+// vega10_ih_irq_init up to the interrupt toggle, from the stage 17 state: the
+// ring off, its pointers 0, the ring and write-back pages zeroed (gart is the
+// GART work area), INTERRUPT_CNTL2 <- the dummy page, IH_RB_CNTL with
+// RPTR_REARM, the pointers 0 again. progress 1 once any register was written.
+Status armIntr(const MemoryReader &gartWork, const MemoryWriter &gart, const RegisterWriter &writer,
+               uint32_t stage, uint32_t *progress);
+
+// vega10_ih_toggle_interrupts(true): IH_RB_CNTL <- kIhRbCntlIntr. The kext
+// calls it only once its handler is enabled. progress 2 once written.
+Status startIntr(const RegisterWriter &writer, uint32_t stage, uint32_t *progress);
+
+// The kext's MSI counter, read without a lock.
+struct InterruptCounter {
+    uint32_t (*count)(void *context);
+    void *context;
+};
+
+struct IntrReport {
+    uint32_t msiCount, fence3, rptr, faultStatus, ihRbCntl;
+    uint32_t ihWriteback, ihWptr, ihRptr;
+    uint32_t ihEntries, sdmaTraps, otherEntries;
+    uint32_t sdmaUnexpected, sdmaFirst, gartUnexpected, gartFirst;
+    uint32_t displayChanged, displayFirst;
+    uint32_t latencyMicroseconds; // filled in by the kext
+    uint32_t ring[kIhReportEntries * kIhEntryBytes / 4];
+};
+
+// Reads only. Polls (up to kSdmaPollPauses) until fence 3, an SDMA0 trap
+// entry and an MSI have all arrived, then checks as verifyGart does with
+// frame 3 in the ring and fence 3 in the write-back page. kGartFault,
+// kIhNoTrap, kIntrNotDelivered (no MSI), or kIntrVerifyFailed (fence, more
+// than one MSI, unexpected words or a display change).
+Status verifyIntr(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &sdmaRegion,
+                  const uint32_t *sdmaSnapshot, const MemoryReader &gartRegion, const uint32_t *gartSnapshot,
+                  const uint32_t *display, const RegisterWriter &writer, const InterruptCounter &counter,
+                  uint32_t stage, IntrReport *report);
+
+// amdgpu_ih_process's acknowledgement: IH_RB_RPTR <- the write-back's offset.
+// Then kIntrSettlePauses pauses; kIntrRefired if the MSI count or the
+// write-back changed meanwhile.
+Status ackIntr(const MemoryReader &gartRegion, const RegisterWriter &writer, const InterruptCounter &counter,
+               uint32_t stage, uint32_t *rptr, uint32_t *countBefore, uint32_t *countAfter, uint32_t *writeback);
+
+// vega10_ih_irq_disable: IH_RB_CNTL <- kIhRbCntlRearm (interrupts and ring
+// off), the pointers 0, one pause. Before the kext removes its handler.
+Status quiesceIntr(const RegisterWriter &writer, uint32_t stage);
+
+// After the handler is removed: INTERRUPT_CNTL2 back to 0, then requires
+// kIntrCheck at boot 22 (kIntrNotRestored with the index and value).
+Status restoreIntr(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   uint32_t stage, uint32_t *index, uint32_t *value);
 
 } // namespace cezanne
 

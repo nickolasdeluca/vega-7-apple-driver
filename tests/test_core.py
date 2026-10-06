@@ -148,12 +148,30 @@ class CoreTests(unittest.TestCase):
             "kGartFault": ("if (report->faultStatus != 0) return kGartFault;", ""),
             "kIhNoTrap": ("if (report->sdmaTraps == 0) return kIhNoTrap;", ""),
             "report.gartFirst == kIhRingPage + 0x800": ("ok = wrapped || offset - kIhRingPage < end || value == 0;",
-                                                         "ok = true;"),
+                                                         "ok = ((void)end, (void)wrapped, true);"),
             "report.displayChanged == 1": ("!= (display[i] & displayMask(i)) &&",
                                            "!= (display[i] & displayMask(i) & 0) + (value & displayMask(i)) &&"),
             "kRegMmhubVmContext0Cntl && g.w.values[before + 10]": (
                 "        note(writeRegister(writer, stage, context.offset, context.boot22));\n", "        (void)context;\n"),
             "ihWptr == 0x20": ("        if (offset == kRegIhRbWptr) {", "        if (false) {"),
+            # Stage 18.
+            "!writeAllowed(kRegInterruptCntl2, kInterruptCntl2Dummy, 17)": (
+                "if (stage >= kIntrStage && intrWriteListed(offset, value))",
+                "if (stage >= kGartStage && intrWriteListed(offset, value))"),
+            "!writeAllowed(kRegIhRbRptr, 0x22, 18)": ("value % kIhEntryBytes == 0 && value < kIhRingBytes",
+                                                      "value < kIhRingBytes"),
+            "!sdmaWorkWriteAllowed(768 * 4, 5, 17)": ("return stage >= kIntrStage && value == intrRingWord(offset / 4);",
+                                                      "return value == intrRingWord(offset / 4);"),
+            "17, 3, &observed) == kRegisterNotAllowed": ("|| (frame == 3 && stage < kIntrStage)", ""),
+            "kIntrUnexpectedState": ("if (*value != 0) return kIntrUnexpectedState;", ""),
+            "kIntrNotDelivered": ("if (report->msiCount == 0) return kIntrNotDelivered;", ""),
+            "report.msiCount == 2": ("report->fence3 == 3 && report->msiCount == 1 &&", "report->fence3 == 3 &&"),
+            "kIntrRefired": ("return *countAfter != *countBefore || *writeback != before ? kIntrRefired : kOK;",
+                             "return kOK;"),
+            "kIntrNotRestored": ("if (*value != 0) return status != kOK ? status : kIntrNotRestored;", ""),
+            "msi.data == 0x4021": ("        data = static_cast<uint8_t>(offset + 12);\n", ""),
+            "g.gartWork.words[kIhRingPage / 4] == 0": ("    for (uint32_t offset = kIhRingPage; offset < kGartWorkSize; offset += 4) {\n        Status status = writeGartWorkWord(gart, stage, offset);",
+                                                       "    for (uint32_t offset = kGartWorkSize; offset < kGartWorkSize; offset += 4) {\n        Status status = writeGartWorkWord(gart, stage, offset);"),
             "g.w.writes == before + 21 + 2 && g.w.offsets[before] == kRegMmhubVmContext0Cntl": (
                 "    if (progress >= 2) {\n        note(writeRegister(writer, stage, kRegIhRbCntl, kIhRbCntlOff));",
                 "    if (progress >= 1) {\n        note(writeRegister(writer, stage, kRegIhRbCntl, kIhRbCntlOff));"),
@@ -190,11 +208,14 @@ class CoreTests(unittest.TestCase):
         # Scratch pattern and restore; SMU response, argument and message; PSP
         # arguments (C2PMSG_69, _70, _71) and command; the ring write pointer.
         # Stage 17 adds the GART, IH and SDMA0_CNTL writes, the flush's request
-        # and release, frame 2's write pointer, and their restores.
-        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 26)
+        # and release, frame 2's write pointer, and their restores. Stage 18
+        # adds the arm (two lists), the interrupt toggle, the acknowledgement,
+        # the quiesce and INTERRUPT_CNTL2's restore.
+        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 32)
         allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
-        self.assertEqual(allow.count("return"), 15)
+        self.assertEqual(allow.count("return"), 16)
         self.assertIn("if (stage >= kGartStage && gartWriteListed(offset, value)) return true;", allow)
+        self.assertIn("if (stage >= kIntrStage && intrWriteListed(offset, value)) return true;", allow)
         # The semaphore is read only by the flush, through the reader directly
         # (never the allowlisted read), after its own stage check.
         self.assertEqual(source.count("kRegVmInvalidateEng17Sem, &"), 1)
