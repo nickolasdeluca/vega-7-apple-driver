@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <map>
 
 using namespace cezanne;
 
@@ -114,7 +115,16 @@ struct FakeRegisters {
     uint32_t frameStart = 0;     // write pointer of the pending frame, in dwords
     uint32_t cmdStatus = 0;      // psp_gfx_resp.status it writes
     FakeMemory *mutateOnPause = nullptr;
+    // A fake SDMA engine (stage 15): its registers, once preset, and the
+    // work area it reads its ring from and writes to.
+    std::map<uint32_t, uint32_t> sdma;
+    FakeMemory *sdmaWork = nullptr;
+    bool sdmaCorruptCopy = false, sdmaStray = false;
     int pauses = 0;
+    void presetBoot19()
+    {
+        for (uint32_t i = 0; i < kSdmaInventoryCount; i++) sdma[kSdmaInventory[i]] = kSdmaBoot19[i];
+    }
     bool fail = false;
     uint32_t order[32];
     int reads = 0;
@@ -125,6 +135,11 @@ struct FakeRegisters {
         if (self->reads < 32) self->order[self->reads] = offset;
         self->reads++;
         if (self->fail) return false;
+        auto preset = self->sdma.find(offset);
+        if (preset != self->sdma.end()) {
+            *value = preset->second;
+            return true;
+        }
         *value = offset == kRegC2PMsg33        ? self->c2pmsg33
                  : offset == kRegConfigMemsize ? self->memsize
                  : offset == kRegMcVmFbOffset  ? self->fbOffset
@@ -719,6 +734,11 @@ struct FakeWriter {
         if (offset == kRegMp0C2PMsg69) r->psp69 = value;
         if (offset == kRegMp0C2PMsg70) r->psp70 = value;
         if (offset == kRegMp0C2PMsg71) r->psp71 = value;
+        if (!r->sdma.empty() && offset >= kRegSdma0PowerCntl && offset <= kRegSdma0Rlc1RbWptrPollCntl) {
+            uint32_t old = r->sdma[offset];
+            r->sdma[offset] = value;
+            if (offset == kRegSdma0GfxRbWptr) runSdma(r, old, value);
+        }
         if (offset == kRegMp0C2PMsg67) {
             r->frameStart = r->psp67;
             r->psp67 = value;
@@ -748,6 +768,43 @@ struct FakeWriter {
             if (r->tableOverflows) r->memory->words[kMetricsSize / 4] = 1;
         }
         r->smuPending = -1;
+    }
+    // Executes the SDMA ring between two write pointers (bytes) if the
+    // engine is unhalted with its ring enabled: WRITE, COPY, FENCE and NOP,
+    // at GPU addresses inside the work area only.
+    static void runSdma(FakeRegisters *r, uint32_t from, uint32_t to)
+    {
+        if (r->sdmaWork == nullptr || r->sdma[kRegSdma0F32Cntl] != 0 || (r->sdma[kRegSdma0GfxRbCntl] & 1) == 0) return;
+        uint32_t *m = r->sdmaWork->words;
+        auto at = [](uint32_t lo, uint32_t hi) -> int64_t {
+            uint64_t a = (uint64_t(hi) << 32) | lo;
+            return a >= kSdmaWorkGpuAddress && a < kSdmaWorkGpuAddress + kSdmaWorkCheckSize
+                       ? int64_t((a - kSdmaWorkGpuAddress) / 4)
+                       : -1;
+        };
+        uint32_t d = from / 4;
+        while (d < to / 4) {
+            uint32_t op = m[d] & 0xff;
+            if (op == kSdmaOpWrite) {
+                int64_t w = at(m[d + 1], m[d + 2]);
+                if (w >= 0) m[w] = m[d + 4];
+                d += 5;
+            } else if (op == kSdmaOpCopy) {
+                int64_t src = at(m[d + 3], m[d + 4]), dst = at(m[d + 5], m[d + 6]);
+                for (uint32_t i = 0; src >= 0 && dst >= 0 && i < (m[d + 1] + 1) / 4; i++) m[dst + i] = m[src + i];
+                if (r->sdmaCorruptCopy && dst >= 0) m[dst + 7] ^= 1;
+                if (r->sdmaStray) m[0x8000 / 4] ^= 1; // once, with the copy
+                d += 7;
+            } else if (op == kSdmaOpFence) {
+                int64_t w = at(m[d + 1], m[d + 2]);
+                if (w >= 0) m[w] = m[d + 3];
+                d += 4;
+            } else {
+                d += 1;
+            }
+        }
+        r->sdma[kRegSdma0GfxRbRptr] = to;
+        m[(kSdmaWbPage + kSdmaWbRptr) / 4] = to;
     }
     // Processes the frame at frameStart if it names the command and fence
     // buffers: writes the response status and the fence value.
@@ -1577,6 +1634,162 @@ static void testSdmaInventory()
     }
 }
 
+static void testSdmaCopy()
+{
+    CHECK(sizeof(kSdmaBoot19) / sizeof(kSdmaBoot19[0]) == kSdmaInventoryCount);
+    CHECK(kSdmaWorkGpuAddress == 0xF440300000ull && kSdmaWorkPhysical == 0x600300000ull);
+    CHECK(kSdmaWorkPhysical >= kSdmaFwPhysical + kSdmaFwCheckSize && kSdmaWorkPhysical + kSdmaWorkCheckSize <= kPspTmrPhysical);
+    // The golden results, derived here independently with
+    // soc15_program_register_sequence's arithmetic from Linux's masks.
+    const struct {
+        uint32_t offset, andMask, orMask, boot19;
+    } golden[] = {{kRegSdma0ChickenBits, 0xfe931f07, 0x02831f07, 0x00831f07},
+                  {kRegSdma0ClkCtrl, 0xffffffff, 0x3f000100, 0xdf000100},
+                  {kRegSdma0GbAddrConfig, 0x0018773f, 0x00000002, 0x00100012},
+                  {kRegSdma0GbAddrConfigRead, 0x0018773f, 0x00000002, 0x00100012},
+                  {kRegSdma0GfxRbWptrPollCntl, 0xfffffff7, 0x00403000, 0x00401000},
+                  {kRegSdma0PowerCntl, 0x003fff07, 0x40000051, 0x40000050},
+                  {kRegSdma0Rlc0RbWptrPollCntl, 0xfffffff7, 0x00403000, 0x00401000},
+                  {kRegSdma0Rlc1RbWptrPollCntl, 0xfffffff7, 0x00403000, 0x00401000},
+                  {kRegSdma0Utcl1Page, 0x000003ff, 0x000003e0, 0x000003e0},
+                  {kRegSdma0Utcl1Watermk, 0xfc000000, 0x03fbe1fe, 0xfffbe1fe}};
+    for (uint32_t i = 0; i < 10; i++) {
+        uint32_t expect = golden[i].andMask == 0xffffffff
+                              ? golden[i].orMask
+                              : (golden[i].boot19 & ~golden[i].andMask) | (golden[i].orMask & golden[i].andMask);
+        CHECK(kSdmaGolden[i].offset == golden[i].offset && kSdmaGolden[i].value == expect);
+    }
+    // gfx_resume arithmetic from boot 19's RB_CNTL and IB_CNTL.
+    CHECK(kSdmaStart[2].value == (0x00040000u | (10u << 1)) && kSdmaStart[20].value == (0x00040014u | 0x1000u | 1u));
+    CHECK(kSdmaStart[21].value == (0x00000100u | 1u) && kSdmaStop[0].value == 0x00041014u);
+    CHECK(kSdmaStart[9].value == 0xF4403000u && kSdmaStart[10].value == 0 && kSdmaStart[8].value == 0x40301000u);
+    CHECK(kSdmaStart[7].value == 0xF4u && kSdmaStart[17].value == 0x40301008u);
+    // Every listed write is allowed from stage 15 only; nothing else is.
+    for (const SdmaWrite &w : kSdmaStart) CHECK(writeAllowed(w.offset, w.value, 15) && !writeAllowed(w.offset, w.value, 14));
+    for (const SdmaWrite &w : kSdmaGolden) CHECK(writeAllowed(w.offset, w.value, 15));
+    CHECK(writeAllowed(kRegSdma0F32Cntl, 1, 15) && writeAllowed(kRegSdma0GfxRbWptr, 2048, 15));
+    CHECK(!writeAllowed(kRegSdma0GbAddrConfig, 0x00100012, 15));
+    CHECK(!writeAllowed(kRegSdma0GfxRbWptr, 3072, 15) && !writeAllowed(kRegSdma0GfxRbBase, 0xF4403001u, 15));
+    CHECK(!writeAllowed(kRegSdma0UcodeChecksum, 0, 15) && !writeAllowed(kRegSdma0GfxRbCntl, 0x00041017u, 15));
+
+    // Every SDMA write lands in the mapped page set.
+    auto inPages = [](uint32_t offset) {
+        for (uint32_t page : kSdmaPages)
+            if (offset >= page && offset + 4 <= page + kPageSize) return true;
+        return false;
+    };
+    for (const SdmaWrite &w : kSdmaGolden) CHECK(inPages(w.offset));
+    for (const SdmaWrite &w : kSdmaStart) CHECK(inPages(w.offset));
+    for (const SdmaWrite &w : kSdmaStop) CHECK(inPages(w.offset));
+    CHECK(inPages(kRegMp1C2PMsg66) && inPages(kRegMp1C2PMsg82) && inPages(kRegMp1C2PMsg90));
+    // The ring and work-area images (vega10_sdma_pkt_open.h).
+    const uint32_t test[] = {2, 0x40301100u, 0xF4, 0, 0xDEADBEEFu};
+    for (uint32_t i = 0; i < 5; i++) CHECK(sdmaRingWord(i) == test[i]);
+    const uint32_t copy[] = {1, 4095, 0, 0x40302000u, 0xF4, 0x40303000u, 0xF4, 5, 0x40301200u, 0xF4, 1};
+    for (uint32_t i = 0; i < 11; i++) CHECK(sdmaRingWord(256 + i) == copy[i]);
+    CHECK(sdmaRingWord(261) == 0x40303000u);
+    for (uint32_t i = 5; i < 256; i++) CHECK(sdmaRingWord(i) == 0);
+    for (uint32_t i = 267; i < 1024; i++) CHECK(sdmaRingWord(i) == 0);
+    CHECK(sdmaWorkWord(kSdmaSrcPage) == 0x5A5A0000u && sdmaWorkWord(kSdmaDstPage - 4) == 0x5A5A03FFu);
+    CHECK(sdmaWorkWord(kSdmaDstPage) == 0 && sdmaWorkWord(kSdmaWbPage + kSdmaWbFence) == 0);
+    CHECK(sdmaWorkWriteAllowed(0, 2, 15) && !sdmaWorkWriteAllowed(0, 2, 14) && !sdmaWorkWriteAllowed(0, 3, 15));
+    CHECK(!sdmaWorkWriteAllowed(kSdmaWorkSize, 0, 15) && !sdmaWorkWriteAllowed(kSdmaDstPage, 1, 15));
+
+    uint8_t data[80];
+    putCells(data, 0x83000010u, 0x640000000ull, 0x10000000ull);
+    putCells(data + 20, 0x83000018u, 0x650000000ull, 0x200000ull);
+    putCells(data + 40, 0x81000020u, 0xe000ull, 0x100ull);
+    putCells(data + 60, 0x82000024u, 0xfca00000ull, 0x80000ull);
+    Range ranges[8];
+    uint32_t count = 0;
+    CHECK(parseAssignedAddresses(data, sizeof(data), ranges, 8, &count) == kOK);
+    MetricsTarget t;
+    uint32_t index = 0, value = 0;
+    {
+        FakeRegisters r;
+        r.fbOffset = 0x5c0;
+        CHECK(checkSdmaWorkTarget(r.reader(), 0x80000, 15, ranges, count, &t) == kOK && t.physical == 0x600300000ull);
+        CHECK(checkSdmaWorkTarget(r.reader(), 0x80000, 14, ranges, count, &t) == kRegisterNotAllowed);
+        r.presetBoot19();
+        CHECK(checkSdmaBoot19(r.reader(), 0x80000, 15, &index, &value) == kOK);
+        r.sdma[kRegSdma0StatusReg] = 0x12345678; // not pinned
+        CHECK(checkSdmaBoot19(r.reader(), 0x80000, 15, &index, &value) == kOK);
+        r.sdma[kRegSdma0Cntl] = 0x3;
+        CHECK(checkSdmaBoot19(r.reader(), 0x80000, 15, &index, &value) == kSdmaUnexpectedState);
+        CHECK(index == 6 && value == 3);
+    }
+
+    // The whole copy against the fake engine.
+    static uint32_t snapshot[kSdmaWorkCheckSize / 4];
+    {
+        FakeRegisters r;
+        r.presetBoot19();
+        FakeMemory work;
+        for (uint32_t i = 0; i < kSdmaWorkCheckSize / 4; i++) work.words[i] = snapshot[i] = 0x9E3779B9u * i;
+        r.sdmaWork = &work;
+        FakeWriter w(&r);
+        CHECK(writeSdmaWork(work.reader(), work.writer(), 15) == kOK && work.writes == int(kSdmaWorkSize / 4));
+        uint32_t progress = 0, up = 0, down = 0, observed = 0;
+        CHECK(startSdma(r.reader(), 0x80000, w.writer(), 15, &progress, &up) == kOK && progress == 2 && up == 1);
+        CHECK(w.writes == 3 + 10 + 24 && w.values[2] == kSmuMsgPowerUpSdma && w.offsets[3] == kRegSdma0ChickenBits);
+        CHECK(r.sdma[kRegSdma0F32Cntl] == 0 && r.sdma[kRegSdma0GfxRbCntl] == 0x00041015u);
+        CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 15, 1, &observed) == kSdmaOutOfOrder);
+        CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 15, 0, &observed) == kOK);
+        CHECK(observed == 0xDEADBEEFu);
+        CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 15, 1, &observed) == kOK && observed == 1);
+        uint32_t rptr = 0, unexpected = 9, first = 9;
+        CHECK(verifySdmaCopy(r.reader(), 0x80000, work.reader(), snapshot, 15, &rptr, &unexpected, &first) == kOK);
+        CHECK(rptr == 2048 && unexpected == 0);
+        for (uint32_t i = 0; i < 1024; i++) CHECK(work.words[kSdmaDstPage / 4 + i] == 0x5A5A0000u + i);
+        int before = w.writes;
+        CHECK(stopSdma(r.reader(), 0x80000, w.writer(), 15, progress, &down) == kOK && down == 1);
+        CHECK(w.writes == before + 3 + 3 && r.sdma[kRegSdma0F32Cntl] == 1);
+        CHECK(r.sdma[kRegSdma0GfxRbCntl] == 0x00041014u && r.sdma[kRegSdma0GfxIbCntl] == 0x100u);
+    }
+    {
+        // A corrupted copy and a stray write are both caught.
+        FakeRegisters r;
+        r.presetBoot19();
+        FakeMemory work;
+        for (uint32_t i = 0; i < kSdmaWorkCheckSize / 4; i++) work.words[i] = snapshot[i] = 0x9E3779B9u * i;
+        r.sdmaWork = &work;
+        r.sdmaCorruptCopy = r.sdmaStray = true;
+        FakeWriter w(&r);
+        uint32_t progress = 0, up = 0, observed = 0, rptr = 0, unexpected = 0, first = 0;
+        CHECK(writeSdmaWork(work.reader(), work.writer(), 15) == kOK);
+        CHECK(startSdma(r.reader(), 0x80000, w.writer(), 15, &progress, &up) == kOK);
+        CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 15, 0, &observed) == kOK);
+        CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 15, 1, &observed) == kOK);
+        CHECK(verifySdmaCopy(r.reader(), 0x80000, work.reader(), snapshot, 15, &rptr, &unexpected, &first) ==
+              kSdmaVerifyFailed);
+        CHECK(unexpected == 2 && first == kSdmaDstPage + 7 * 4);
+    }
+    {
+        // A halted engine never answers.
+        FakeRegisters r;
+        r.presetBoot19();
+        FakeMemory work;
+        r.sdmaWork = &work;
+        FakeWriter w(&r);
+        uint32_t observed = 0, down = 0;
+        CHECK(writeSdmaWork(work.reader(), work.writer(), 15) == kOK);
+        CHECK(submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 15, 0, &observed) == kSdmaTimeout);
+        CHECK(r.pauses == int(kSdmaPollPauses));
+        int before = w.writes;
+        CHECK(stopSdma(r.reader(), 0x80000, w.writer(), 15, 1, &down) == kOK && w.writes == before + 3);
+        CHECK(stopSdma(r.reader(), 0x80000, w.writer(), 15, 0, &down) == kOK && w.writes == before + 3);
+    }
+    {
+        FakeRegisters r;
+        r.presetBoot19();
+        FakeWriter w(&r);
+        uint32_t down = 0;
+        r.sdma[kRegSdma0F32Cntl] = 0;
+        CHECK(stopSdma(r.reader(), 0x80000, w.writer(), 15, 2, &down) == kOK);
+        CHECK(r.sdma[kRegSdma0F32Cntl] == 1);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -1599,6 +1812,7 @@ int main()
     testPspTmr();
     testSdmaLoad();
     testSdmaInventory();
+    testSdmaCopy();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

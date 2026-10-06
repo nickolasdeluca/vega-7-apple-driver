@@ -110,6 +110,14 @@ class CoreTests(unittest.TestCase):
             "!smuArgumentAllowed(kSmuMsgPowerUpSdma, 1, 14)": (
                 "case kSmuMsgPowerDownSdma: return stage >= kSdmaInventoryStage && argument == 0;",
                 "case kSmuMsgPowerDownSdma: return stage >= kSdmaInventoryStage;"),
+            "kSdmaUnexpectedState": ("if (i != kSdmaStatusIndex && *value != kSdmaBoot19[i]) {",
+                                     "if (i != kSdmaStatusIndex && false) {"),
+            "!writeAllowed(kRegSdma0GbAddrConfig, 0x00100012, 15)": (
+                "return offset == kRegSdma0GfxRbWptr && (value == kSdmaFrameDwords * 4 || value == 2 * kSdmaFrameDwords * 4);",
+                "return (void)value, offset >= kRegSdma0PowerCntl && offset <= kRegSdma0Rlc1RbWptrPollCntl;"),
+            "sdmaRingWord(261) == 0x40303000u": ("uint32_t(destination),", "uint32_t(destination + kSdmaWorkCheckSize),"),
+            "r.sdma[kRegSdma0F32Cntl] == 1": ("    if (progress >= 2) {\n        for (const SdmaWrite &write : kSdmaStop)",
+                                              "    if (progress >= 3) {\n        for (const SdmaWrite &write : kSdmaStop)"),
             "gfxGated(kRegGcApertureHigh)": ("if (kStage10GfxGatedRegisters[i] == offset) return true;", "(void)0;"),
             "registerAllowed(kRegGrbmGfxIndex, 2)": ("stage == 2 ? kStage2RegisterCount",
                                                      "stage == 2 ? kStage3RegisterCount"),
@@ -129,7 +137,7 @@ class CoreTests(unittest.TestCase):
         # The only calls of the write callbacks: writeRegister after the
         # register allowlist, writeWork after the work-area allowlist,
         # writeFirmwareWord after the firmware-buffer allowlist.
-        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 3)
+        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 4)
         firmware = re.search(r"static Status writeFirmwareWord\(.*?\n}\n", source, re.S).group(0)
         self.assertLess(firmware.index("sdmaFirmwareWriteAllowed(image, offset, value, stage)"),
                         firmware.index("write32"))
@@ -140,9 +148,9 @@ class CoreTests(unittest.TestCase):
         self.assertLess(body.index("writeAllowed"), body.index("write32"))
         # Scratch pattern and restore; SMU response, argument and message; PSP
         # arguments (C2PMSG_69, _70, _71) and command; the ring write pointer.
-        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 10)
+        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 14)
         allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
-        self.assertEqual(allow.count("return"), 13)
+        self.assertEqual(allow.count("return"), 14)
         self.assertIn("if (stage >= kScratchStage && offset == kRegScratchReg0) return true;", allow)
         self.assertIn("if (offset == kRegMp1C2PMsg90) return value == 0;", allow)
         # Every SMU message is checked against its argument before any write.

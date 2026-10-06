@@ -31,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 14;
+const uint32_t kMaxStage = 15;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -472,6 +472,83 @@ const uint32_t kSmuMsgPowerDownSdma = 0xD;
 const uint32_t kSmuMsgPowerUpSdma = 0xE;
 const uint32_t kSdmaInventoryStage = 14;
 
+// Stage 15: the first SDMA copy. Values are what Linux v6.12 computes from
+// the registers boot 19 measured; the check requires those values first.
+const uint32_t kSdmaCopyStage = 15;
+// Boot 19, in kSdmaInventory order; STATUS_REG (index 3) is not pinned.
+const uint32_t kSdmaBoot19[] = {0x00000001, 0xdf000100, 0x40000050, 0x46dee557, 0x00040000, 0x25a1ba79,
+                                0x00000002, 0x00831f07, 0x00100012, 0x00100012, 0x00000000, 0xfffbe1fe,
+                                0x00010001, 0x000003e0, 0,          0,          0,          0,
+                                0,          0,          0x00401000, 0,          0,          0x00000100,
+                                0,          0,          0,          0,          0,          0x00401000,
+                                0x00401000};
+const uint32_t kSdmaStatusIndex = 3;
+// The copy work area: ring, write-back, source and destination pages.
+const uint64_t kSdmaWorkCarveoutOffset = 0x40300000ull;
+const uint64_t kSdmaWorkGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kSdmaWorkCarveoutOffset;
+const uint64_t kSdmaWorkPhysical = (uint64_t(kExpectedFbOffset) << 24) + kSdmaWorkCarveoutOffset;
+const uint32_t kSdmaWorkSize = 0x4000;
+const uint32_t kSdmaWorkCheckSize = 0x10000;
+const uint32_t kSdmaWbPage = 0x1000, kSdmaSrcPage = 0x2000, kSdmaDstPage = 0x3000;
+const uint32_t kSdmaWbRptr = 0x000, kSdmaWbPoll = 0x008, kSdmaWbTest = 0x100, kSdmaWbFence = 0x200;
+const uint32_t kSdmaTestValue = 0xDEADBEEF; // sdma_v4_0_ring_test_ring
+const uint32_t kSdmaCopyBytes = 0x1000;
+const uint32_t kSdmaRingDwords = 1024; // RB_SIZE 10
+const uint32_t kSdmaFrameDwords = 256; // align_mask 0xff
+const uint32_t kSdmaSourceBase = 0x5A5A0000;
+// vega10_sdma_pkt_open.h opcodes (sub-op 0: linear).
+const uint32_t kSdmaOpNop = 0, kSdmaOpCopy = 1, kSdmaOpWrite = 2, kSdmaOpFence = 5;
+const uint32_t kSdmaPollPauses = 100; // adev->usec_timeout, 100 ms
+struct SdmaWrite {
+    uint32_t offset, value;
+};
+// golden_settings_sdma_4_3 results from boot 19, in Linux's order.
+const SdmaWrite kSdmaGolden[] = {
+    {kRegSdma0ChickenBits, 0x02831f07},        {kRegSdma0ClkCtrl, 0x3f000100},
+    {kRegSdma0GbAddrConfig, 0x00000002},       {kRegSdma0GbAddrConfigRead, 0x00000002},
+    {kRegSdma0GfxRbWptrPollCntl, 0x00403000},  {kRegSdma0PowerCntl, 0x40000051},
+    {kRegSdma0Rlc0RbWptrPollCntl, 0x00403000}, {kRegSdma0Rlc1RbWptrPollCntl, 0x00403000},
+    {kRegSdma0Utcl1Page, 0x000003e0},          {kRegSdma0Utcl1Watermk, 0x03fbe1fe},
+};
+// sdma_v4_0_start / sdma_v4_0_gfx_resume for one ring without a doorbell.
+const SdmaWrite kSdmaStart[] = {
+    {kRegSdma0F32Cntl, 0x00000000},
+    {kRegSdma0SemWaitFailTimerCntl, 0},
+    {kRegSdma0GfxRbCntl, 0x00040014},
+    {kRegSdma0GfxRbRptr, 0},
+    {kRegSdma0GfxRbRptrHi, 0},
+    {kRegSdma0GfxRbWptr, 0},
+    {kRegSdma0GfxRbWptrHi, 0},
+    {kRegSdma0GfxRbRptrAddrHi, uint32_t((kSdmaWorkGpuAddress + kSdmaWbPage + kSdmaWbRptr) >> 32)},
+    {kRegSdma0GfxRbRptrAddrLo, uint32_t(kSdmaWorkGpuAddress + kSdmaWbPage + kSdmaWbRptr)},
+    {kRegSdma0GfxRbBase, uint32_t(kSdmaWorkGpuAddress >> 8)},
+    {kRegSdma0GfxRbBaseHi, uint32_t(kSdmaWorkGpuAddress >> 40)},
+    {kRegSdma0GfxMinorPtrUpdate, 1},
+    {kRegSdma0GfxDoorbell, 0},
+    {kRegSdma0GfxDoorbellOffset, 0},
+    {kRegSdma0GfxRbWptr, 0},
+    {kRegSdma0GfxRbWptrHi, 0},
+    {kRegSdma0GfxMinorPtrUpdate, 0},
+    {kRegSdma0GfxRbWptrPollAddrLo, uint32_t(kSdmaWorkGpuAddress + kSdmaWbPage + kSdmaWbPoll)},
+    {kRegSdma0GfxRbWptrPollAddrHi, uint32_t((kSdmaWorkGpuAddress + kSdmaWbPage + kSdmaWbPoll) >> 32)},
+    {kRegSdma0GfxRbWptrPollCntl, 0x00403000},
+    {kRegSdma0GfxRbCntl, 0x00041015},
+    {kRegSdma0GfxIbCntl, 0x00000101},
+    {kRegSdma0Cntl, 0x00000002},
+    {kRegSdma0F32Cntl, 0x00000000},
+};
+// The BAR5 pages the stage 15 SDMA operations may write: the SDMA0
+// registers (two pages) and the SMU mailbox (PowerUpSdma/PowerDownSdma).
+// The adapter maps these three for kSdmaPageSet and no others.
+const uint32_t kSdmaPageSet = 0x4000;
+const uint32_t kSdmaPages[] = {0x4000, 0x5000, 0x58000};
+// sdma_v4_0_hw_fini: gfx_enable(false), then halt.
+const SdmaWrite kSdmaStop[] = {
+    {kRegSdma0GfxRbCntl, 0x00041014},
+    {kRegSdma0GfxIbCntl, 0x00000100},
+    {kRegSdma0F32Cntl, 0x00000001},
+};
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -558,6 +635,10 @@ enum Status : uint32_t {
     kSdmaNotHalted,
     // Stage 14.
     kSdmaOutOfOrder,
+    // Stage 15.
+    kSdmaUnexpectedState,
+    kSdmaTimeout,
+    kSdmaVerifyFailed,
 };
 
 const char *statusName(Status status);
@@ -676,7 +757,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 10;
+const uint32_t kDiagnosticVersion = 11;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -708,7 +789,13 @@ enum DiagnosticSelector : uint32_t {
     // Stage 14, after a LOAD_IP_FW that fenced (selector 18).
     kDiagnosticSdmaInventory = 20, // out: Status, PowerUpSdma response, PowerDownSdma response;
                                    // structure: SdmaInventory
-    kDiagnosticSelectorCount = 21,
+    // Stage 15, after a LOAD_IP_FW that fenced (selector 18), in this order.
+    kDiagnosticSdmaCopyCheck = 21, // out: Status, index of the first differing register, its value
+    kDiagnosticSdmaStart = 22,     // out: Status, progress, PowerUpSdma response
+    kDiagnosticSdmaSubmit = 23,    // in: frame (0 ring test, 1 copy); out: Status, observed, GFX_RB_RPTR, GFX_RB_WPTR
+    kDiagnosticSdmaVerify = 24,    // out: Status, GFX_RB_RPTR, unexpected words, first offset, STATUS_REG
+    kDiagnosticSdmaStop = 25,      // out: Status, F32_CNTL, PowerDownSdma response, DESTROY_TMR fence, ring response
+    kDiagnosticSelectorCount = 26,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -959,6 +1046,57 @@ Status readSdmaInventory(const RegisterReader &registers, uint64_t apertureLengt
 // whenever PowerUpSdma was answered OK, even if the second reading fails.
 Status runSdmaInventory(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                         uint32_t stage, SdmaInventory *inventory, uint32_t *upResponse, uint32_t *downResponse);
+
+// Stage 15. Whether a register write is in kSdmaGolden, kSdmaStart or
+// kSdmaStop, or a write-pointer value of a frame (1024 or 2048 bytes).
+bool sdmaWriteListed(uint32_t offset, uint32_t value);
+
+// The SDMA ring's dword at an index: frame 0 (WRITE_LINEAR test), frame 1
+// (COPY_LINEAR and FENCE), plain NOPs elsewhere.
+uint32_t sdmaRingWord(uint32_t dword);
+
+// The work area's word at a byte offset: the ring, a zero write-back page,
+// the source pattern, a zero destination.
+uint32_t sdmaWorkWord(uint32_t offset);
+
+// Work-area writes allowed from stage 15: only its own word.
+bool sdmaWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage);
+
+// The work area and its check region: the stage 9 page checks.
+Status checkSdmaWorkTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                           const Range *ranges, uint32_t rangeCount, MetricsTarget *target);
+
+// Requires every kSdmaInventory register except STATUS_REG to read its boot
+// 19 value (kSdmaUnexpectedState, with the first index and value).
+Status checkSdmaBoot19(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                       uint32_t *value);
+
+// Writes the whole work area, then reads every word back (kPspReadbackMismatch).
+Status writeSdmaWork(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage);
+
+// PowerUpSdma, then kSdmaGolden and kSdmaStart in order. progress: 1 after
+// PowerUpSdma was answered OK, 2 once any SDMA register was written.
+Status startSdma(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                 uint32_t stage, uint32_t *progress, uint32_t *upResponse);
+
+// Requires GFX_RB_WPTR at frame * 1024 bytes (kSdmaOutOfOrder), writes
+// (frame + 1) * 1024, and polls the frame's result word (the test value, or
+// fence 1) in the work area, up to kSdmaPollPauses (kSdmaTimeout).
+Status submitSdma(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                  const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *observed);
+
+// No writes. GFX_RB_RPTR must be 2048; the 64 KiB from the work area must
+// hold the ring, the write-back page (read pointer at +0 and +4 not pinned,
+// the test value, fence 1, else 0), the source, the source again in the
+// destination, then the snapshot. kSdmaVerifyFailed otherwise.
+Status verifySdmaCopy(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &region,
+                      const uint32_t *snapshot, uint32_t stage, uint32_t *rptr, uint32_t *unexpected,
+                      uint32_t *firstOffset);
+
+// Undoes startSdma by progress: kSdmaStop (progress 2), then PowerDownSdma
+// (progress >= 1). Attempts every step; returns the first failure.
+Status stopSdma(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                uint32_t stage, uint32_t progress, uint32_t *downResponse);
 
 } // namespace cezanne
 

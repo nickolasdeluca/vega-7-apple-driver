@@ -75,6 +75,9 @@ const char *statusName(Status status)
     case kSdmaImageInvalid: return "sdma-image-invalid";
     case kSdmaNotHalted: return "sdma-not-halted";
     case kSdmaOutOfOrder: return "sdma-out-of-order";
+    case kSdmaUnexpectedState: return "sdma-unexpected-state";
+    case kSdmaTimeout: return "sdma-timeout";
+    case kSdmaVerifyFailed: return "sdma-verify-failed";
     }
     return "unknown";
 }
@@ -426,6 +429,7 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
 {
     if (stage >= kScratchStage && offset == kRegScratchReg0) return true;
     if (stage < kSmuStage) return false;
+    if (stage >= kSdmaCopyStage && sdmaWriteListed(offset, value)) return true;
     if (offset == kRegMp1C2PMsg90) return value == 0;
     if (offset == kRegMp1C2PMsg82)
         return value == 0 || (stage >= kMetricsStage && (value == uint32_t(kMetricsGpuAddress >> 32) ||
@@ -1150,6 +1154,196 @@ Status runSdmaInventory(const RegisterReader &registers, uint64_t apertureLength
     if (status != kOK) return status;
     if (powered != kOK) return powered;
     return readSdmaInventory(registers, apertureLength, stage, inventory->gated);
+}
+
+bool sdmaWriteListed(uint32_t offset, uint32_t value)
+{
+    for (const SdmaWrite &write : kSdmaGolden)
+        if (write.offset == offset && write.value == value) return true;
+    for (const SdmaWrite &write : kSdmaStart)
+        if (write.offset == offset && write.value == value) return true;
+    for (const SdmaWrite &write : kSdmaStop)
+        if (write.offset == offset && write.value == value) return true;
+    return offset == kRegSdma0GfxRbWptr && (value == kSdmaFrameDwords * 4 || value == 2 * kSdmaFrameDwords * 4);
+}
+
+uint32_t sdmaRingWord(uint32_t dword)
+{
+    const uint64_t wb = kSdmaWorkGpuAddress + kSdmaWbPage;
+    const uint64_t source = kSdmaWorkGpuAddress + kSdmaSrcPage, destination = kSdmaWorkGpuAddress + kSdmaDstPage;
+    // Frame 0: sdma_v4_0_ring_test_ring.
+    const uint32_t test[] = {kSdmaOpWrite, uint32_t(wb + kSdmaWbTest), uint32_t((wb + kSdmaWbTest) >> 32), 0,
+                             kSdmaTestValue};
+    // Frame 1: sdma_v4_0_emit_copy_buffer and sdma_v4_0_ring_emit_fence (no TRAP).
+    const uint32_t copy[] = {kSdmaOpCopy,
+                             kSdmaCopyBytes - 1,
+                             0,
+                             uint32_t(source),
+                             uint32_t(source >> 32),
+                             uint32_t(destination),
+                             uint32_t(destination >> 32),
+                             kSdmaOpFence,
+                             uint32_t(wb + kSdmaWbFence),
+                             uint32_t((wb + kSdmaWbFence) >> 32),
+                             1};
+    if (dword < 5) return test[dword];
+    if (dword >= kSdmaFrameDwords && dword < kSdmaFrameDwords + 11) return copy[dword - kSdmaFrameDwords];
+    return kSdmaOpNop;
+}
+
+uint32_t sdmaWorkWord(uint32_t offset)
+{
+    if (offset < kSdmaWbPage) return sdmaRingWord(offset / 4);
+    if (offset >= kSdmaSrcPage && offset < kSdmaDstPage) return kSdmaSourceBase + (offset - kSdmaSrcPage) / 4;
+    return 0;
+}
+
+bool sdmaWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
+{
+    if (stage < kSdmaCopyStage || (offset & 3) != 0 || offset >= kSdmaWorkSize) return false;
+    return value == sdmaWorkWord(offset);
+}
+
+static Status writeSdmaWorkWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset)
+{
+    uint32_t value = sdmaWorkWord(offset);
+    if (!sdmaWorkWriteAllowed(offset, value, stage)) return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+Status checkSdmaWorkTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                           const Range *ranges, uint32_t rangeCount, MetricsTarget *target)
+{
+    *target = MetricsTarget();
+    if (stage < kSdmaCopyStage) return kRegisterNotAllowed;
+    Status status = checkCarveoutPage(registers, apertureLength, stage, kSdmaWorkCarveoutOffset, kSdmaWorkCheckSize,
+                                      ranges, rangeCount, target);
+    if (status != kOK) return status;
+    if (target->gpuAddress != kSdmaWorkGpuAddress || target->physical != kSdmaWorkPhysical)
+        return kMetricsAddressMismatch;
+    return kOK;
+}
+
+Status checkSdmaBoot19(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                       uint32_t *value)
+{
+    *index = *value = 0;
+    if (stage < kSdmaCopyStage) return kRegisterNotAllowed;
+    for (uint32_t i = 0; i < kSdmaInventoryCount; i++) {
+        Status status = readRegister(registers, apertureLength, stage, kSdmaInventory[i], value);
+        if (status != kOK) return status;
+        if (i != kSdmaStatusIndex && *value != kSdmaBoot19[i]) {
+            *index = i;
+            return kSdmaUnexpectedState;
+        }
+    }
+    *value = 0;
+    return kOK;
+}
+
+Status writeSdmaWork(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage)
+{
+    if (stage < kSdmaCopyStage) return kRegisterNotAllowed;
+    for (uint32_t offset = 0; offset < kSdmaWorkSize; offset += 4) {
+        Status status = writeSdmaWorkWord(writer, stage, offset);
+        if (status != kOK) return status;
+    }
+    for (uint32_t offset = 0; offset < kSdmaWorkSize; offset += 4) {
+        uint32_t value = 0;
+        if (!work.read32(work.context, offset, &value)) return kRegisterReadFailed;
+        if (value != sdmaWorkWord(offset)) return kPspReadbackMismatch;
+    }
+    return kOK;
+}
+
+Status startSdma(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                 uint32_t stage, uint32_t *progress, uint32_t *upResponse)
+{
+    *progress = *upResponse = 0;
+    if (stage < kSdmaCopyStage) return kRegisterNotAllowed;
+    Status status = sendSmuMessage(registers, apertureLength, writer, stage, kSmuMsgPowerUpSdma, 0, upResponse, nullptr);
+    if (status != kOK) return status;
+    *progress = 1;
+    for (const SdmaWrite &write : kSdmaGolden) {
+        *progress = 2;
+        status = writeRegister(writer, stage, write.offset, write.value);
+        if (status != kOK) return status;
+    }
+    for (const SdmaWrite &write : kSdmaStart) {
+        status = writeRegister(writer, stage, write.offset, write.value);
+        if (status != kOK) return status;
+    }
+    return kOK;
+}
+
+Status submitSdma(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                  const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *observed)
+{
+    *observed = 0;
+    if (stage < kSdmaCopyStage || frame > 1) return kRegisterNotAllowed;
+    uint32_t pointer = 0;
+    Status status = readRegister(registers, apertureLength, stage, kRegSdma0GfxRbWptr, &pointer);
+    if (status != kOK) return status;
+    if (pointer != frame * kSdmaFrameDwords * 4) return kSdmaOutOfOrder;
+    status = writeRegister(writer, stage, kRegSdma0GfxRbWptr, (frame + 1) * kSdmaFrameDwords * 4);
+    if (status != kOK) return status;
+    const uint32_t at = kSdmaWbPage + (frame == 0 ? kSdmaWbTest : kSdmaWbFence);
+    const uint32_t expected = frame == 0 ? kSdmaTestValue : 1;
+    for (uint32_t i = 0; i <= kSdmaPollPauses; i++) {
+        if (!work.read32(work.context, at, observed)) return kRegisterReadFailed;
+        if (*observed == expected) return kOK;
+        if (i == kSdmaPollPauses) return kSdmaTimeout;
+        writer.pause(writer.context);
+    }
+    return kSdmaTimeout;
+}
+
+Status verifySdmaCopy(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &region,
+                      const uint32_t *snapshot, uint32_t stage, uint32_t *rptr, uint32_t *unexpected,
+                      uint32_t *firstOffset)
+{
+    *rptr = *unexpected = *firstOffset = 0;
+    if (stage < kSdmaCopyStage) return kRegisterNotAllowed;
+    Status status = readRegister(registers, apertureLength, stage, kRegSdma0GfxRbRptr, rptr);
+    if (status != kOK) return status;
+    for (uint32_t offset = 0; offset < kSdmaWorkCheckSize; offset += 4) {
+        uint32_t value = 0;
+        if (!region.read32(region.context, offset, &value)) return kRegisterReadFailed;
+        bool ok;
+        if (offset < kSdmaWbPage || (offset >= kSdmaSrcPage && offset < kSdmaDstPage)) {
+            ok = value == sdmaWorkWord(offset);
+        } else if (offset >= kSdmaWbPage && offset < kSdmaSrcPage) {
+            uint32_t at = offset - kSdmaWbPage;
+            ok = at == kSdmaWbRptr || at == kSdmaWbRptr + 4 ||
+                 value == (at == kSdmaWbTest ? kSdmaTestValue : at == kSdmaWbFence ? 1u : 0u);
+        } else if (offset >= kSdmaDstPage && offset < kSdmaWorkSize) {
+            ok = value == sdmaWorkWord(offset - kSdmaDstPage + kSdmaSrcPage);
+        } else {
+            ok = value == snapshot[offset / 4];
+        }
+        if (!ok && (*unexpected)++ == 0) *firstOffset = offset;
+    }
+    return *rptr == 2 * kSdmaFrameDwords * 4 && *unexpected == 0 ? kOK : kSdmaVerifyFailed;
+}
+
+Status stopSdma(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                uint32_t stage, uint32_t progress, uint32_t *downResponse)
+{
+    *downResponse = 0;
+    if (stage < kSdmaCopyStage) return kRegisterNotAllowed;
+    Status first = kOK;
+    if (progress >= 2) {
+        for (const SdmaWrite &write : kSdmaStop) {
+            Status status = writeRegister(writer, stage, write.offset, write.value);
+            if (first == kOK) first = status;
+        }
+    }
+    if (progress >= 1) {
+        Status status = sendSmuMessage(registers, apertureLength, writer, stage, kSmuMsgPowerDownSdma, 0,
+                                       downResponse, nullptr);
+        if (first == kOK) first = status;
+    }
+    return first;
 }
 
 } // namespace cezanne
