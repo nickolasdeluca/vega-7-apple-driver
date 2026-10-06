@@ -8,11 +8,11 @@
 // teardown through the ring (--psp-tmr) and the stage 13 SDMA0 firmware load
 // (--psp-sdma), and the stage 14 SDMA power-up register inventory
 // (--sdma-inventory), and the stage 15 first SDMA copy (--sdma-copy).
-// --psp-state (stage 10) only reads.
+// --psp-state (stage 10) and --inventory16 (stage 16) only read.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
 //                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--sdma-inventory]
-//                          [--sdma-copy] [--psp-state]
+//                          [--sdma-copy] [--psp-state] [--inventory16]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -32,7 +32,7 @@ struct Named {
     uint32_t offset;
 };
 
-// Every register the driver allows at stage 14, in its list order; earlier
+// Every register the driver allows at stage 16, in its list order; earlier
 // stages allow a prefix.
 const Named kRegisters[] = {
     {"MP0_SMN_C2PMSG_33", kRegC2PMsg33},
@@ -136,8 +136,101 @@ const Named kRegisters[] = {
     {"SDMA0_GFX_MINOR_PTR_UPDATE", kRegSdma0GfxMinorPtrUpdate},
     {"SDMA0_RLC0_RB_WPTR_POLL_CNTL", kRegSdma0Rlc0RbWptrPollCntl},
     {"SDMA0_RLC1_RB_WPTR_POLL_CNTL", kRegSdma0Rlc1RbWptrPollCntl},
+    // Stage 16.
+    {"OTG0_OTG_CONTROL", kRegOtg0OtgControl},
+    {"OTG0_OTG_H_TOTAL", kRegOtg0OtgHTotal},
+    {"OTG0_OTG_V_TOTAL", kRegOtg0OtgVTotal},
+    {"OTG0_OTG_H_BLANK_START_END", kRegOtg0OtgHBlankStartEnd},
+    {"OTG0_OTG_V_BLANK_START_END", kRegOtg0OtgVBlankStartEnd},
+    {"HUBP0_DCHUBP_CNTL", kRegHubp0DchubpCntl},
+    {"HUBP0_DCSURF_SURFACE_CONFIG", kRegHubp0DcsurfSurfaceConfig},
+    {"HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION", kRegHubp0DcsurfPriViewportDimension},
+    {"HUBPREQ0_DCSURF_SURFACE_PITCH", kRegHubpreq0DcsurfSurfacePitch},
+    {"HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS", kRegHubpreq0DcsurfPrimarySurfaceAddress},
+    {"HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH", kRegHubpreq0DcsurfPrimarySurfaceAddressHigh},
+    {"OTG1_OTG_CONTROL", kRegOtg1OtgControl},
+    {"OTG1_OTG_H_TOTAL", kRegOtg1OtgHTotal},
+    {"OTG1_OTG_V_TOTAL", kRegOtg1OtgVTotal},
+    {"OTG1_OTG_H_BLANK_START_END", kRegOtg1OtgHBlankStartEnd},
+    {"OTG1_OTG_V_BLANK_START_END", kRegOtg1OtgVBlankStartEnd},
+    {"HUBP1_DCHUBP_CNTL", kRegHubp1DchubpCntl},
+    {"HUBP1_DCSURF_SURFACE_CONFIG", kRegHubp1DcsurfSurfaceConfig},
+    {"HUBP1_DCSURF_PRI_VIEWPORT_DIMENSION", kRegHubp1DcsurfPriViewportDimension},
+    {"HUBPREQ1_DCSURF_SURFACE_PITCH", kRegHubpreq1DcsurfSurfacePitch},
+    {"HUBPREQ1_DCSURF_PRIMARY_SURFACE_ADDRESS", kRegHubpreq1DcsurfPrimarySurfaceAddress},
+    {"HUBPREQ1_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH", kRegHubpreq1DcsurfPrimarySurfaceAddressHigh},
+    {"OTG2_OTG_CONTROL", kRegOtg2OtgControl},
+    {"OTG2_OTG_H_TOTAL", kRegOtg2OtgHTotal},
+    {"OTG2_OTG_V_TOTAL", kRegOtg2OtgVTotal},
+    {"OTG2_OTG_H_BLANK_START_END", kRegOtg2OtgHBlankStartEnd},
+    {"OTG2_OTG_V_BLANK_START_END", kRegOtg2OtgVBlankStartEnd},
+    {"HUBP2_DCHUBP_CNTL", kRegHubp2DchubpCntl},
+    {"HUBP2_DCSURF_SURFACE_CONFIG", kRegHubp2DcsurfSurfaceConfig},
+    {"HUBP2_DCSURF_PRI_VIEWPORT_DIMENSION", kRegHubp2DcsurfPriViewportDimension},
+    {"HUBPREQ2_DCSURF_SURFACE_PITCH", kRegHubpreq2DcsurfSurfacePitch},
+    {"HUBPREQ2_DCSURF_PRIMARY_SURFACE_ADDRESS", kRegHubpreq2DcsurfPrimarySurfaceAddress},
+    {"HUBPREQ2_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH", kRegHubpreq2DcsurfPrimarySurfaceAddressHigh},
+    {"OTG3_OTG_CONTROL", kRegOtg3OtgControl},
+    {"OTG3_OTG_H_TOTAL", kRegOtg3OtgHTotal},
+    {"OTG3_OTG_V_TOTAL", kRegOtg3OtgVTotal},
+    {"OTG3_OTG_H_BLANK_START_END", kRegOtg3OtgHBlankStartEnd},
+    {"OTG3_OTG_V_BLANK_START_END", kRegOtg3OtgVBlankStartEnd},
+    {"HUBP3_DCHUBP_CNTL", kRegHubp3DchubpCntl},
+    {"HUBP3_DCSURF_SURFACE_CONFIG", kRegHubp3DcsurfSurfaceConfig},
+    {"HUBP3_DCSURF_PRI_VIEWPORT_DIMENSION", kRegHubp3DcsurfPriViewportDimension},
+    {"HUBPREQ3_DCSURF_SURFACE_PITCH", kRegHubpreq3DcsurfSurfacePitch},
+    {"HUBPREQ3_DCSURF_PRIMARY_SURFACE_ADDRESS", kRegHubpreq3DcsurfPrimarySurfaceAddress},
+    {"HUBPREQ3_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH", kRegHubpreq3DcsurfPrimarySurfaceAddressHigh},
+    {"DCN_VM_FB_LOCATION_BASE", kRegDcnVmFbLocationBase},
+    {"DCN_VM_FB_LOCATION_TOP", kRegDcnVmFbLocationTop},
+    {"DCN_VM_FB_OFFSET", kRegDcnVmFbOffset},
+    {"DCN_VM_AGP_BASE", kRegDcnVmAgpBase},
+    {"DCN_VM_AGP_BOT", kRegDcnVmAgpBot},
+    {"DCN_VM_AGP_TOP", kRegDcnVmAgpTop},
+    {"DIG0_DIG_BE_CNTL", kRegDig0DigBeCntl},
+    {"DIG1_DIG_BE_CNTL", kRegDig1DigBeCntl},
+    {"DIG2_DIG_BE_CNTL", kRegDig2DigBeCntl},
+    {"DIG3_DIG_BE_CNTL", kRegDig3DigBeCntl},
+    {"DIG4_DIG_BE_CNTL", kRegDig4DigBeCntl},
+    {"VM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32", kRegVmContext0PageTableBaseAddrLo32},
+    {"VM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32", kRegVmContext0PageTableBaseAddrHi32},
+    {"VM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32", kRegVmContext0PageTableStartAddrLo32},
+    {"VM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32", kRegVmContext0PageTableStartAddrHi32},
+    {"VM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32", kRegVmContext0PageTableEndAddrLo32},
+    {"VM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32", kRegVmContext0PageTableEndAddrHi32},
+    {"VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32", kRegVmL2ProtectionFaultDefaultAddrLo32},
+    {"VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32", kRegVmL2ProtectionFaultDefaultAddrHi32},
+    {"VM_L2_PROTECTION_FAULT_CNTL", kRegVmL2ProtectionFaultCntl},
+    {"VM_L2_PROTECTION_FAULT_CNTL2", kRegVmL2ProtectionFaultCntl2},
+    {"VM_L2_PROTECTION_FAULT_STATUS", kRegVmL2ProtectionFaultStatus},
+    {"VM_L2_CNTL2", kRegVmL2Cntl2},
+    {"VM_L2_CNTL3", kRegVmL2Cntl3},
+    {"VM_L2_CNTL4", kRegVmL2Cntl4},
+    {"VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32", kRegVmL2Context1IdentityApertureLowAddrLo32},
+    {"VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_HI32", kRegVmL2Context1IdentityApertureLowAddrHi32},
+    {"VM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32", kRegVmL2Context1IdentityApertureHighAddrLo32},
+    {"VM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_HI32", kRegVmL2Context1IdentityApertureHighAddrHi32},
+    {"VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32", kRegVmL2ContextIdentityPhysicalOffsetLo32},
+    {"VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_HI32", kRegVmL2ContextIdentityPhysicalOffsetHi32},
+    {"VM_INVALIDATE_ENG17_ACK", kRegVmInvalidateEng17Ack},
+    {"VM_INVALIDATE_ENG17_SEM", kRegVmInvalidateEng17Sem},
+    {"VM_INVALIDATE_ENG0_ADDR_RANGE_LO32", kRegVmInvalidateEng0AddrRangeLo32},
+    {"VM_INVALIDATE_ENG0_ADDR_RANGE_HI32", kRegVmInvalidateEng0AddrRangeHi32},
+    {"IH_RB_BASE", kRegIhRbBase},
+    {"IH_RB_BASE_HI", kRegIhRbBaseHi},
+    {"IH_RB_WPTR", kRegIhRbWptr},
+    {"IH_RB_RPTR", kRegIhRbRptr},
+    {"IH_RB_WPTR_ADDR_LO", kRegIhRbWptrAddrLo},
+    {"IH_RB_WPTR_ADDR_HI", kRegIhRbWptrAddrHi},
+    {"IH_DOORBELL_RPTR", kRegIhDoorbellRptr},
+    {"IH_CHICKEN", kRegIhChicken},
+    {"IH_RB_CNTL_RING1", kRegIhRbCntlRing1},
+    {"IH_RB_CNTL_RING2", kRegIhRbCntlRing2},
+    {"INTERRUPT_CNTL", kRegInterruptCntl},
+    {"INTERRUPT_CNTL2", kRegInterruptCntl2},
+    {"BIF_IH_DOORBELL_RANGE", kRegBifIhDoorbellRange},
 };
-static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage14RegisterCount, "one name per register");
+static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage16RegisterCount, "one name per register");
 
 const char *registerName(uint32_t offset)
 {
@@ -152,6 +245,7 @@ void usage(FILE *out)
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
                       "                         [--psp-sdma] [--sdma-inventory] [--sdma-copy] [--psp-state]\n"
+                      "                         [--inventory16]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
@@ -169,7 +263,8 @@ void usage(FILE *out)
                       "it and after PowerDownSdma, before the teardown.\n"
                       "--sdma-copy does --psp-sdma, then starts SDMA0, runs the ring test and one 4 KiB copy with a\n"
                       "fence, verifies it, and halts, powers down and tears down.\n"
-                      "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n");
+                      "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n"
+                      "--inventory16 first reads the display, memory-hub VM and interrupt registers (reads only).\n");
 }
 
 bool parseCount(const char *text, unsigned long max, unsigned long *value)
@@ -811,11 +906,75 @@ bool pspSdma(io_connect_t connection, int mode)
     return loadedCall && loaded[0] == kOK && observedCall && observed[0] == kOK && inventoried && torn;
 }
 
+// Reads a list through the driver into values, printing each name first.
+// Returns the number of failed reads.
+int readList(io_connect_t connection, const uint32_t *offsets, uint32_t count, uint32_t *values, bool print)
+{
+    int failed = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (print) {
+            std::printf("  %-48s 0x%05x  ", registerName(offsets[i]), offsets[i]);
+            std::fflush(stdout);
+        }
+        uint64_t input = offsets[i], output[2] = {0, 0};
+        uint32_t outputCount = 2;
+        kern_return_t result =
+            IOConnectCallScalarMethod(connection, kDiagnosticReadRegister, &input, 1, output, &outputCount);
+        values[i] = static_cast<uint32_t>(output[1]);
+        bool ok = result == KERN_SUCCESS && outputCount == 2 && output[0] == kOK;
+        if (!ok) failed++;
+        if (print) {
+            if (ok)
+                std::printf("0x%08x\n", values[i]);
+            else
+                std::printf("%s\n", result == KERN_SUCCESS ? statusName(static_cast<Status>(output[0])) : "call failed");
+        }
+    }
+    return failed;
+}
+
+// The stage 16 inventory: display, VM, interrupts, then the display again.
+bool inventory16(io_connect_t connection)
+{
+    uint32_t display[kDisplayInventoryCount], vm[kVmInventoryCount], ih[kIhInventoryCount],
+        again[kDisplayInventoryCount];
+    std::printf("inventory16 A: display (DCN 2.1)\n");
+    int failed = readList(connection, kDisplayInventory, kDisplayInventoryCount, display, true);
+    std::printf("inventory16 B: memory hub VM (GART path)\n");
+    failed += readList(connection, kVmInventory, kVmInventoryCount, vm, true);
+    std::printf("inventory16 C: interrupts (IH, NBIO)\n");
+    failed += readList(connection, kIhInventory, kIhInventoryCount, ih, true);
+    std::printf("inventory16 A again: display\n");
+    failed += readList(connection, kDisplayInventory, kDisplayInventoryCount, again, false);
+    for (uint32_t i = 0; i < kDisplayInventoryCount; i++) {
+        if (display[i] != again[i])
+            std::printf("  changed: %s 0x%08x -> 0x%08x\n", registerName(kDisplayInventory[i]), display[i], again[i]);
+    }
+    // Decode each pipe: OTG enable and timing, HUBP surface.
+    for (uint32_t pipe = 0; pipe < kDisplayPipes; pipe++) {
+        const uint32_t *r = display + pipe * kDisplayPipeRegisters;
+        uint32_t control = r[0], hTotal = r[1] & 0x7FFF, vTotal = r[2] & 0x7FFF;
+        uint32_t hStart = r[3] & 0x7FFF, hEnd = (r[3] >> 16) & 0x7FFF, vStart = r[4] & 0x7FFF,
+                 vEnd = (r[4] >> 16) & 0x7FFF;
+        uint32_t blank = r[5] & 1, format = r[6] & 0x7F, width = r[7] & 0x3FFF, height = (r[7] >> 16) & 0x3FFF,
+                 pitch = r[8] & 0x3FFF;
+        uint64_t surface = (uint64_t(r[10]) << 32) | r[9];
+        std::printf("pipe %u: OTG %s, total %ux%u, active %ux%u; HUBP %s, surface 0x%010llx%s, viewport %ux%u,"
+                    " pitch %u, format %u\n",
+                    pipe, (control & kOtgMasterEn) ? "enabled" : "off", hTotal + 1, vTotal + 1, hStart - hEnd,
+                    vStart - vEnd, blank ? "blanked" : "unblanked", static_cast<unsigned long long>(surface),
+                    surface == (uint64_t(kExpectedFbLocationBase) << 24) ? " (GOP framebuffer, carveout offset 0)" : "",
+                    width, height, pitch + 1, format);
+    }
+    std::printf("%d failed reads\n", failed);
+    return failed == 0;
+}
+
 int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
     bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
-         inventory = false, copy = false, psp = false;
+         inventory = false, copy = false, psp = false, inventory16Flag = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -851,6 +1010,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--sdma-copy") == 0) {
             copy = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--inventory16") == 0) {
+            inventory16Flag = true;
             continue;
         }
         if (std::strcmp(argv[i], "--psp-state") == 0) {
@@ -901,7 +1064,8 @@ int main(int argc, char **argv)
     std::printf("CezanneGPU diagnostics v%llu, driver stage %llu\n", static_cast<unsigned long long>(info[0]),
                 static_cast<unsigned long long>(info[1]));
 
-    const uint32_t count = info[1] >= 14  ? kStage14RegisterCount
+    const uint32_t count = info[1] >= 16  ? kStage16RegisterCount
+                           : info[1] >= 14 ? kStage14RegisterCount
                            : info[1] >= 13 ? kStage13RegisterCount
                            : info[1] >= 10 ? kStage10RegisterCount
                            : info[1] >= 6 ? kStage6RegisterCount
@@ -979,6 +1143,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!pspSdma(connection, 2)) failures++;
+    }
+    if (inventory16Flag) {
+        if (info[1] < kInventory16Stage) {
+            std::fprintf(stderr, "cezanne-diag: --inventory16 needs driver stage %u\n", kInventory16Stage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!inventory16(connection)) failures++;
     }
     if (psp) {
         if (info[1] < kPspStateStage) {

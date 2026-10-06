@@ -41,6 +41,7 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(tmr\) \{[^}]*info\[1\] < kPspTmrStage")
         self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["0", "1", "2"])
         self.assertRegex(source, r"if \(copy\) \{[^}]*info\[1\] < kSdmaCopyStage")
+        self.assertRegex(source, r"if \(inventory16Flag\) \{[^}]*info\[1\] < kInventory16Stage")
         self.assertRegex(source, r"if \(inventory\) \{[^}]*info\[1\] < kSdmaInventoryStage")
         self.assertRegex(source, r"if \(sdma\) \{[^}]*info\[1\] < kPspSdmaStage")
         self.assertEqual(len(re.findall(r"\bpspState\(connection\)", source)), 1)
@@ -49,10 +50,10 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(scratch\) \{[^}]*info\[1\] < kScratchStage")
         self.assertIn('std::strcmp(argv[i], "--scratch-test") == 0', source)
 
-    def test_tool_names_every_stage_14_register_in_order(self):
+    def test_tool_names_every_stage_16_register_in_order(self):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
-        listed = re.search(r"kStage14Registers\[\] = \{([^}]*)\}", header).group(1)
+        listed = re.search(r"kStage16Registers\[\] = \{([^}]*)\}", header).group(1)
         expected = [name.strip() for name in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
 
