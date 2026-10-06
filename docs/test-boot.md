@@ -18,7 +18,8 @@ so no SMU message was sent. Its check needs a better criterion before
 another attempt. The [SysReport dump boot](#sysreport-dump-boot) gave the
 VBIOS: the firmware reserves no carveout memory. With the
 [revised check](#revision-stage-9-free-page-check), stage 9 read the SMU
-metrics table in boot 13. No later stage is authorized.
+metrics table in boot 13. Stage 10 (read-only PSP and aperture state) is
+approved and built, not yet booted. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -72,6 +73,10 @@ off restores the known-good boot. This is the experimental environment
    - **Stage 9** (proposed and approved by the user on 2026-10-05): stage 8
      plus the SMU metrics table, written by the SMU into one checked carveout
      page on request, described [below](#stage-9-smu-metrics-table).
+   - **Stage 10** (proposed 2026-10-06 and approved by the user the same
+     day): stage 9 plus 21 read-only PSP mailbox and memory-aperture
+     registers, read only through the diagnostic interface, described
+     [below](#stage-10-psp-and-memory-aperture-state-proposal). No new write.
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -1242,7 +1247,9 @@ Do not sleep the machine.
 
 ### Stage 10: PSP and memory-aperture state (proposal)
 
-**Status: proposed 2026-10-06, not approved, not implemented.**
+**Status: proposed 2026-10-06, approved by the user the same day, and
+implemented as proposed; not yet booted.** The heading keeps "proposal" so
+links stay stable.
 
 **Purpose.** Prepare the first firmware load. Linux v6.12 loads every
 Renoir/Green Sardine engine firmware (SDMA, CP, RLC, …) through the PSP
@@ -1354,7 +1361,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -1461,6 +1468,21 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 10 succeeds when:
+
+- the stage 9 conditions hold with `CezanneGPU stage` 10 (running
+  `--smu-metrics` again is optional);
+- `sudo cezanne-diag --gfxoff-disallow --psp-state` reports `ok` for the
+  message and reads every stage 10 register, and the plain dump lists all 70
+  registers with values;
+- the values are recorded and compared with the expectations in the stage 10
+  section;
+- the machine stays as before.
+
+A `gfx-not-on` on the GC-hub registers is a finding, not a failure (run
+`--gfxoff-disallow` first). Save the output with `tee` in an ignored
+directory. Nothing in stage 10 writes, so no backup step is added.
 
 Stage 9 succeeds when:
 

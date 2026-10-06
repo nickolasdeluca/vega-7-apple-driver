@@ -133,7 +133,15 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: choose the next reviewed step
+## Next task: boot stage 10, then propose stage 11
+
+Stage 10 (read-only PSP mailbox and memory-aperture state, the step before
+the first PSP write) is approved and built: `out/test-efi/usb-stage10`,
+`out/diag/cezanne-diag --psp-state`. Next: the user copies it to the stick
+and boots it; record the boot in the test boot log; then, if the PSP is
+ready and no ring exists, propose stage 11 (IH reroute and creating and
+destroying a kernel-mode PSP ring, no firmware), as the stage 10 section
+describes.
 
 Stages 0–9 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
 

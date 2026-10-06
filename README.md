@@ -79,7 +79,9 @@ experiments run only from that USB EFI. `tools/diag/build.sh` builds
 root-only diagnostic interface during a stage 4 or later test boot;
 `--scratch-test` runs the stage 6 reversible write test, `--smu-query` the
 stage 7 SMU version queries, `--gfxoff-disallow` the stage 8
-`DisallowGfxOff` message and `--smu-metrics` the stage 9 metrics table.
+`DisallowGfxOff` message and `--smu-metrics` the stage 9 metrics table;
+`--psp-state` (stage 10, reads only) decodes the PSP ring mailbox and the
+memory-hub apertures.
 
 ## Verify
 
