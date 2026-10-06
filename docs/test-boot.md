@@ -41,8 +41,11 @@ the interrupt ring) succeeded in boot 25: the MMHUB GART translated an SDMA
 read through a driver-built page table, the SDMA0 trap arrived in IH ring 0,
 and every register was restored. Boot 24 had stopped at the precondition
 check on a live display status bit, since fixed. Stage 18 (interrupt
-delivery) is approved and built (`usb-stage18`), and waits for its first
-boot; no later stage is authorized.
+delivery) is approved and built. Its first boot (26) delivered the SDMA0
+trap as an MSI to the kext's handler, but the verify counted a second MSI
+that arrived before the trap; the verify now counts only MSIs after the
+submit and records each one's time, rebuilt for boot 27. No later stage is
+authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -3160,7 +3163,9 @@ also removes the event source if it is still registered.
   `0x20`. The allowlist accepts any 32-byte entry boundary inside the 4 KiB
   ring, so that another client's entry before the trap does not block the
   acknowledgement. With only the trap, the value is `0x20`.
-- **The verify requires exactly one MSI,** and `kIntrNotDelivered` is kept
+- **The verify requires exactly one MSI after the frame 3 submit** (revised
+  after boot 26; it first required exactly one in all). MSIs before the
+  submit are counted and timed, not required. `kIntrNotDelivered` is kept
   apart from other failures. It does not require exactly one IH entry:
   another client's entry is recorded, and can take the one MSI instead.
 - **`GFX_RB_RPTR` after frame 3** is reported, not required (4096 or 0).
@@ -4315,6 +4320,45 @@ boot-25-stage17 --gfxoff-disallow --gart-ih --psp-state`; exit 0).
   The engine 17 range registers read 0/0, as assumed.
 - Captures are in ignored `out/test-efi/boot-25-stage17/`.
 - Result: **stage 17 succeeded.**
+
+**Boot 26, 2026-10-06, stage 18** (`out/test-efi/usb-stage18/`, first
+build; cold boot; `tools/capture_boot.sh boot-26-stage18 --gfxoff-disallow
+--ih-intr --psp-state`; exit 1).
+
+- The stage 15 copy and the whole stage 17 flow passed as in boot 25.
+- **Check:** ok. The MSI vector is interrupt index 1. Its capability read
+  control `0x0084` (64-bit, disabled), address `0xfee00000`, data `0x4079`.
+- **Enable:** ok, progress 2. macOS enabled the capability (control
+  `0x0085`), with the same address and data.
+- **Frame 3:** fence 3; `GFX_RB_RPTR` read 4096.
+- **Verify: `intr-verify-failed`, because the MSI count was 2.**
+  - Everything else passed: one ring entry (client 8, source 224), fence 3,
+    no VM fault, both regions clean, display unchanged.
+  - The entry's dw1 now holds a GPU timestamp (`3e2870d9`, from
+    `RB_GPU_TS_ENABLE`), and dw2 is 2.
+  - `IH_RB_CNTL` read back `0x40330195`: `WPTR_OVERFLOW_CLEAR` (bit 31)
+    reads 0, so it acts as a write strobe.
+  - The latency read 0 µs, which the kext reports when the first MSI came
+    **before** the frame 3 write pointer was written. So one MSI arrived
+    after the handler was enabled and before the trap existed, most likely
+    at the `ENABLE_INTR` write while the ring was empty. The second is the
+    trap's. With `RPTR_REARM` and no `IH_RB_RPTR` write between them, the
+    first did not block the second.
+- The acknowledgement was skipped (the verify had failed). The interrupt
+  restore, the stage 17 restore and the stop all passed, and the MSI
+  capability went back to disabled (`0x0084`). The final dump shows every
+  IH, NBIO, GART and `SDMA0_CNTL` register at its boot 22 value.
+- The machine stayed up and the display was unchanged: **the first
+  interrupt handler worked.**
+- **Fix (within the stage):** the kext records the MSI count when frame 3 is
+  submitted and the time of each of the first 8 MSIs. The verify requires
+  exactly one MSI after the submit, and reports those before it. The tool
+  prints every MSI's time from the `ENABLE_INTR` write, and the submit's. No
+  register, value or step changed. The first build is kept as
+  `superseded-*-stage18-count`.
+- Captures are in ignored `out/test-efi/boot-26-stage18/`.
+- Result: **MSI delivery works; the verify's count is fixed.** Boot 27
+  repeats the run and should show when the extra MSI arrives.
 
 ## Unknowns and limits
 

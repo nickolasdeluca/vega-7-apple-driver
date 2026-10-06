@@ -21,8 +21,9 @@ following:
 
 Stage 17 (GART and the IH ring) succeeded in boot 25: an SDMA copy read
 through a driver-built GART page table, its trap arrived in IH ring 0, and
-everything was restored. Stage 18 (MSI interrupt delivery) is approved and
-built, waiting for its first boot; see "Next task" below. The sections that follow are the earlier discovery record and
+everything was restored. Stage 18 (MSI interrupt delivery) delivered the
+trap as an MSI in boot 26; the verify's count was fixed and rebuilt for boot
+27; see "Next task" below. The sections that follow are the earlier discovery record and
 still apply.
 
 Completed work:
@@ -136,24 +137,26 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 18 (approved and built 2026-10-06)
+## Next task: boot stage 18 again (boot 27)
 
-**Resume here.** Stage 18 (interrupt delivery, the
-[proposal](test-boot.md#stage-18-interrupt-delivery-proposal)) is implemented
-and built; it has not been booted. The display test pattern follows as stage
-19, proposed after this boot. Steps:
+**Resume here.** Boot 26 (2026-10-06) delivered SDMA0's trap as an MSI to the
+kext's handler, but counted a second MSI that came before the trap (see the
+boot 26 entry in the [test boot log](test-boot.md#test-boot-log)). The verify
+now counts only MSIs after the submit and records each one's time. The
+display test pattern follows as stage 19. Steps:
 
-1. The user makes a Time Machine backup, runs `tools/update_stick.sh 18`,
-   cold boots the stick, and runs
-   `tools/capture_boot.sh boot-26-stage18 --gfxoff-disallow --ih-intr --psp-state`.
+1. The user runs `tools/update_stick.sh 18` (the stick holds the first
+   build), cold boots the stick, and runs
+   `tools/capture_boot.sh boot-27-stage18 --gfxoff-disallow --ih-intr --psp-state`.
 2. Read the output against "Stage 18 succeeds when" in
-   [test-boot.md](test-boot.md) and record boot 26 in the log. Follow the
+   [test-boot.md](test-boot.md) and record boot 27 in the log. Follow the
    [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
    for defects. A kernel panic is a finding: power off, then read the panic
    log from the next normal boot.
 
 **Builds:** `out/test-efi/usb-stage18` (`usb-stage18-build.json`),
-`out/test-efi/driver`, `out/diag`; the stage 17 builds are kept as
+`out/test-efi/driver`, `out/diag` (rebuilt after boot 26; the first stage 18
+builds are kept as `superseded-*-stage18-count`); the stage 17 builds are kept as
 `superseded-driver-stage17` and `superseded-diag-stage17`.
 
 ### Earlier: booting stage 17
