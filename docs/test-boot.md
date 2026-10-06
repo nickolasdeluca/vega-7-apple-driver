@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-06: **stages 0 to 12 succeeded** (see
+Status, 2026-10-06: **stages 0 to 13 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -25,9 +25,9 @@ the PSP answered its first command, `GBR_IH_SET`, with "unknown command". A
 revised stage 11 succeeded in boot 16: the PSP created (`0x80020000`) and
 destroyed (`0x80030000`) a kernel-mode ring without touching its memory.
 Stage 12 succeeded in boot 17: the first ring frames, `SETUP_TMR` and
-`DESTROY_TMR`, both fenced with status 0. Stage 13 (the first firmware
-load: SDMA0 through `LOAD_IP_FW`, engine left halted) is approved and built,
-not yet booted. No later stage is authorized.
+`DESTROY_TMR`, both fenced with status 0. Stage 13 succeeded in boot 18:
+the PSP accepted and loaded the SDMA0 firmware (`SDMA0_UCODE_CHECKSUM` 0 →
+`0x25a1ba79`) with the engine left halted. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -1880,8 +1880,8 @@ change. It sends no second command while the first is unfenced.
 
 ### Stage 13: first firmware load, SDMA0 (proposal)
 
-**Status: proposed 2026-10-06, approved by the user the same day, and
-implemented; not yet booted.** The proposal is kept as approved. The
+**Status: proposed 2026-10-06, approved by the user the same day,
+implemented, and succeeded in boot 18.** The proposal is kept as approved. The
 implementation notes follow it.
 
 **Purpose.** Load the first engine firmware: SDMA0, the DMA engine needed
@@ -2859,6 +2859,46 @@ kernel up 09:00:52 local).
     `DESTROY_TMR` both fenced with status 0.
   - The full submit protocol (frame, write pointer, fence, response) works
     as Linux implements it.
+
+**Boot 18, 2026-10-06, stage 13** (`out/test-efi/usb-stage13/`, written
+with `tools/update_stick.sh 13`; cold boot, kernel up 09:42:22 local).
+
+- `CezanneGPU stage` 13, diagnostics v9; stages 1–3 `ok`.
+- `sudo cezanne-diag --gfxoff-disallow --psp-sdma --psp-state`:
+  - **DisallowGfxOff:** `ok`.
+  - **Check:** `ok`. PSP, ring, TMR and firmware-buffer regions, and the
+    embedded image's header.
+    - Before: `SDMA0_UCODE_CHECKSUM` `0x00000000`, `SDMA0_F32_CNTL`
+      `0x00000001` (halted).
+  - **Create:** `0x80020000`.
+  - **`SETUP_TMR`:** fence 1, status 0, `C2PMSG_67` 16.
+  - **Load:** `ok`. The 17,152-byte image was copied to `0xF440200000` and
+    read back. `LOAD_IP_FW` (type 9) as frame 1: **fence 2, status 0**,
+    `C2PMSG_67` 32.
+    - `fw_addr` came back 0, so this PSP does not report a TMR location for
+      the load. That is recorded, not an error: Linux only stores the
+      value.
+  - **Observe:** `ok`.
+    - **0 unexpected words** in the work area and in the firmware region.
+    - **`SDMA0_UCODE_CHECKSUM` changed from 0 to `0x25a1ba79`:** the SDMA
+      engine received firmware.
+    - `SDMA0_F32_CNTL` is still `0x00000001` (halted).
+  - **Teardown:** `DESTROY_TMR` as frame 2, **fence 3, status 0**. The ring
+    destroy answered `0x80030000`.
+- **Afterwards:**
+  - `SDMA0_UCODE_CHECKSUM` stays `0x25a1ba79` after the TMR is destroyed.
+  - **`SDMA0_CLK_CTRL` changed from `0xff000100` to `0xdf000100`:** bit 29,
+    `SOFT_OVERRIDE2`, was cleared by the PSP or the firmware load, not by
+    the driver. This is a clock-gating override; record it for the
+    clock-gating stage.
+  - Otherwise the dump equals boot 17, except the PSP counter and
+    `C2PMSG_67` (48). The machine stayed as before.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-18-stage13/`.
+- Result: **stage 13 succeeded.** It was the first firmware load: the PSP
+  accepted the pinned SDMA0 image (signature and all) and installed it, and
+  SDMA0 stayed halted. `tools/update_stick.sh` was used for the first time
+  and verified the stick.
 
 ## Unknowns and limits
 

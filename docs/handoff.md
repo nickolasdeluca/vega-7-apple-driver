@@ -133,7 +133,31 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 13
+## Next task: propose stage 14, starting SDMA0 and a first verified copy
+
+Stages 0–13 succeeded. In boot 18 the PSP accepted the pinned SDMA0 image:
+- `LOAD_IP_FW` fenced 2 with status 0;
+- `SDMA0_UCODE_CHECKSUM` went from 0 to `0x25a1ba79`;
+- SDMA0 stayed halted;
+- the teardown fenced 3.
+
+`SDMA0_CLK_CTRL` lost `SOFT_OVERRIDE2` during the load. The next proposal
+is the first verified DMA copy:
+- keep the TMR and firmware (no teardown before the copy);
+- program one SDMA0 ring (gfx queue) in the carveout, as `sdma_v4_0_gfx_resume`
+  does;
+- unhalt it (`sdma_v4_0_enable`);
+- submit a copy packet between two checked carveout pages and a fence
+  write;
+- verify the destination and the fence, then halt it again.
+
+Prerequisites to source:
+- `sdma_v4_0` ring registers and packet formats (`vega10_sdma_pkt_open.h`);
+- the address translation SDMA uses: VMID 0 and the system aperture, with
+  the default-page finding from boot 14;
+- the doorbell or write-pointer path.
+
+### Earlier: booting stage 13
 
 Stage 13 (copy the pinned SDMA0 image into a firmware buffer and load it
 through `LOAD_IP_FW` between `SETUP_TMR` and `DESTROY_TMR`, SDMA0 left
