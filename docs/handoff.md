@@ -133,7 +133,14 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: propose stage 15, the first SDMA copy
+## Next task: boot stage 15, the first SDMA copy
+
+Stage 15 is approved and built: `out/test-efi/usb-stage15`, `--sdma-copy`.
+It applies the golden `GB_ADDR_CONFIG` and leaves the default page for
+later. Next: a cold boot after a Time Machine backup, then record the
+result.
+
+### Earlier: proposing stage 15
 
 Stages 0–14 succeeded. Boot 19:
 - `PowerUpSdma`/`PowerDownSdma` answered `0x01`;

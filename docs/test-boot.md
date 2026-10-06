@@ -29,7 +29,8 @@ Stage 12 succeeded in boot 17: the first ring frames, `SETUP_TMR` and
 the PSP accepted and loaded the SDMA0 firmware (`SDMA0_UCODE_CHECKSUM` 0 →
 `0x25a1ba79`) with the engine left halted. Stage 14 succeeded in boot 19:
 `PowerUpSdma`/`PowerDownSdma` answered `0x01`, and the 31-register SDMA
-inventory is recorded. No later stage is authorized.
+inventory is recorded. Stage 15 (the first SDMA copy) is approved and
+built, not yet booted. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -103,6 +104,11 @@ off restores the known-good boot. This is the experimental environment
      day): stage 13 plus `PowerUpSdma`/`PowerDownSdma` and 25 read-only SDMA
      registers, read three times on request, described
      [below](#stage-14-sdma0-power-up-and-register-inventory-proposal).
+   - **Stage 15** (proposed 2026-10-06 and approved by the user the same
+     day, with the golden `GB_ADDR_CONFIG` applied and the default page left
+     for later): stage 14 plus starting SDMA0 with exact register values, a
+     ring test and the first 4 KiB copy with a fence, on request, described
+     [below](#stage-15-first-sdma-copy-proposal).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -2270,7 +2276,51 @@ proposal with the measured values):
 
 ### Stage 15: first SDMA copy (proposal)
 
-**Status: proposed 2026-10-06, not approved, not implemented.**
+**Status: proposed 2026-10-06, approved by the user the same day (golden
+`GB_ADDR_CONFIG` applied, default page left for later), and implemented; not
+yet booted.**
+
+**Implementation notes:**
+
+- **Core:**
+  - `kSdmaBoot19` pins the 31 boot 19 values, `STATUS_REG` excepted.
+  - The register tables are `kSdmaGolden` (10), `kSdmaStart` (24) and
+    `kSdmaStop` (3). `sdmaWriteListed` derives the allowlist from them,
+    plus write-pointer values 1024 and 2048.
+  - `sdmaRingWord` and `sdmaWorkWord` give the exact images.
+    `sdmaWorkWriteAllowed` permits only those words in the 16 KiB work
+    area. `writeSdmaWorkWord` is the fourth memory write site.
+  - `startSdma` records progress (powered, registers written), and
+    `stopSdma` undoes exactly that much.
+  - `submitSdma` requires the previous write pointer.
+  - `verifySdmaCopy` checks the read pointer, the destination against the
+    source, and the 64 KiB region.
+- **Adapter:**
+  - `accessDevice` can now map a fixed set of three writable BAR5 pages
+    (`kSdmaPages`: `0x4000` and `0x5000` for SDMA0, `0x58000` for the SMU).
+    It is used only by the start, submit and stop operations, and every
+    write still passes `writeAllowed`.
+  - The copy work area is the third writable carveout mapping.
+  - Selectors 21–25 (check, start, submit, verify, stop), accepted in
+    order. Diagnostics version 11.
+  - The stage 13 teardown selector is refused while a copy is under way.
+    Stop, and abandon after the check, halt and power SDMA down before the
+    PSP teardown.
+- **Tool:** `--sdma-copy` runs the stage 13 load, then the copy steps. Once
+  the copy check passes it always ends with the stop.
+- **Tests:**
+  - The golden values are re-derived in the test from Linux's masks and
+    the boot 19 values.
+  - The `gfx_resume` arithmetic, every write inside the mapped pages, and
+    the packet images.
+  - A fake SDMA engine executes WRITE, COPY and FENCE from the fake ring:
+    the full run, a corrupted copy plus a stray write (both caught), a
+    halted engine (timeout), out-of-order submits, and stops at each
+    progress.
+  - Four more weakened cores must fail.
+  - The kext tests now name four writable carveout mappings and stores,
+    and match the two-index register store. Their store pattern was
+    tightened so a `base[i][...]` store cannot slip past.
 
 **Purpose.** This is the "verified DMA copy and fence" milestone: SDMA0, running
 the firmware stage 13 loaded, copies 4 KiB from one checked carveout page to
@@ -2447,7 +2497,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -2563,6 +2613,29 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 15 succeeds when:
+
+- the stage 14 conditions hold with `CezanneGPU stage` 15;
+- `sudo cezanne-diag --gfxoff-disallow --sdma-copy --psp-state` reports
+  `ok` for:
+  - the stage 13 load;
+  - the copy check;
+  - the start: progress 2, `PowerUpSdma` `0x01`;
+  - the ring test: observed `0xDEADBEEF`, read pointer 1024;
+  - the copy: fence 1, read pointer 2048;
+  - the verify: 0 unexpected words;
+  - the stop: `F32_CNTL` halted, `PowerDownSdma` `0x01`, `DESTROY_TMR`
+    fence 3;
+- the machine stays as before.
+
+**On failure:**
+- `sdma-unexpected-state` at the check means a register no longer reads its
+  boot 19 value: record it, nothing was sent.
+- `sdma-timeout` means: the stop still halts SDMA; shut down fully
+  afterwards.
+- Unexpected words outside the work area mean: power off at once.
+- Make a Time Machine backup first. Save the output with `tee`.
 
 Stage 14 succeeds when:
 
