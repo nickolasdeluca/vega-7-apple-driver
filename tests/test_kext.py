@@ -131,15 +131,22 @@ void f(IOPCIDevice *p, Aperture *a) {
                                     ("cezanne::kScratchPageOffset", "scratchWriteOperation"),
                                     ("cezanne::kSmuPageOffset", "gfxOffOperation"),
                                     ("cezanne::kSmuPageOffset", "metricsTransferOperation"),
+                                    ("cezanne::kSmuPageOffset", "pspCreateOperation"),
+                                    ("cezanne::kSmuPageOffset", "pspDestroyOperation"),
                                     ("cezanne::kSmuPageOffset", "smuQueryOperation")])
         self.assertEqual(sorted(re.findall(r"accessDevice\(0, (\w+)", source)),
-                         ["metricsCheckOperation", "metricsReadOperation", "readOperation", "scratchCheckOperation",
-                          "smuCheckOperation"])
-        # Carveout memory: only the metrics page's range, read-only, at the
-        # check size or one page.
-        self.assertEqual(re.findall(r"IODeviceMemory::withRange\(cezanne::(\w+), length\)", source), ["kMetricsPhysical"])
-        self.assertEqual(sorted(re.findall(r"withMetricsMemory\(cezanne::(\w+),", source)),
-                         ["kMetricsCheckSize", "kPageSize"])
+                         ["metricsCheckOperation", "metricsReadOperation", "pspCheckOperation", "pspObserveOperation",
+                          "readOperation", "scratchCheckOperation", "smuCheckOperation"])
+        # Carveout memory: only the metrics page's and the PSP ring page's
+        # ranges, read-only, at their check sizes or one page.
+        self.assertEqual(re.findall(r"IODeviceMemory::withRange\((\w+), length\)", source), ["physical"])
+        self.assertIn("if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical) {", source)
+        self.assertEqual(sorted(re.findall(r"withCarveoutMemory\(cezanne::(\w+), cezanne::(\w+),", source)),
+                         [("kMetricsPhysical", "kMetricsCheckSize"), ("kMetricsPhysical", "kPageSize"),
+                          ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize")])
+        # A PSP ring created by a connection is destroyed if it closes early.
+        abandon = re.search(r"void CezanneGPU::scratchAbandon\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("pspDestroyLocked(&response, &mailbox)", abandon)
         self.assertIn("memory->map(kIOMapReadOnly | kIOMapInhibitCache)", source)
         self.assertIn("writablePage != 0 && writablePage != cezanne::kScratchPageOffset && "
                       "writablePage != cezanne::kSmuPageOffset", source)
@@ -163,7 +170,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 10;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 11;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
