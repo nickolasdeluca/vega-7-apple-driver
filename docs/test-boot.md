@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-06: **stages 0 to 11 succeeded** (see
+Status, 2026-10-06: **stages 0 to 12 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -24,8 +24,8 @@ first PSP commands: create and destroy a ring) stopped safely in boot 15:
 the PSP answered its first command, `GBR_IH_SET`, with "unknown command". A
 revised stage 11 succeeded in boot 16: the PSP created (`0x80020000`) and
 destroyed (`0x80030000`) a kernel-mode ring without touching its memory.
-Stage 12 (the first ring frame: `SETUP_TMR`, then `DESTROY_TMR`) is approved
-and built, not yet booted. No later stage is authorized.
+Stage 12 succeeded in boot 17: the first ring frames, `SETUP_TMR` and
+`DESTROY_TMR`, both fenced with status 0. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -1661,9 +1661,9 @@ the PSP starts from the boot 14 state, not boot 15's rejected command.
 
 ### Stage 12: first PSP ring frame, TMR setup (proposal)
 
-**Status: proposed 2026-10-06, approved by the user the same day, and
-implemented; not yet booted.** The proposal is kept as approved. The
-implementation notes follow it.
+**Status: proposed 2026-10-06, approved by the user the same day,
+implemented, and succeeded in boot 17.** The proposal is kept as approved.
+The implementation notes follow it.
 
 **Purpose.** Submit the first command through the ring stage 11 proved: set
 up the PSP's trusted memory region (TMR). Linux v6.12 does this right after
@@ -2574,6 +2574,39 @@ cold boot, kernel up 08:44:13 local).
 - Result: **stage 11 succeeded.** This is the first PSP command accepted
   from this driver: a kernel-mode ring at GPU `0xF440100000`, created and
   destroyed, with no frame and no memory change.
+
+**Boot 17, 2026-10-06, stage 12** (`out/test-efi/usb-stage12/`; cold boot,
+kernel up 09:00:52 local).
+
+- `CezanneGPU stage` 12, diagnostics v8; stages 1–3 `ok`.
+- `sudo cezanne-diag --gfxoff-disallow --psp-tmr --psp-state`:
+  - **DisallowGfxOff:** `ok`.
+  - **Check:** `ok`. PSP ready, no ring, the 64 KiB at the ring stable, and
+    the 4 MiB TMR region placed and stable.
+  - **Create:** `ok`, `0x80020000`.
+  - **Submit `SETUP_TMR`:** `ok`.
+    - The command (TMR GPU `0xF440400000`, physical `0x600400000`, 4 MiB)
+      went in as frame 0, and `C2PMSG_67` ← 16.
+    - **Fence 1 arrived, with response status 0.** `fw_addr` and `tmr_size`
+      are 0, as expected: those fields answer `LOAD_IP_FW` and `LOAD_TOC`.
+  - **Observe:** `ok`, **0 unexpected words** in the 64 KiB. The PSP wrote
+    only the fence and, at most, its response area.
+  - **Teardown:** `ok`. `DESTROY_TMR` went in as frame 1 (`C2PMSG_67` ← 32)
+    and fence 2 arrived with status 0. The ring destroy answered
+    `0x80030000`.
+- **Afterwards:** `C2PMSG_67` stays 32 after the destroy, like the argument
+  registers in boot 16: the PSP leaves the write pointer as written. The rest
+  of the dump equals boot 16 except the PSP counter. The machine stayed as
+  before.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-17-stage12/`.
+- Result: **stage 12 succeeded.**
+  - **First CPU writes to carveout memory:** the command buffer, the fence
+    buffer and two ring frames.
+  - **First ring frames processed by the PSP:** `SETUP_TMR` and
+    `DESTROY_TMR` both fenced with status 0.
+  - The full submit protocol (frame, write pointer, fence, response) works
+    as Linux implements it.
 
 ## Unknowns and limits
 

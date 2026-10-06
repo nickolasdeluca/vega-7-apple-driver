@@ -133,7 +133,20 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 12
+## Next task: propose stage 13, the first firmware load (SDMA0)
+
+Stages 0–12 succeeded. In boot 17, `SETUP_TMR` (TMR at GPU `0xF440400000`,
+4 MiB) and `DESTROY_TMR` went through the PSP ring as frames 0 and 1. Both
+fenced with status 0, and no unexpected memory changed. The next proposal
+is `GFX_CMD_ID_LOAD_IP_FW` for SDMA0, after `SETUP_TMR`, as
+`psp_load_non_psp_fw` does for Green Sardine. It needs:
+- the pinned `green_sardine_sdma.bin`, its header parsed with
+  `tools/amdgpu_firmware.py`, copied into a 1 MiB firmware buffer
+  (`fw_pri`);
+- the `psp_gfx_cmd_load_ip_fw` layout and `GFX_FW_TYPE_SDMA0`;
+- the SDMA register readback that shows the firmware is running.
+
+### Earlier: booting stage 12
 
 Stage 12 (the first ring frame: `SETUP_TMR` through the ring, then
 `DESTROY_TMR` and the ring destroy) is approved and built:
