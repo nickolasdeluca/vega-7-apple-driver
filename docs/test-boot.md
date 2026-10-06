@@ -2093,6 +2093,152 @@ makes no IH, GART or default-page change.
   - Three frames against the fake PSP.
   - Three more weakened cores must fail.
 
+### Stage 14: SDMA0 power-up and register inventory (proposal)
+
+**Status: proposed 2026-10-06, not approved, not implemented.**
+
+**Purpose.** Prepare the first DMA copy (stage 15). Linux starts SDMA0 by
+writing about 25 SDMA registers, most of them read-modify-write. The values
+it writes therefore depend on what each register holds. Stage 14 measures
+those registers on this host, with the firmware loaded and SDMA powered up,
+so that stage 15's write allowlist can name exact values. It also sends the
+two SMU messages Linux uses to power SDMA up and down on APUs. It writes no
+SDMA register.
+
+**Linux v6.12, the path stage 15 will follow** (`sdma_v4_0.c`):
+
+1. **`sdma_v4_0_hw_init`.** On APUs it first calls
+   `amdgpu_dpm_set_powergating_by_smu(SDMA, false)`, which reaches
+   `smu_v12_0_powergate_sdma` and sends `PowerUpSdma` (`0xE`, argument 0;
+   `smu_v12_0_ppsmc.h` says "SDMA is power gated by default"). Then
+   `sdma_v4_0_init_golden_registers` applies `golden_settings_sdma_4_3` for
+   SDMA 4.1.2: ten registers, each by `soc15_program_register_sequence`
+   (a read, `& ~and_mask | (or_mask & and_mask)`, or a plain write for an
+   and-mask of `0xffffffff`).
+2. **`sdma_v4_0_start`.**
+   - Unhalt (`F32_CNTL.HALT` = 0) and `ctx_switch_enable`.
+   - `SEM_WAIT_FAIL_TIMER_CNTL` ← 0.
+   - `sdma_v4_0_gfx_resume`: ring size, read and write pointers 0, the
+     read-pointer write-back address, the ring base, `MINOR_PTR_UPDATE`,
+     doorbell enable and offset, write-pointer poll off, `RB_ENABLE`, and
+     `IB_ENABLE`.
+   - `CNTL.UTC_L1_ENABLE` = 1, then unhalt again.
+   - The page queue is not used on 4.1.2:
+     `sdma_v4_0_fw_support_paging_queue` returns false.
+3. **The ring test** (`sdma_v4_0_ring_test_ring`). One `WRITE_LINEAR` packet
+   writes `0xDEADBEEF` to a write-back dword. The write pointer goes through
+   `SDMA0_GFX_RB_WPTR`/`_HI` in bytes when no doorbell is used
+   (`sdma_v4_0_ring_set_wptr`). Commits pad with NOPs to the ring's
+   `align_mask`.
+4. **Copy and fence.** `sdma_v4_0_emit_copy_buffer` builds a 7-dword
+   `COPY_LINEAR` (byte count − 1, swap 0, source, destination).
+   `sdma_v4_0_ring_emit_fence` builds a 4-dword `FENCE` (address, value),
+   followed by a `TRAP`. Opcodes come from `vega10_sdma_pkt_open.h`: NOP 0,
+   COPY 1, WRITE 2, FENCE 5, TRAP 6.
+5. **Teardown** (`sdma_v4_0_hw_fini`): `ctx_switch_enable(false)`, then
+   `sdma_v4_0_enable(false)`: `RB_ENABLE` and `IB_ENABLE` 0, then
+   `HALT` = 1. On APUs it then sends `PowerDownSdma` (`0xD`).
+
+**Steps** (on request only, `sudo cezanne-diag --sdma-inventory`, each
+printed first):
+
+1. **Stage 13 up to the load.** Check, create, `SETUP_TMR`, copy, and
+   `LOAD_IP_FW` as in boot 18.
+2. **Read** the 25 registers below, plus `F32_CNTL`, `CLK_CTRL`,
+   `POWER_CNTL`, `STATUS_REG`, `GFX_RB_CNTL` and `UCODE_CHECKSUM` from
+   stages 5 and 13: the "loaded, gated" state.
+3. **`PowerUpSdma`** (`0xE`, argument 0) through the stage 7 mailbox path.
+   The response must be `0x01`.
+4. **Read the same 31 registers** again: the "powered" state that stage 15
+   will start from.
+5. **`PowerDownSdma`** (`0xD`, argument 0); the response must be `0x01`.
+   Then **read them a third time**, to learn whether power gating keeps the
+   firmware (checksum) and settings.
+6. **Teardown** as in stage 13: `DESTROY_TMR`, then the ring destroy.
+
+**New readable registers** (diagnostic interface, from stage 14; SDMA0 base
+`0x1260`, `sdma0_4_0_offset.h`):
+
+| Register | BAR5 byte offset | Linux v6.12 use |
+| --- | --- | --- |
+| `SDMA0_CNTL` | `0x049f0` | sdma_v4_0_start, ctx_switch_enable (UTC_L1_ENABLE, AUTO_CTXSW_ENABLE) |
+| `SDMA0_CHICKEN_BITS` | `0x049f4` | golden_settings_sdma_4_3 |
+| `SDMA0_GB_ADDR_CONFIG` | `0x049f8` | golden_settings_sdma_4_3 |
+| `SDMA0_GB_ADDR_CONFIG_READ` | `0x049fc` | golden_settings_sdma_4_3 |
+| `SDMA0_SEM_WAIT_FAIL_TIMER_CNTL` | `0x04a04` | sdma_v4_0_start (written 0) |
+| `SDMA0_UTCL1_WATERMK` | `0x04a74` | golden_settings_sdma_4_3 |
+| `SDMA0_UTCL1_TIMEOUT` | `0x04a9c` | ctx_switch_enable (written 0x00800080) |
+| `SDMA0_UTCL1_PAGE` | `0x04aa0` | golden_settings_sdma_4_3 |
+| `SDMA0_GFX_RB_BASE` | `0x04b84` | gfx_resume |
+| `SDMA0_GFX_RB_BASE_HI` | `0x04b88` | gfx_resume |
+| `SDMA0_GFX_RB_RPTR` | `0x04b8c` | gfx_resume; sdma_reg_list_4_0 |
+| `SDMA0_GFX_RB_RPTR_HI` | `0x04b90` | gfx_resume; sdma_reg_list_4_0 |
+| `SDMA0_GFX_RB_WPTR` | `0x04b94` | gfx_resume, ring_set_wptr (no doorbell) |
+| `SDMA0_GFX_RB_WPTR_HI` | `0x04b98` | gfx_resume, ring_set_wptr |
+| `SDMA0_GFX_RB_WPTR_POLL_CNTL` | `0x04b9c` | gfx_resume (read-modify-write); golden |
+| `SDMA0_GFX_RB_RPTR_ADDR_HI` | `0x04ba0` | gfx_resume |
+| `SDMA0_GFX_RB_RPTR_ADDR_LO` | `0x04ba4` | gfx_resume |
+| `SDMA0_GFX_IB_CNTL` | `0x04ba8` | gfx_resume (read-modify-write) |
+| `SDMA0_GFX_DOORBELL` | `0x04bc8` | gfx_resume (read-modify-write) |
+| `SDMA0_GFX_DOORBELL_OFFSET` | `0x04c2c` | gfx_resume (read-modify-write) |
+| `SDMA0_GFX_RB_WPTR_POLL_ADDR_HI` | `0x04c48` | gfx_resume |
+| `SDMA0_GFX_RB_WPTR_POLL_ADDR_LO` | `0x04c4c` | gfx_resume |
+| `SDMA0_GFX_MINOR_PTR_UPDATE` | `0x04c54` | gfx_resume |
+| `SDMA0_RLC0_RB_WPTR_POLL_CNTL` | `0x04e9c` | golden_settings_sdma_4_3 |
+| `SDMA0_RLC1_RB_WPTR_POLL_CNTL` | `0x0501c` | golden_settings_sdma_4_3 |
+
+None of them is a data port or a clear-on-read counter. `SDMA0_UCODE_DATA`
+(auto-incrementing) is deliberately left out.
+
+**New writes:** the SMU message register (`C2PMSG_66`) may also take `0xD`
+and `0xE`, each paired with argument 0. Nothing else is new. No SDMA
+register is written, and `F32_CNTL` stays halted throughout.
+
+**Changes:**
+
+- **Core:**
+  - The stage 14 register list.
+  - The two SMU messages in `writeAllowed`/`smuArgumentAllowed`, sent with
+    the stage 7 send-and-poll.
+- **Adapter:** one selector that runs steps 2–5 after the stage 13 load, and
+  returns the three readings and both responses. Diagnostics version 10.
+  The stage 13 teardown still applies on abandon.
+- **Tool:** `--sdma-inventory` prints the 31 registers in three columns
+  (loaded, powered up, powered down).
+- **Tests:**
+  - The new offsets and that they are not writable.
+  - The message and argument pairs, and the message order.
+  - A weakened core allowing `0xE` with a non-zero argument must fail.
+
+**Expected values.**
+- Both responses `0x01`.
+- `F32_CNTL` halted in all three readings.
+- The checksum stays `0x25a1ba79`, at least while powered.
+- No prediction for the others. They are what stage 15 needs.
+
+**What stage 15 will then propose** (for orientation; it gets its own
+proposal with the measured values):
+
+- Keep the TMR and the firmware. Apply the golden settings and the
+  `sdma_v4_0_start` writes, with exact values computed from the stage 14
+  readings. Use no doorbell; write the write pointer to the registers.
+- Set up a ring and a write-back page at carveout `0x40300000`, and a source
+  and destination page next to them.
+- Run the ring test (`WRITE_LINEAR` `0xDEADBEEF`), then a 4 KiB
+  `COPY_LINEAR` and a `FENCE` (no `TRAP`, since no interrupts are set up).
+- Verify the destination against the source, the fence, and the 64 KiB
+  around the pages. Then halt, `PowerDownSdma`, and tear down.
+- **Addressing:** SDMA uses MMHUB, VMID 0. Context 0 is disabled (boot 14),
+  so every address must lie in the FB aperture. The default page is 0
+  (boot 14 finding): stage 15 must use only checked carveout addresses,
+  and point the default page at a scratch page first if review requires it.
+
+**Risks.**
+- `PowerUpSdma` and `PowerDownSdma` are what Linux sends on every APU
+  start and stop. A non-`0x01` response is a finding. If the SDMA register
+  reads hang after power changes, power off.
+- Make a Time Machine backup before this boot.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
