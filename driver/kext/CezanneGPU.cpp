@@ -66,7 +66,14 @@
 //            (exact values), run the ring test and one 4 KiB copy with a
 //            fence, verify, then halt, power down and tear down (also on an
 //            abandoned connection after the start).
-//            Apart from the stage 6 to 15 tests, nothing is written to
+//   Stage 17: after a verified stage 15 copy, check the GART and IH
+//            registers and display pipe 0 hold their boot 22 values, write
+//            the GART work area (the fourth writable memory mapping) and
+//            frame 2, enable MMHUB VM context 0 and IH ring 0 with exact
+//            values and an engine 17 flush, copy through the GART with a
+//            fence and a TRAP, verify, and restore every register (also
+//            before the stage 15 stop, and on an abandoned connection).
+//            Apart from the stage 6 to 17 tests, nothing is written to
 //            configuration space, registers or memory, and every mapping and
 //            the provider are released before start() returns.
 //
@@ -94,12 +101,11 @@ struct Aperture {
     const volatile UInt32 *base;
     UInt64 length;
     UInt32 stage;
+    bool semaphore; // the stage 17 flush may read VM_INVALIDATE_ENG17_SEM
 };
 
-// The writable 4 KiB BAR5 page of a stage 6 or 7 test: SCRATCH_REG0's or the
-// SMU mailbox's.
 // Up to three writable BAR5 pages: one for a stage 6 to 14 test, the
-// kSdmaPages set for stage 15.
+// kSdmaPages set for stage 15, the kGartPages set for stage 17.
 struct WritePage {
     volatile UInt32 *base[3];
     uint32_t pageOffset[3];
@@ -163,6 +169,10 @@ public:
                                uint32_t *status);
     cezanne::Status sdmaStop(const void *owner, uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence,
                              uint32_t *ringResponse);
+    cezanne::Status gartCheck(const void *owner, uint32_t *index, uint32_t *value);
+    cezanne::Status gartEnable(const void *owner, uint32_t *progress, uint32_t *ack);
+    cezanne::Status gartVerify(const void *owner, cezanne::GartReport *report);
+    cezanne::Status gartRestore(const void *owner, uint32_t *index, uint32_t *value, uint32_t *ihWptr);
 
 private:
     enum ScratchState { kScratchIdle, kScratchChecked, kScratchWritten };
@@ -200,6 +210,24 @@ private:
     CopyState copyState_ = kCopyIdle;
     uint32_t sdmaProgress_ = 0;
     uint32_t sdmaWorkSnapshot_[cezanne::kSdmaWorkCheckSize / 4];
+    bool copyVerified_ = false; // the stage 15 verify passed
+    // Stage 17: the steps on this connection, and how far the enable got (0
+    // nothing, 1 GART registers, 2 IH registers, 3 SDMA0_CNTL); non-zero
+    // until the restore ran.
+    enum GartState {
+        kGartIdle,
+        kGartChecked,
+        kGartEnabled,   // the enable passed
+        kGartFailed,    // the enable failed after any write
+        kGartSubmitted, // frame 2 fenced
+        kGartVerified,
+        kGartRestored,
+    };
+    GartState gartState_ = kGartIdle;
+    uint32_t gartProgress_ = 0;
+    uint32_t gartSnapshot_[cezanne::kGartWorkCheckSize / 4];
+    uint32_t gartDisplay_[cezanne::kDisplayInventoryCount];
+    cezanne::Status gartRestoreLocked(uint32_t *index, uint32_t *value, uint32_t *ihWptr);
     cezanne::Status sdmaStopLocked(uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence, uint32_t *ringResponse);
     cezanne::Status pspTeardownLocked(uint32_t *fence, uint32_t *tmrStatus, uint32_t *ringResponse,
                                       cezanne::PspMailbox *mailbox);
@@ -261,8 +289,11 @@ static bool configRead(void *context, uint8_t offset, uint8_t width, uint32_t *v
 static bool registerRead(void *context, uint32_t offset, uint32_t *value)
 {
     const Aperture *aperture = static_cast<const Aperture *>(context);
-    // The core already checks this; the adapter refuses independently.
-    if (!cezanne::registerAllowed(offset, aperture->stage) || (offset & 3) != 0 || offset + 4ull > aperture->length) {
+    // The core already checks this; the adapter refuses independently. The
+    // semaphore only through a stage 17 page-set access (its flush).
+    bool allowed = cezanne::registerAllowed(offset, aperture->stage) ||
+                   (aperture->semaphore && cezanne::semaphoreReadAllowed(offset, aperture->stage));
+    if (!allowed || (offset & 3) != 0 || offset + 4ull > aperture->length) {
         return false;
     }
     *value = aperture->base[offset / 4];
@@ -487,7 +518,7 @@ cezanne::Status CezanneGPU::runDevice(IOPCIDevice *pci)
         return cezanne::kApertureUnavailable;
     }
     Aperture aperture = {reinterpret_cast<const volatile UInt32 *>(map->getVirtualAddress()), map->getLength(),
-                         stage_};
+                         stage_, false};
     publish("bar5 length", aperture.length, 64);
     status = cezanne::checkAperture(state, map->getPhysicalAddress(), aperture.length);
     if (status == cezanne::kOK) {
@@ -565,7 +596,7 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
 {
     // Caller holds lock_.
     if (writablePage != 0 && writablePage != cezanne::kScratchPageOffset && writablePage != cezanne::kSmuPageOffset &&
-        writablePage != cezanne::kSdmaPageSet) {
+        writablePage != cezanne::kSdmaPageSet && writablePage != cezanne::kGartPageSet) {
         return cezanne::kRegisterNotAllowed;
     }
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, getProvider());
@@ -584,7 +615,7 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
         map = pci->mapDeviceMemoryWithRegister(cezanne::kRegisterBar, kIOMapInhibitCache | kIOMapReadOnly);
         status = map == nullptr ? cezanne::kApertureUnavailable : cezanne::kOK;
     }
-    Aperture aperture = {nullptr, 0, stage_};
+    Aperture aperture = {nullptr, 0, stage_, writablePage == cezanne::kGartPageSet};
     if (status == cezanne::kOK) {
         aperture.base = reinterpret_cast<const volatile UInt32 *>(map->getVirtualAddress());
         aperture.length = map->getLength();
@@ -593,10 +624,11 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
     IODeviceMemory *pageMemories[3] = {nullptr, nullptr, nullptr};
     IOMemoryMap *pageMaps[3] = {nullptr, nullptr, nullptr};
     WritePage page = {{nullptr, nullptr, nullptr}, {0, 0, 0}, 0, stage_};
-    if (writablePage == cezanne::kSdmaPageSet) {
+    if (writablePage == cezanne::kSdmaPageSet || writablePage == cezanne::kGartPageSet) {
         page.count = 3;
         for (uint32_t i = 0; i < 3; i++) {
-            page.pageOffset[i] = cezanne::kSdmaPages[i];
+            page.pageOffset[i] =
+                writablePage == cezanne::kSdmaPageSet ? cezanne::kSdmaPages[i] : cezanne::kGartPages[i];
         }
     } else if (writablePage != 0) {
         page.count = 1;
@@ -831,7 +863,7 @@ template <typename Check> static cezanne::Status withCarveoutMemory(UInt64 physi
 {
     if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical &&
         physical != cezanne::kPspTmrPhysical && physical != cezanne::kSdmaFwPhysical &&
-        physical != cezanne::kSdmaWorkPhysical) {
+        physical != cezanne::kSdmaWorkPhysical && physical != cezanne::kGartWorkPhysical) {
         return cezanne::kRegisterNotAllowed;
     }
     IODeviceMemory *memory = IODeviceMemory::withRange(physical, length);
@@ -958,16 +990,18 @@ template <typename Use> static cezanne::Status withSdmaFirmware(UInt32 stage, Us
     return status;
 }
 
-// The stage 15 copy work area: ring, write-back, source and destination.
+// The stage 15 copy work area: ring, write-back, source and destination;
+// from stage 17 also the second destination.
 struct SdmaWorkWindow {
     volatile UInt32 *base;
     UInt32 stage;
+    UInt32 length;
 };
 
 static bool sdmaWorkRead(void *context, uint32_t offset, uint32_t *value)
 {
     const SdmaWorkWindow *sdmaWork = static_cast<const SdmaWorkWindow *>(context);
-    if ((offset & 3) != 0 || offset + 4ull > cezanne::kSdmaWorkSize) {
+    if ((offset & 3) != 0 || offset + 4ull > sdmaWork->length) {
         return false;
     }
     *value = sdmaWork->base[offset / 4];
@@ -991,14 +1025,15 @@ template <typename Use> static cezanne::Status withSdmaWork(UInt32 stage, Use us
     if (stage < cezanne::kSdmaCopyStage) {
         return cezanne::kRegisterNotAllowed;
     }
-    IODeviceMemory *sdmaWorkMemory = IODeviceMemory::withRange(cezanne::kSdmaWorkPhysical, cezanne::kSdmaWorkSize);
+    const UInt32 length = stage >= cezanne::kGartStage ? cezanne::kGartSdmaWorkSize : cezanne::kSdmaWorkSize;
+    IODeviceMemory *sdmaWorkMemory = IODeviceMemory::withRange(cezanne::kSdmaWorkPhysical, length);
     if (sdmaWorkMemory == nullptr) {
         return cezanne::kApertureUnavailable;
     }
     IOMemoryMap *sdmaWorkMap = sdmaWorkMemory->map(kIOMapInhibitCache);
     cezanne::Status status = cezanne::kApertureUnavailable;
-    if (sdmaWorkMap != nullptr && sdmaWorkMap->getLength() >= cezanne::kSdmaWorkSize) {
-        SdmaWorkWindow window = {reinterpret_cast<volatile UInt32 *>(sdmaWorkMap->getVirtualAddress()), stage};
+    if (sdmaWorkMap != nullptr && sdmaWorkMap->getLength() >= length) {
+        SdmaWorkWindow window = {reinterpret_cast<volatile UInt32 *>(sdmaWorkMap->getVirtualAddress()), stage, length};
         cezanne::MemoryReader reader = {sdmaWorkRead, &window};
         cezanne::MemoryWriter writer = {sdmaWorkWrite, &window};
         status = use(reader, writer);
@@ -1007,6 +1042,59 @@ template <typename Use> static cezanne::Status withSdmaWork(UInt32 stage, Use us
         sdmaWorkMap->release();
     }
     sdmaWorkMemory->release();
+    return status;
+}
+
+// The stage 17 GART work area: page table, dummy page, IH ring and its
+// write-back; written only with gartWorkWord's words.
+struct GartWorkWindow {
+    volatile UInt32 *base;
+    UInt32 stage;
+};
+
+static bool gartWorkRead(void *context, uint32_t offset, uint32_t *value)
+{
+    const GartWorkWindow *gartWork = static_cast<const GartWorkWindow *>(context);
+    if ((offset & 3) != 0 || offset + 4ull > cezanne::kGartWorkSize) {
+        return false;
+    }
+    *value = gartWork->base[offset / 4];
+    return true;
+}
+
+static bool gartWorkWrite(void *context, uint32_t offset, uint32_t value)
+{
+    GartWorkWindow *gartWork = static_cast<GartWorkWindow *>(context);
+    // The core already checks this; the adapter refuses independently.
+    if (!cezanne::gartWorkWriteAllowed(offset, value, gartWork->stage)) {
+        return false;
+    }
+    gartWork->base[offset / 4] = value;
+    return true;
+}
+
+// Maps the GART work area writable and uncached, runs use, and releases it.
+template <typename Use> static cezanne::Status withGartWork(UInt32 stage, Use use)
+{
+    if (stage < cezanne::kGartStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IODeviceMemory *gartWorkMemory = IODeviceMemory::withRange(cezanne::kGartWorkPhysical, cezanne::kGartWorkSize);
+    if (gartWorkMemory == nullptr) {
+        return cezanne::kApertureUnavailable;
+    }
+    IOMemoryMap *gartWorkMap = gartWorkMemory->map(kIOMapInhibitCache);
+    cezanne::Status status = cezanne::kApertureUnavailable;
+    if (gartWorkMap != nullptr && gartWorkMap->getLength() >= cezanne::kGartWorkSize) {
+        GartWorkWindow window = {reinterpret_cast<volatile UInt32 *>(gartWorkMap->getVirtualAddress()), stage};
+        cezanne::MemoryReader reader = {gartWorkRead, &window};
+        cezanne::MemoryWriter writer = {gartWorkWrite, &window};
+        status = use(reader, writer);
+    }
+    if (gartWorkMap != nullptr) {
+        gartWorkMap->release();
+    }
+    gartWorkMemory->release();
     return status;
 }
 
@@ -1737,11 +1825,14 @@ cezanne::Status CezanneGPU::sdmaSubmit(const void *owner, uint32_t frame, uint32
     *observed = *rptr = *wptr = *f32Cntl = *status = 0;
     IOLockLock(lock_);
     cezanne::Status result = cezanne::kSdmaOutOfOrder;
-    bool next = (frame == 0 && copyState_ == kCopyStarted) || (frame == 1 && copyState_ == kCopyTested);
+    bool next = (frame == 0 && copyState_ == kCopyStarted) || (frame == 1 && copyState_ == kCopyTested) ||
+                (frame == 2 && gartState_ == kGartEnabled && gartProgress_ == 3);
     if (next && pspOwner_ == owner) {
         CopyArgument copy = {nullptr, 0, nullptr, observed, rptr, wptr, f32Cntl, status, frame, 0, false};
         result = accessDevice(cezanne::kSdmaPageSet, copySubmitOperation, &copy);
-        if (result == cezanne::kOK) {
+        if (result == cezanne::kOK && frame == 2) {
+            gartState_ = kGartSubmitted;
+        } else if (result == cezanne::kOK) {
             copyState_ = frame == 0 ? kCopyTested : kCopySubmitted;
         }
         IOLog(LOG_PREFIX "SDMA frame %u: %s, observed 0x%08x, RPTR %u, WPTR %u, F32_CNTL 0x%08x, STATUS 0x%08x\n", frame,
@@ -1760,6 +1851,7 @@ cezanne::Status CezanneGPU::sdmaVerify(const void *owner, uint32_t *rptr, uint32
     if (copyState_ == kCopySubmitted && pspOwner_ == owner) {
         CopyArgument copy = {nullptr, 0, sdmaWorkSnapshot_, rptr, unexpected, firstOffset, status, nullptr, 0, 0, false};
         result = accessDevice(0, copyVerifyOperation, &copy);
+        copyVerified_ = result == cezanne::kOK;
         IOLog(LOG_PREFIX "SDMA verify: %s, RPTR %u, %u unexpected words, first at 0x%x\n",
               cezanne::statusName(result), *rptr, *unexpected, *firstOffset);
     }
@@ -1770,7 +1862,16 @@ cezanne::Status CezanneGPU::sdmaVerify(const void *owner, uint32_t *rptr, uint32
 cezanne::Status CezanneGPU::sdmaStopLocked(uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence,
                                            uint32_t *ringResponse)
 {
-    // Caller holds lock_: halt and power down by progress, then the stage 13 teardown.
+    // Caller holds lock_: the stage 17 restore if any GART or IH register
+    // may have changed, halt and power down by progress, then the stage 13
+    // teardown.
+    cezanne::Status restore = cezanne::kOK;
+    if (gartState_ >= kGartEnabled && gartState_ != kGartRestored) {
+        uint32_t index = 0, value = 0, ihWptr = 0;
+        restore = gartRestoreLocked(&index, &value, &ihWptr);
+    }
+    gartState_ = kGartIdle;
+    copyVerified_ = false;
     CopyArgument copy = {nullptr, 0, nullptr, f32Cntl, downResponse, nullptr, nullptr, nullptr, 0, sdmaProgress_, false};
     cezanne::Status status = accessDevice(cezanne::kSdmaPageSet, copyStopOperation, &copy);
     uint32_t tmrStatus = 0;
@@ -1780,7 +1881,7 @@ cezanne::Status CezanneGPU::sdmaStopLocked(uint32_t *f32Cntl, uint32_t *downResp
     sdmaProgress_ = 0;
     IOLog(LOG_PREFIX "SDMA stop: %s, F32_CNTL 0x%08x, PowerDownSdma 0x%x; teardown %s\n", cezanne::statusName(status),
           *f32Cntl, *downResponse, cezanne::statusName(teardown));
-    return status != cezanne::kOK ? status : teardown;
+    return restore != cezanne::kOK ? restore : status != cezanne::kOK ? status : teardown;
 }
 
 cezanne::Status CezanneGPU::sdmaStop(const void *owner, uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence,
@@ -1791,6 +1892,174 @@ cezanne::Status CezanneGPU::sdmaStop(const void *owner, uint32_t *f32Cntl, uint3
     cezanne::Status status = cezanne::kSdmaOutOfOrder;
     if (copyState_ != kCopyIdle && pspOwner_ == owner) {
         status = sdmaStopLocked(f32Cntl, downResponse, fence, ringResponse);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+struct GartArgument {
+    const cezanne::Range *ranges;
+    uint32_t rangeCount;
+    uint32_t *snapshot, *display;
+    const uint32_t *sdmaSnapshot;
+    uint32_t *a, *b, *c; // per-step outputs
+    uint32_t progress;
+    cezanne::GartReport *report;
+};
+
+static cezanne::Status gartCheckOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                          const cezanne::RegisterWriter *writer, void *argument)
+{
+    GartArgument *gart = static_cast<GartArgument *>(argument);
+    cezanne::Status status = cezanne::checkGartBoot22(registers, length, stage, gart->a, gart->b);
+    cezanne::MetricsTarget target;
+    if (status == cezanne::kOK) {
+        status = cezanne::checkGartWorkTarget(registers, length, stage, gart->ranges, gart->rangeCount, &target);
+    }
+    if (status == cezanne::kOK) {
+        uint32_t *snapshot = gart->snapshot;
+        status = withCarveoutMemory(cezanne::kGartWorkPhysical, cezanne::kGartWorkCheckSize,
+                                    [writer, snapshot](const cezanne::MemoryReader &memory) {
+            return cezanne::checkRegionStable(memory, cezanne::kGartWorkCheckSize, *writer,
+                                              cezanne::kMetricsStablePauses, snapshot);
+        });
+    }
+    if (status == cezanne::kOK) {
+        status = cezanne::readDisplayInventory(registers, length, stage, gart->display);
+    }
+    return status;
+}
+
+static cezanne::Status gartEnableOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                           const cezanne::RegisterWriter *writer, void *argument)
+{
+    GartArgument *gart = static_cast<GartArgument *>(argument);
+    cezanne::Status status = withGartWork(stage, [&](const cezanne::MemoryReader &work,
+                                                     const cezanne::MemoryWriter &memory) {
+        return cezanne::writeGartWork(work, memory, stage);
+    });
+    if (status == cezanne::kOK) {
+        status = withSdmaWork(stage, [&](const cezanne::MemoryReader &work, const cezanne::MemoryWriter &memory) {
+            return cezanne::writeSdmaFrame2(work, memory, stage);
+        });
+    }
+    if (status == cezanne::kOK) {
+        status = cezanne::enableGart(registers, length, *writer, stage, gart->a, gart->b);
+    }
+    return status;
+}
+
+static cezanne::Status gartVerifyOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                           const cezanne::RegisterWriter *writer, void *argument)
+{
+    GartArgument *gart = static_cast<GartArgument *>(argument);
+    return withCarveoutMemory(cezanne::kSdmaWorkPhysical, cezanne::kSdmaWorkCheckSize,
+                              [&](const cezanne::MemoryReader &sdmaRegion) {
+        return withCarveoutMemory(cezanne::kGartWorkPhysical, cezanne::kGartWorkCheckSize,
+                                  [&](const cezanne::MemoryReader &gartRegion) {
+            return cezanne::verifyGart(registers, length, sdmaRegion, gart->sdmaSnapshot, gartRegion, gart->snapshot,
+                                       gart->display, *writer, stage, gart->report);
+        });
+    });
+}
+
+static cezanne::Status gartRestoreOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                            const cezanne::RegisterWriter *writer, void *argument)
+{
+    GartArgument *gart = static_cast<GartArgument *>(argument);
+    uint32_t ack = 0;
+    cezanne::Status status = cezanne::restoreGart(registers, length, *writer, stage, gart->progress, &ack);
+    cezanne::Status restored = cezanne::checkGartRestored(registers, length, stage, gart->a, gart->b, gart->c);
+    return status != cezanne::kOK ? status : restored;
+}
+
+cezanne::Status CezanneGPU::gartCheck(const void *owner, uint32_t *index, uint32_t *value)
+{
+    *index = *value = 0;
+    if (!diagnosticsReady_ || stage_ < cezanne::kGartStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, getProvider());
+    OSData *assigned = pci != nullptr ? OSDynamicCast(OSData, pci->getProperty("assigned-addresses")) : nullptr;
+    cezanne::Range ranges[8];
+    uint32_t count = 0;
+    cezanne::Status status = cezanne::parseAssignedAddresses(
+        assigned != nullptr ? static_cast<const uint8_t *>(assigned->getBytesNoCopy()) : nullptr,
+        assigned != nullptr ? assigned->getLength() : 0, ranges, 8, &count);
+    if (status != cezanne::kOK) {
+        return status;
+    }
+    IOLockLock(lock_);
+    status = cezanne::kGartOutOfOrder;
+    // After a verified stage 15 copy on this connection, once.
+    if (copyState_ == kCopySubmitted && copyVerified_ && pspOwner_ == owner && gartState_ == kGartIdle) {
+        GartArgument gart = {ranges, count, gartSnapshot_, gartDisplay_, nullptr, index, value, nullptr, 0, nullptr};
+        status = accessDevice(0, gartCheckOperation, &gart);
+        gartState_ = status == cezanne::kOK ? kGartChecked : kGartIdle;
+        IOLog(LOG_PREFIX "GART check: %s, index %u, value 0x%08x\n", cezanne::statusName(status), *index, *value);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::gartEnable(const void *owner, uint32_t *progress, uint32_t *ack)
+{
+    *progress = *ack = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kGartOutOfOrder;
+    if (gartState_ == kGartChecked && pspOwner_ == owner) {
+        GartArgument gart = {nullptr, 0, nullptr, nullptr, nullptr, progress, ack, nullptr, 0, nullptr};
+        status = accessDevice(cezanne::kGartPageSet, gartEnableOperation, &gart);
+        gartProgress_ = *progress;
+        // Anything written from here on is undone by the restore.
+        gartState_ = status == cezanne::kOK ? kGartEnabled : kGartFailed;
+        IOLog(LOG_PREFIX "GART enable: %s, progress %u, ENG17_ACK 0x%08x\n", cezanne::statusName(status), *progress,
+              *ack);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::gartVerify(const void *owner, cezanne::GartReport *report)
+{
+    *report = cezanne::GartReport();
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kGartOutOfOrder;
+    if (gartState_ == kGartSubmitted && pspOwner_ == owner) {
+        GartArgument gart = {nullptr, 0, gartSnapshot_, gartDisplay_, sdmaWorkSnapshot_, nullptr, nullptr, nullptr, 0,
+                             report};
+        status = accessDevice(0, gartVerifyOperation, &gart);
+        gartState_ = kGartVerified;
+        IOLog(LOG_PREFIX "GART verify: %s, RPTR %u, fence %u, fault 0x%08x, IH write-back 0x%08x, %u entries, "
+                         "%u SDMA traps; %u + %u unexpected words, %u display changes\n",
+              cezanne::statusName(status), report->rptr, report->fence2, report->faultStatus, report->ihWriteback,
+              report->ihEntries, report->sdmaTraps, report->sdmaUnexpected, report->gartUnexpected,
+              report->displayChanged);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::gartRestoreLocked(uint32_t *index, uint32_t *value, uint32_t *ihWptr)
+{
+    // Caller holds lock_.
+    GartArgument gart = {nullptr, 0, nullptr, nullptr, nullptr, index, value, ihWptr, gartProgress_, nullptr};
+    cezanne::Status status = accessDevice(cezanne::kGartPageSet, gartRestoreOperation, &gart);
+    IOLog(LOG_PREFIX "GART restore (progress %u): %s, index %u, value 0x%08x, IH_RB_WPTR 0x%08x\n", gartProgress_,
+          cezanne::statusName(status), *index, *value, *ihWptr);
+    setProperty("CezanneGPU GART restore", cezanne::statusName(status));
+    gartProgress_ = 0;
+    gartState_ = kGartRestored;
+    return status;
+}
+
+cezanne::Status CezanneGPU::gartRestore(const void *owner, uint32_t *index, uint32_t *value, uint32_t *ihWptr)
+{
+    *index = *value = *ihWptr = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kGartOutOfOrder;
+    if (gartState_ >= kGartEnabled && gartState_ != kGartRestored && pspOwner_ == owner) {
+        status = gartRestoreLocked(index, value, ihWptr);
     }
     IOLockUnlock(lock_);
     return status;
@@ -1886,6 +2155,10 @@ private:
     static IOReturn sdmaSubmit(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn sdmaVerify(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn sdmaStop(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn gartCheck(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn gartEnable(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn gartVerify(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn gartRestore(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPUUserClient, IOUserClient)
@@ -2189,7 +2462,7 @@ IOReturn CezanneGPUUserClient::sdmaSubmit(OSObject *target, void *, IOExternalMe
 {
     CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
     uint64_t frame = arguments->scalarInput[0];
-    if (frame > 1) {
+    if (frame > 2) {
         return kIOReturnBadArgument;
     }
     uint32_t v[5] = {};
@@ -2210,6 +2483,41 @@ IOReturn CezanneGPUUserClient::sdmaStop(OSObject *target, void *, IOExternalMeth
     CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
     uint32_t v[4] = {};
     return putScalars(arguments, self->gpu_->sdmaStop(self, &v[0], &v[1], &v[2], &v[3]), v, 4);
+}
+
+IOReturn CezanneGPUUserClient::gartCheck(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[2] = {};
+    return putScalars(arguments, self->gpu_->gartCheck(self, &v[0], &v[1]), v, 2);
+}
+
+IOReturn CezanneGPUUserClient::gartEnable(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[2] = {};
+    return putScalars(arguments, self->gpu_->gartEnable(self, &v[0], &v[1]), v, 2);
+}
+
+IOReturn CezanneGPUUserClient::gartVerify(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    cezanne::GartReport report;
+    arguments->scalarOutput[0] = self->gpu_->gartVerify(self, &report);
+    // The dispatch table fixes the structure size at sizeof(GartReport).
+    UInt8 *out = static_cast<UInt8 *>(arguments->structureOutput);
+    const UInt8 *in = reinterpret_cast<const UInt8 *>(&report);
+    for (uint32_t i = 0; i < sizeof(report); i++) {
+        out[i] = in[i];
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn CezanneGPUUserClient::gartRestore(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[3] = {};
+    return putScalars(arguments, self->gpu_->gartRestore(self, &v[0], &v[1], &v[2]), v, 3);
 }
 
 IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
@@ -2243,6 +2551,10 @@ IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMetho
         {sdmaSubmit, 1, 0, 6, 0},    // kDiagnosticSdmaSubmit
         {sdmaVerify, 0, 0, 5, 0},    // kDiagnosticSdmaVerify
         {sdmaStop, 0, 0, 5, 0},      // kDiagnosticSdmaStop
+        {gartCheck, 0, 0, 3, 0},     // kDiagnosticGartCheck
+        {gartEnable, 0, 0, 3, 0},    // kDiagnosticGartEnable
+        {gartVerify, 0, 0, 1, sizeof(cezanne::GartReport)}, // kDiagnosticGartVerify
+        {gartRestore, 0, 0, 4, 0},   // kDiagnosticGartRestore
     };
     if (selector >= cezanne::kDiagnosticSelectorCount) {
         return kIOReturnUnsupported;
