@@ -8,12 +8,13 @@
 // teardown through the ring (--psp-tmr) and the stage 13 SDMA0 firmware load
 // (--psp-sdma), and the stage 14 SDMA power-up register inventory
 // (--sdma-inventory), and the stage 15 first SDMA copy (--sdma-copy), and
-// the stage 17 GART and interrupt ring (--gart-ih).
+// the stage 17 GART and interrupt ring (--gart-ih), and the stage 18 MSI
+// delivery (--ih-intr).
 // --psp-state (stage 10) and --inventory16 (stage 16) only read.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
 //                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--sdma-inventory]
-//                          [--sdma-copy] [--gart-ih] [--psp-state] [--inventory16]
+//                          [--sdma-copy] [--gart-ih] [--ih-intr] [--psp-state] [--inventory16]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -248,7 +249,7 @@ void usage(FILE *out)
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
                       "                         [--psp-sdma] [--sdma-inventory] [--sdma-copy] [--gart-ih]\n"
-                      "                         [--psp-state] [--inventory16]\n"
+                      "                         [--ih-intr] [--psp-state] [--inventory16]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
@@ -268,6 +269,8 @@ void usage(FILE *out)
                       "fence, verifies it, and halts, powers down and tears down.\n"
                       "--gart-ih does --sdma-copy up to its verify, then enables the GART and IH ring 0, copies\n"
                       "through the GART with a fence and a TRAP, verifies, restores every register, and stops.\n"
+                      "--ih-intr does --gart-ih up to its verify, then turns on MSI delivery, runs a fence and a\n"
+                      "TRAP, counts the interrupt, acknowledges it, restores, and finishes as --gart-ih.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n"
                       "--inventory16 first reads the display, memory-hub VM and interrupt registers (reads only).\n");
 }
@@ -775,10 +778,118 @@ void printGartCheckEntry(uint64_t index, uint64_t value)
                 expected);
 }
 
+void printMsi(const char *when, const uint64_t *msi)
+{
+    std::printf("  MSI %s: control 0x%04llx (%s), address 0x%08llx%08llx, data 0x%04llx\n", when,
+                static_cast<unsigned long long>(msi[0]), (msi[0] & 1) != 0 ? "enabled" : "disabled",
+                static_cast<unsigned long long>(msi[2]), static_cast<unsigned long long>(msi[1]),
+                static_cast<unsigned long long>(msi[3]));
+}
+
+// The stage 18 steps after a verified stage 17 run: check, enable, frame 3,
+// verify, acknowledge, restore. The restore runs whenever the enable was
+// sent; the stage 17 restore that follows would also run it.
+bool intrIh(io_connect_t connection)
+{
+    uint64_t check[8] = {};
+    step("intr 1/6 check: INTERRUPT_CNTL, INTERRUPT_CNTL2, BIF_IH_DOORBELL_RANGE at boot 22; find the MSI vector");
+    if (!call(connection, kDiagnosticIntrCheck, check, 8)) return false;
+    std::printf("%s, MSI index %llu", statusName(static_cast<Status>(check[0])),
+                static_cast<unsigned long long>(check[3]));
+    if (check[0] == kIntrUnexpectedState && check[1] < kIntrCheckCount)
+        std::printf(" (%s reads 0x%08llx, boot 22 0)", registerName(kIntrCheck[check[1]]),
+                    static_cast<unsigned long long>(check[2]));
+    std::printf("\n");
+    printMsi("before", check + 4);
+    if (check[0] != kOK) return false;
+
+    uint64_t enable[6] = {};
+    step("intr 2/6 enable: ring off and reset, INTERRUPT_CNTL2 <- 0x06008010, IH_RB_CNTL <- 0xc0310114,\n"
+         "  register the MSI handler, IH_RB_CNTL <- 0xc0330195 (ENABLE_INTR)");
+    bool ok = call(connection, kDiagnosticIntrEnable, enable, 6);
+    if (ok) {
+        std::printf("%s, progress %llu\n", statusName(static_cast<Status>(enable[0])),
+                    static_cast<unsigned long long>(enable[1]));
+        printMsi("after", enable + 2);
+        ok = enable[0] == kOK;
+    }
+    if (ok) {
+        uint64_t frame = 3, out[6] = {};
+        step("intr 3/6 frame 3: FENCE 3, TRAP; GFX_RB_WPTR <- 4096, _HI <- 0");
+        ok = call(connection, kDiagnosticSdmaSubmit, out, 6, &frame, 1);
+        if (ok) {
+            std::printf("%s, fence %llu, GFX_RB_RPTR %llu, GFX_RB_WPTR %llu\n"
+                        "  SDMA0_F32_CNTL 0x%08llx, SDMA0_STATUS_REG 0x%08llx\n",
+                        statusName(static_cast<Status>(out[0])), static_cast<unsigned long long>(out[1]),
+                        static_cast<unsigned long long>(out[2]), static_cast<unsigned long long>(out[3]),
+                        static_cast<unsigned long long>(out[4]), static_cast<unsigned long long>(out[5]));
+            ok = out[0] == kOK;
+        }
+    }
+    if (ok) {
+        step("intr 4/6 verify: fence 3, the SDMA0 trap in the IH ring, exactly one MSI, no VM fault, regions, display");
+        uint64_t scalar = 0;
+        uint32_t scalarCount = 1;
+        IntrReport report = {};
+        size_t size = sizeof(report);
+        kern_return_t result = IOConnectCallMethod(connection, kDiagnosticIntrVerify, nullptr, 0, nullptr, 0, &scalar,
+                                                   &scalarCount, &report, &size);
+        ok = result == KERN_SUCCESS && scalarCount == 1 && size == sizeof(report);
+        if (!ok) {
+            std::printf("call failed 0x%08x\n", result);
+        } else {
+            std::printf("%s\n  MSI count %u, first %u us after the WPTR write; fence 3 %u, GFX_RB_RPTR %u\n"
+                        "  IH_RB_CNTL 0x%08x, VM_L2_PROTECTION_FAULT_STATUS 0x%08x\n"
+                        "  IH write-back 0x%08x, IH_RB_WPTR 0x%08x, IH_RB_RPTR 0x%08x: %u entries, %u SDMA0 traps, %u other\n"
+                        "  SDMA region %u unexpected (first +0x%x), GART region %u unexpected (first +0x%x)\n"
+                        "  display: %u changed",
+                        statusName(static_cast<Status>(scalar)), report.msiCount, report.latencyMicroseconds,
+                        report.fence3, report.rptr, report.ihRbCntl, report.faultStatus, report.ihWriteback,
+                        report.ihWptr, report.ihRptr, report.ihEntries, report.sdmaTraps, report.otherEntries,
+                        report.sdmaUnexpected, report.sdmaFirst, report.gartUnexpected, report.gartFirst,
+                        report.displayChanged);
+            if (report.displayChanged != 0) std::printf(" (first %s)", registerName(kDisplayInventory[report.displayFirst]));
+            std::printf("\n");
+            for (uint32_t entry = 0; entry < report.ihEntries && entry < kIhReportEntries; entry++) {
+                const uint32_t *dw = report.ring + entry * kIhEntryBytes / 4;
+                std::printf("  IH %3u: client %3u source %3u ring %u vmid %u | %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                            entry, dw[0] & 0xFF, (dw[0] >> 8) & 0xFF, (dw[0] >> 16) & 0xFF, (dw[0] >> 24) & 0xF, dw[0],
+                            dw[1], dw[2], dw[3], dw[4], dw[5], dw[6], dw[7]);
+            }
+            ok = scalar == kOK;
+        }
+    }
+    if (ok) {
+        uint64_t ack[5] = {};
+        step("intr 5/6 acknowledge: IH_RB_RPTR <- the write pointer, wait 100 ms for any re-fire");
+        ok = call(connection, kDiagnosticIntrAck, ack, 5);
+        if (ok) {
+            std::printf("%s, IH_RB_RPTR <- 0x%llx; MSI count %llu, after 100 ms %llu; IH write-back 0x%08llx\n",
+                        statusName(static_cast<Status>(ack[0])), static_cast<unsigned long long>(ack[1]),
+                        static_cast<unsigned long long>(ack[2]), static_cast<unsigned long long>(ack[3]),
+                        static_cast<unsigned long long>(ack[4]));
+            ok = ack[0] == kOK;
+        }
+    }
+    uint64_t restore[7] = {};
+    step("intr 6/6 restore: IH_RB_CNTL <- 0xc0310114, pointers 0, remove the handler, INTERRUPT_CNTL2 <- 0");
+    bool restored = call(connection, kDiagnosticIntrRestore, restore, 7);
+    if (restored) {
+        std::printf("%s", statusName(static_cast<Status>(restore[0])));
+        if (restore[0] == kIntrNotRestored && restore[1] < kIntrCheckCount)
+            std::printf(" (%s reads 0x%08llx, boot 22 0)", registerName(kIntrCheck[restore[1]]),
+                        static_cast<unsigned long long>(restore[2]));
+        std::printf("\n");
+        printMsi("after the restore", restore + 3);
+        restored = restore[0] == kOK;
+    }
+    return ok && restored;
+}
+
 // The stage 17 steps after a verified copy: check, enable, frame 2, verify,
 // restore. The restore runs whenever the enable was sent; the stage 15 stop
 // that follows would also run it.
-bool gartIh(io_connect_t connection)
+bool gartIh(io_connect_t connection, bool intr)
 {
     uint64_t check[3] = {};
     step("gart 1/5 check: GART and IH registers and display pipe 0 at boot 22; area 0xf440800000 placed and stable");
@@ -840,6 +951,7 @@ bool gartIh(io_connect_t connection)
             ok = scalar == kOK;
         }
     }
+    if (ok && intr) ok = intrIh(connection);
     uint64_t restore[4] = {};
     step("gart 5/5 restore: IH ring off, IH and SDMA0_CNTL to boot 22, VM_CONTEXT0_CNTL then GART to boot 22, flush");
     bool restored = call(connection, kDiagnosticGartRestore, restore, 4);
@@ -854,10 +966,11 @@ bool gartIh(io_connect_t connection)
 }
 
 // The stage 15 copy, after the stage 13 load: check, start, ring test,
-// copy, verify, stop; with gart, the stage 17 steps between verify and stop.
+// copy, verify, stop; with gart, the stage 17 steps between verify and stop,
+// and with intr also the stage 18 steps inside them.
 // Returns whether every step passed; the caller's teardown is skipped once
 // the check passed (stop does it).
-bool sdmaCopy(io_connect_t connection, bool *stopped, bool gart)
+bool sdmaCopy(io_connect_t connection, bool *stopped, bool gart, bool intr)
 {
     *stopped = false;
     uint64_t check[3] = {};
@@ -906,13 +1019,14 @@ bool sdmaCopy(io_connect_t connection, bool *stopped, bool gart)
             ok = verify[0] == kOK;
         }
     }
-    if (ok && gart) ok = gartIh(connection);
+    if (ok && gart) ok = gartIh(connection, intr);
     bool halted = copyStop(connection);
     return ok && halted;
 }
 
 // mode: 0 load only, 1 with the stage 14 inventory, 2 with the stage 15 copy,
-// 3 with the copy and the stage 17 GART and interrupt ring.
+// 3 with the copy and the stage 17 GART and interrupt ring, 4 with those and
+// the stage 18 MSI delivery.
 bool pspSdma(io_connect_t connection, int mode)
 {
     uint64_t check[7] = {};
@@ -995,7 +1109,7 @@ bool pspSdma(io_connect_t connection, int mode)
             std::printf("copy: skipped, LOAD_IP_FW did not fence\n");
         } else {
             bool stopped = false;
-            bool copied = sdmaCopy(connection, &stopped, mode == 3);
+            bool copied = sdmaCopy(connection, &stopped, mode >= 3, mode == 4);
             if (stopped) return copied && loaded[0] == kOK;
         }
         inventoried = false;
@@ -1082,7 +1196,8 @@ int main(int argc, char **argv)
 {
     unsigned long repeat = 1, interval = 1000;
     bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
-         inventory = false, copy = false, psp = false, inventory16Flag = false, gartFlag = false;
+         inventory = false, copy = false, psp = false, inventory16Flag = false, gartFlag = false,
+         intrFlag = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -1122,6 +1237,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--gart-ih") == 0) {
             gartFlag = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--ih-intr") == 0) {
+            intrFlag = true;
             continue;
         }
         if (std::strcmp(argv[i], "--inventory16") == 0) {
@@ -1264,6 +1383,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!pspSdma(connection, 3)) failures++;
+    }
+    if (intrFlag) {
+        if (info[1] < kIntrStage) {
+            std::fprintf(stderr, "cezanne-diag: --ih-intr needs driver stage %u\n", kIntrStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspSdma(connection, 4)) failures++;
     }
     if (inventory16Flag) {
         if (info[1] < kInventory16Stage) {
