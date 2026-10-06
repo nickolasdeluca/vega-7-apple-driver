@@ -1,6 +1,6 @@
 # USB test boot
 
-Status, 2026-10-06: **stages 0 to 14 succeeded** (see
+Status, 2026-10-06: **stages 0 to 15 succeeded** (see
 [Test boot log](#test-boot-log)). Stage 1 read both boot-state registers with
 the expected values. The first stage 0 attempt stalled in OpenCore file
 logging, which the test EFI no longer does. Stage 2 read and validated the IP
@@ -31,9 +31,10 @@ the PSP accepted and loaded the SDMA0 firmware (`SDMA0_UCODE_CHECKSUM` 0 →
 `PowerUpSdma`/`PowerDownSdma` answered `0x01`, and the 31-register SDMA
 inventory is recorded. Stage 15 (the first SDMA copy) ran in boot 20:
 SDMA0 started and stopped cleanly, but the ring test timed out because the
-driver wrote only the low half of the write pointer. That is fixed (it
-now also writes `GFX_RB_WPTR_HI`, as Linux does) and rebuilt, not yet
-booted. No later stage is authorized.
+driver wrote only the low half of the write pointer. With that fixed,
+**boot 21 completed the first verified DMA copy and fence**: SDMA0 wrote
+`0xDEADBEEF`, copied 4 KiB exactly and signalled fence 1, and nothing else
+in the checked region changed. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -2290,9 +2291,9 @@ proposal with the measured values):
 
 ### Stage 15: first SDMA copy (proposal)
 
-**Status: proposed 2026-10-06, approved by the user the same day (golden
-`GB_ADDR_CONFIG` applied, default page left for later), and implemented; not
-yet booted.**
+**Status: proposed 2026-10-06 and approved by the user the same day (golden
+`GB_ADDR_CONFIG` applied, default page left for later). Implemented; boot 20
+found the write-pointer defect, and with the fix it succeeded in boot 21.**
 
 **Implementation notes:**
 
@@ -2502,7 +2503,7 @@ rest of the 64 KiB must match the snapshot afterwards.
 
 ### Revision: stage 15 write-pointer commit
 
-**Status: fixed 2026-10-06 after boot 20, rebuilt, not yet booted.** It
+**Status: fixed 2026-10-06 after boot 20; it succeeded in boot 21.** It
 was written as a proposal, then applied directly under the rule the user
 set the same day (see [Rules](#rules)): defects found while testing an
 approved stage are fixed, documented and retested.
@@ -3480,6 +3481,40 @@ with `tools/update_stick.sh 15`; cold boot, kernel up 10:16:21 local).
   [revision](#revision-stage-15-write-pointer-commit).
 - **Every SDMA register write was verified on hardware**, and so was the
   full start and stop path.
+
+**Boot 21, 2026-10-06, stage 15 with the write-pointer fix**
+(`out/test-efi/usb-stage15/`, written with `tools/update_stick.sh 15`; cold
+boot, kernel up 10:26:47 local).
+
+- `CezanneGPU stage` 15, diagnostics v12; stages 1–3 `ok`.
+- **Load:** as boots 19 and 20 (fences 1 and 2, status 0, checksum
+  `0x25a1ba79`). **Copy check:** `ok`. **Start:** `ok`, progress 2,
+  `PowerUpSdma` `0x01`.
+- **Ring test:** `ok`. Observed **`0xdeadbeef`**, `GFX_RB_RPTR` 1024,
+  `GFX_RB_WPTR` 1024. `F32_CNTL` 0 (running), `STATUS_REG` `0x46deed57`.
+- **Copy and fence:** `ok`. **Fence 1**, `GFX_RB_RPTR` 2048, `GFX_RB_WPTR`
+  2048.
+- **Verify:** `ok`.
+  - `GFX_RB_RPTR` 2048.
+  - **The destination equals the source word for word.**
+  - **0 unexpected words** in the 64 KiB around the work area.
+- **Stop:** `ok`. `F32_CNTL` `0x00000001` (halted), `PowerDownSdma` `0x01`,
+  `DESTROY_TMR` fence 3, ring destroy `0x80030000`.
+- **Afterwards:** `GFX_RB_RPTR` and `GFX_RB_WPTR` stay at `0x800` (2048).
+  Otherwise the dump equals boot 20 (golden and start values in place,
+  ring disabled). The machine stayed as before.
+- **`STATUS_REG` changed:** it read `0x46dee557` while halted (boots 7 to
+  19) and `0x46deed57` while running. Bit 11 differs; recorded for later
+  decoding.
+- Captures (`diag.txt`, `ioreg.plist`) are in ignored
+  `out/test-efi/boot-21-stage15/`.
+- Result: **stage 15 succeeded. This is the "verified DMA copy and fence"
+  milestone:**
+  - SDMA0 ran firmware the PSP loaded;
+  - it executed a ring the driver built;
+  - it wrote memory (`0xDEADBEEF`), copied 4 KiB, and signalled a fence;
+  - nothing else in the checked region changed.
+  - Boot 20's missing `GFX_RB_WPTR_HI` write was the only defect.
 
 ## Unknowns and limits
 

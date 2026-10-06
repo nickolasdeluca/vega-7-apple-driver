@@ -133,7 +133,29 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: retest stage 15 with the write-pointer fix
+## Next task: choose the next milestone
+
+**Stages 0–15 succeeded. Boot 21 completed the "verified DMA copy and
+fence" milestone.**
+- SDMA0 ran PSP-loaded firmware and executed a driver-built ring: the ring
+  test wrote `0xDEADBEEF`, then a 4 KiB copy matched word for word, and
+  fence 1 arrived.
+- No unexpected memory changed, and the engine halted and powered down
+  cleanly.
+
+Candidates for the next proposal (AGENTS.md "Future stages"):
+- **Interrupts:** the IH ring, so fences can signal instead of being
+  polled. The deferred `TRAP` and the IH reroute question from boot 15
+  belong here.
+- **GART and the default page:** VMID 0 page tables, so engines can reach
+  system memory and the boot 14 zero default page is replaced by a scratch
+  page.
+- **Display:** one connector and mode with a test pattern, toward the
+  display milestone; DCN 2.1 state first, read-only.
+
+Each needs its own proposal.
+
+### Earlier: retesting stage 15
 
 Boot 20 showed the following:
 - SDMA0 started with every exact value and stopped cleanly.
