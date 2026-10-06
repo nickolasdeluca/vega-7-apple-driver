@@ -37,8 +37,10 @@ driver wrote only the low half of the write pointer. With that fixed,
 in the checked region changed. Stage 16 (a read-only display, VM and
 interrupt inventory) succeeded in boot 22, apart from one semaphore register
 whose read has a side effect, now removed from the list. Stage 17 (GART and
-the interrupt ring) is approved and built (`usb-stage17`), and waits for
-its first boot. No later stage is authorized.
+the interrupt ring) is approved and built (`usb-stage17`). Its first boot
+(24) stopped at the precondition check, before any write, on a live display
+status bit; the check is fixed and rebuilt, and waits for boot 25. No later
+stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -2885,7 +2887,8 @@ semaphore):
   client 8 (`SOC15_IH_CLIENTID_SDMA0`) with source 224
   (`SDMA0_4_0__SRCID__SDMA_TRAP`); other clients' entries are recorded;
 - the display inventory (stage 16) is unchanged, apart from the live
-  `HUBP_IN_BLANK` bit;
+  `DCHUBP_CNTL` status bits (`HUBP_NO_OUTSTANDING_REQ`, `HUBP_IN_BLANK`,
+  `HUBP_XRQ_NO_OUTSTANDING_REQ`; widened after boot 24);
 - the two 64 KiB regions hold only expected words.
 
 **Restore** (before the stage 15 stop):
@@ -4057,6 +4060,35 @@ with `tools/update_stick.sh 16`; cold boot, kernel up 10:39:35 local).
   frame, and is not a change of state.
 - Captures are in ignored `out/test-efi/boot-23-stage16/`.
 - Result: **the stage 16 fix is confirmed.**
+
+**Boot 24, 2026-10-06, stage 17** (`out/test-efi/usb-stage17/`, first
+build; cold boot; `tools/capture_boot.sh boot-24-stage17 --gfxoff-disallow
+--gart-ih --psp-state`).
+
+- GFXOFF disallow, the SDMA0 load (fences 1 and 2) and the stage 15 copy
+  (ring test, `COPY_LINEAR`, fence 1, verify) all passed as in boot 21.
+- `gart 1/5 check` stopped with `gart-unexpected-state`:
+  `HUBP0_DCHUBP_CNTL` read `0x000e0000`, against boot 22's `0x000f0002`.
+  Nothing of stage 17 was written: no GART, IH, `SDMA0_CNTL` or engine 17
+  write, and no frame 2.
+- The stage 15 stop then ran normally (`SDMA0_F32_CNTL` 1, `PowerDownSdma`,
+  `DESTROY_TMR` fence 3, ring response `0x80030000`). The final dump read
+  `HUBP0_DCHUBP_CNTL` `0x000f0002` again; every GART and IH register still
+  held its boot 22 value. `cezanne-diag` exited 1.
+- **Finding:** the two bits that differ are `HUBP_NO_OUTSTANDING_REQ`
+  (bit 1) and bit 16 of `HUBP_XRQ_NO_OUTSTANDING_REQ` (19:16). Like
+  `HUBP_IN_BLANK` (boot 23), they are live status: pipe 0 is scanning out,
+  and they report whether a fetch is in flight when the read lands.
+  The check masked only bit 3.
+- **Fix (within the stage):** `kHubpLiveStatus` = `0x000f000a` (bits 1, 3
+  and 19:16) is masked out in the precondition check and in the verify's
+  display comparison. `HUBP_BLANK_EN`, `HUBP_DISABLE`, the timeout and the
+  underflow status are still compared. The core test now accepts the boot
+  24 value and rejects an underflow status. The first build is kept as
+  `superseded-*-stage17-hubp`.
+- Captures are in ignored `out/test-efi/boot-24-stage17/`.
+- Result: **stopped before any stage 17 write; the check is fixed.** Boot 25
+  repeats the run with the rebuilt `usb-stage17`.
 
 ## Unknowns and limits
 

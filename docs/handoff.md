@@ -17,8 +17,9 @@ following:
 - run a verified SDMA copy and fence (boot 21);
 - read the display, MMHUB VM and IH state (boot 22).
 
-Stage 17 (GART and the IH ring) is approved and built, waiting for its
-first boot; see "Next task" below. The sections that follow are the earlier discovery record and
+Stage 17 (GART and the IH ring) is approved and built. Boot 24 stopped at
+its precondition check before any write; the check is fixed and rebuilt for
+boot 25; see "Next task" below. The sections that follow are the earlier discovery record and
 still apply.
 
 Completed work:
@@ -132,23 +133,28 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 17 (approved and built 2026-10-06)
+## Next task: boot stage 17 again (boot 25)
 
-**Resume here.** Stage 17 is implemented and built; it has not been booted.
-The user is on the known-good EFI. Steps:
+**Resume here.** Boot 24 (2026-10-06) stopped at the stage 17 precondition
+check on a live `HUBP0_DCHUBP_CNTL` status bit, before any stage 17 write;
+the check is fixed and `usb-stage17` is rebuilt (see the boot 24 entry in
+the [test boot log](test-boot.md#test-boot-log)). Steps:
 
-1. The user makes a Time Machine backup, runs `tools/update_stick.sh 17`
-   (done 2026-10-06: the stick matched), cold boots the stick, and runs
-   `tools/capture_boot.sh boot-24-stage17 --gfxoff-disallow --gart-ih --psp-state`.
+1. The user runs `tools/update_stick.sh 17` (the stick still holds the first
+   build), cold boots the stick, and runs
+   `tools/capture_boot.sh boot-25-stage17 --gfxoff-disallow --gart-ih --psp-state`.
 2. Read the output against "Stage 17 succeeds when" in
-   [test-boot.md](test-boot.md) and record boot 24 in the log. Follow the
+   [test-boot.md](test-boot.md) and record boot 25 in the log. Follow the
    [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
    for defects.
 
 **Builds:**
-- `out/test-efi/usb-stage17` (its build record is `usb-stage17-build.json`);
+- `out/test-efi/usb-stage17` (rebuilt after boot 24; its `manifest.json`
+  is the build record);
 - `out/test-efi/driver`;
 - `out/diag`;
+- the first stage 17 builds, kept as `superseded-driver-stage17-hubp`,
+  `superseded-diag-stage17-hubp` and `superseded-usb-stage17-hubp`;
 - the stage 16 builds, kept as `superseded-driver-stage16` and
   `superseded-diag-stage16`.
 
