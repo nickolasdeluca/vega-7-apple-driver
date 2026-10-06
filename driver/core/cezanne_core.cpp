@@ -69,6 +69,9 @@ const char *statusName(Status status)
     case kPspResponseNotOk: return "psp-response-not-ok";
     case kPspRegionChanged: return "psp-region-changed";
     case kPspOutOfOrder: return "psp-out-of-order";
+    case kPspReadbackMismatch: return "psp-readback-mismatch";
+    case kPspFenceTimeout: return "psp-fence-timeout";
+    case kPspCommandFailed: return "psp-command-failed";
     }
     return "unknown";
 }
@@ -434,6 +437,8 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (offset == kRegMp0C2PMsg69) return value == uint32_t(kPspRingGpuAddress);
     if (offset == kRegMp0C2PMsg70) return value == uint32_t(kPspRingGpuAddress >> 32);
     if (offset == kRegMp0C2PMsg71) return value == kPspRingSize;
+    if (stage < kPspTmrStage) return false;
+    if (offset == kRegMp0C2PMsg67) return value == kPspFrameDwords || value == 2 * kPspFrameDwords;
     return false;
 }
 
@@ -824,6 +829,191 @@ Status destroyPspRing(const RegisterReader &registers, uint64_t apertureLength, 
     if (!created) return kPspOutOfOrder;
     bool written = false;
     return sendPspCommand(registers, apertureLength, writer, stage, kPspCmdDestroyRings, 0, 0, 0, response, &written);
+}
+
+uint32_t pspCommandWord(uint32_t command, uint32_t word)
+{
+    if (word == kPspCmdIdOffset / 4) return command;
+    if (command != kGfxCmdSetupTmr) return 0;
+    // psp_prep_tmr_cmd_buf: psp_gfx_cmd_setup_tmr at +28.
+    switch (word - kPspCmdFieldsOffset / 4) {
+    case 0: return uint32_t(kPspTmrGpuAddress);
+    case 1: return uint32_t(kPspTmrGpuAddress >> 32);
+    case 2: return kPspTmrSize;
+    case 3: return kPspTmrFlagVirtPhysAddr;
+    case 4: return uint32_t(kPspTmrPhysical);
+    case 5: return uint32_t(kPspTmrPhysical >> 32);
+    default: return 0;
+    }
+}
+
+uint32_t pspFrameWord(uint32_t frame, uint32_t word)
+{
+    // psp_ring_cmd_submit: cmd_buf_addr, cmd_buf_size 0, fence_addr, fence_value.
+    switch (word) {
+    case 0: return uint32_t(kPspCmdGpuAddress);
+    case 1: return uint32_t(kPspCmdGpuAddress >> 32);
+    case 3: return uint32_t(kPspFenceGpuAddress);
+    case 4: return uint32_t(kPspFenceGpuAddress >> 32);
+    case 5: return frame + 1;
+    default: return 0;
+    }
+}
+
+bool pspWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
+{
+    if (stage < kPspTmrStage || (offset & 3) != 0 || offset >= kPspWorkSize) return false;
+    if (offset >= kPspFencePage) return value == 0;
+    if (offset >= kPspCmdPage) {
+        uint32_t word = (offset - kPspCmdPage) / 4;
+        return value == 0 || value == pspCommandWord(kGfxCmdSetupTmr, word) ||
+               value == pspCommandWord(kGfxCmdDestroyTmr, word);
+    }
+    uint32_t frame = offset / kPspFrameSize;
+    return frame < 2 && (value == 0 || value == pspFrameWord(frame, (offset % kPspFrameSize) / 4));
+}
+
+static Status writeWork(const MemoryWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
+{
+    if (!pspWorkWriteAllowed(offset, value, stage)) return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+Status checkPspTmrTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                         const Range *ranges, uint32_t rangeCount, MetricsTarget *target)
+{
+    *target = MetricsTarget();
+    if (stage < kPspTmrStage) return kRegisterNotAllowed;
+    Status status = checkCarveoutPage(registers, apertureLength, stage, kPspTmrCarveoutOffset, kPspTmrSize, ranges,
+                                      rangeCount, target);
+    if (status != kOK) return status;
+    if (target->gpuAddress != kPspTmrGpuAddress || target->physical != kPspTmrPhysical) return kMetricsAddressMismatch;
+    return kOK;
+}
+
+static Status regionSum(const MemoryReader &memory, uint32_t length, uint64_t *sum)
+{
+    *sum = 0;
+    for (uint32_t offset = 0; offset < length; offset += 4) {
+        uint32_t value = 0;
+        if (!memory.read32(memory.context, offset, &value)) return kRegisterReadFailed;
+        // Position-dependent, so moved words also change the sum.
+        *sum = (*sum ^ value) * 0x100000001B3ull + offset;
+    }
+    return kOK;
+}
+
+Status checkRegionChecksum(const MemoryReader &memory, uint32_t length, const RegisterWriter &writer,
+                           uint32_t pauses)
+{
+    uint64_t first = 0, second = 0;
+    Status status = regionSum(memory, length, &first);
+    if (status != kOK) return status;
+    for (uint32_t i = 0; i < pauses; i++) writer.pause(writer.context);
+    status = regionSum(memory, length, &second);
+    if (status != kOK) return status;
+    return first == second ? kOK : kTableRegionInUse;
+}
+
+Status writePspCommand(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage, uint32_t command)
+{
+    if (stage < kPspTmrStage || (command != kGfxCmdSetupTmr && command != kGfxCmdDestroyTmr))
+        return kRegisterNotAllowed;
+    uint32_t frame = command == kGfxCmdSetupTmr ? 0 : 1;
+    // Each pass writes, then reads back: the command page, the fence page
+    // (SETUP_TMR only), and the frame.
+    for (int pass = 0; pass < 2; pass++) {
+        for (uint32_t word = 0; word < kPspRingSize / 4; word++) {
+            uint32_t offset = kPspCmdPage + word * 4, expected = pspCommandWord(command, word);
+            if (pass == 0) {
+                Status status = writeWork(writer, stage, offset, expected);
+                if (status != kOK) return status;
+            } else {
+                uint32_t value = 0;
+                if (!work.read32(work.context, offset, &value)) return kRegisterReadFailed;
+                if (value != expected) return kPspReadbackMismatch;
+            }
+        }
+        for (uint32_t word = 0; command == kGfxCmdSetupTmr && word < kPspRingSize / 4; word++) {
+            uint32_t offset = kPspFencePage + word * 4;
+            if (pass == 0) {
+                Status status = writeWork(writer, stage, offset, 0);
+                if (status != kOK) return status;
+            } else {
+                uint32_t value = 0;
+                if (!work.read32(work.context, offset, &value)) return kRegisterReadFailed;
+                if (value != 0) return kPspReadbackMismatch;
+            }
+        }
+        for (uint32_t word = 0; word < kPspFrameDwords; word++) {
+            uint32_t offset = frame * kPspFrameSize + word * 4, expected = pspFrameWord(frame, word);
+            if (pass == 0) {
+                Status status = writeWork(writer, stage, offset, expected);
+                if (status != kOK) return status;
+            } else {
+                uint32_t value = 0;
+                if (!work.read32(work.context, offset, &value)) return kRegisterReadFailed;
+                if (value != expected) return kPspReadbackMismatch;
+            }
+        }
+    }
+    return kOK;
+}
+
+Status submitPspFrame(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *fence)
+{
+    *fence = 0;
+    if (stage < kPspTmrStage || frame > 1) return kRegisterNotAllowed;
+    uint32_t pointer = 0;
+    Status status = readRegister(registers, apertureLength, stage, kRegMp0C2PMsg67, &pointer);
+    if (status != kOK) return status;
+    if (pointer != frame * kPspFrameDwords) return kPspOutOfOrder;
+    status = writeRegister(writer, stage, kRegMp0C2PMsg67, (pointer + kPspFrameDwords) % kPspRingDwords);
+    if (status != kOK) return status;
+    for (uint32_t i = 0; i <= kPspFencePollPauses; i++) {
+        if (!work.read32(work.context, kPspFencePage, fence)) return kRegisterReadFailed;
+        if (*fence == frame + 1) return kOK;
+        if (i == kPspFencePollPauses) return kPspFenceTimeout;
+        writer.pause(writer.context);
+    }
+    return kPspFenceTimeout;
+}
+
+Status readPspResponse(const MemoryReader &work, PspResponse *response)
+{
+    *response = PspResponse();
+    uint32_t *fields[] = {&response->status, nullptr, &response->fwAddrLo, &response->fwAddrHi, &response->tmrSize};
+    for (uint32_t i = 0; i < 5; i++) {
+        uint32_t value = 0;
+        if (!work.read32(work.context, kPspCmdPage + kPspRespOffset + i * 4, &value)) return kRegisterReadFailed;
+        if (fields[i] != nullptr) *fields[i] = value;
+    }
+    return response->status == 0 ? kOK : kPspCommandFailed;
+}
+
+Status verifyPspWorkArea(const MemoryReader &region, const uint32_t *snapshot, uint32_t frames, uint32_t command,
+                         uint32_t fence, uint32_t *unexpected, uint32_t *firstOffset)
+{
+    *unexpected = 0;
+    *firstOffset = 0;
+    for (uint32_t offset = 0; offset < kPspRingCheckSize; offset += 4) {
+        uint32_t value = 0;
+        if (!region.read32(region.context, offset, &value)) return kRegisterReadFailed;
+        bool ok;
+        if (offset < frames * kPspFrameSize) {
+            ok = value == pspFrameWord(offset / kPspFrameSize, (offset % kPspFrameSize) / 4);
+        } else if (offset >= kPspCmdPage && offset < kPspFencePage) {
+            uint32_t at = offset - kPspCmdPage;
+            ok = (at >= kPspRespOffset && at < kPspRespOffset + kPspRespSize) || value == pspCommandWord(command, at / 4);
+        } else if (offset >= kPspFencePage && offset < kPspWorkSize) {
+            ok = value == (offset == kPspFencePage ? fence : 0);
+        } else {
+            ok = value == snapshot[offset / 4];
+        }
+        if (!ok && (*unexpected)++ == 0) *firstOffset = offset;
+    }
+    return *unexpected == 0 ? kOK : kPspRegionChanged;
 }
 
 } // namespace cezanne

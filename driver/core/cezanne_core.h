@@ -2,13 +2,15 @@
 // IP discovery table.
 //
 // Freestanding C++ shared by the kext and the host unit tests: it uses no
-// IOKit, libc or allocation. The adapter supplies read callbacks and, for the
-// stage 6 scratch test and stage 7 SMU queries, one write callback. The write
-// allowlist names exact registers and values: SCRATCH_REG0 (stage 6) and the
-// three SMU mailbox writes of a version query (stage 7), plus the
-// DisableGfxOff message (stage 8), plus the three metrics-table messages and
-// their arguments (stage 9). Widening it is a reviewed stage change
-// (docs/test-boot.md).
+// IOKit, libc or allocation. The adapter supplies read callbacks, a register
+// write callback (stage 6 on) and a work-area memory write callback (stage
+// 12). The register write allowlist names exact registers and values:
+// SCRATCH_REG0 (stage 6) and the three SMU mailbox writes of a version query
+// (stage 7), plus the DisableGfxOff message (stage 8), plus the three
+// metrics-table messages and their arguments (stage 9), plus the PSP ring
+// create and destroy (stage 11) and its write pointer (stage 12). The memory
+// write allowlist names the three work-area pages and their exact words
+// (stage 12). Widening either is a reviewed stage change (docs/test-boot.md).
 //
 // Register offsets are byte offsets into the MMIO register BAR (BAR5). Linux
 // v6.12 selects BAR5 for CHIP_BONAIRE and later in amdgpu_device_init and,
@@ -29,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 11;
+const uint32_t kMaxStage = 12;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -332,6 +334,36 @@ const uint32_t kPspSettlePauses = 20;
 const uint32_t kPspPollPauses = 100;
 const uint32_t kPspRingStage = 11;
 
+// Stage 12: the first ring frame, GFX_CMD_ID_SETUP_TMR, then
+// GFX_CMD_ID_DESTROY_TMR (psp_gfx_if.h; psp_tmr_load, psp_tmr_unload). The
+// "work area" is the ring page and the two pages after it: the command
+// buffer and the fence buffer; it is the only memory the CPU writes.
+const uint32_t kGfxCmdSetupTmr = 5;
+const uint32_t kGfxCmdDestroyTmr = 7;
+const uint32_t kPspWorkSize = 0x3000;
+const uint32_t kPspCmdPage = 0x1000;   // work-area offset of the command buffer
+const uint32_t kPspFencePage = 0x2000; // work-area offset of the fence buffer
+const uint64_t kPspCmdGpuAddress = kPspRingGpuAddress + kPspCmdPage;
+const uint64_t kPspFenceGpuAddress = kPspRingGpuAddress + kPspFencePage;
+// psp_gfx_cmd_resp: cmd_id at +8, the command at +28, psp_gfx_resp (96
+// bytes) at +864; 1024 bytes in all.
+const uint32_t kPspCmdIdOffset = 8, kPspCmdFieldsOffset = 28, kPspRespOffset = 864, kPspRespSize = 96;
+// psp_gfx_rb_frame: 64 bytes, 16 dwords; the write pointer counts dwords
+// modulo the ring's 1024.
+const uint32_t kPspFrameSize = 64;
+const uint32_t kPspFrameDwords = 16;
+const uint32_t kPspRingDwords = kPspRingSize / 4;
+// PSP_TMR_SIZE (4 MiB), aligned to its size; amdgpu_gmc_vram_mc2pa gives the
+// physical address from MC_VM_FB_OFFSET as for every carveout page here.
+const uint64_t kPspTmrCarveoutOffset = 0x40400000ull;
+const uint32_t kPspTmrSize = 0x400000;
+const uint64_t kPspTmrGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kPspTmrCarveoutOffset;
+const uint64_t kPspTmrPhysical = (uint64_t(kExpectedFbOffset) << 24) + kPspTmrCarveoutOffset;
+const uint32_t kPspTmrFlagVirtPhysAddr = 0x2; // tmr_flags.virt_phy_addr
+// psp_cmd_submit_buf waits up to psp_timeout (20000) x 10-100 us; here 2 s.
+const uint32_t kPspFencePollPauses = 2000;
+const uint32_t kPspTmrStage = 12;
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -409,6 +441,10 @@ enum Status : uint32_t {
     kPspResponseNotOk,
     kPspRegionChanged,
     kPspOutOfOrder,
+    // Stage 12.
+    kPspReadbackMismatch,
+    kPspFenceTimeout,
+    kPspCommandFailed,
 };
 
 const char *statusName(Status status);
@@ -527,7 +563,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 7;
+const uint32_t kDiagnosticVersion = 8;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -549,7 +585,11 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticPspRingCreate = 12,  // out: Status, response, command written
     kDiagnosticPspRingObserve = 13, // out: Status, C2PMSG_64, 67, 69, 70, 71, changed in page, changed outside
     kDiagnosticPspRingDestroy = 14, // out: Status, response, C2PMSG_64, 67, 69, 70, 71
-    kDiagnosticSelectorCount = 15,
+    // Stage 12, after a passing check and create (selectors 11 and 12).
+    kDiagnosticPspTmrSubmit = 15,   // out: Status, fence, response status, fw_addr lo, hi, tmr_size, C2PMSG_67
+    kDiagnosticPspTmrObserve = 16,  // out: Status, unexpected words, first unexpected work-area offset
+    kDiagnosticPspTmrTeardown = 17, // out: Status, DESTROY_TMR fence, its status, ring response, C2PMSG_64, 67
+    kDiagnosticSelectorCount = 18,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -700,6 +740,61 @@ Status compareRegion(const MemoryReader &memory, uint32_t length, uint32_t pageS
 // same settle, poll and response checks.
 Status destroyPspRing(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                       uint32_t stage, bool created, uint32_t *response);
+
+// Stage 12. Writes 32-bit words at byte offsets of the work area's writable
+// mapping.
+struct MemoryWriter {
+    bool (*write32)(void *context, uint32_t offset, uint32_t value);
+    void *context;
+};
+
+// The exact words the driver writes: a command buffer (SETUP_TMR or
+// DESTROY_TMR; 0 beyond cmd_id and the fields) and ring frames 0 (SETUP_TMR,
+// fence value 1) and 1 (DESTROY_TMR, fence value 2). word is the dword index.
+uint32_t pspCommandWord(uint32_t command, uint32_t word);
+uint32_t pspFrameWord(uint32_t frame, uint32_t word);
+
+// Memory writes allowed in the work area from stage 12: 0 anywhere in the
+// command and fence pages and in frames 0 and 1, or a frame's or either
+// command's word at its own offset.
+bool pspWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage);
+
+// The TMR region and its placement: the stage 9 page checks for 4 MiB at
+// kPspTmrCarveoutOffset. No memory access.
+Status checkPspTmrTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                         const Range *ranges, uint32_t rangeCount, MetricsTarget *target);
+
+// Sums the region twice, pauses pauses apart (kTableRegionInUse if the sums
+// differ). For the TMR, which is too large to snapshot.
+Status checkRegionChecksum(const MemoryReader &memory, uint32_t length, const RegisterWriter &writer,
+                           uint32_t pauses);
+
+// Writes a command into the work area as psp_cmd_submit_buf and
+// psp_ring_cmd_submit do: the whole command page (zeros and the command), the
+// fence page zeroed (SETUP_TMR only), and its frame (0 for SETUP_TMR, 1 for
+// DESTROY_TMR); then reads every written word back (kPspReadbackMismatch).
+Status writePspCommand(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage, uint32_t command);
+
+// Advances C2PMSG_67 from frame * 16 (kPspOutOfOrder otherwise) to
+// (frame + 1) * 16 and polls the fence dword for frame + 1, up to
+// kPspFencePollPauses pauses (kPspFenceTimeout).
+Status submitPspFrame(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *fence);
+
+struct PspResponse {
+    uint32_t status, fwAddrLo, fwAddrHi, tmrSize; // psp_gfx_resp
+};
+
+// Reads psp_gfx_resp from the command page; kPspCommandFailed if status != 0.
+Status readPspResponse(const MemoryReader &work, PspResponse *response);
+
+// Compares the 64 KiB from the ring page with the snapshot taken before the
+// create: frames below frames and the command page must hold the driver's
+// words (the response area may hold anything), the fence dword must be
+// fence, the rest of the fence page 0, and every other word unchanged.
+// Counts the words that differ (kPspRegionChanged if any).
+Status verifyPspWorkArea(const MemoryReader &region, const uint32_t *snapshot, uint32_t frames, uint32_t command,
+                         uint32_t fence, uint32_t *unexpected, uint32_t *firstOffset);
 
 } // namespace cezanne
 

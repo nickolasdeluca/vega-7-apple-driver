@@ -56,6 +56,8 @@ struct FakeConfig {
 struct FakeMemory {
     uint32_t words[kMetricsCheckSize / 4];
     bool fail = false;
+    int stuckOffset = -1; // a word whose writes are lost
+    int writes = 0;
     FakeMemory() { std::memset(words, 0, sizeof(words)); }
     static bool read32(void *context, uint32_t offset, uint32_t *value)
     {
@@ -64,7 +66,16 @@ struct FakeMemory {
         *value = self->words[offset / 4];
         return true;
     }
+    static bool write32(void *context, uint32_t offset, uint32_t value)
+    {
+        FakeMemory *self = static_cast<FakeMemory *>(context);
+        self->writes++;
+        if (self->fail || offset % 4 != 0 || offset >= kMetricsCheckSize) return false;
+        if (int(offset) != self->stuckOffset) self->words[offset / 4] = value;
+        return true;
+    }
     MemoryReader reader() { return MemoryReader{read32, this}; }
+    MemoryWriter writer() { return MemoryWriter{write32, this}; }
 };
 
 struct FakeRegisters {
@@ -95,6 +106,14 @@ struct FakeRegisters {
     uint32_t pspReply = 0x80000000u; // C2PMSG_64 once it answers
     int pspDelay = 0;                // pauses before it answers; -1 never
     int pspPending = -1;
+    // The fake PSP's ring processing: work is the work area it reads frames
+    // from and writes fences and responses to.
+    FakeMemory *work = nullptr;
+    int frameDelay = 0;          // pauses before it processes a frame; -1 never
+    int framePending = -1;
+    uint32_t frameStart = 0;     // write pointer of the pending frame, in dwords
+    uint32_t cmdStatus = 0;      // psp_gfx_resp.status it writes
+    FakeMemory *mutateOnPause = nullptr;
     int pauses = 0;
     bool fail = false;
     uint32_t order[32];
@@ -700,6 +719,12 @@ struct FakeWriter {
         if (offset == kRegMp0C2PMsg69) r->psp69 = value;
         if (offset == kRegMp0C2PMsg70) r->psp70 = value;
         if (offset == kRegMp0C2PMsg71) r->psp71 = value;
+        if (offset == kRegMp0C2PMsg67) {
+            r->frameStart = r->psp67;
+            r->psp67 = value;
+            r->framePending = r->frameDelay;
+            if (r->framePending == 0) process(r);
+        }
         if (offset == kRegMp0C2PMsg64) {
             r->psp64 = value; // response flag clear until the PSP answers
             r->pspPending = r->pspDelay;
@@ -724,6 +749,19 @@ struct FakeWriter {
         }
         r->smuPending = -1;
     }
+    // Processes the frame at frameStart if it names the command and fence
+    // buffers: writes the response status and the fence value.
+    static void process(FakeRegisters *r)
+    {
+        r->framePending = -1;
+        if (r->work == nullptr) return;
+        const uint32_t *frame = &r->work->words[r->frameStart];
+        uint64_t cmd = (uint64_t(frame[1]) << 32) | frame[0], fence = (uint64_t(frame[4]) << 32) | frame[3];
+        if (cmd != kPspCmdGpuAddress || fence != kPspFenceGpuAddress) return;
+        r->work->words[(kPspCmdPage + kPspRespOffset) / 4] = r->cmdStatus;
+        r->work->words[(kPspCmdPage + kPspRespOffset) / 4 + 4] = 0x400000; // tmr_size
+        r->work->words[kPspFencePage / 4] = frame[5];
+    }
     static void pause(void *context)
     {
         FakeWriter *self = static_cast<FakeWriter *>(context);
@@ -732,6 +770,8 @@ struct FakeWriter {
         if (r->smuPending > 0 && --r->smuPending == 0) answer(r);
         if (r->gfxOffPending > 0 && --r->gfxOffPending == 0) r->gfxMisc = 0x4;
         if (r->pspPending > 0 && --r->pspPending == 0) r->psp64 = r->pspReply;
+        if (r->framePending > 0 && --r->framePending == 0) process(r);
+        if (r->mutateOnPause != nullptr) r->mutateOnPause->words[100] ^= 1;
         r->pauses++;
     }
     RegisterWriter writer() { return RegisterWriter{write32, pause, this}; }
@@ -1239,6 +1279,146 @@ static void testPspRing()
     }
 }
 
+static void testPspTmr()
+{
+    // Addresses and the exact images (psp_gfx_if.h offsets).
+    CHECK(kPspCmdGpuAddress == 0xF440101000ull && kPspFenceGpuAddress == 0xF440102000ull);
+    CHECK(kPspTmrGpuAddress == 0xF440400000ull && kPspTmrPhysical == 0x600400000ull);
+    CHECK(kPspTmrCarveoutOffset % kPspTmrSize == 0 && kPspTmrPhysical >= kPspRingPhysical + kPspRingCheckSize);
+    CHECK(kPspRespOffset == 864 && kPspCmdFieldsOffset == 28 && kPspFrameSize == 64);
+    const uint32_t setup[] = {0, 0, 5, 0, 0, 0, 0, 0x40400000u, 0xF4u, 0x400000u, 0x2u, 0x00400000u, 0x6u, 0};
+    for (uint32_t i = 0; i < 14; i++) CHECK(pspCommandWord(kGfxCmdSetupTmr, i) == setup[i]);
+    CHECK(pspCommandWord(kGfxCmdDestroyTmr, 2) == 7);
+    for (uint32_t i = 0; i < 256; i++) {
+        if (i != 2) CHECK(pspCommandWord(kGfxCmdDestroyTmr, i) == 0);
+        if (i > 12) CHECK(pspCommandWord(kGfxCmdSetupTmr, i) == 0);
+    }
+    const uint32_t frame0[] = {0x40101000u, 0xF4u, 0, 0x40102000u, 0xF4u, 1};
+    for (uint32_t i = 0; i < 16; i++) {
+        CHECK(pspFrameWord(0, i) == (i < 6 ? frame0[i] : 0));
+        CHECK(pspFrameWord(1, i) == (i == 5 ? 2 : i < 6 ? frame0[i] : 0));
+    }
+
+    // Memory writes: the three pages only, exact values only, stage 12 only.
+    CHECK(pspWorkWriteAllowed(0, 0x40101000u, 12) && !pspWorkWriteAllowed(0, 0x40101000u, 11));
+    CHECK(pspWorkWriteAllowed(64 + 20, 2, 12) && !pspWorkWriteAllowed(20, 2, 12));
+    CHECK(!pspWorkWriteAllowed(128, 0, 12)); // frame 2
+    CHECK(pspWorkWriteAllowed(kPspCmdPage + 8, 5, 12) && pspWorkWriteAllowed(kPspCmdPage + 8, 7, 12));
+    CHECK(!pspWorkWriteAllowed(kPspCmdPage + 8, 6, 12) && !pspWorkWriteAllowed(kPspCmdPage + 12, 5, 12));
+    CHECK(pspWorkWriteAllowed(kPspCmdPage + 28, 0x40400000u, 12) && !pspWorkWriteAllowed(kPspCmdPage + 28, 0x40500000u, 12));
+    CHECK(pspWorkWriteAllowed(kPspFencePage, 0, 12) && !pspWorkWriteAllowed(kPspFencePage, 1, 12));
+    CHECK(!pspWorkWriteAllowed(kPspWorkSize, 0, 12));
+    CHECK(!pspWorkWriteAllowed(kPspCmdPage + 2, 0, 12));
+    // Write-pointer values.
+    CHECK(writeAllowed(kRegMp0C2PMsg67, 16, 12) && writeAllowed(kRegMp0C2PMsg67, 32, 12));
+    CHECK(!writeAllowed(kRegMp0C2PMsg67, 16, 11) && !writeAllowed(kRegMp0C2PMsg67, 0, 12));
+    CHECK(!writeAllowed(kRegMp0C2PMsg67, 48, 12));
+
+    // The TMR placement.
+    uint8_t data[80];
+    putCells(data, 0x83000010u, 0x640000000ull, 0x10000000ull);
+    putCells(data + 20, 0x83000018u, 0x650000000ull, 0x200000ull);
+    putCells(data + 40, 0x81000020u, 0xe000ull, 0x100ull);
+    putCells(data + 60, 0x82000024u, 0xfca00000ull, 0x80000ull);
+    Range ranges[8];
+    uint32_t count = 0;
+    CHECK(parseAssignedAddresses(data, sizeof(data), ranges, 8, &count) == kOK);
+    MetricsTarget t;
+    {
+        FakeRegisters r;
+        r.fbOffset = 0x5c0;
+        CHECK(checkPspTmrTarget(r.reader(), 0x80000, 12, ranges, count, &t) == kOK);
+        CHECK(t.gpuAddress == 0xF440400000ull && t.physical == 0x600400000ull);
+        CHECK(checkPspTmrTarget(r.reader(), 0x80000, 11, ranges, count, &t) == kRegisterNotAllowed);
+        Range clash[1] = {{0x600700000ull, 0x1000}};
+        CHECK(checkPspTmrTarget(r.reader(), 0x80000, 12, clash, 1, &t) == kMetricsTargetInvalid);
+    }
+    // The TMR stability checksum.
+    {
+        FakeRegisters r;
+        FakeWriter w(&r);
+        FakeMemory m;
+        for (uint32_t i = 0; i < kMetricsCheckSize / 4; i++) m.words[i] = 0x9E3779B9u * i;
+        CHECK(checkRegionChecksum(m.reader(), kMetricsCheckSize, w.writer(), 3) == kOK);
+        r.mutateOnPause = &m;
+        CHECK(checkRegionChecksum(m.reader(), kMetricsCheckSize, w.writer(), 3) == kTableRegionInUse);
+    }
+
+    // The whole SETUP_TMR flow against the fake PSP.
+    static uint32_t snapshot[kPspRingCheckSize / 4];
+    {
+        FakeRegisters r;
+        FakeMemory work;
+        for (uint32_t i = 0; i < kPspRingCheckSize / 4; i++) work.words[i] = snapshot[i] = 0x9E3779B9u * i;
+        r.work = &work;
+        r.frameDelay = 3;
+        FakeWriter w(&r);
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr) == kOK);
+        CHECK(work.writes == 1024 + 1024 + 16);
+        for (uint32_t i = 0; i < 256; i++) CHECK(work.words[kPspCmdPage / 4 + i] == pspCommandWord(kGfxCmdSetupTmr, i));
+        for (uint32_t i = 0; i < 16; i++) CHECK(work.words[i] == pspFrameWord(0, i));
+        CHECK(work.words[16] == snapshot[16] && work.words[kPspFencePage / 4] == 0);
+        uint32_t fence = 0;
+        CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 12, 0, &fence) == kOK);
+        CHECK(fence == 1 && r.psp67 == 16 && w.writes == 1 && w.offsets[0] == kRegMp0C2PMsg67 && w.values[0] == 16);
+        CHECK(r.pauses == 3);
+        PspResponse response;
+        CHECK(readPspResponse(work.reader(), &response) == kOK && response.tmrSize == 0x400000);
+        uint32_t unexpected = 9, first = 9;
+        CHECK(verifyPspWorkArea(work.reader(), snapshot, 1, kGfxCmdSetupTmr, 1, &unexpected, &first) == kOK);
+        CHECK(unexpected == 0);
+        work.words[(kPspFencePage + 0x800) / 4] = 1; // a stray write in the fence page
+        work.words[0x8000 / 4] ^= 1;                 // and one beyond the work area
+        CHECK(verifyPspWorkArea(work.reader(), snapshot, 1, kGfxCmdSetupTmr, 1, &unexpected, &first) ==
+              kPspRegionChanged);
+        CHECK(unexpected == 2 && first == kPspFencePage + 0x800);
+        work.words[(kPspFencePage + 0x800) / 4] = 0;
+        work.words[0x8000 / 4] ^= 1;
+        // Teardown: DESTROY_TMR as frame 1.
+        CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 12, 0, &fence) == kPspOutOfOrder);
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdDestroyTmr) == kOK);
+        CHECK(work.words[kPspFencePage / 4] == 1 && work.words[kPspCmdPage / 4 + 2] == 7 && work.words[16 + 5] == 2);
+        CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 12, 1, &fence) == kOK);
+        CHECK(fence == 2 && r.psp67 == 32);
+        CHECK(verifyPspWorkArea(work.reader(), snapshot, 2, kGfxCmdDestroyTmr, 2, &unexpected, &first) == kOK);
+    }
+    {
+        FakeRegisters r;
+        FakeMemory work;
+        r.work = &work;
+        r.frameDelay = -1; // never processes the frame
+        FakeWriter w(&r);
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr) == kOK);
+        uint32_t fence = 0;
+        CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 12, 0, &fence) == kPspFenceTimeout);
+        CHECK(r.pauses == int(kPspFencePollPauses) && fence == 0);
+    }
+    {
+        FakeRegisters r;
+        FakeMemory work;
+        r.work = &work;
+        r.cmdStatus = 0xFFFF000Au; // TEE_ERROR_NOT_SUPPORTED
+        FakeWriter w(&r);
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr) == kOK);
+        uint32_t fence = 0;
+        CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), work.reader(), 12, 0, &fence) == kOK);
+        PspResponse response;
+        CHECK(readPspResponse(work.reader(), &response) == kPspCommandFailed && response.status == 0xFFFF000Au);
+    }
+    {
+        FakeMemory work;
+        work.stuckOffset = kPspCmdPage + kPspCmdIdOffset;
+        CHECK(writePspCommand(work.reader(), work.writer(), 12, kGfxCmdSetupTmr) == kPspReadbackMismatch);
+        FakeMemory fence;
+        fence.stuckOffset = kPspFencePage;
+        fence.words[kPspFencePage / 4] = 1;
+        CHECK(writePspCommand(fence.reader(), fence.writer(), 12, kGfxCmdSetupTmr) == kPspReadbackMismatch);
+        FakeMemory any;
+        CHECK(writePspCommand(any.reader(), any.writer(), 11, kGfxCmdSetupTmr) == kRegisterNotAllowed);
+        CHECK(writePspCommand(any.reader(), any.writer(), 12, 6) == kRegisterNotAllowed && any.writes == 0);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -1258,6 +1438,7 @@ int main()
     testGfxOff();
     testMetrics();
     testPspRing();
+    testPspTmr();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

@@ -93,6 +93,14 @@ class CoreTests(unittest.TestCase):
                 "return (*response & kPspResponseMask) == kPspResponseFlag ? kOK : kPspResponseNotOk;",
                 "return *response == kPspResponseFlag ? kOK : kPspResponseNotOk;"),
             "kPspTimeout && written": ("    *written = true;\n    for", "    for"),
+            "kPspReadbackMismatch": ("return kPspReadbackMismatch;", "(void)0;"),
+            "kPspFenceTimeout": ("if (i == kPspFencePollPauses) return kPspFenceTimeout;",
+                                 "if (i == kPspFencePollPauses) return kOK;"),
+            "!writeAllowed(kRegMp0C2PMsg67, 48, 12)": ("return value == kPspFrameDwords || value == 2 * kPspFrameDwords;",
+                                                       "return value <= 3 * kPspFrameDwords;"),
+            "!pspWorkWriteAllowed(kPspWorkSize, 0, 12)": (
+                "if (stage < kPspTmrStage || (offset & 3) != 0 || offset >= kPspWorkSize) return false;",
+                "if (stage < kPspTmrStage || (offset & 3) != 0) return false;"),
             "gfxGated(kRegGcApertureHigh)": ("if (kStage10GfxGatedRegisters[i] == offset) return true;", "(void)0;"),
             "registerAllowed(kRegGrbmGfxIndex, 2)": ("stage == 2 ? kStage2RegisterCount",
                                                      "stage == 2 ? kStage3RegisterCount"),
@@ -109,16 +117,19 @@ class CoreTests(unittest.TestCase):
             self.assertNotRegex(source, r"#include\s*<(?!stdint\.h>)", name)
             self.assertNotIn("volatile", source, name)
         source = (CORE / "cezanne_core.cpp").read_text()
-        # The only call of the write callback, inside writeRegister, after the allowlist.
-        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 1)
+        # The only calls of the write callbacks: writeRegister after the
+        # register allowlist, writeWork after the work-area allowlist.
+        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 2)
+        work = re.search(r"static Status writeWork\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(work.index("pspWorkWriteAllowed(offset, value, stage)"), work.index("write32"))
         body = re.search(r"static Status writeRegister\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("if (!writeAllowed(offset, value, stage)) return kRegisterNotAllowed;", body)
         self.assertLess(body.index("writeAllowed"), body.index("write32"))
         # Scratch pattern and restore; SMU response, argument and message; PSP
-        # arguments (C2PMSG_69, _70, _71) and command.
-        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 9)
+        # arguments (C2PMSG_69, _70, _71) and command; the ring write pointer.
+        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 10)
         allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
-        self.assertEqual(allow.count("return"), 11)
+        self.assertEqual(allow.count("return"), 13)
         self.assertIn("if (stage >= kScratchStage && offset == kRegScratchReg0) return true;", allow)
         self.assertIn("if (offset == kRegMp1C2PMsg90) return value == 0;", allow)
         # Every SMU message is checked against its argument before any write.
