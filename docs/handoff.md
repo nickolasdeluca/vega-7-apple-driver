@@ -7,7 +7,7 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 ## Current checkpoint
 
 Current checkpoint, 2026-10-06, branch `cezanne-discovery`: **driver stages
-0–16 succeeded on the USB test EFI** (boots 1–23; see the
+0–17 succeeded on the USB test EFI** (boots 1–25; see the
 [test boot log](test-boot.md#test-boot-log)). The driver can do the
 following:
 - read the GPU, the discovery table and the engine state;
@@ -15,11 +15,14 @@ following:
 - run PSP ring commands (TMR setup, firmware load);
 - load SDMA0 firmware;
 - run a verified SDMA copy and fence (boot 21);
-- read the display, MMHUB VM and IH state (boot 22).
+- read the display, MMHUB VM and IH state (boot 22);
+- enable the MMHUB GART and IH ring 0, copy through the GART and receive the
+  SDMA0 trap, then restore (boot 25).
 
-Stage 17 (GART and the IH ring) is approved and built. Boot 24 stopped at
-its precondition check before any write; the check is fixed and rebuilt for
-boot 25; see "Next task" below. The sections that follow are the earlier discovery record and
+Stage 17 (GART and the IH ring) succeeded in boot 25: an SDMA copy read
+through a driver-built GART page table, its trap arrived in IH ring 0, and
+everything was restored. No later stage is proposed yet; see "Next task"
+below. The sections that follow are the earlier discovery record and
 still apply.
 
 Completed work:
@@ -133,20 +136,23 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 17 again (boot 25)
+## Next task: propose stage 18
 
-**Resume here.** Boot 24 (2026-10-06) stopped at the stage 17 precondition
-check on a live `HUBP0_DCHUBP_CNTL` status bit, before any stage 17 write;
-the check is fixed and `usb-stage17` is rebuilt (see the boot 24 entry in
-the [test boot log](test-boot.md#test-boot-log)). Steps:
+**Resume here.** Stage 17 succeeded in boot 25 (2026-10-06); see the
+[test boot log](test-boot.md#test-boot-log). The next stage needs a proposal
+in [test-boot.md](test-boot.md) and the user's approval. The candidates from
+"Earlier: choosing the next milestone" that remain:
+- **Interrupt delivery:** `ENABLE_INTR`, so the IH raises an MSI that the
+  kext handles, instead of polling the ring.
+- **Display:** one connector and mode with a test pattern, starting from the
+  stage 16 DCN 2.1 inventory.
 
-1. The user runs `tools/update_stick.sh 17` (the stick still holds the first
-   build), cold boots the stick, and runs
-   `tools/capture_boot.sh boot-25-stage17 --gfxoff-disallow --gart-ih --psp-state`.
-2. Read the output against "Stage 17 succeeds when" in
-   [test-boot.md](test-boot.md) and record boot 25 in the log. Follow the
-   [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
-   for defects.
+### Earlier: booting stage 17
+
+Boot 24 stopped at the precondition check on live `HUBP0_DCHUBP_CNTL` status
+bits, before any stage 17 write; the mask was widened (`964ecaa`) and boot 25
+ran the stage with `tools/capture_boot.sh boot-25-stage17 --gfxoff-disallow
+--gart-ih --psp-state`.
 
 **Builds:**
 - `out/test-efi/usb-stage17` (rebuilt after boot 24; its `manifest.json`

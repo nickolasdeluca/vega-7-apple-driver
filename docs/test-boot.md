@@ -37,10 +37,11 @@ driver wrote only the low half of the write pointer. With that fixed,
 in the checked region changed. Stage 16 (a read-only display, VM and
 interrupt inventory) succeeded in boot 22, apart from one semaphore register
 whose read has a side effect, now removed from the list. Stage 17 (GART and
-the interrupt ring) is approved and built (`usb-stage17`). Its first boot
-(24) stopped at the precondition check, before any write, on a live display
-status bit; the check is fixed and rebuilt, and waits for boot 25. No later
-stage is authorized.
+the interrupt ring) succeeded in boot 25: the MMHUB GART translated an SDMA
+read through a driver-built page table, the SDMA0 trap arrived in IH ring 0,
+and every register was restored. Boot 24 had stopped at the precondition
+check on a live display status bit, since fixed. No later stage is
+authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -4089,6 +4090,40 @@ build; cold boot; `tools/capture_boot.sh boot-24-stage17 --gfxoff-disallow
 - Captures are in ignored `out/test-efi/boot-24-stage17/`.
 - Result: **stopped before any stage 17 write; the check is fixed.** Boot 25
   repeats the run with the rebuilt `usb-stage17`.
+
+**Boot 25, 2026-10-06, stage 17 with the live-status mask**
+(`out/test-efi/usb-stage17/`, rebuilt; cold boot; `tools/capture_boot.sh
+boot-25-stage17 --gfxoff-disallow --gart-ih --psp-state`; exit 0).
+
+- GFXOFF, the SDMA0 load and the stage 15 copy passed as in boot 21.
+- **Check:** ok, with every GART, IH and `SDMA0_CNTL` register at its
+  boot 22 value.
+- **Enable:** ok, progress 3. The engine 17 flush completed with
+  `VM_INVALIDATE_ENG17_ACK` `0x00010001`.
+- **Frame 2:** `COPY_LINEAR` read 4 KiB from GART address 0 through PTE 0;
+  fence 2 arrived; `GFX_RB_RPTR` 3072.
+- **Verify:** ok.
+  - `VM_L2_PROTECTION_FAULT_STATUS` 0.
+  - Both 64 KiB regions held only expected words, so the second destination
+    equals the source.
+  - The IH write-back and `IH_RB_WPTR` are both `0x20`: exactly one entry,
+    `8000e008 00000003 0 …` = client 8 (SDMA0), source 224 (`SDMA_TRAP`),
+    ring 0, VMID 0. No other client posted.
+  - 0 display changes.
+- **Restore:** ok. `IH_RB_WPTR` went back to `0x00080000` (boot 22).
+- **Stop:** as in stage 15 (`DESTROY_TMR` fence 3, ring response
+  `0x80030000`).
+- **Final dump against boot 24's:** the only differences are:
+  - `SDMA0_GFX_RB_RPTR`/`WPTR` `0xc00` (frame 2);
+  - the live `HUBP0_DCHUBP_CNTL` status bits;
+  - the `MP0_SMN_C2PMSG_81` counter;
+  - `VM_INVALIDATE_ENG17_ACK` 1. This is the restore flush's own
+    acknowledgement, a status register that Linux also leaves set; it is
+    not restored and not part of the GART state.
+  
+  The engine 17 range registers read 0/0, as assumed.
+- Captures are in ignored `out/test-efi/boot-25-stage17/`.
+- Result: **stage 17 succeeded.**
 
 ## Unknowns and limits
 
