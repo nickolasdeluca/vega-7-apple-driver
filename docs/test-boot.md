@@ -25,7 +25,9 @@ the PSP answered its first command, `GBR_IH_SET`, with "unknown command". A
 revised stage 11 succeeded in boot 16: the PSP created (`0x80020000`) and
 destroyed (`0x80030000`) a kernel-mode ring without touching its memory.
 Stage 12 succeeded in boot 17: the first ring frames, `SETUP_TMR` and
-`DESTROY_TMR`, both fenced with status 0. No later stage is authorized.
+`DESTROY_TMR`, both fenced with status 0. Stage 13 (the first firmware
+load: SDMA0 through `LOAD_IP_FW`, engine left halted) is approved and built,
+not yet booted. No later stage is authorized.
 
 The host keeps booting from its **known-good** OpenCore EFI on the internal
 macOS disk. Driver experiments run only after choosing a separate **test EFI**
@@ -91,6 +93,10 @@ off restores the known-good boot. This is the experimental environment
      day): stage 11 plus the first CPU writes to carveout memory and the
      first ring frame, `SETUP_TMR` then `DESTROY_TMR`, on request, described
      [below](#stage-12-first-psp-ring-frame-tmr-setup-proposal).
+   - **Stage 13** (proposed 2026-10-06 and approved by the user the same
+     day): stage 12 plus the first firmware load, the pinned SDMA0 image
+     through `LOAD_IP_FW`, on request, with SDMA0 left halted, described
+     [below](#stage-13-first-firmware-load-sdma0-proposal).
    - Each later stage (indexed register reads, any register or configuration
      write, firmware, memory mapping, DMA, interrupts) needs its own reviewed
      update to this document and the user's approval before it is built.
@@ -1874,7 +1880,9 @@ change. It sends no second command while the first is unfenced.
 
 ### Stage 13: first firmware load, SDMA0 (proposal)
 
-**Status: proposed 2026-10-06, not approved, not implemented.**
+**Status: proposed 2026-10-06, approved by the user the same day, and
+implemented; not yet booted.** The proposal is kept as approved. The
+implementation notes follow it.
 
 **Purpose.** Load the first engine firmware: SDMA0, the DMA engine needed
 for the "verified DMA copy and fence" milestone. The PSP loads it into the
@@ -2037,6 +2045,54 @@ is only read.
 copy anything with SDMA. It loads no other firmware (no CP, RLC or VCN). It
 makes no IH, GART or default-page change.
 
+**Implementation notes:**
+
+- **Build:**
+  - `build.sh` reads `out/firmware-provenance/fw/green_sardine_sdma.bin`
+    (or `CEZANNE_SDMA_FW`) and refuses any SHA-256 other than the pin.
+  - It generates `obj/sdma_image.cpp` with `xxd -i` in the build
+    directory. The kext binary grows to about 112 KiB.
+  - The kext build tests skip when the firmware is absent from `out/`.
+  - Tests check that no `.bin` or generated image is tracked, and that a
+    one-bit change to the firmware fails the build.
+- **Core:**
+  - `checkSdmaImage` compares the header fields with the pins (size, header
+    version 1.0, IP 4.1, `ucode_version` 40, size 17,152, offset 256).
+  - `sdmaFirmwareWord` and `sdmaFirmwareWriteAllowed` permit only the
+    image's word at its offset, or 0 in the padding, inside the 20 KiB
+    buffer.
+  - `writeFirmwareWord` is the third write site, checked first.
+    `writeSdmaFirmware` writes the whole buffer and reads it back.
+  - `verifySdmaFirmwareRegion` compares the image and then the snapshot.
+  - `writePspCommand` now takes the frame. The allowed pairs are
+    `SETUP_TMR`/0, `DESTROY_TMR`/1 or 2 (2 from stage 13), and
+    `LOAD_IP_FW`/1 (stage 13).
+  - `C2PMSG_67` ← 48 is allowed from stage 13.
+  - `SDMA0_UCODE_CHECKSUM` becomes readable at stage 13, the only new
+    diagnostic register.
+- **Adapter:**
+  - The stage 11 check also validates the image, the firmware-buffer
+    placement, and its 64 KiB stability (with a snapshot) at stage 13.
+  - Selectors 18 (load) and 19 (observe). Diagnostics version 9.
+  - Load needs a `SETUP_TMR` that fenced with status 0.
+  - The teardown sends `DESTROY_TMR` as the next frame only if the last
+    frame fenced.
+  - Observe reports `sdma-not-halted` if `SDMA0_F32_CNTL.HALT` is clear.
+  - The firmware buffer is the second writable carveout mapping, created
+    only inside the load step.
+- **Tool:** `--psp-sdma` prints:
+  - each step;
+  - the checksum and `F32_CNTL` before and after;
+  - the fences and statuses;
+  - `fw_addr`, and whether it lies inside the TMR;
+  - both region comparisons.
+- **Tests:**
+  - A synthetic image (never the real firmware): header mutations, the
+    allowlist, the copy, a lost write, the region compare, and the
+    command and frame pairs.
+  - Three frames against the fake PSP.
+  - Three more weakened cores must fail.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -2048,7 +2104,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
@@ -2155,6 +2211,28 @@ Stage 2 succeeds when:
   (ignored; it is a raw capture).
 - `MC_VM_FB_OFFSET`, `carveout base`, `discovery address`, the GC version and
   the bases are recorded and compared with the expected values above.
+
+Stage 13 succeeds when:
+
+- the stage 12 conditions hold with `CezanneGPU stage` 13;
+- `sudo cezanne-diag --gfxoff-disallow --psp-sdma --psp-state` reports
+  `ok` for:
+  - the check;
+  - the create;
+  - `SETUP_TMR` (fence 1, status 0);
+  - the load (fence 2, status 0, `C2PMSG_67` 32);
+  - the observe: 0 unexpected words in both regions, SDMA0 still halted;
+  - the teardown (`DESTROY_TMR` fence 3, then the ring destroy);
+- `fw_addr` and the checksum before and after are recorded;
+- the machine stays as before.
+
+**On failure:**
+- A non-zero `LOAD_IP_FW` status (for example a rejected signature) is a
+  finding: record it and do not retry.
+- `sdma-not-halted` means: shut down fully.
+- Unexpected words outside the work area or the firmware image mean: power
+  off at once.
+- Make a Time Machine backup before this boot. Save the output with `tee`.
 
 Stage 12 succeeds when:
 

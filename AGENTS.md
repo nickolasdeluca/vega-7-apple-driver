@@ -47,7 +47,9 @@ Experimental booting is available only through the USB test EFI in
   interface; and stage 11, the first PSP commands, creating and destroying
   the kernel-mode ring at one checked carveout page on request; and stage 12,
   the first CPU writes to carveout memory and the first ring frames,
-  `SETUP_TMR` then `DESTROY_TMR`, on request). Advancing
+  `SETUP_TMR` then `DESTROY_TMR`, on request; and stage 13, the first firmware
+  load, the pinned SDMA0 image through `LOAD_IP_FW` with the engine left
+  halted, on request). Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS
   volume, or load it with `kmutil`. The user performs disk, EFI and reboot steps.

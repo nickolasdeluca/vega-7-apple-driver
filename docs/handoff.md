@@ -133,7 +133,18 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: propose stage 13, the first firmware load (SDMA0)
+## Next task: boot stage 13
+
+Stage 13 (copy the pinned SDMA0 image into a firmware buffer and load it
+through `LOAD_IP_FW` between `SETUP_TMR` and `DESTROY_TMR`, SDMA0 left
+halted) is approved and built: `out/test-efi/usb-stage13`,
+`out/diag/cezanne-diag --psp-sdma`. The kext now embeds the firmware at
+build time from ignored `out/` (SHA-256 pinned in `driver/kext/build.sh`).
+Next: a cold boot after a Time Machine backup, then record the result. If
+the PSP accepts the image, the next proposal is starting SDMA0: unhalt, ring
+and a first copy with a fence, the "verified DMA copy" milestone.
+
+### Earlier: proposing stage 13
 
 Stages 0–12 succeeded. In boot 17, `SETUP_TMR` (TMR at GPU `0xF440400000`,
 4 MiB) and `DESTROY_TMR` went through the PSP ring as frames 0 and 1. Both
