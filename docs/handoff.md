@@ -31,8 +31,8 @@ with no re-fire after the acknowledgement. Stage 19 (display test pattern)
 succeeded in boot 28: the flip landed in 13 ms, the pattern showed for 5 s
 with straight grey lines (the hardware reads 1920 pixels per line), and the
 desktop came back unchanged. Stage 20 (SDMA draws the pattern, and the flip
-interrupt) is approved, implemented and built, waiting for boot 29; see
-"Next task" below. The sections that follow are the earlier discovery record and
+interrupt) stopped at its check in boot 29 (firmware status latches); it is
+fixed and rebuilt for boot 30; see "Next task" below. The sections that follow are the earlier discovery record and
 still apply.
 
 Completed work:
@@ -146,31 +146,34 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 20 (SDMA fill and the flip interrupt)
+## Next task: boot stage 20 again (boot 30)
 
-Stage 20 was approved on 2026-10-07 (the
-[proposal](test-boot.md#stage-20-sdma-draws-the-pattern-and-the-flip-interrupt-proposal))
-and implemented and built the same day; the implementation notes are in
-that section. Starting the main graphics engine is stage 21, to be proposed
-after this boot. Steps:
+Stage 20 was approved and built on 2026-10-07 (the
+[proposal](test-boot.md#stage-20-sdma-draws-the-pattern-and-the-flip-interrupt-proposal)).
+Boot 29 stopped at the stage 20 check before any stage 20 write. The
+flip-interrupt register held the firmware's status latches (`0x00050000`),
+and the check required 0. The check and the restore now look at the
+interrupt enables only (see the boot 29 entry in the
+[test boot log](test-boot.md#test-boot-log)). Starting the main graphics
+engine is stage 21, proposed after this stage boots. Steps:
 
-1. Make a Time Machine backup (the proposal's risks).
-2. The user runs `tools/update_stick.sh 20` (the stick holds stage 19),
-   shuts down fully, cold boots the stick, and runs
-   `tools/capture_boot.sh boot-29-stage20 --gfxoff-disallow --sdma-flip --psp-state`.
-3. The user reports what the screen showed for those 5 seconds: eight
+1. The user runs `tools/update_stick.sh 20` (the stick holds the first
+   build), shuts down fully, cold boots the stick, and runs
+   `tools/capture_boot.sh boot-30-stage20 --gfxoff-disallow --sdma-flip --psp-state`.
+2. The user reports what the screen showed for those 5 seconds: eight
    bands, black at the top and white at the bottom, with no grey lines. Then
    whether the desktop came back unchanged.
-4. Read the output against "Stage 20 succeeds when" in
-   [test-boot.md](test-boot.md) and record boot 29 in the log. Follow the
+3. Read the output against "Stage 20 succeeds when" in
+   [test-boot.md](test-boot.md) and record boot 30 in the log. Follow the
    [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
    for defects. A kernel panic is a finding: power off, then read the panic
    log from the next normal boot.
 
-**Builds:** `out/test-efi/usb-stage20` (`usb-stage20-build.json`),
-`out/test-efi/driver`, `out/diag`. The stage 19 builds that passed boot 28
-are kept as `out/test-efi/superseded-driver-stage19` and
-`superseded-diag-stage19`, with `out/test-efi/usb-stage19`.
+**Builds:** `out/test-efi/usb-stage20` (`usb-stage20-build.json`, rebuilt
+after boot 29), `out/test-efi/driver`, `out/diag`. The first stage 20 build
+is kept as `superseded-*-stage20-latch`. The stage 19 builds that passed
+boot 28 are kept as `superseded-driver-stage19` and `superseded-diag-stage19`,
+with `out/test-efi/usb-stage19`.
 
 ### Earlier: booting stage 19
 

@@ -3333,8 +3333,10 @@ connection runs it, and so does the kext's `stop()` if needed.
 ### Stage 20: SDMA draws the pattern, and the flip interrupt (proposal)
 
 **Status: proposed 2026-10-07 and approved by the user the same day;
-implemented and built (`out/test-efi/usb-stage20`) the same day. Not yet
-booted.** The user chose to combine
+implemented and built (`out/test-efi/usb-stage20`) the same day. Boot 29
+stopped at the check, before any stage 20 write: the flip-interrupt
+register held the firmware's status latches. The check and the restore now
+look at the enables only (fix within the stage), rebuilt for boot 30.** The user chose to combine
 two steps in this stage: the GPU drawing what is shown, and the display's
 flip interrupt. Starting the main graphics engine is stage 21, proposed
 after this stage boots, and probably split over several stages as SDMA was
@@ -3405,7 +3407,7 @@ display's.
 
 | Register | Offset | Expected |
 | --- | --- | --- |
-| `HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT` | `0x0eb80` | 0 (disabled, nothing pending) |
+| `HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT` | `0x0eb80` | both enables 0 (bits 0 and 2); the status latches recorded (revised after boot 29, which read `0x00050000`) |
 | `DCHUB_INTERRUPT_DEST2` | `0x0d83c` | bit 0 = 0; the rest recorded |
 | `DISP_INTERRUPT_STATUS_CONTINUE17` | `0x0d7ec` | recorded; bit 2 is HUBP0's flip interrupt |
 
@@ -3421,7 +3423,7 @@ display's.
 | 5 flip | Stage 19's two address writes, to `0xF441000000`. Then wait up to 100 ms for both of these: the poll (`FLIP_PENDING` 0 and `EARLIEST_INUSE` at the pattern), and the MSI count going up by one. Record the time from the low write to the MSI, the IH entries, and `SURFACE_FLIP_INTERRUPT`. | 2 |
 | 6 acknowledge | `SURFACE_FLIP_INTERRUPT` ← `0x00000101` (clear, still enabled), then `IH_RB_RPTR` ← the IH write-back (`0x40`), as `amdgpu_ih_process` does. | 2 |
 | 7 hold, verify | 5 s, then stage 19's verify against the reversed bands. No further MSI during the hold: the flip interrupt fires once per flip, not once per frame. | none |
-| 8 restore | The two address writes back to `0xF400000000`, the poll, and the MSI for this flip (recorded, not required). Then `SURFACE_FLIP_INTERRUPT` ← `0x00000100`, then ← 0 (disabled, as `dal_irq_service_set(false)`). `IH_RB_RPTR` ← the write-back. Pipe 0 against boot 22, and `SURFACE_FLIP_INTERRUPT` reads 0. | 6 |
+| 8 restore | The two address writes back to `0xF400000000`, the poll, and the MSI for this flip (recorded, not required). Then `SURFACE_FLIP_INTERRUPT` ← `0x00000100`, then ← 0 (disabled, as `dal_irq_service_set(false)`). `IH_RB_RPTR` ← the write-back. Pipe 0 against boot 22, and `SURFACE_FLIP_INTERRUPT`'s enables 0. | 6 |
 
 Then the stage 18 restore (interrupts off, handler removed), the stage 17
 restore and the stage 15 stop, unchanged. A closed or abandoned connection,
@@ -3430,7 +3432,7 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
 **Preconditions:**
 - the stage 18 acknowledgement passed on this connection;
 - stage 19's check passes;
-- `SURFACE_FLIP_INTERRUPT` reads 0, and `DCHUB_INTERRUPT_DEST2` bit 0 reads
+- `SURFACE_FLIP_INTERRUPT`'s enables read 0, and `DCHUB_INTERRUPT_DEST2` bit 0 reads
   0.
 
 **New writes:**
@@ -3491,12 +3493,12 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
 
 | Step | Selector | What it does |
 | --- | --- | --- |
-| check | 39 `FlipCheck` | Only after a passing stage 18 acknowledgement, with no stage 19 pattern up. Stage 19's check (pipe 0, `kDisplayExpect`, the region placed, the 1 s checksum, a pipe 0 snapshot), then `SURFACE_FLIP_INTERRUPT` 0 and `DCHUB_INTERRUPT_DEST2` bit 0 = 0. A failing flip register is reported as index 19 or 20, after stage 19's 19 entries. No write. |
+| check | 39 `FlipCheck` | Only after a passing stage 18 acknowledgement, with no stage 19 pattern up. Stage 19's check (pipe 0, `kDisplayExpect`, the region placed, the 1 s checksum, a pipe 0 snapshot), then `SURFACE_FLIP_INTERRUPT`'s enables (bits 0 and 2) 0 and `DCHUB_INTERRUPT_DEST2` bit 0 = 0. A failing flip register is reported as index 19 or 20, after stage 19's 19 entries. No write. |
 | fill | 40 `FlipFill` | The CPU zeroes the 8 MiB region through the stage 19 mapping and reads it back. Then frame 4 is written to ring dwords 0–255 and read back, and submitted (`submitSdma` frame 4: `GFX_RB_WPTR` must read 4096; ← 5120, `_HI` ← 0; fence 4 polled for 100 ms). Then the whole region is read against the reversed bands. Any MSI during the step fails it. Reports the step reached (1 clear, 2 frame written, 3 submitted, 4 checked). |
 | show | 41 `FlipShow` | The arm (`0x100`, `0x1`, read back: enable set), then `flipWithIntr`: stage 19's two writes and poll, then up to 100 more pauses for the MSI, then the new IH entries from `IH_RB_RPTR` to the write-back. Returns a `FlipReport`, with the latency from just before the flip's operation to the handler's time for that MSI. |
 | acknowledge | 42 `FlipAck` | `SURFACE_FLIP_INTERRUPT` ← `0x101`, then stage 18's `ackIntr` (`IH_RB_RPTR` ← the write-back, 100 ms, no re-fire). |
 | verify | 43 `FlipVerify` | Reads only: stage 19's verify against the reversed bands, and the MSI count unchanged since the acknowledgement. |
-| restore | 44 `FlipRestore` | `restoreFlip`: the flip back with its MSI recorded, `0x101` then 0, pipe 0 at boot 22 and `SURFACE_FLIP_INTERRUPT` 0 (index 11). Then `ackIntr`. Its result is also the property `CezanneGPU flip restore`. |
+| restore | 44 `FlipRestore` | `restoreFlip`: the flip back with its MSI recorded, `0x101` then 0, pipe 0 at boot 22 and `SURFACE_FLIP_INTERRUPT`'s enables 0 (index 11). Then `ackIntr`. Its result is also the property `CezanneGPU flip restore`. |
 
 - **No new writable page set.** The flip-interrupt and surface writes use
   the stage 19 display page (`0xe000`). `GFX_RB_WPTR` uses the stage 15
@@ -3524,6 +3526,12 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
   during the fill would come from something else and is reported.
 - **The verify compares pipe 0 with the stage 20 check's snapshot,** as
   stage 19 does.
+- **After boot 29, the check and the restore read only the two enables**
+  (`kFlipIntEnables`, bits 0 and 2). The status latches are the firmware's
+  flips. Linux never requires them clear: `dal_irq_service_set` clears
+  `SURFACE_FLIP_OCCURRED` before enabling. `SURFACE_FLIP_AWAY_OCCURRED`
+  (bit 18) has its own clear bit, which this stage does not write, so it
+  stays set after the restore.
 
 ## Build the test EFIs
 
@@ -4775,6 +4783,31 @@ exit 0).
   inventory decode still adds 1 and prints 1921.
 - Captures are in ignored `out/test-efi/boot-28-stage19/`.
 - Result: **stage 19 succeeded.**
+
+**Boot 29, 2026-10-07, stage 20** (`out/test-efi/usb-stage20/`, first
+build; cold boot; `tools/capture_boot.sh boot-29-stage20 --gfxoff-disallow
+--sdma-flip --psp-state`; exit 1).
+
+- Every stage 15, 17 and 18 step passed as in boot 27:
+  - the stage 18 verify: MSI at 23 µs (`ENABLE_INTR`) and 83 µs (the trap),
+    32 µs after the submit;
+  - the acknowledgement: no re-fire.
+- **Flip check: `flip-unexpected-state`.**
+  `HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT` read `0x00050000` where the check
+  required 0. These are `SURFACE_FLIP_OCCURRED` (bit 16) and
+  `SURFACE_FLIP_AWAY_OCCURRED` (bit 18), the status latches of the
+  firmware's flips. Both enables (bits 0 and 2) were 0.
+  `DCHUB_INTERRUPT_DEST2` read 0 (routed to the host) and
+  `DISP_INTERRUPT_STATUS_CONTINUE17` read 0.
+- **No stage 20 write was made.** The screen did not change (the user saw
+  no pattern).
+- **Restores and stop:** ok. The stage 18 restore, the stage 17 restore and
+  the stage 15 stop all ran.
+- **Fix (within the stage):** the check requires only the two enables to be
+  0, and the restore requires the same. Linux clears `OCCURRED` with the
+  arm's first write. Rebuilt for boot 30; the first build is kept as
+  `superseded-*-stage20-latch`.
+- Captures are in ignored `out/test-efi/boot-29-stage20/`.
 
 ## Unknowns and limits
 
