@@ -3330,6 +3330,160 @@ connection runs it, and so does the kext's `stop()` if needed.
 - **The kext holds its lock through the check's 1 s checksum.** No other
   diagnostic runs at the same time.
 
+### Stage 20: SDMA draws the pattern, and the flip interrupt (proposal)
+
+**Status: proposed 2026-10-07. Not approved.** The user chose to combine
+two steps in this stage: the GPU drawing what is shown, and the display's
+flip interrupt. Starting the main graphics engine is stage 21, proposed
+after this stage boots, and probably split over several stages as SDMA was
+(13–15).
+
+**Purpose.** Two firsts, at the same event:
+- **SDMA draws the surface the display shows.** Stage 19's pattern was
+  written by the CPU. Here SDMA0 fills the same region with
+  `CONST_FILL` packets.
+- **The display tells the driver the flip happened.** HUBP0's flip
+  interrupt goes through the IH ring to the stage 18 handler. Stage 19 only
+  polled for the flip.
+
+**It builds on stage 18.** `sudo cezanne-diag --gfxoff-disallow --sdma-flip
+--psp-state` runs the stage 18 flow unchanged through its acknowledgement:
+the stage 15 copy, the GART and IH enable, frame 2, the MSI handler,
+frame 3, and the stage 18 verify and acknowledgement. Then it runs the steps
+below, then the stage 18 restore, the stage 17 restore and the stage 15 stop.
+Stage 19's `--display-pattern` stays as it is.
+
+**Kept apart so that a failure points at one part.** SDMA's fill is
+finished and read back by the CPU before any display register is written.
+The flip is confirmed both by stage 19's poll and by the interrupt, each on
+its own. If the interrupt does not arrive, the poll still shows whether
+the flip happened, the pattern still shows, and the restore still runs.
+
+**The pattern** is stage 19's bands in reverse order, so it can be told
+apart from stage 19 on screen: black, blue, red, magenta, green, cyan,
+yellow, white from top to bottom. It has no grey lines, which would take
+1080 × 9 small fills. The region is the same: carveout `0x41000000` (GPU
+`0xF441000000`), 8 MiB.
+
+**Frame 4** (SDMA0, `sdma_v4_0_emit_fill_buffer`; `vega10_sdma_pkt_open.h`).
+Frame 3 ended the ring at `GFX_RB_WPTR` 4096 and the engine read all of it.
+Frame 4 is written at the start of the ring again (dwords 0–255). Like
+Linux with 64-bit pointers, the write pointer continues from 4096 to 5120;
+it is not wrapped to 0.
+
+| Dwords | Packet | Values |
+| --- | --- | --- |
+| 9 × 5 | `CONST_FILL`: header `0x0000000b`, destination low, high, data, byte count − 1 | bands 0–7: destination `0xF441000000` + k × `0xfd200` (135 lines × 7680 bytes), count `0x000fd1ff`, data the band's colour; the 9th: the tail `0xF4417e9000`, count `0x00016fff`, data 0 |
+| 4 | `FENCE` 4 | write-back `+0x20c` |
+| rest | `NOP` | to dword 255 |
+
+Linux's header has no fill size field set, as here. Each count is below
+the 4 MiB limit (`fill_max_bytes` `0x400000`; the count field is 22 bits).
+Frame 4 has no `TRAP`, so the only interrupt this stage expects is the
+display's.
+
+**HUBP0's flip interrupt** (Linux `irq_service_dcn21.c`, `pflip_int_entry`;
+`irq_service.c`; `amdgpu_dm.c` `dcn10_register_irq_handlers`):
+- IH client `SOC15_IH_CLIENTID_DCE` (4), source
+  `DCN_1_0__SRCID__HUBP0_FLIP_INTERRUPT` (`0x4f`). The IH needs no change
+  for a new client.
+- **Enable:** `DCSURF_SURFACE_FLIP_INTERRUPT.SURFACE_FLIP_INT_MASK` (bit 0)
+  set to 1. In DCN, `MASK` 1 means enabled.
+- **Acknowledge:** `SURFACE_FLIP_CLEAR` (bit 8) set to 1.
+  `dal_irq_service_set` acknowledges before it enables.
+- **Status:** `SURFACE_FLIP_OCCURRED` (bit 16) and `SURFACE_FLIP_INT_STATUS`
+  (bit 17), read only.
+- **Routing:** `DCHUB_INTERRUPT_DEST2.HUBP0_IHC_FLIP_INTERRUPT_DEST`
+  (bit 0) selects the destination. Linux never writes it and receives
+  this interrupt, so its reset value routes to the host. The check requires
+  0 and never writes it. If it reads 1, the stage stops before any write,
+  and that is a finding.
+
+**New reads**, from `dcn_2_1_0_offset.h` (DMU segment 2, base `0x34c0`):
+
+| Register | Offset | Expected |
+| --- | --- | --- |
+| `HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT` | `0x0eb80` | 0 (disabled, nothing pending) |
+| `DCHUB_INTERRUPT_DEST2` | `0x0d83c` | bit 0 = 0; the rest recorded |
+| `DISP_INTERRUPT_STATUS_CONTINUE17` | `0x0d7ec` | recorded; bit 2 is HUBP0's flip interrupt |
+
+**Steps** (after the stage 18 acknowledgement, with the IH ring on,
+`RPTR_REARM` armed, and `IH_RB_RPTR` at `0x20`):
+
+| Step | What | Writes |
+| --- | --- | --- |
+| 1 check | Stage 19's check: pipe 0 at boot 22, the region placed and stable. The three new reads. The stage 18 acknowledgement passed on this connection. | none |
+| 2 clear | The CPU zeroes the 8 MiB region and reads it back. After frame 4, every non-zero word must therefore be SDMA's. | memory |
+| 3 frame 4 | Write frame 4 into the ring (read back), then `GFX_RB_WPTR` 4096 → 5120 and `_HI` ← 0. Poll fence 4 for up to 100 ms. Then the CPU reads the whole region against the reversed bands. The MSI count must not change. | ring, `GFX_RB_WPTR` |
+| 4 arm | `SURFACE_FLIP_INTERRUPT` ← `0x00000100` (clear), then ← `0x00000001` (enable). Read back. | 2 |
+| 5 flip | Stage 19's two address writes, to `0xF441000000`. Then wait up to 100 ms for both of these: the poll (`FLIP_PENDING` 0 and `EARLIEST_INUSE` at the pattern), and the MSI count going up by one. Record the time from the low write to the MSI, the IH entries, and `SURFACE_FLIP_INTERRUPT`. | 2 |
+| 6 acknowledge | `SURFACE_FLIP_INTERRUPT` ← `0x00000101` (clear, still enabled), then `IH_RB_RPTR` ← the IH write-back (`0x40`), as `amdgpu_ih_process` does. | 2 |
+| 7 hold, verify | 5 s, then stage 19's verify against the reversed bands. No further MSI during the hold: the flip interrupt fires once per flip, not once per frame. | none |
+| 8 restore | The two address writes back to `0xF400000000`, the poll, and the MSI for this flip (recorded, not required). Then `SURFACE_FLIP_INTERRUPT` ← `0x00000100`, then ← 0 (disabled, as `dal_irq_service_set(false)`). `IH_RB_RPTR` ← the write-back. Pipe 0 against boot 22, and `SURFACE_FLIP_INTERRUPT` reads 0. | 6 |
+
+Then the stage 18 restore (interrupts off, handler removed), the stage 17
+restore and the stage 15 stop, unchanged. A closed or abandoned connection,
+and the kext's `stop()`, run step 8 before the stage 18 restore.
+
+**Preconditions:**
+- the stage 18 acknowledgement passed on this connection;
+- stage 19's check passes;
+- `SURFACE_FLIP_INTERRUPT` reads 0, and `DCHUB_INTERRUPT_DEST2` bit 0 reads
+  0.
+
+**New writes:**
+- **Registers:**
+  - `HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT` ← `0x100`, `0x1`, `0x101` and
+    0, on the stage 19 display page (`0xe000`);
+  - `GFX_RB_WPTR` ← 5120.
+
+  Everything else is an earlier stage's value: the surface address writes
+  (stage 19), `IH_RB_RPTR` acknowledgements (stage 18), and `_HI` ← 0.
+- **Memory:**
+  - the 8 MiB region, zeroed by the CPU;
+  - frame 4's 256 words in the SDMA ring;
+  - through SDMA, the 9 fills inside the region.
+
+**Risks:**
+- **SDMA writes 8 MiB in one frame.** Every earlier frame wrote at most
+  4 KiB. The destinations are fixed in the frame's words and lie inside the
+  checked region, which is not on screen while SDMA writes. A wrong
+  destination would corrupt carveout memory. The core tests check every
+  fill's address range against the region.
+- **The flip interrupt may go elsewhere.** The routing check covers the
+  known register. If no MSI arrives, the poll still completes the flip,
+  and the restore runs. That is a finding, not a hang.
+- **The display interrupt is new to the handler.** With `RPTR_REARM`, it
+  raises at most one MSI before each acknowledgement, as the SDMA trap
+  did.
+- The screen changes for 5 seconds, as in stage 19. If it stays wrong
+  after the tool ends, shut down fully.
+- Make a Time Machine backup before this boot.
+
+**Expected:**
+- Every stage 18 result again.
+- Fence 4. The region matches the reversed bands with no CPU write after
+  the zeroing.
+- On screen for 5 seconds: eight bands, black at the top and white at the
+  bottom, with no grey lines. Then the desktop, unchanged.
+- One MSI per flip, with an IH entry from client 4, source `0x4f`. No MSI
+  during the hold.
+
+**Stage 20 succeeds when:**
+- `sudo cezanne-diag --gfxoff-disallow --sdma-flip --psp-state` reports
+  `ok` for every stage 18 step up to the acknowledgement, then for:
+  - the check;
+  - the clear;
+  - frame 4: fence 4, and the region equal to the reversed bands;
+  - the arm;
+  - the flip: the poll and exactly one MSI, from a client 4, source `0x4f`
+    entry;
+  - the acknowledgement;
+  - the verify after 5 s, with no MSI during the hold;
+  - the restore, then the stage 18, 17 and 15 restores;
+- you saw the reversed bands, and the desktop came back unchanged;
+- the final register dump shows the boot 22 values.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the

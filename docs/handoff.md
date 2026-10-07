@@ -144,12 +144,14 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: choose stage 20
+## Next task: stage 20 proposed, waiting for approval
 
 Stages 0–19 succeeded (boot 28, 2026-10-07, in the
-[test boot log](test-boot.md#test-boot-log)). Stage 20 is not chosen yet.
-Ask the user which direction to take next, then write its proposal in
-`test-boot.md`. Nothing is built until the user approves it.
+[test boot log](test-boot.md#test-boot-log)). On 2026-10-07 the user chose
+to combine SDMA drawing the displayed pattern and HUBP0's flip interrupt
+into stage 20, and to make starting the main graphics engine stage 21. The
+[stage 20 proposal](test-boot.md#stage-20-sdma-draws-the-pattern-and-the-flip-interrupt-proposal)
+is written. Nothing is built until the user approves it.
 
 **Builds:** `out/test-efi/usb-stage19` (`usb-stage19-build.json`, on the
 stick), `out/test-efi/driver`, `out/diag`. The stage 18 builds are kept as
