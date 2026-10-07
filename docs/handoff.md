@@ -150,15 +150,15 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: propose stage 21 (start the main graphics engine)
+## Next task: stage 21 proposed, waiting for approval
 
-Stages 0–20 succeeded (boot 31, 2026-10-07, in the
-[test boot log](test-boot.md#test-boot-log)). The user chose stage 21 on
-2026-10-07: starting the main graphics engine (GFX: RLC, the command
-processor's firmware through the PSP, a CP ring), probably split over
-several stages as SDMA was (13–15). The next step is a proposal in
-`test-boot.md` when the user asks for it. Nothing is built until the user
-approves it.
+Stages 0–20 succeeded (boot 31, 2026-10-07). The user chose the main
+graphics engine for stage 21, split into small stages as SDMA was. The
+[stage 21 proposal](test-boot.md#stage-21-gfx-firmware-load-engines-halted-proposal)
+is the first step: the PSP loads the nine GFX images (CE, PFP, ME, MEC1 and
+its jump table, the three RLC save/restore lists, RLC_G), with every engine
+halted. The RLC start, the CP unhalt and a GFX ring test follow in later
+stages. Nothing is built until the user approves it.
 
 **Builds:** `out/test-efi/usb-stage20` (`usb-stage20-build.json`, on the
 stick, passed boot 31), `out/test-efi/driver`, `out/diag`. Earlier stage 20

@@ -3543,6 +3543,180 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
   (bit 18) has its own clear bit, which this stage does not write, so it
   stays set after the restore.
 
+### Stage 21: GFX firmware load, engines halted (proposal)
+
+**Status: proposed 2026-10-07. Not approved.**
+
+**Purpose.** This is the first step towards the main graphics engine (GC
+9.3), which the user chose as the next direction on 2026-10-07. Like SDMA
+(stages 13–15), it is split into small stages:
+- **Stage 21 (this one):** the PSP loads the GFX firmware (the command
+  processor's CE, PFP, ME and MEC, and the RLC with its save/restore
+  lists). Every engine stays halted, as stage 13 did for SDMA.
+- **Next stages (proposed only after this boots):**
+  - the RLC start and the command processor's unhalt (`gfx_v9_0_rlc_resume`,
+    `gfx_v9_0_cp_resume`);
+  - then a GFX ring test: a scratch-register write through the ring, as
+    `gfx_v9_0_ring_test_ring` does;
+  - then a fence and an interrupt from GFX.
+
+**Linux v6.12:**
+
+- **Images and order.** `gfx_v9_0_init_microcode` registers these for GC
+  9.3.0 with PSP loading:
+  - `CP_PFP`, `CP_ME` and `CP_CE` (`amdgpu_gfx_cp_init_microcode`);
+  - `CP_MEC1` and `CP_MEC1_JT`. MEC2 is not loaded:
+    `gfx_v9_0_load_mec2_fw_bin_support` is false for GC 9.3.0;
+  - `RLC_G`, and for RLC header v2.1 the three save/restore lists
+    `RLC_RESTORE_LIST_CNTL`, `_GPM_MEM` and `_SRM_MEM`
+    (`amdgpu_gfx_rlc_init_microcode_v2_1`).
+
+  `psp_load_non_psp_fw` loads them in `AMDGPU_UCODE_ID` order, so the RLC
+  comes last: CE, PFP, ME, MEC1, MEC1_JT, the three lists, RLC_G.
+- **No autoload.** PSP v12 sets `autoload_supported = false`
+  (`psp_early_init`). So no `psp_rlc_autoload_start`, and loading `RLC_G`
+  does not start the RLC: `gfx_v9_0_rlc_start` does that later.
+- **The bytes** (`amdgpu_ucode_init_single_fw`):
+  - CE, PFP, ME and `RLC_G`: `ucode_size_bytes` from
+    `ucode_array_offset_bytes`;
+  - `MEC1`: `ucode_size_bytes − jt_size × 4`;
+  - `MEC1_JT`: `jt_size × 4` bytes at `ucode_array_offset_bytes + jt_offset
+    × 4`;
+  - the lists: their sizes and offsets from the v2.1 header.
+
+  Each image goes into a page-aligned slot of the firmware buffer.
+- **The command** is stage 13's `LOAD_IP_FW` (6): the slot's GPU address,
+  the payload size, and the `psp_gfx_if.h` type: CE 3, PFP 2, ME 1, MEC 4,
+  MEC_ME1 (the jump table) 5, the three lists 22, 20 and 21, RLC_G 8.
+
+**The firmware** is the pinned linux-firmware `20260916` set
+([firmware provenance](firmware-provenance.md)). `tools/amdgpu_firmware.py`
+accepts every file, and the payloads stay opaque:
+
+| # | Image | File, SHA-256 | Payload (file offset, bytes) | Type | Slot offset (pages) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | CE | `green_sardine_ce.bin`, `3bba10cf…ca70fd` | 256, 36,352 | 3 | `0x00000` (9) |
+| 2 | PFP | `green_sardine_pfp.bin`, `94e1474b…7bdcdc` | 256, 85,504 | 2 | `0x09000` (21) |
+| 3 | ME | `green_sardine_me.bin`, `671af908…68fb9c` | 256, 69,120 | 1 | `0x1e000` (17) |
+| 4 | MEC1 | `green_sardine_mec.bin`, `0e4c6712…4eba6` | 256, 267,072 | 4 | `0x2f000` (66) |
+| 5 | MEC1 jump table | the same file | 267,328, 896 | 5 | `0x71000` (1) |
+| 6 | RLC list CNTL | `green_sardine_rlc.bin`, `66f4397c…db319d` | 26,832, 592 | 22 | `0x72000` (1) |
+| 7 | RLC list GPM | the same file | 27,424, 2,560 | 20 | `0x73000` (1) |
+| 8 | RLC list SRM | the same file | 29,984, 9,944 | 21 | `0x74000` (3) |
+| 9 | RLC_G | the same file | 256, 16,896 | 8 | `0x77000` (5) |
+
+The pinned headers give these values: CE, PFP and ME `ucode_size_bytes`;
+MEC `jt_offset` 66,768 and `jt_size` 224; RLC v2.1 list sizes and offsets.
+The core accepts an image only if its header matches them. MEC2 and the
+other images are not used.
+
+**Placement.** A new firmware buffer at carveout `0x40900000` (GPU
+`0xF440900000`, physical `0x600900000`), 496 KiB (`0x7c000`). It sits in
+the free space between the GART work area and the stage 19 pattern
+region. The 1 MiB around it gets the stage 9 placement checks and a 1 s
+stability snapshot. The ring, command and fence pages (stage 12) and the
+TMR (`0x40400000`, 4 MiB) are unchanged.
+
+**How the firmware reaches the driver:** embedded at build time, as for
+SDMA. `build.sh` checks each file's SHA-256 against the pin above and
+generates the arrays; the files stay in ignored `out/`.
+
+**New reads**, all GFX-gated and all in Linux's `gc_reg_list_9` (the GC IP
+dump). They are read before and after the loads, and recorded:
+
+| Register | Offset |
+| --- | --- |
+| `GRBM_STATUS2` | `0x08008` |
+| `CP_STAT` | `0x08680` |
+| `CP_CPF_STATUS` | `0x0821c` |
+| `CP_CPC_STATUS` | `0x08210` |
+| `RLC_STAT` | `0x3b010` |
+| `CP_PFP_INSTR_PNTR` | `0x08694` |
+| `CP_ME_INSTR_PNTR` | `0x08698` |
+| `CP_CE_INSTR_PNTR` | `0x0869c` |
+| `CP_MEC1_INSTR_PNTR` | `0x086a0` |
+
+`CP_ME_CNTL`, `CP_MEC_CNTL`, `RLC_CNTL` and `GRBM_STATUS` are already
+allowed (stage 6). The `*_UCODE_ADDR`/`_DATA` pairs are never read: they
+are Linux's direct-load interface, and a data read moves the address.
+
+**Steps** (on request only: `sudo cezanne-diag --gfxoff-disallow --psp-gfx
+--psp-state`, each printed first, ordered selectors):
+
+1. **Check (no writes):**
+   - stage 12's check;
+   - the nine embedded images' headers match the pinned values;
+   - the firmware buffer is placed and stable;
+   - GFX is on (`--gfxoff-disallow` first);
+   - `CP_ME_CNTL` reads its boot value with ME, PFP and CE halted, and
+     `CP_MEC_CNTL` with both MECs halted;
+   - `RLC_CNTL` reads 0 (RLC off);
+   - the nine new registers are read.
+2. **Create the ring** (stage 11).
+3. **`SETUP_TMR`** as frame 0, fence 1 (stage 12).
+4. **Copy the firmware.** The nine payloads go into their slots, with zero
+   padding to each slot's end, through a writable, uncached mapping of
+   exactly the 124 pages. Then everything is read back; any mismatch stops
+   the step.
+5. **Nine `LOAD_IP_FW`s** as frames 1–9, in the order above
+   (`C2PMSG_67` ← 32 … 160, fences 2–10). After each: the response status
+   and `fw_addr`. The first non-zero status stops the loads, and the
+   teardown follows.
+6. **Observe (no writes):**
+   - the registers of step 1 again: CP still halted, RLC still off;
+   - the work area against stage 12's rules, now with frames 0–9;
+   - the firmware buffer: the images, then the snapshot.
+7. **Teardown:** `DESTROY_TMR` as frame 10 (`C2PMSG_67` ← 176, fence 11),
+   then `DESTROY_RINGS`. An abandoned connection after step 3 does the
+   same.
+
+**New writes:**
+
+| Target | Values |
+| --- | --- |
+| `C2PMSG_67` | 16 × (k + 1) for frames 0–10 (stage 13 allows up to 48) |
+| Work area | the nine `LOAD_IP_FW` commands' words; `DESTROY_TMR` moves to frame 10 |
+| GFX firmware buffer (new) | physical `0x600900000`–`0x60097BFFF`, only the validated payloads' words, or 0 in each slot's padding |
+
+**No GC register is written.** The engines are only read. `RLC_CNTL`,
+`CP_ME_CNTL` and `CP_MEC_CNTL` keep their boot values.
+
+**Expected:**
+- Fences 1–11, all with status 0.
+- Each `fw_addr` inside the TMR, or a TMR offset (recorded either way).
+- CP halted and RLC off after the loads.
+- The new status registers are recorded. The instruction pointers may
+  change, but no engine runs.
+- Only the expected words change in the work area and the firmware buffer.
+
+**Risks:**
+- **The PSP checks each image's signature.** A rejected image gives a
+  non-zero status: a finding, not a fault. The loads stop and the teardown
+  runs.
+- **The firmware stays in the halted engines until power-off,** as
+  SDMA0's has since stage 13. Nothing starts it: the RLC needs
+  `RLC_CNTL.RLC_ENABLE_F32` and the CP needs its halt bits cleared, and
+  this stage writes neither.
+- **GFX power.** The loads need GC powered, so `--gfxoff-disallow` comes
+  first (Linux loads before it allows GFXOFF). If GFX is off, the check
+  stops before any write.
+- **A misdirected write** is checked only across the firmware buffer's
+  1 MiB and the work area. Unexpected words mean: power off at once.
+- Make a Time Machine backup before this boot.
+
+**What it does not do.** It does not start the RLC or unhalt the CP. It
+sets up no GFX ring, and it changes no GC, IH, GART or display register.
+It loads neither MEC2 nor SDMA.
+
+**Stage 21 succeeds when:**
+- `sudo cezanne-diag --gfxoff-disallow --psp-gfx --psp-state` reports `ok`
+  for the check, the ring, `SETUP_TMR`, the copy, all nine loads (each
+  status 0), the observation and the teardown;
+- CP is still halted and RLC still off afterwards;
+- the final register dump matches the boot 22 values apart from the
+  recorded GC status and the PSP counters;
+- the machine stays up and the display is unchanged.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
