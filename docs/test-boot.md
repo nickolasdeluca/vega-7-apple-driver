@@ -3338,7 +3338,7 @@ stopped at the check, before any stage 20 write: the flip-interrupt
 register held the firmware's status latches. The check and the restore now
 look at the enables only (fix within the stage). Boot 30 filled the region
 but only the white band came out right: the fill packet filled bytes. It
-now sets `FILLSIZE` 2 (dword fills), as Mesa's RADV does; rebuilt for
+now sets `FILLSIZE` 2 (dword fills), as Mesa's RADV does. Succeeded in
 boot 31.**
 
 The user chose to combine
@@ -4847,6 +4847,45 @@ boot-30-stage20 --gfxoff-disallow --sdma-flip --psp-state`; exit 1).
 
   The second build is kept as `superseded-*-stage20-fill`.
 - Captures are in ignored `out/test-efi/boot-30-stage20/`.
+
+**Boot 31, 2026-10-07, stage 20 with dword fills**
+(`out/test-efi/usb-stage20/`, rebuilt; cold boot; `tools/capture_boot.sh
+boot-31-stage20 --gfxoff-disallow --sdma-flip --psp-state`; exit 0).
+
+- **Stages 15, 17 and 18:** passed as before. The trap's MSI came 45 µs
+  after the submit, and the `ENABLE_INTR` MSI at 29 µs.
+- **Check:** ok. Frame count 5148, region checksum `0x03bbaa4f11fa4326`.
+- **Fill: ok.** Fence 4, `GFX_RB_RPTR` 5120, and **all 8 MiB matched the
+  reversed bands**: SDMA drew the whole surface. No MSI during the fill.
+- **Show: ok.**
+  - The arm read back `0x00040001`: enabled, with the flip-away latch.
+  - `EARLIEST_INUSE` reached `0xF441000000` after 7 ms.
+  - **One MSI, 7.2 ms after the address writes**, which is the wait for the
+    next vertical sync.
+  - One IH entry: client 4, source `0x4f` (79), dw0 `0x80004f04`, with a
+    GPU timestamp in dw1 and dw4.
+  - `SURFACE_FLIP_INTERRUPT` read `0x00070001` (occurred, status, flip-away
+    latch, enabled) and `DISP_INTERRUPT_STATUS_CONTINUE17` read
+    `0x00000004`: the HUBP0 flip bit, as `irqsrcs_dcn_1_0.h` names it.
+- **What the user saw:** eight bands, black at the top and white at the
+  bottom, no grey lines.
+- **Acknowledgement: ok.** `0x101` left `0x00040001`: status cleared,
+  still enabled. `IH_RB_RPTR` ← `0x40`, and after 100 ms the MSI count was
+  still 3: no re-fire.
+- **Verify after 5 s: ok.** 306 frames since the flip, **no MSI during the
+  hold** (the flip interrupt fires once per flip), pipe 0 unchanged, and the
+  pattern intact.
+- **Restore: ok.** Back to `0xF400000000` after 1 ms. The flip back raised
+  its own MSI (3 → 4) and entry. `IH_RB_RPTR` ← `0x60`. The user saw the
+  desktop return unchanged.
+- **Then the stage 18 restore, the stage 17 restore and the stage 15
+  stop:** all ok.
+- **Final dump against boot 27,** which ran the same chain without
+  stage 20: it differs only in the PSP counter `C2PMSG_81` and SDMA's ring
+  pointers (5120, frame 4). Pipe 0 matches. `SURFACE_FLIP_INTERRUPT` ends at
+  `0x00040000`: disabled, with the flip-away latch, as expected.
+- Captures are in ignored `out/test-efi/boot-31-stage20/`.
+- Result: **stage 20 succeeded.**
 
 ## Unknowns and limits
 

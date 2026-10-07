@@ -7,7 +7,7 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 ## Current checkpoint
 
 Current checkpoint, 2026-10-07, branch `cezanne-discovery`: **driver stages
-0–19 succeeded on the USB test EFI** (boots 1–28; see the
+0–20 succeeded on the USB test EFI** (boots 1–31; see the
 [test boot log](test-boot.md#test-boot-log)). The driver can do the
 following:
 - read the GPU, the discovery table and the engine state;
@@ -21,7 +21,9 @@ following:
 - deliver that trap as an MSI to a kext handler, acknowledge it, then
   restore (boot 27);
 - show its own test pattern on display pipe 0 by flipping the surface
-  address, then flip back (boot 28).
+  address, then flip back (boot 28);
+- have SDMA0 draw that surface, then flip to it with HUBP0's flip interrupt
+  arriving as an MSI, then flip back (boot 31).
 
 Stage 17 (GART and the IH ring) succeeded in boot 25: an SDMA copy read
 through a driver-built GART page table, its trap arrived in IH ring 0, and
@@ -31,8 +33,9 @@ with no re-fire after the acknowledgement. Stage 19 (display test pattern)
 succeeded in boot 28: the flip landed in 13 ms, the pattern showed for 5 s
 with straight grey lines (the hardware reads 1920 pixels per line), and the
 desktop came back unchanged. Stage 20 (SDMA draws the pattern, and the flip
-interrupt) was fixed twice within the stage: the check after boot 29, and
-the fill size after boot 30. It is rebuilt for boot 31; see "Next task"
+interrupt) succeeded in boot 31, after two fixes within the stage (the
+check after boot 29, the fill size after boot 30). The flip's MSI arrived
+7.2 ms after the address writes, and none during the hold. See "Next task"
 below. The sections that follow are the earlier discovery record and
 still apply.
 
@@ -147,39 +150,21 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 20 again (boot 31)
+## Next task: propose stage 21 (start the main graphics engine)
 
-Stage 20 was approved and built on 2026-10-07 (the
-[proposal](test-boot.md#stage-20-sdma-draws-the-pattern-and-the-flip-interrupt-proposal)).
-Two fixes so far, both within the stage (the boot 29 and 30 entries in the
-[test boot log](test-boot.md#test-boot-log)):
-- **Boot 29** stopped at the stage 20 check before any stage 20 write. The
-  flip-interrupt register held the firmware's status latches
-  (`0x00050000`), and the check required 0. The check and the restore now
-  look at the interrupt enables only.
-- **Boot 30** passed the check, and SDMA ran frame 4 to fence 4. But only
-  the white band was right, because the fill packet's `FILLSIZE` 0 fills
-  bytes. Frame 4 now uses `FILLSIZE` 2 (dword fills), as Mesa's RADV does. Starting the main graphics
-engine is stage 21, proposed after this stage boots. Steps:
+Stages 0–20 succeeded (boot 31, 2026-10-07, in the
+[test boot log](test-boot.md#test-boot-log)). The user chose stage 21 on
+2026-10-07: starting the main graphics engine (GFX: RLC, the command
+processor's firmware through the PSP, a CP ring), probably split over
+several stages as SDMA was (13–15). The next step is a proposal in
+`test-boot.md` when the user asks for it. Nothing is built until the user
+approves it.
 
-1. The user runs `tools/update_stick.sh 20` (the stick holds the boot 30
-   build), shuts down fully, cold boots the stick, and runs
-   `tools/capture_boot.sh boot-31-stage20 --gfxoff-disallow --sdma-flip --psp-state`.
-2. The user reports what the screen showed for those 5 seconds: eight
-   bands, black at the top and white at the bottom, with no grey lines. Then
-   whether the desktop came back unchanged.
-3. Read the output against "Stage 20 succeeds when" in
-   [test-boot.md](test-boot.md) and record boot 31 in the log. Follow the
-   [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
-   for defects. A kernel panic is a finding: power off, then read the panic
-   log from the next normal boot.
-
-**Builds:** `out/test-efi/usb-stage20` (`usb-stage20-build.json`, rebuilt
-after boot 30), `out/test-efi/driver`, `out/diag`. The earlier stage 20
+**Builds:** `out/test-efi/usb-stage20` (`usb-stage20-build.json`, on the
+stick, passed boot 31), `out/test-efi/driver`, `out/diag`. Earlier stage 20
 builds are kept as `superseded-*-stage20-latch` (boot 29) and
-`superseded-*-stage20-fill` (boot 30). The stage 19 builds that passed
-boot 28 are kept as `superseded-driver-stage19` and `superseded-diag-stage19`,
-with `out/test-efi/usb-stage19`.
+`superseded-*-stage20-fill` (boot 30). The stage 19 builds are kept as
+`superseded-driver-stage19` and `superseded-diag-stage19`.
 
 ### Earlier: booting stage 19
 
