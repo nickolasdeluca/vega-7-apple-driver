@@ -38,7 +38,8 @@ check after boot 29, the fill size after boot 30). The flip's MSI arrived
 7.2 ms after the address writes, and none during the hold. Stage 21 (the
 graphics engine: firmware, RLC, CP, ring test, fence, CP drawing) is
 approved and implemented. In boot 32 the CP ran and then stalled in the
-clear-state preamble; it is rebuilt with stall diagnostics for boot 33.
+clear-state preamble (boots 32 and 33: the ring fetch waits on memory);
+it is rebuilt with Linux's golden settings for boot 34.
 See "Next task" below. The sections that follow are the earlier discovery record and
 still apply.
 
@@ -153,32 +154,31 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 21 again (boot 33, stall diagnostics)
+## Next task: boot stage 21 again (boot 34, golden settings)
 
-Boot 32 (2026-10-07; [test boot log](test-boot.md#test-boot-log)):
-- all nine GFX firmware loads passed;
-- loading `RLC_G` started the RLC by itself;
-- our RLC start passed;
-- the CP started and ran, its read pointer reaching 152, then it stalled
-  inside the clear-state preamble's first `SET_CONTEXT_REG`;
-- everything was restored.
-
-The rebuild adds Linux's GC hang-dump registers (stall reasons, the last
-packet headers, RLC state) to every report. It makes no new writes. Steps:
+Boots 32 and 33 (2026-10-07; [test boot log](test-boot.md#test-boot-log))
+were the same: the CP ran our ring for 152 dwords, then its ring fetch
+waited on a memory read that never returned (`RING_FETCHING_DATA`). The
+fix within the stage is Linux's own first `hw_init` step, which this stage
+had deferred: Renoir's twelve golden settings (`golden_settings_gc_9_1_rn`).
+Three of them configure the GC's memory path, and they boot far from
+Linux's values (`GB_ADDR_CONFIG`, `TCP_CHAN_STEER`, `GCEA_PROBE_MAP`).
+Steps:
 
 1. The user runs `tools/update_stick.sh 21`, shuts down fully, cold boots
    the stick, and runs
-   `tools/capture_boot.sh boot-33-stage21 --gfxoff-disallow --gfx-start --psp-state`.
-2. Decode the CP step's report: `CP_STALLED_STAT1`/`2`,
-   `CP_CPF_STALLED_STAT1` and the header dumps (`gc_9_0_sh_mask.h`). Then
-   decide the fix, which may be one of Linux's skipped steps (golden
-   settings, `constants_init`, the KIQ) or dialling the stage down, with the
-   user.
+   `tools/capture_boot.sh boot-34-stage21 --gfxoff-disallow --gfx-start --psp-state`.
+2. If the CP gets past dword 152, the stage may reach the drawing: red,
+   green and blue bands. If it stalls again, read the new UTCL1 and fault
+   status registers. The next candidates are `constants_init` and the GC
+   hub's own setup (`gfxhub_v1_0`); either may mean dialling the stage
+   down, with the user.
 
 **Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, rebuilt
-after boot 32), `out/test-efi/driver`, `out/diag`. The first stage 21 build
-is kept as `superseded-*-stage21-stall`. The stage 20 builds are kept as
-`superseded-driver-stage20` and `superseded-diag-stage20`.
+after boot 33), `out/test-efi/driver`, `out/diag`. Earlier stage 21 builds:
+`superseded-*-stage21-stall` (boot 32), `superseded-*-stage21-fetch`
+(boot 33). The stage 20 builds are kept as `superseded-driver-stage20` and
+`superseded-diag-stage20`.
 
 ### Earlier: booting stage 19
 

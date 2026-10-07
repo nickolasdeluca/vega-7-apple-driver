@@ -3549,8 +3549,9 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
 for a bolder stage) and approved by the user the same day; implemented and
 built (`out/test-efi/usb-stage21`) the same day. Boot 32: firmware loaded,
 the RLC and the CP started, and the CP fetched and ran commands. It then
-stalled in the clear-state preamble, and everything was restored. Rebuilt
-with stall diagnostics for boot 33.**
+stalled in the clear-state preamble, and everything was restored. Boot 33:
+the stall is the CP's ring fetch waiting on memory. Rebuilt with Linux's
+Renoir golden settings first, for boot 34.**
 
 **Purpose.** This is the first time the main graphics engine (GC 9.3)
 executes commands from the driver. The user asked for visible progress, so
@@ -3907,7 +3908,11 @@ registers. The tool prints them.
 - **The serdes waits do not fail the step.** Linux logs a timeout and
   continues; the readings are reported.
 - **`GCEA_PROBE_MAP`** (Renoir's twelfth golden register) is not in
-  `gc_9_0_offset.h`, so it is not read. The other 11 are.
+  `gc_9_0_offset.h`. It was left out until boot 33; Linux defines it in
+  `gfx_v9_0.c` (`0x070c`, segment 0), which gives its offset.
+- **The golden settings run first in the RLC step (after boot 33),** not in
+  the shader stage as the proposal said. The proposal is kept as approved,
+  and the change is recorded in the boot 33 entry.
 
 ## Build the test EFIs
 
@@ -5309,6 +5314,52 @@ readings.**
   `RLC_SAFE_MODE` and `RLC_INT_STAT`. There are no new writes. The first
   build is kept as `superseded-*-stage21-stall`.
 - Captures are in ignored `out/test-efi/boot-32-stage21/`.
+
+**Boot 33, 2026-10-07, stage 21 with the stall diagnostics**
+(`out/test-efi/usb-stage21/`, rebuilt; cold boot; `tools/capture_boot.sh
+boot-33-stage21 --gfxoff-disallow --gfx-start --psp-state`; exit 1).
+
+- **The same result as boot 32:** the loads and the RLC start passed, the CP
+  ran to `CP_RB0_RPTR` 152 and stopped, and everything was restored. That
+  makes it reproducible.
+- **RLC firmware:** `RLC_GPM_GENERAL_6` reads `0x59` once loaded (0
+  before). The RLC firmware is running.
+- **The stall reason**, decoded from `gc_9_0_sh_mask.h`:
+  - **`CP_CPF_STALLED_STAT1` `0x1` (`RING_FETCHING_DATA`)** and
+    `CP_CPF_BUSY_STAT` `0x2` (`CSF_RING_BUSY`). The fetcher is waiting for
+    ring data from memory: a read that never returns.
+  - `CP_STALLED_STAT1` `0x00000c00`: `ME_HAS_ACTIVE_CE_BUFFER_FLAG` and
+    `ME_HAS_ACTIVE_DE_BUFFER_FLAG` only.
+  - `CP_GFX_ERROR` 0. The header dumps read `0xdefNdefN` (no header
+    recorded).
+- **Reading:** the commands are not the problem. The CP's memory path
+  answered the first fetches, up to 152 dwords, then stopped answering.
+- **The fix (within the stage): Linux's golden settings first.**
+  `gfx_v9_0_hw_init` programs `golden_settings_gc_9_1_rn` before anything
+  else, and this stage had deferred them to the shader stage. Three of the
+  twelve configure the GC's memory path, and boot 32 read them far from
+  Linux's values:
+  - `GB_ADDR_CONFIG` `0x24000011`: 2 pipes, against Linux's `0x24000042`
+    (4 pipes, under mask `0xf3e777ff`);
+  - `TCP_CHAN_STEER_LO`/`HI` `0x76543210`/`0xfedcba98`: 16 channels,
+    against `0x3120`/0;
+  - `GCEA_PROBE_MAP`, which Linux sets to `0xcccc` (its offset, `0x09c30`,
+    is defined in `gfx_v9_0.c`).
+
+  Requests steered to channels that do not exist would explain a fetch that
+  answers at first and then hangs. The RLC step now starts with the twelve
+  writes, each `(read & ~mask) | (value & mask)` as
+  `soc15_program_register_sequence` does. They go through the
+  snapshot-relative allowlist, and the restore puts all twelve back.
+- **What else changed:**
+  - the snapshot grows to 36 registers;
+  - the GC page set gains `0x9000` and `0xa000`;
+  - each report also reads `CPF_`, `CPC_` and `CPG_UTCL1_STATUS` and the
+    GC hub's `VM_L2_PROTECTION_FAULT_STATUS`, which would show a translation
+    fault.
+
+  The boot 33 build is kept as `superseded-*-stage21-fetch`.
+- Captures are in ignored `out/test-efi/boot-33-stage21/`.
 
 ## Unknowns and limits
 
