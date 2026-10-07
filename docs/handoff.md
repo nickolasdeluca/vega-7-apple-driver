@@ -37,8 +37,9 @@ interrupt) succeeded in boot 31, after two fixes within the stage (the
 check after boot 29, the fill size after boot 30). The flip's MSI arrived
 7.2 ms after the address writes, and none during the hold. Stage 21 (the
 graphics engine: firmware, RLC, CP, ring test, fence, CP drawing) is
-approved, implemented and built, waiting for boot 32. See "Next task"
-below. The sections that follow are the earlier discovery record and
+approved and implemented. In boot 32 the CP ran and then stalled in the
+clear-state preamble; it is rebuilt with stall diagnostics for boot 33.
+See "Next task" below. The sections that follow are the earlier discovery record and
 still apply.
 
 Completed work:
@@ -152,32 +153,32 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 21 (the graphics engine runs our commands and draws)
+## Next task: boot stage 21 again (boot 33, stall diagnostics)
 
-Stage 21 was approved on 2026-10-07 (the
-[proposal](test-boot.md#stage-21-the-graphics-engine-runs-our-commands-and-draws-proposal))
-and implemented and built the same day; the implementation notes are in
-that section. This is the riskiest stage so far: the first code to run on
-GC, and the first GC registers written. Expect fix-within-stage boots. Steps:
+Boot 32 (2026-10-07; [test boot log](test-boot.md#test-boot-log)):
+- all nine GFX firmware loads passed;
+- loading `RLC_G` started the RLC by itself;
+- our RLC start passed;
+- the CP started and ran, its read pointer reaching 152, then it stalled
+  inside the clear-state preamble's first `SET_CONTEXT_REG`;
+- everything was restored.
 
-1. Make a Time Machine backup (the proposal's risks).
-2. The user runs `tools/update_stick.sh 21` (the stick holds stage 20),
-   shuts down fully, cold boots the stick, and runs
-   `tools/capture_boot.sh boot-32-stage21 --gfxoff-disallow --gfx-start --psp-state`.
-3. The user reports what the screen showed for those 5 seconds (red, green
-   and blue bands, top to bottom), and whether the desktop came back.
-4. Read the output against "Stage 21 succeeds when" in
-   [test-boot.md](test-boot.md) and record boot 32 in the log. Every step
-   prints the 54-register GC state, so even an early stop gives the first
-   GC readings. Follow the
-   [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
-   for defects. A hang or a kernel panic is a finding: power off, then read
-   the panic log from the next normal boot.
+The rebuild adds Linux's GC hang-dump registers (stall reasons, the last
+packet headers, RLC state) to every report. It makes no new writes. Steps:
 
-**Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`),
-`out/test-efi/driver` (with the five GFX files embedded), `out/diag`. The
-stage 20 builds that passed boot 31 are kept as `superseded-driver-stage20`
-and `superseded-diag-stage20`, with `out/test-efi/usb-stage20`.
+1. The user runs `tools/update_stick.sh 21`, shuts down fully, cold boots
+   the stick, and runs
+   `tools/capture_boot.sh boot-33-stage21 --gfxoff-disallow --gfx-start --psp-state`.
+2. Decode the CP step's report: `CP_STALLED_STAT1`/`2`,
+   `CP_CPF_STALLED_STAT1` and the header dumps (`gc_9_0_sh_mask.h`). Then
+   decide the fix, which may be one of Linux's skipped steps (golden
+   settings, `constants_init`, the KIQ) or dialling the stage down, with the
+   user.
+
+**Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, rebuilt
+after boot 32), `out/test-efi/driver`, `out/diag`. The first stage 21 build
+is kept as `superseded-*-stage21-stall`. The stage 20 builds are kept as
+`superseded-driver-stage20` and `superseded-diag-stage20`.
 
 ### Earlier: booting stage 19
 

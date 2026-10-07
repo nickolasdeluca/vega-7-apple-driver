@@ -3547,7 +3547,10 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
 
 **Status: proposed 2026-10-07 (revised the same day at the user's request
 for a bolder stage) and approved by the user the same day; implemented and
-built (`out/test-efi/usb-stage21`) the same day. Not yet booted.**
+built (`out/test-efi/usb-stage21`) the same day. Boot 32: firmware loaded,
+the RLC and the CP started, and the CP fetched and ran commands. It then
+stalled in the clear-state preamble, and everything was restored. Rebuilt
+with stall diagnostics for boot 33.**
 
 **Purpose.** This is the first time the main graphics engine (GC 9.3)
 executes commands from the driver. The user asked for visible progress, so
@@ -5249,6 +5252,63 @@ boot-31-stage20 --gfxoff-disallow --sdma-flip --psp-state`; exit 0).
   `0x00040000`: disabled, with the flip-away latch, as expected.
 - Captures are in ignored `out/test-efi/boot-31-stage20/`.
 - Result: **stage 20 succeeded.**
+
+**Boot 32, 2026-10-07, stage 21** (`out/test-efi/usb-stage21/`, first
+build; cold boot; `tools/capture_boot.sh boot-32-stage21 --gfxoff-disallow
+--gfx-start --psp-state`; exit 1). **These are the first GC register
+readings.**
+
+- **Check: ok.** Snapshot (boot values):
+  - `RLC_CNTL` 0, `CP_ME_CNTL` `0x15000000`, `CP_MEC_CNTL` `0x50000000`,
+    `CP_INT_CNTL_RING0` 0;
+  - `RLC_CGCG_CGLS_CTRL` `0x0001003c`, `RLC_SRM_CNTL` 2, `RLC_SPM_MC_CNTL` 0,
+    `RLC_CSIB_*` 0;
+  - `CP_RB0_CNTL` `0x00400000`, `CP_RB0_BASE` `0xfedcbaef` (an uninitialised
+    pattern), `CP_MAX_CONTEXT` 7, `CP_DEVICE_ID` 0, the other ring registers
+    0;
+  - `GRBM_GFX_INDEX` 0 and `SCRATCH_REG0` 0;
+  - the GC hub as MMHUB at boot 22;
+  - golden registers: `GB_ADDR_CONFIG` `0x24000011` (Linux's golden value
+    is `0x24000042`, under a mask), `CB_HW_CONTROL` `0x00014107`,
+    `PA_SC_ENHANCE` 1, `PA_SC_ENHANCE_1` `0x04040000`, `TCP_CHAN_STEER`
+    `0xfedcba98`/`0x76543210`, the others 0.
+- **Load: ok.** All nine `LOAD_IP_FW`s returned status 0, fence 10.
+  `fw_addr` read 0, as for SDMA0 in stage 13.
+- **Finding: loading `RLC_G` started the RLC.** After the loads, before any
+  GC write, `RLC_CNTL` read 1 and `RLC_SRM_CNTL` read 3. That is
+  `RLC_ENABLE_F32` and `SRM_ENABLE` set, although PSP v12 does not use
+  autoload in Linux. `RLC_STAT` stayed 0.
+- **RLC start: ok.** 11 writes, serdes idle. `RLC_CSIB_*` at
+  `0xf4`/`0x40a03000`/904, `RLC_SPM_MC_CNTL` `0xf`, `RLC_CNTL` 1.
+- **CP start: `gfx-cp-timeout`.** All 15 writes took: the ring registers
+  read back as written, and `CP_ME_CNTL` read 0. **The CP ran:**
+  - `CP_RB0_RPTR` reached 152 (0x98) of frame 0's 1024 dwords;
+  - the PFP, ME and CE instruction pointers moved (`0x38`, `0xa`, `0x4c`).
+
+  It then stopped. Decoded:
+  - `CP_STAT` `0x84008200`: ROQ ring, PFP, CE and CP busy;
+  - `CP_CPF_STATUS` `0x94000023`, `CP_BUSY_STAT` `0x00400000`
+    (`CE_PARSING_PACKETS`);
+  - `GRBM_STATUS` `0xa0003028` (`CP_BUSY`, `GUI_ACTIVE`);
+  - the ME's command FIFO was empty.
+
+  Dword 152 lies inside the preamble's first `SET_CONTEXT_REG`
+  (dwords 5–218, 212 context registers). The read-pointer write-back stayed
+  0: the CP writes it per `RB_BLKSZ` block (512 dwords), which it never
+  reached.
+- **Restore: ok.** The CP was halted, the RLC stopped, and all 24 registers
+  were back at the snapshot. The flip back was not needed. The PSP teardown
+  passed (`DESTROY_TMR` fence 11). The CP's busy bits stay set until a cold
+  boot.
+- **What the readings cannot say** is which packet the PFP and CE are
+  waiting on, or why.
+- **Fix (within the stage):** every stage 21 state report now also reads
+  11 more registers from Linux's GC hang dump (`gc_reg_list_9`):
+  `CP_STALLED_STAT1`/`2`, `CP_CPF_STALLED_STAT1`, `CP_CPF_BUSY_STAT`,
+  `CP_GFX_ERROR`, the CE, PFP and ME header dumps, `RLC_GPM_GENERAL_6`,
+  `RLC_SAFE_MODE` and `RLC_INT_STAT`. There are no new writes. The first
+  build is kept as `superseded-*-stage21-stall`.
+- Captures are in ignored `out/test-efi/boot-32-stage21/`.
 
 ## Unknowns and limits
 
