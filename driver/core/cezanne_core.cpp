@@ -2252,7 +2252,7 @@ Status checkFlipIntr(const RegisterReader &registers, uint64_t apertureLength, u
     if (status == kOK) status = readRegister(registers, apertureLength, stage, kRegDchubInterruptDest2, dest2);
     if (status == kOK) status = readRegister(registers, apertureLength, stage, kRegDispInterruptStatusContinue17, continue17);
     if (status != kOK) return status;
-    if (flipInterrupt != 0) {
+    if ((flipInterrupt & kFlipIntEnables) != 0) {
         *value = flipInterrupt;
         return kFlipUnexpectedState;
     }
@@ -2419,8 +2419,8 @@ Status restoreFlip(const RegisterReader &registers, uint64_t apertureLength, con
     if (restored == kOK) {
         *index = 11;
         restored = readRegister(registers, apertureLength, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, value);
-        if (restored == kOK && *value != 0) restored = kFlipNotRestored;
-        if (restored == kOK) *index = 0;
+        if (restored == kOK && (*value & kFlipIntEnables) != 0) restored = kFlipNotRestored;
+        if (restored == kOK) *index = *value = 0;
     }
     return flip != kOK ? flip : status != kOK ? status : restored;
 }

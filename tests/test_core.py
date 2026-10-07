@@ -201,7 +201,9 @@ class CoreTests(unittest.TestCase):
             # At stage 19 the allowlist still refuses frame 4's write pointer; at
             # stage 18 the gate is what reports the frame as not allowed.
             "18, 4, &observed) == kRegisterNotAllowed": ("(frame == 4 && stage < kFlipStage)", "false"),
-            "index == 0 && value == 1": ("    if (flipInterrupt != 0) {", "    if (false) {"),
+            "index == 0 && value == 1": ("    if ((flipInterrupt & kFlipIntEnables) != 0) {", "    if (false) {"),
+            "index == 0 && value == 0x00050004": ("    if ((flipInterrupt & kFlipIntEnables) != 0) {",
+                                                 "    if ((flipInterrupt & kFlipIntEnable) != 0) {"),
             "index == 1 && value == 0x41": ("    if ((*dest2 & kFlipIntDest) != 0) {", "    if (false) {"),
             "== kFlipFillMismatch": ("return *unexpected == 0 ? kOK : kFlipFillMismatch;", "return kOK;"),
             "clearPattern(g.pattern.reader(), g.pattern.writer(), 20) == kOK && g.pattern.words[5] == 0": (
@@ -219,9 +221,9 @@ class CoreTests(unittest.TestCase):
                 "report->msiPauses < kDisplayFlipPauses", "report->msiPauses < 0"),
             "kFlipVerifyFailed && msiChange == 1": ("(status == kOK && *msiChange != 0)", "false"),
             "msiChange == 0 && hold.patternUnexpected == 0": ("stage, fillWord, report);", "stage, patternWord, report);"),
-            "g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] == 0": (
+            "g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] == 0x00040000": (
                 "    if (status == kOK) status = writeRegister(writer, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, 0);\n", ""),
-            "== kFlipNotRestored": ("if (restored == kOK && *value != 0) restored = kFlipNotRestored;", ""),
+            "== kFlipNotRestored": ("if (restored == kOK && (*value & kFlipIntEnables) != 0) restored = kFlipNotRestored;", ""),
             "g.r.msiCount, &report, &index, &value) == kOK": (
                 "if (flip == kFlipIntrNotDelivered || flip == kFlipIntrVerifyFailed) flip = kOK;", ""),
             # Stage 18.

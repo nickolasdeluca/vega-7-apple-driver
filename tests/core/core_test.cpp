@@ -152,10 +152,10 @@ struct FakeRegisters {
     std::vector<uint32_t> *patternWords = nullptr;
     int fillSkip = -1;        // a CONST_FILL (by its order) the engine drops
     bool flipIntDrop = false; // the flip interrupt never reaches the IH
-    bool flipIntSticky = false; // SURFACE_FLIP_CLEAR leaves the status set
+    bool flipIntStuck = false; // writes to SURFACE_FLIP_INTERRUPT are lost
     void presetFlip()
     {
-        gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] = 0;
+        gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] = 0x00050000; // boot 29: the firmware's flips latched
         gart[kRegDchubInterruptDest2] = 0x00000040; // another source's destination: not checked
         gart[kRegDispInterruptStatusContinue17] = 0;
     }
@@ -863,11 +863,13 @@ struct FakeWriter {
             return;
         }
         if (offset == kRegHubpreq0DcsurfSurfaceFlipInterrupt) {
-            // SURFACE_FLIP_CLEAR clears the status and reads back 0.
-            uint32_t status = r->gart[offset] & (kFlipIntOccurred | kFlipIntStatus);
-            if ((value & kFlipIntClear) != 0 && !r->flipIntSticky) status = 0;
-            r->gart[offset] = (value & kFlipIntEnable) | status;
-            if (status == 0) r->gart[kRegDispInterruptStatusContinue17] &= ~kFlipIntContinue17;
+            // SURFACE_FLIP_CLEAR clears the flip status (not FLIP_AWAY's) and
+            // reads back 0.
+            if (r->flipIntStuck) return;
+            uint32_t status = r->gart[offset] & 0xFFFF0000u;
+            if ((value & kFlipIntClear) != 0) status &= ~(kFlipIntOccurred | kFlipIntStatus);
+            r->gart[offset] = (value & kFlipIntEnables) | status;
+            if ((status & kFlipIntStatus) == 0) r->gart[kRegDispInterruptStatusContinue17] &= ~kFlipIntContinue17;
             return;
         }
         r->gart[offset] = value;
@@ -2749,7 +2751,7 @@ static void testFlip()
         CHECK(g.pattern.words[0] == 0xFF000000u && g.r.gart[kRegVmL2ProtectionFaultStatus] == 0);
         int before = g.w.writes;
         uint32_t readback = 0;
-        CHECK(armFlipIntr(g.r.reader(), 0x80000, g.w.writer(), 20, &readback) == kOK && readback == 1);
+        CHECK(armFlipIntr(g.r.reader(), 0x80000, g.w.writer(), 20, &readback) == kOK && readback == 0x00040001);
         CHECK(g.w.writes == before + 2 && g.w.values[before] == 0x100 && g.w.values[before + 1] == 0x1);
         FlipReport report;
         CHECK(flipWithIntr(g.r.reader(), 0x80000, g.w.writer(), g.gartWork.reader(), g.counter, 20, kPatternGpuAddress,
@@ -2758,7 +2760,7 @@ static void testFlip()
         CHECK(report.ihStart == 0x20 && report.ihWriteback == 0x40 && report.flipEntries == 1 && report.otherEntries == 0);
         CHECK((report.entries[0] & 0xFFFF) == 0x4F04 && (report.flipInterrupt & kFlipIntStatus) != 0);
         CHECK((report.continue17 & kFlipIntContinue17) != 0);
-        CHECK(ackFlipIntr(g.r.reader(), 0x80000, g.w.writer(), 20, &readback) == kOK && readback == 1);
+        CHECK(ackFlipIntr(g.r.reader(), 0x80000, g.w.writer(), 20, &readback) == kOK && readback == 0x00040001);
         CHECK(g.r.gart[kRegDispInterruptStatusContinue17] == 0);
         uint32_t rptr = 0, countBefore = 0, countAfter = 0, writeback = 0;
         CHECK(ackIntr(g.gartWork.reader(), g.w.writer(), g.counter, 20, &rptr, &countBefore, &countAfter, &writeback) ==
@@ -2778,7 +2780,7 @@ static void testFlip()
         CHECK(report.inuseLo == 0 && report.inuseHi == 0xf4 && report.flipEntries == 1 && index == 0 && value == 0);
         CHECK(g.w.values[g.w.writes - 2] == 0x101 && g.w.values[g.w.writes - 1] == 0 &&
               g.w.offsets[g.w.writes - 1] == kRegHubpreq0DcsurfSurfaceFlipInterrupt);
-        CHECK(g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] == 0);
+        CHECK(g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] == 0x00040000); // FLIP_AWAY's latch stays
         CHECK(ackIntr(g.gartWork.reader(), g.w.writer(), g.counter, 20, &rptr, &countBefore, &countAfter, &writeback) ==
               kOK && rptr == 0x60);
         // Then the stage 18 and 17 restores, as before.
@@ -2787,13 +2789,17 @@ static void testFlip()
         CHECK(restoreGart(g.r.reader(), 0x80000, g.w.writer(), 20, 3, &g.ack) == kOK);
     }
     {
-        // Preconditions: the interrupt already enabled, or routed away.
+        // Preconditions: either interrupt already enabled, or routed away.
         FlipRig g;
         uint32_t index = 0, value = 0, dest2 = 0, continue17 = 0;
         g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] = 0x1;
         CHECK(checkFlipIntr(g.r.reader(), 0x80000, 20, &index, &value, &dest2, &continue17) == kFlipUnexpectedState);
         CHECK(index == 0 && value == 1);
-        g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] = 0;
+        g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] = 0x00050004;
+        CHECK(checkFlipIntr(g.r.reader(), 0x80000, 20, &index, &value, &dest2, &continue17) == kFlipUnexpectedState);
+        CHECK(index == 0 && value == 0x00050004);
+        g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] = 0x00070000; // latches only: ok
+        CHECK(checkFlipIntr(g.r.reader(), 0x80000, 20, &index, &value, &dest2, &continue17) == kOK);
         g.r.gart[kRegDchubInterruptDest2] = 0x41;
         CHECK(checkFlipIntr(g.r.reader(), 0x80000, 20, &index, &value, &dest2, &continue17) == kFlipUnexpectedState);
         CHECK(index == 1 && value == 0x41);
@@ -2826,7 +2832,7 @@ static void testFlip()
         uint32_t index = 0, value = 0;
         CHECK(restoreFlip(g.r.reader(), 0x80000, g.w.writer(), g.gartWork.reader(), g.counter, 20, g.r.msiCount, &report,
                           &index, &value) == kOK);
-        CHECK(report.inuseLo == 0 && g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] == 0);
+        CHECK(report.inuseLo == 0 && (g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] & kFlipIntEnables) == 0);
     }
     {
         // Two MSIs for one flip; an MSI during the hold; a status that stays.
@@ -2847,11 +2853,11 @@ static void testFlip()
         g.pattern.words[7] ^= 1;
         CHECK(verifyFlip(g.r.reader(), 0x80000, g.pattern.reader(), g.display, report.frameCount, g.counter,
                          g.r.msiCount, 20, &hold, &msiChange) == kFlipVerifyFailed && hold.patternFirst == 28);
-        g.r.flipIntSticky = true;
+        g.r.flipIntStuck = true; // the disable does not take
         uint32_t index = 0, value = 0;
         CHECK(restoreFlip(g.r.reader(), 0x80000, g.w.writer(), g.gartWork.reader(), g.counter, 20, g.r.msiCount, &report,
                           &index, &value) == kFlipNotRestored);
-        CHECK(index == 11 && (value & kFlipIntStatus) != 0 && (value & kFlipIntEnable) == 0);
+        CHECK(index == 11 && (value & kFlipIntEnable) != 0);
         // A restore that cannot write still disables nothing it cannot, and checks.
         g.w.fail = true;
         CHECK(restoreFlip(g.r.reader(), 0x80000, g.w.writer(), g.gartWork.reader(), g.counter, 20, g.r.msiCount, &report,

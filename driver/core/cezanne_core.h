@@ -987,6 +987,10 @@ const uint32_t kStage20RegisterCount = sizeof(kStage20Registers) / sizeof(kStage
 // (17); DCHUB_INTERRUPT_DEST2.HUBP0_IHC_FLIP_INTERRUPT_DEST (0);
 // DISP_INTERRUPT_STATUS_CONTINUE17.HUBP0_IHC_FLIP_INTERRUPT (2).
 const uint32_t kFlipIntEnable = 0x1, kFlipIntClear = 0x100, kFlipIntOccurred = 0x10000, kFlipIntStatus = 0x20000;
+// Both interrupt enables, SURFACE_FLIP_INT_MASK and SURFACE_FLIP_AWAY_INT_MASK
+// (2). Only these are checked: the status latches hold the firmware's
+// flips (boot 29 read 0x00050000, OCCURRED and FLIP_AWAY_OCCURRED).
+const uint32_t kFlipIntEnables = kFlipIntEnable | 0x4;
 const uint32_t kFlipIntDest = 0x1, kFlipIntContinue17 = 0x4;
 // The values written, in dal_irq_service_set's order (acknowledge, then
 // enable or disable): clear; enable; clear while enabled; disable.
@@ -1867,7 +1871,7 @@ uint32_t fillWord(uint32_t offset);
 // intrRingWord elsewhere.
 uint32_t fillRingWord(uint32_t dword);
 
-// No writes. SURFACE_FLIP_INTERRUPT 0 (index 0) and DCHUB_INTERRUPT_DEST2's
+// No writes. SURFACE_FLIP_INTERRUPT's enables 0 (index 0) and DCHUB_INTERRUPT_DEST2's
 // HUBP0 flip destination 0, the host (index 1): kFlipUnexpectedState with the
 // index and value. dest2 and continue17 are recorded.
 Status checkFlipIntr(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
@@ -1920,7 +1924,7 @@ Status verifyFlip(const RegisterReader &registers, uint64_t apertureLength, cons
 
 // The restore: flipWithIntr back to the GOP surface (its MSI recorded, not
 // required), dal_irq_service_set(false) (clear | enable, then 0), then pipe 0 at
-// boot 22 and SURFACE_FLIP_INTERRUPT 0 (index 11): kFlipNotRestored with the
+// boot 22 and SURFACE_FLIP_INTERRUPT's enables 0 (index 11): kFlipNotRestored with the
 // index and value. The flip's status comes first.
 Status restoreFlip(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                    const MemoryReader &gartRegion, const InterruptCounter &counter, uint32_t stage, uint32_t msiBefore,
