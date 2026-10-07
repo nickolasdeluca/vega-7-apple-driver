@@ -185,6 +185,13 @@ public:
     cezanne::Status intrAck(const void *owner, uint32_t *rptr, uint32_t *countBefore, uint32_t *countAfter,
                             uint32_t *writeback);
     cezanne::Status intrRestore(const void *owner, uint32_t *index, uint32_t *value, uint32_t msi[4]);
+    // Stage 19.
+    cezanne::Status displayCheck(const void *owner, uint32_t *index, uint32_t *value, uint32_t *frames,
+                                 uint64_t *checksum);
+    cezanne::Status displayFlip(const void *owner, uint64_t *inuse, uint32_t *pauses, uint32_t *frames);
+    cezanne::Status displayVerify(const void *owner, cezanne::DisplayReport *report);
+    cezanne::Status displayRestore(const void *owner, uint64_t *inuse, uint32_t *pauses, uint32_t *index,
+                                   uint32_t *value);
 
 private:
     enum ScratchState { kScratchIdle, kScratchChecked, kScratchWritten };
@@ -272,6 +279,14 @@ private:
     void removeIntrSourceLocked();
     void readMsiLocked(uint32_t msi[4]);
     cezanne::Status intrRestoreLocked(uint32_t *index, uint32_t *value, uint32_t msi[4]);
+    // Stage 19: the steps on one connection; once the flip was sent, the
+    // surface may be the pattern until the restore.
+    enum DisplayState { kDisplayIdle, kDisplayChecked, kDisplayFlipped, kDisplayVerified, kDisplayRestored };
+    DisplayState displayState_ = kDisplayIdle;
+    const void *displayOwner_ = nullptr;
+    uint32_t displaySnapshot_[cezanne::kDisplayInventoryCount];
+    uint32_t displayFlipFrames_ = 0;
+    cezanne::Status displayRestoreLocked(uint64_t *inuse, uint32_t *pauses, uint32_t *index, uint32_t *value);
     cezanne::Status sdmaStopLocked(uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence, uint32_t *ringResponse);
     cezanne::Status pspTeardownLocked(uint32_t *fence, uint32_t *tmrStatus, uint32_t *ringResponse,
                                       cezanne::PspMailbox *mailbox);
@@ -641,7 +656,7 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
     // Caller holds lock_.
     if (writablePage != 0 && writablePage != cezanne::kScratchPageOffset && writablePage != cezanne::kSmuPageOffset &&
         writablePage != cezanne::kSdmaPageSet && writablePage != cezanne::kGartPageSet &&
-        writablePage != cezanne::kIntrPageSet) {
+        writablePage != cezanne::kIntrPageSet && writablePage != cezanne::kDisplayPageOffset) {
         return cezanne::kRegisterNotAllowed;
     }
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, getProvider());
@@ -913,7 +928,8 @@ template <typename Check> static cezanne::Status withCarveoutMemory(UInt64 physi
 {
     if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical &&
         physical != cezanne::kPspTmrPhysical && physical != cezanne::kSdmaFwPhysical &&
-        physical != cezanne::kSdmaWorkPhysical && physical != cezanne::kGartWorkPhysical) {
+        physical != cezanne::kSdmaWorkPhysical && physical != cezanne::kGartWorkPhysical &&
+        physical != cezanne::kPatternPhysical) {
         return cezanne::kRegisterNotAllowed;
     }
     IODeviceMemory *memory = IODeviceMemory::withRange(physical, length);
@@ -1145,6 +1161,58 @@ template <typename Use> static cezanne::Status withGartWork(UInt32 stage, Use us
         gartWorkMap->release();
     }
     gartWorkMemory->release();
+    return status;
+}
+
+// The stage 19 pattern region: 8 MiB, written only with patternWord's words.
+struct PatternWindow {
+    volatile UInt32 *base;
+    UInt32 stage;
+};
+
+static bool patternRead(void *context, uint32_t offset, uint32_t *value)
+{
+    const PatternWindow *pattern = static_cast<const PatternWindow *>(context);
+    if ((offset & 3) != 0 || offset + 4ull > cezanne::kPatternSize) {
+        return false;
+    }
+    *value = pattern->base[offset / 4];
+    return true;
+}
+
+static bool patternWrite(void *context, uint32_t offset, uint32_t value)
+{
+    PatternWindow *pattern = static_cast<PatternWindow *>(context);
+    // The core already checks this; the adapter refuses independently.
+    if (!cezanne::patternWriteAllowed(offset, value, pattern->stage)) {
+        return false;
+    }
+    pattern->base[offset / 4] = value;
+    return true;
+}
+
+// Maps the pattern region writable and uncached, runs use, and releases it.
+template <typename Use> static cezanne::Status withPattern(UInt32 stage, Use use)
+{
+    if (stage < cezanne::kDisplayStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IODeviceMemory *patternMemory = IODeviceMemory::withRange(cezanne::kPatternPhysical, cezanne::kPatternSize);
+    if (patternMemory == nullptr) {
+        return cezanne::kApertureUnavailable;
+    }
+    IOMemoryMap *patternMap = patternMemory->map(kIOMapInhibitCache);
+    cezanne::Status status = cezanne::kApertureUnavailable;
+    if (patternMap != nullptr && patternMap->getLength() >= cezanne::kPatternSize) {
+        PatternWindow window = {reinterpret_cast<volatile UInt32 *>(patternMap->getVirtualAddress()), stage};
+        cezanne::MemoryReader reader = {patternRead, &window};
+        cezanne::MemoryWriter writer = {patternWrite, &window};
+        status = use(reader, writer);
+    }
+    if (patternMap != nullptr) {
+        patternMap->release();
+    }
+    patternMemory->release();
     return status;
 }
 
@@ -2461,6 +2529,171 @@ cezanne::Status CezanneGPU::intrRestore(const void *owner, uint32_t *index, uint
     return status;
 }
 
+struct DisplayArgument {
+    const cezanne::Range *ranges;
+    uint32_t rangeCount;
+    uint32_t *display;
+    uint32_t *a, *b, *c; // per-step outputs
+    uint64_t *wide;
+    uint32_t flipFrames;
+    cezanne::DisplayReport *report;
+};
+
+static cezanne::Status displayCheckOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                             const cezanne::RegisterWriter *writer, void *argument)
+{
+    DisplayArgument *display = static_cast<DisplayArgument *>(argument);
+    cezanne::Status status = cezanne::checkDisplayBoot22(registers, length, stage, display->a, display->b, display->c);
+    cezanne::MetricsTarget target;
+    if (status == cezanne::kOK) {
+        status = cezanne::checkPatternTarget(registers, length, stage, display->ranges, display->rangeCount, &target);
+    }
+    if (status == cezanne::kOK) {
+        uint64_t *sum = display->wide;
+        status = withCarveoutMemory(cezanne::kPatternPhysical, cezanne::kPatternSize,
+                                    [writer, sum](const cezanne::MemoryReader &memory) {
+            return cezanne::regionChecksum(memory, cezanne::kPatternSize, *writer, cezanne::kMetricsStablePauses, sum);
+        });
+    }
+    if (status == cezanne::kOK) {
+        status = cezanne::readDisplayInventory(registers, length, stage, display->display);
+    }
+    return status;
+}
+
+static cezanne::Status displayFlipOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                            const cezanne::RegisterWriter *writer, void *argument)
+{
+    DisplayArgument *display = static_cast<DisplayArgument *>(argument);
+    cezanne::Status status = withPattern(stage, [&](const cezanne::MemoryReader &pattern,
+                                                    const cezanne::MemoryWriter &memory) {
+        return cezanne::writePattern(pattern, memory, stage);
+    });
+    if (status == cezanne::kOK) {
+        status = cezanne::flipDisplay(registers, length, *writer, stage, cezanne::kPatternGpuAddress, display->wide,
+                                      display->a);
+    }
+    cezanne::readDiagnosticRegister(registers, length, stage, cezanne::kRegOtg0OtgStatusFrameCount, display->b);
+    return status;
+}
+
+static cezanne::Status displayVerifyOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                              const cezanne::RegisterWriter *, void *argument)
+{
+    DisplayArgument *display = static_cast<DisplayArgument *>(argument);
+    return withCarveoutMemory(cezanne::kPatternPhysical, cezanne::kPatternSize,
+                              [&](const cezanne::MemoryReader &pattern) {
+        return cezanne::verifyDisplay(registers, length, pattern, display->display, display->flipFrames, stage,
+                                      display->report);
+    });
+}
+
+static cezanne::Status displayRestoreOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                               const cezanne::RegisterWriter *writer, void *argument)
+{
+    DisplayArgument *display = static_cast<DisplayArgument *>(argument);
+    cezanne::Status status = cezanne::flipDisplay(registers, length, *writer, stage, cezanne::kGopSurfaceAddress,
+                                                  display->wide, display->a);
+    cezanne::Status restored = cezanne::checkDisplayRestored(registers, length, stage, display->b, display->c);
+    return status != cezanne::kOK ? status : restored;
+}
+
+cezanne::Status CezanneGPU::displayCheck(const void *owner, uint32_t *index, uint32_t *value, uint32_t *frames,
+                                         uint64_t *checksum)
+{
+    *index = *value = *frames = 0;
+    *checksum = 0;
+    if (!diagnosticsReady_ || stage_ < cezanne::kDisplayStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, getProvider());
+    OSData *assigned = pci != nullptr ? OSDynamicCast(OSData, pci->getProperty("assigned-addresses")) : nullptr;
+    cezanne::Range ranges[8];
+    uint32_t count = 0;
+    cezanne::Status status = cezanne::parseAssignedAddresses(
+        assigned != nullptr ? static_cast<const uint8_t *>(assigned->getBytesNoCopy()) : nullptr,
+        assigned != nullptr ? assigned->getLength() : 0, ranges, 8, &count);
+    if (status != cezanne::kOK) {
+        return status;
+    }
+    IOLockLock(lock_);
+    status = cezanne::kDisplayOutOfOrder;
+    // Once per connection, with no other connection's pattern up.
+    if (displayState_ == kDisplayIdle || (displayState_ == kDisplayRestored && displayOwner_ != owner)) {
+        DisplayArgument display = {ranges, count, displaySnapshot_, index, value, frames, checksum, 0, nullptr};
+        status = accessDevice(0, displayCheckOperation, &display);
+        displayState_ = status == cezanne::kOK ? kDisplayChecked : kDisplayIdle;
+        displayOwner_ = status == cezanne::kOK ? owner : nullptr;
+        IOLog(LOG_PREFIX "display check: %s, index %u, value 0x%08x, frame count %u\n", cezanne::statusName(status),
+              *index, *value, *frames);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::displayFlip(const void *owner, uint64_t *inuse, uint32_t *pauses, uint32_t *frames)
+{
+    *inuse = 0;
+    *pauses = *frames = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kDisplayOutOfOrder;
+    if (displayState_ == kDisplayChecked && displayOwner_ == owner) {
+        DisplayArgument display = {nullptr, 0, nullptr, pauses, frames, nullptr, inuse, 0, nullptr};
+        // From here the surface may be the pattern until the restore.
+        displayState_ = kDisplayFlipped;
+        status = accessDevice(cezanne::kDisplayPageOffset, displayFlipOperation, &display);
+        displayFlipFrames_ = *frames;
+        IOLog(LOG_PREFIX "display flip: %s, in use 0x%010llx after %u pauses, frame count %u\n",
+              cezanne::statusName(status), static_cast<unsigned long long>(*inuse), *pauses, *frames);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::displayVerify(const void *owner, cezanne::DisplayReport *report)
+{
+    *report = cezanne::DisplayReport();
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kDisplayOutOfOrder;
+    if (displayState_ == kDisplayFlipped && displayOwner_ == owner) {
+        DisplayArgument display = {nullptr, 0, displaySnapshot_, nullptr, nullptr, nullptr, nullptr,
+                                   displayFlipFrames_, report};
+        status = accessDevice(0, displayVerifyOperation, &display);
+        displayState_ = kDisplayVerified;
+        IOLog(LOG_PREFIX "display verify: %s, in use 0x%02x%08x, %u frames, %u display changes, %u pattern words\n",
+              cezanne::statusName(status), report->inuseHi, report->inuseLo, report->framesAdvanced,
+              report->displayChanged, report->patternUnexpected);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::displayRestoreLocked(uint64_t *inuse, uint32_t *pauses, uint32_t *index, uint32_t *value)
+{
+    // Caller holds lock_ (or the driver is stopping).
+    DisplayArgument display = {nullptr, 0, nullptr, pauses, index, value, inuse, 0, nullptr};
+    cezanne::Status status = accessDevice(cezanne::kDisplayPageOffset, displayRestoreOperation, &display);
+    IOLog(LOG_PREFIX "display restore: %s, in use 0x%010llx after %u pauses, index %u, value 0x%08x\n",
+          cezanne::statusName(status), static_cast<unsigned long long>(*inuse), *pauses, *index, *value);
+    setProperty("CezanneGPU display restore", cezanne::statusName(status));
+    displayState_ = kDisplayRestored;
+    return status;
+}
+
+cezanne::Status CezanneGPU::displayRestore(const void *owner, uint64_t *inuse, uint32_t *pauses, uint32_t *index,
+                                           uint32_t *value)
+{
+    *inuse = 0;
+    *pauses = *index = *value = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kDisplayOutOfOrder;
+    if ((displayState_ == kDisplayFlipped || displayState_ == kDisplayVerified) && displayOwner_ == owner) {
+        status = displayRestoreLocked(inuse, pauses, index, value);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
 void CezanneGPU::scratchAbandon(const void *owner)
 {
     if (lock_ == nullptr) {
@@ -2474,6 +2707,17 @@ void CezanneGPU::scratchAbandon(const void *owner)
     if (metricsOwner_ == owner) {
         metricsState_ = kMetricsIdle;
         metricsOwner_ = nullptr;
+    }
+    if (displayOwner_ == owner) {
+        if (displayState_ == kDisplayFlipped || displayState_ == kDisplayVerified) {
+            uint64_t inuse = 0;
+            uint32_t pauses = 0, index = 0, value = 0;
+            cezanne::Status status = displayRestoreLocked(&inuse, &pauses, &index, &value);
+            IOLog(LOG_PREFIX "display pattern abandoned; restore: %s\n", cezanne::statusName(status));
+            setProperty("CezanneGPU display abandoned restore", cezanne::statusName(status));
+        }
+        displayState_ = kDisplayIdle;
+        displayOwner_ = nullptr;
     }
     if (pspOwner_ == owner && copyState_ != kCopyIdle) {
         uint32_t f32 = 0, down = 0, fence = 0, ring = 0;
@@ -2560,6 +2804,10 @@ private:
     static IOReturn intrVerify(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn intrAck(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn intrRestore(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn displayCheck(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn displayFlip(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn displayVerify(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn displayRestore(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPUUserClient, IOUserClient)
@@ -2963,6 +3211,53 @@ IOReturn CezanneGPUUserClient::intrRestore(OSObject *target, void *, IOExternalM
     return putScalars(arguments, self->gpu_->intrRestore(self, &v[0], &v[1], &v[2]), v, 6);
 }
 
+IOReturn CezanneGPUUserClient::displayCheck(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[5] = {};
+    uint64_t checksum = 0;
+    cezanne::Status status = self->gpu_->displayCheck(self, &v[0], &v[1], &v[2], &checksum);
+    v[3] = static_cast<uint32_t>(checksum);
+    v[4] = static_cast<uint32_t>(checksum >> 32);
+    return putScalars(arguments, status, v, 5);
+}
+
+IOReturn CezanneGPUUserClient::displayFlip(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[4] = {};
+    uint64_t inuse = 0;
+    cezanne::Status status = self->gpu_->displayFlip(self, &inuse, &v[2], &v[3]);
+    v[0] = static_cast<uint32_t>(inuse);
+    v[1] = static_cast<uint32_t>(inuse >> 32);
+    return putScalars(arguments, status, v, 4);
+}
+
+IOReturn CezanneGPUUserClient::displayVerify(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    cezanne::DisplayReport report;
+    arguments->scalarOutput[0] = self->gpu_->displayVerify(self, &report);
+    // The dispatch table fixes the structure size at sizeof(DisplayReport).
+    UInt8 *out = static_cast<UInt8 *>(arguments->structureOutput);
+    const UInt8 *in = reinterpret_cast<const UInt8 *>(&report);
+    for (uint32_t i = 0; i < sizeof(report); i++) {
+        out[i] = in[i];
+    }
+    return kIOReturnSuccess;
+}
+
+IOReturn CezanneGPUUserClient::displayRestore(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[5] = {};
+    uint64_t inuse = 0;
+    cezanne::Status status = self->gpu_->displayRestore(self, &inuse, &v[2], &v[3], &v[4]);
+    v[0] = static_cast<uint32_t>(inuse);
+    v[1] = static_cast<uint32_t>(inuse >> 32);
+    return putScalars(arguments, status, v, 5);
+}
+
 IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                               IOExternalMethodDispatch *, OSObject *, void *reference)
 {
@@ -3003,6 +3298,10 @@ IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMetho
         {intrVerify, 0, 0, 1, sizeof(cezanne::IntrReport)}, // kDiagnosticIntrVerify
         {intrAck, 0, 0, 5, 0},       // kDiagnosticIntrAck
         {intrRestore, 0, 0, 7, 0},   // kDiagnosticIntrRestore
+        {displayCheck, 0, 0, 6, 0},  // kDiagnosticDisplayCheck
+        {displayFlip, 0, 0, 5, 0},   // kDiagnosticDisplayFlip
+        {displayVerify, 0, 0, 1, sizeof(cezanne::DisplayReport)}, // kDiagnosticDisplayVerify
+        {displayRestore, 0, 0, 6, 0}, // kDiagnosticDisplayRestore
     };
     if (selector >= cezanne::kDiagnosticSelectorCount) {
         return kIOReturnUnsupported;
@@ -3045,6 +3344,11 @@ void CezanneGPU::stop(IOService *provider)
     if (lock_ != nullptr) {
         IOLockLock(lock_);
         removeIntrSourceLocked();
+        if (displayState_ == kDisplayFlipped || displayState_ == kDisplayVerified) {
+            uint64_t inuse = 0;
+            uint32_t pauses = 0, index = 0, value = 0;
+            displayRestoreLocked(&inuse, &pauses, &index, &value);
+        }
         IOLockUnlock(lock_);
     }
     IOService::stop(provider);
