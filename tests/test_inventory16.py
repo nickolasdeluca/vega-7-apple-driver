@@ -85,7 +85,7 @@ class Inventory16OffsetTests(unittest.TestCase):
         gc_regs["GCEA_PROBE_MAP"] = int(re.search(r"#define mmGCEA_PROBE_MAP\s+0x([0-9a-fA-F]+)", local).group(1), 16)
         gc_idx["GCEA_PROBE_MAP"] = int(re.search(r"#define mmGCEA_PROBE_MAP_BASE_IDX\s+(\d+)", local).group(1))
         stage21 = stage21_constants()
-        self.assertEqual(len(stage21), 55)
+        self.assertEqual(len(stage21), 58)
         for name, offset in stage21:
             with self.subTest(name):
                 self.assertEqual(((0x2000, 0xA000)[gc_idx[name]] + gc_regs[name]) * 4, offset)

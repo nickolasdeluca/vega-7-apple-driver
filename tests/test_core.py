@@ -200,7 +200,10 @@ class CoreTests(unittest.TestCase):
             # A word past the jump table's end reads past the MEC file: ASan stops it.
             "AddressSanitizer: heap-buffer-overflow": (
                 "offset - image.slot + 4 <= image.payloadSize", "offset - image.slot < image.payloadSize + 4"),
-            "writes == 23 && g.w.writes == before + 23": ("        {kRegRlcCntl, rlc & ~kRlcEnableF32}, // rlc_stop\n", ""),
+            "writes == 24 && g.w.writes == before + 24": ("        {kRegRlcCntl, rlc & ~kRlcEnableF32}, // rlc_stop\n", ""),
+            "g.w.offsets[before + 12] == kRegGrbmCntl": (
+                "for (uint32_t i = kGfxWriteCount - kGfxGoldenCount - 1; i < kGfxWriteCount; i++) {",
+                "for (uint32_t i = kGfxWriteCount - kGfxGoldenCount - 1; i + 1 < kGfxWriteCount; i++) {"),
             "g.r.gc[kRegGbAddrConfig] == 0x24000042u": (
                 "const uint32_t value = (snapshotOf(snapshot, golden.offset) & ~golden.mask) | (golden.value & golden.mask);",
                 "const uint32_t value = snapshotOf(snapshot, golden.offset);"),

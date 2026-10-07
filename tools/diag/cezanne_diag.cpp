@@ -303,6 +303,9 @@ const Named kRegisters[] = {
     {"CPC_UTCL1_STATUS", kRegCpcUtcl1Status},
     {"CPG_UTCL1_STATUS", kRegCpgUtcl1Status},
     {"VM_L2_PROTECTION_FAULT_STATUS_GC", kRegGcVmL2ProtectionFaultStatus},
+    {"GRBM_CNTL", kRegGrbmCntl},
+    {"GRBM_READ_ERROR", kRegGrbmReadError},
+    {"GRBM_READ_ERROR2", kRegGrbmReadError2},
 };
 static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage16RegisterCount + kStage17RegisterCount +
                                                                 kStage19RegisterCount + kStage20RegisterCount +
@@ -1370,8 +1373,8 @@ bool gfxEngine(io_connect_t connection)
 
     // From here the restore is owed.
     uint64_t rlc[4] = {};
-    step("gfx 3/8 RLC start: the 12 golden settings, rlc_stop, serdes, CG off, clear-state buffer, save/restore\n"
-         "  machine, SPM VMID 0xf, RLC_ENABLE_F32");
+    step("gfx 3/8 RLC start: the 12 golden settings, GRBM_CNTL.READ_TIMEOUT 0xff, rlc_stop, serdes, CG off,\n"
+         "  clear-state buffer, save/restore machine, SPM VMID 0xf, RLC_ENABLE_F32");
     bool ok = callReport(connection, kDiagnosticGfxRlc, rlc, 4, &state);
     if (ok) {
         std::printf("%s, %llu writes, serdes CU 0x%08llx, NONCU 0x%08llx\n", statusName(static_cast<Status>(rlc[0])),

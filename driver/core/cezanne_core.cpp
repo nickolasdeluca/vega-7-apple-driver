@@ -2764,7 +2764,8 @@ Status startRlc(const RegisterReader &registers, uint64_t apertureLength, const 
     if (stage < kGfxStage) return kRegisterNotAllowed;
     // gfx_v9_0_hw_init programs the golden settings first (after boot 33:
     // the CP's ring fetch stalled without them).
-    for (uint32_t i = kGfxWriteCount - kGfxGoldenCount; i < kGfxWriteCount; i++) {
+    // Then constants_init's GRBM_CNTL.READ_TIMEOUT (after boot 34).
+    for (uint32_t i = kGfxWriteCount - kGfxGoldenCount - 1; i < kGfxWriteCount; i++) {
         const GfxWrite &golden = kGfxWrites[i];
         const uint32_t value = (snapshotOf(snapshot, golden.offset) & ~golden.mask) | (golden.value & golden.mask);
         Status status = writeGfxRegister(writer, stage, snapshot, golden.offset, value);
