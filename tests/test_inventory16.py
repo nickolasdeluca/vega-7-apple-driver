@@ -81,7 +81,7 @@ class Inventory16OffsetTests(unittest.TestCase):
                    for m in re.finditer(r"#define mm(\w+)\s+0x([0-9a-fA-F]+)\b", gc) if not m.group(1).endswith("_BASE_IDX")}
         gc_idx = {m.group(1): int(m.group(2)) for m in re.finditer(r"#define mm(\w+)_BASE_IDX\s+(\d+)", gc)}
         stage21 = stage21_constants()
-        self.assertEqual(len(stage21), 39)
+        self.assertEqual(len(stage21), 50)
         for name, offset in stage21:
             with self.subTest(name):
                 self.assertEqual(((0x2000, 0xA000)[gc_idx[name]] + gc_regs[name]) * 4, offset)

@@ -287,6 +287,17 @@ const Named kRegisters[] = {
     {"TA_CNTL_AUX", kRegTaCntlAux},
     {"TCP_CHAN_STEER_HI", kRegTcpChanSteerHi},
     {"TCP_CHAN_STEER_LO", kRegTcpChanSteerLo},
+    {"CP_STALLED_STAT1", kRegCpStalledStat1},
+    {"CP_STALLED_STAT2", kRegCpStalledStat2},
+    {"CP_CPF_STALLED_STAT1", kRegCpCpfStalledStat1},
+    {"CP_CPF_BUSY_STAT", kRegCpCpfBusyStat},
+    {"CP_GFX_ERROR", kRegCpGfxError},
+    {"CP_CE_HEADER_DUMP", kRegCpCeHeaderDump},
+    {"CP_PFP_HEADER_DUMP", kRegCpPfpHeaderDump},
+    {"CP_ME_HEADER_DUMP", kRegCpMeHeaderDump},
+    {"RLC_GPM_GENERAL_6", kRegRlcGpmGeneral6},
+    {"RLC_SAFE_MODE", kRegRlcSafeMode},
+    {"RLC_INT_STAT", kRegRlcIntStat},
 };
 static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage16RegisterCount + kStage17RegisterCount +
                                                                 kStage19RegisterCount + kStage20RegisterCount +

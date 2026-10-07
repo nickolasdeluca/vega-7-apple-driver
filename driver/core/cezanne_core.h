@@ -1061,7 +1061,20 @@ const uint32_t kRegPaScLineStippleState = 0x30a04; // PA_SC_LINE_STIPPLE_STATE: 
 const uint32_t kRegTaCntlAux = 0x09508; // TA_CNTL_AUX: golden_settings_gc_9_1_rn (read)
 const uint32_t kRegTcpChanSteerHi = 0x0ac10; // TCP_CHAN_STEER_HI: golden_settings_gc_9_1_rn (read)
 const uint32_t kRegTcpChanSteerLo = 0x0ac0c; // TCP_CHAN_STEER_LO: golden_settings_gc_9_1_rn (read)
+const uint32_t kRegCpStalledStat1 = 0x08674; // CP_STALLED_STAT1: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegCpStalledStat2 = 0x08678; // CP_STALLED_STAT2: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegCpCpfStalledStat1 = 0x08224; // CP_CPF_STALLED_STAT1: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegCpCpfBusyStat = 0x08220; // CP_CPF_BUSY_STAT: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegCpGfxError = 0x0c0ec; // CP_GFX_ERROR: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegCpCeHeaderDump = 0x08690; // CP_CE_HEADER_DUMP: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegCpPfpHeaderDump = 0x08688; // CP_PFP_HEADER_DUMP: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegCpMeHeaderDump = 0x08684; // CP_ME_HEADER_DUMP: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegRlcGpmGeneral6 = 0x3b1a4; // RLC_GPM_GENERAL_6: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegRlcSafeMode = 0x3b014; // RLC_SAFE_MODE: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegRlcIntStat = 0x3b060; // RLC_INT_STAT: gc_reg_list_9 (IP dump), after boot 32
 // Read from stage 21 on (all GFX-gated), in addition to the earlier lists.
+// The last 11 were added after boot 32 (the CP stalled): stall reasons and
+// the last packet headers.
 const uint32_t kStage21Registers[] = {
     kRegCpIntCntlRing0,     kRegRlcCsibAddrHi,      kRegRlcCsibAddrLo,      kRegRlcCsibLength,
     kRegRlcSrmCntl,         kRegRlcSpmMcCntl,       kRegRlcSerdesCuMasterBusy, kRegRlcSerdesNoncuMasterBusy,
@@ -1072,7 +1085,8 @@ const uint32_t kStage21Registers[] = {
     kRegGcVmL2Cntl,         kRegGcVmContext0Cntl,   kRegCpStat,             kRegCpCpcStatus,
     kRegCpCeInstrPntr,      kRegCbHwControl,        kRegCbHwControl2,       kRegDbDebug2,
     kRegGbAddrConfigRead,   kRegPaScEnhance,        kRegPaScEnhance1,       kRegPaScLineStippleState,
-    kRegTaCntlAux,          kRegTcpChanSteerHi,     kRegTcpChanSteerLo};
+    kRegTaCntlAux,          kRegTcpChanSteerHi,     kRegTcpChanSteerLo,
+    kRegCpStalledStat1, kRegCpStalledStat2, kRegCpCpfStalledStat1, kRegCpCpfBusyStat, kRegCpGfxError, kRegCpCeHeaderDump, kRegCpPfpHeaderDump, kRegCpMeHeaderDump, kRegRlcGpmGeneral6, kRegRlcSafeMode, kRegRlcIntStat};
 const uint32_t kStage21RegisterCount = sizeof(kStage21Registers) / sizeof(kStage21Registers[0]);
 
 // Part A: the GFX firmware. The pinned linux-firmware 20260916 files (their
@@ -1253,7 +1267,7 @@ const uint32_t kGfxStateRegisters[] = {
     kRegCpMec1InstrPntr, kRegRlcSerdesCuMasterBusy, kRegRlcSerdesNoncuMasterBusy, kRegCpRbDoorbellControl,
     kRegGcMxL1TlbCntl, kRegGcVmL2Cntl, kRegGcVmContext0Cntl, kRegCbHwControl, kRegCbHwControl2, kRegDbDebug2,
     kRegGbAddrConfig, kRegGbAddrConfigRead, kRegPaScEnhance, kRegPaScEnhance1, kRegPaScLineStippleState,
-    kRegTaCntlAux, kRegTcpChanSteerHi, kRegTcpChanSteerLo};
+    kRegTaCntlAux, kRegTcpChanSteerHi, kRegTcpChanSteerLo, kRegCpStalledStat1, kRegCpStalledStat2, kRegCpCpfStalledStat1, kRegCpCpfBusyStat, kRegCpGfxError, kRegCpCeHeaderDump, kRegCpPfpHeaderDump, kRegCpMeHeaderDump, kRegRlcGpmGeneral6, kRegRlcSafeMode, kRegRlcIntStat};
 const uint32_t kGfxStateCount = sizeof(kGfxStateRegisters) / sizeof(kGfxStateRegisters[0]);
 // The BAR5 pages the stage 21 register writes use: CP_ME_CNTL and
 // CP_RB_WPTR_DELAY; the CP ring registers; GRBM_GFX_INDEX and SCRATCH_REG0;
