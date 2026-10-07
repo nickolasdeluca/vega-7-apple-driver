@@ -35,7 +35,9 @@ with straight grey lines (the hardware reads 1920 pixels per line), and the
 desktop came back unchanged. Stage 20 (SDMA draws the pattern, and the flip
 interrupt) succeeded in boot 31, after two fixes within the stage (the
 check after boot 29, the fill size after boot 30). The flip's MSI arrived
-7.2 ms after the address writes, and none during the hold. See "Next task"
+7.2 ms after the address writes, and none during the hold. Stage 21 (the
+graphics engine: firmware, RLC, CP, ring test, fence, CP drawing) is
+approved, implemented and built, waiting for boot 32. See "Next task"
 below. The sections that follow are the earlier discovery record and
 still apply.
 
@@ -150,29 +152,32 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 21 proposed, waiting for approval
+## Next task: boot stage 21 (the graphics engine runs our commands and draws)
 
-Stages 0–20 succeeded (boot 31, 2026-10-07). The user chose the main
-graphics engine for stage 21 and asked for a bold stage. The
-[stage 21 proposal](test-boot.md#stage-21-the-graphics-engine-runs-our-commands-and-draws-proposal)
-covers:
-- the GFX firmware load through the PSP;
-- the RLC start;
-- the CP start with a GFX ring (no doorbell);
-- Linux's ring test;
-- a fence;
-- the CP drawing three colour bands (`DMA_DATA`) shown on pipe 0;
-- a full restore.
+Stage 21 was approved on 2026-10-07 (the
+[proposal](test-boot.md#stage-21-the-graphics-engine-runs-our-commands-and-draws-proposal))
+and implemented and built the same day; the implementation notes are in
+that section. This is the riskiest stage so far: the first code to run on
+GC, and the first GC registers written. Expect fix-within-stage boots. Steps:
 
-Shaders, the KIQ and compute queues, and the EOP interrupt are left for
-later stages. If it proves too tangled, the user agreed to dial it down.
-Nothing is built until the user approves it.
+1. Make a Time Machine backup (the proposal's risks).
+2. The user runs `tools/update_stick.sh 21` (the stick holds stage 20),
+   shuts down fully, cold boots the stick, and runs
+   `tools/capture_boot.sh boot-32-stage21 --gfxoff-disallow --gfx-start --psp-state`.
+3. The user reports what the screen showed for those 5 seconds (red, green
+   and blue bands, top to bottom), and whether the desktop came back.
+4. Read the output against "Stage 21 succeeds when" in
+   [test-boot.md](test-boot.md) and record boot 32 in the log. Every step
+   prints the 54-register GC state, so even an early stop gives the first
+   GC readings. Follow the
+   [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
+   for defects. A hang or a kernel panic is a finding: power off, then read
+   the panic log from the next normal boot.
 
-**Builds:** `out/test-efi/usb-stage20` (`usb-stage20-build.json`, on the
-stick, passed boot 31), `out/test-efi/driver`, `out/diag`. Earlier stage 20
-builds are kept as `superseded-*-stage20-latch` (boot 29) and
-`superseded-*-stage20-fill` (boot 30). The stage 19 builds are kept as
-`superseded-driver-stage19` and `superseded-diag-stage19`.
+**Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`),
+`out/test-efi/driver` (with the five GFX files embedded), `out/diag`. The
+stage 20 builds that passed boot 31 are kept as `superseded-driver-stage20`
+and `superseded-diag-stage20`, with `out/test-efi/usb-stage20`.
 
 ### Earlier: booting stage 19
 

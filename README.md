@@ -96,8 +96,10 @@ MSI delivery of that trap to a counting handler, one acknowledgement, and a
 restore; `--display-pattern` (stage 19) draws a test pattern in the carveout
 and shows it on pipe 0 for 5 seconds by flipping the surface address, then
 flips back; `--sdma-flip` (stage 20) adds to `--ih-intr` an SDMA fill of
-that region and the display's flip interrupt as an MSI while it is shown.
-Building the kext needs that firmware in ignored
+that region and the display's flip interrupt as an MSI while it is shown;
+`--gfx-start` (stage 21) loads the GFX firmware, starts the RLC and the
+command processor, runs a ring test and a fence, and shows three bands the
+CP draws, then restores every GC register. Building the kext needs that firmware in ignored
 `out/firmware-provenance/fw/` (see
 [firmware provenance](docs/firmware-provenance.md)).
 

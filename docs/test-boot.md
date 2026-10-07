@@ -3546,7 +3546,8 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
 ### Stage 21: the graphics engine runs our commands and draws (proposal)
 
 **Status: proposed 2026-10-07 (revised the same day at the user's request
-for a bolder stage). Not approved.**
+for a bolder stage) and approved by the user the same day; implemented and
+built (`out/test-efi/usb-stage21`) the same day. Not yet booted.**
 
 **Purpose.** This is the first time the main graphics engine (GC 9.3)
 executes commands from the driver. The user asked for visible progress, so
@@ -3844,6 +3845,67 @@ them.
 - the final register dump shows every stage 21 register at its snapshot
   and pipe 0 at boot 22.
 
+**Implementation** (2026-10-07). Diagnostic interface version 17,
+selectors 45–52. `--gfx-start` runs stage 13's PSP check, ring create and
+`SETUP_TMR`, then these steps, then stage 12's teardown. Every step except
+the verify returns a `GfxState`: the 54 registers of `kGfxStateRegisters`
+after it. The first 24 are the snapshot list; the rest are status
+registers, instruction pointers, serdes, doorbell, GC hub and golden
+registers. The tool prints them.
+
+| Step | Selector | What it does |
+| --- | --- | --- |
+| check | 45 `GfxCheck` | Only right after a passing `SETUP_TMR` by this connection, with no SDMA copy or stage 19 pattern up. The five embedded files' lengths and 38 pinned header words (`kGfxImageInvalid` names the file); GFX on and `kGfxExpect` (index 0–9); the 24-register snapshot; stage 19's pipe 0 check and display snapshot; the placement of the pattern region and the two new buffers; 1 s stability of the firmware buffer's 1 MiB, the work area's 64 KiB and the 8 MiB pattern region. |
+| load | 46 `GfxLoad` | Writes the firmware buffer and the GFX work area (ring with all four frames, zeroed write-back page, clear-state buffer), each read back. Then the nine `LOAD_IP_FW`s as frames 1–9, stopping at the first failure; reports the images loaded and the last fence, status and `fw_addr`. The kext then follows the PSP's frame count, so the teardown's `DESTROY_TMR` takes the next frame whatever happened. |
+| RLC | 47 `GfxRlc` | Part B. The restore is owed before its first write. |
+| CP | 48 `GfxCp` | Part C, then frame 0. It passes when either the read-pointer write-back or `CP_RB0_RPTR` reaches 1024. |
+| test | 49 `GfxTest` | The ring test, then fence 1. |
+| draw | 50 `GfxDraw` | The CPU clear (stage 20's), frame 3 and fence 2 (1 s), the CPU check against the image, then stage 19's flip. The GOP surface is owed before the flip. |
+| verify | 51 `GfxVerify` | Stage 19's verify against the image. Returns a `DisplayReport`. |
+| restore | 52 `GfxRestore` | The flip back if owed, then `restoreGfx` if owed; the property `CezanneGPU GFX restore`. |
+
+- **Two allowlists for GC registers.** The fixed values stay in
+  `writeAllowed`. The snapshot-relative ones go in `gfxWriteAllowed`, which
+  takes the check's snapshot:
+  - the values of `kGfxWrites`, each `(snapshot & ~mask) | value`;
+  - the snapshot itself, for the restore.
+
+  The core's `writeGfxRegister` checks both before writing. The kext's
+  write adapter checks them again, with the snapshot it holds, and only for
+  the new GC page set.
+- **The GC page set**, `kGfxPageSet`: `0x8000` (`CP_ME_CNTL`,
+  `CP_RB_WPTR_DELAY`), `0xc000` (the CP ring registers), `0x30000`
+  (`GRBM_GFX_INDEX`, `SCRATCH_REG0`), `0x3b000` (the RLC). `WritePage` now
+  holds four pages.
+- **New writable carveout mappings**, the only ones besides earlier stages':
+  the 124-page firmware buffer and the 4-page work area. Both go through one
+  helper, `withGfxMemory`, and each has its own allowlisted store.
+- **The clear-state table** is `driver/core/clearstate_gfx9.h`, converted
+  from Linux's `clearstate_gfx9.h` with its MIT notice kept and the values
+  unchanged (879 values in 8 extents).
+- **The firmware:** `build.sh` embeds the five files, each checked against
+  its SHA-256 pin (`CEZANNE_GFX_FW_DIR` overrides the directory).
+- **The restore is owed** from the RLC start on and runs:
+  - from its selector;
+  - before the PSP teardown (`pspTeardownLocked`), so also on an abandoned
+    connection and from the SDMA stop;
+  - from `stop()`.
+- **The tool:** `--gfx-start` is `pspSdma` mode 6. It needs
+  `--gfxoff-disallow` first, or the check stops with `gfx-not-on`. The
+  register dump includes the 39 new registers.
+
+**Choices not fixed by the proposal:**
+- **`GRBM_GFX_INDEX` is recorded, not required to be `0xe0000000`.** Every
+  boot dump reads `0x00000000`. Its writes are Linux's two (`0x40000000`,
+  `0xe0000000`), and the restore puts the reading back.
+- **The restore writes the snapshot in list order, not reverse.** That keeps
+  `CP_RB0_WPTR_HI` after `CP_RB0_WPTR`: the high write commits the pointer,
+  as stage 15 found for SDMA.
+- **The serdes waits do not fail the step.** Linux logs a timeout and
+  continues; the readings are reported.
+- **`GCEA_PROBE_MAP`** (Renoir's twelfth golden register) is not in
+  `gc_9_0_offset.h`, so it is not read. The other 11 are.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -3855,7 +3917,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate
