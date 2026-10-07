@@ -31,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 19;
+const uint32_t kMaxStage = 20;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -970,6 +970,43 @@ const DisplayExpect kDisplayExpect[] = {
 const uint32_t kDisplayExpectCount = sizeof(kDisplayExpect) / sizeof(kDisplayExpect[0]);
 const uint32_t kDisplayCheckCount = 11 + kDisplayExpectCount;
 
+// Stage 20: SDMA fills the pattern region, then pipe 0 flips to it with
+// HUBP0's flip interrupt enabled (docs/test-boot.md, stage 20), after the
+// stage 18 acknowledgement and undone before its restore. Offsets from
+// dcn_2_1_0_offset.h (DCN base segment 2, 0x34C0).
+const uint32_t kFlipStage = 20;
+const uint32_t kRegHubpreq0DcsurfSurfaceFlipInterrupt = 0x0eb80; // HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT: irq_service_dcn21 pflip_int_entry
+const uint32_t kRegDchubInterruptDest2 = 0x0d83c; // DCHUB_INTERRUPT_DEST2: HUBP0_IHC_FLIP_INTERRUPT_DEST, never written
+const uint32_t kRegDispInterruptStatusContinue17 = 0x0d7ec; // DISP_INTERRUPT_STATUS_CONTINUE17: HUBP0_IHC_FLIP_INTERRUPT
+// Read from stage 20 on, in addition to the stage 16, 17 and 19 registers.
+const uint32_t kStage20Registers[] = {kRegHubpreq0DcsurfSurfaceFlipInterrupt, kRegDchubInterruptDest2,
+                                      kRegDispInterruptStatusContinue17};
+const uint32_t kStage20RegisterCount = sizeof(kStage20Registers) / sizeof(kStage20Registers[0]);
+// DCSURF_SURFACE_FLIP_INTERRUPT: SURFACE_FLIP_INT_MASK (0, 1 = enabled),
+// SURFACE_FLIP_CLEAR (8), SURFACE_FLIP_OCCURRED (16), SURFACE_FLIP_INT_STATUS
+// (17); DCHUB_INTERRUPT_DEST2.HUBP0_IHC_FLIP_INTERRUPT_DEST (0);
+// DISP_INTERRUPT_STATUS_CONTINUE17.HUBP0_IHC_FLIP_INTERRUPT (2).
+const uint32_t kFlipIntEnable = 0x1, kFlipIntClear = 0x100, kFlipIntOccurred = 0x10000, kFlipIntStatus = 0x20000;
+const uint32_t kFlipIntDest = 0x1, kFlipIntContinue17 = 0x4;
+// The values written, in dal_irq_service_set's order (acknowledge, then
+// enable or disable): clear; enable; clear while enabled; disable.
+const uint32_t kFlipIntWrites[] = {kFlipIntClear, kFlipIntEnable, kFlipIntClear | kFlipIntEnable, 0};
+// IH entry dw0: client 4 (SOC15_IH_CLIENTID_DCE), source 0x4f
+// (DCN_1_0__SRCID__HUBP0_FLIP_INTERRUPT).
+const uint32_t kIhClientDce = 4, kIhSrcHubp0Flip = 0x4f;
+// Frame 4, the ring's first quarter again: 9 CONST_FILLs and FENCE 4; the
+// write pointer continues from 4096 to 5120.
+const uint32_t kSdmaOpConstFill = 11;
+const uint32_t kSdmaWbFence4 = 0x20c;
+const uint32_t kFillCount = 9; // the 8 bands, then the tail
+const uint32_t kFillBandBytes = kPatternBandLines * kPatternWidth * 4;
+const uint32_t kFillTailOffset = 8 * kFillBandBytes;
+const uint32_t kFillMaxBytes = 0x400000; // sdma_v4_0 fill_max_bytes
+const uint32_t kSdmaFrame4Dwords = kFillCount * 5 + 4; // CONST_FILL 5 each, FENCE 4
+const uint32_t kFlipWptr = 5 * kSdmaFrameDwords * 4;
+// How many new IH entries a flip report keeps.
+const uint32_t kFlipReportEntries = 4;
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -1084,6 +1121,14 @@ enum Status : uint32_t {
     kDisplayVerifyFailed,
     kDisplayNotRestored,
     kDisplayOutOfOrder,
+    // Stage 20.
+    kFlipUnexpectedState,
+    kFlipFillMismatch,
+    kFlipIntrNotDelivered,
+    kFlipIntrVerifyFailed,
+    kFlipVerifyFailed,
+    kFlipNotRestored,
+    kFlipOutOfOrder,
 };
 
 const char *statusName(Status status);
@@ -1202,7 +1247,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 15;
+const uint32_t kDiagnosticVersion = 16;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -1262,7 +1307,16 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticDisplayFlip = 36,    // out: Status, in-use lo, hi, pauses, frame count
     kDiagnosticDisplayVerify = 37,  // out: Status; structure: DisplayReport
     kDiagnosticDisplayRestore = 38, // out: Status, in-use lo, hi, pauses, index, value
-    kDiagnosticSelectorCount = 39,
+    // Stage 20, after a passing stage 18 acknowledgement (selector 33) on the
+    // same connection, in this order; undone before the stage 18 restore.
+    kDiagnosticFlipCheck = 39,   // out: Status, index, value, frame count, checksum lo, hi, DEST2, CONTINUE17
+    kDiagnosticFlipFill = 40,    // out: Status, step, fence 4, GFX_RB_RPTR, unexpected words, first offset, MSI change
+    kDiagnosticFlipShow = 41,    // out: Status, SURFACE_FLIP_INTERRUPT after the arm; structure: FlipReport
+    kDiagnosticFlipAck = 42,     // out: Status, SURFACE_FLIP_INTERRUPT, IH_RB_RPTR written, MSI before, after,
+                                 // write-back after
+    kDiagnosticFlipVerify = 43,  // out: Status, MSI change during the hold; structure: DisplayReport
+    kDiagnosticFlipRestore = 44, // out: Status, index, value, IH_RB_RPTR written; structure: FlipReport
+    kDiagnosticSelectorCount = 45,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -1800,6 +1854,77 @@ Status verifyDisplay(const RegisterReader &registers, uint64_t apertureLength, c
 // value).
 Status checkDisplayRestored(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
                             uint32_t *index, uint32_t *value);
+
+// Stage 20. Whether a register write is a stage 20 value: one of
+// kFlipIntWrites to SURFACE_FLIP_INTERRUPT, or frame 4's write pointer.
+bool flipWriteListed(uint32_t offset, uint32_t value);
+
+// The region SDMA fills: stage 19's bands in reverse order, no grey lines,
+// zero past the image.
+uint32_t fillWord(uint32_t offset);
+
+// The SDMA ring with frame 4 (9 CONST_FILLs, FENCE 4) at dwords 0..255;
+// intrRingWord elsewhere.
+uint32_t fillRingWord(uint32_t dword);
+
+// No writes. SURFACE_FLIP_INTERRUPT 0 (index 0) and DCHUB_INTERRUPT_DEST2's
+// HUBP0 flip destination 0, the host (index 1): kFlipUnexpectedState with the
+// index and value. dest2 and continue17 are recorded.
+Status checkFlipIntr(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                     uint32_t *value, uint32_t *dest2, uint32_t *continue17);
+
+// Zeroes the pattern region and reads it back (kPspReadbackMismatch).
+Status clearPattern(const MemoryReader &pattern, const MemoryWriter &writer, uint32_t stage);
+
+// Writes frame 4 into the SDMA ring and reads it back (kPspReadbackMismatch).
+Status writeSdmaFrame4(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage);
+
+// Reads the whole region against fillWord: kFlipFillMismatch with the count
+// and first offset.
+Status checkFill(const MemoryReader &pattern, uint32_t stage, uint32_t *unexpected, uint32_t *first);
+
+// dal_irq_service_set(true): SURFACE_FLIP_INTERRUPT <- clear, then <- enable.
+// readback is the register afterwards; kFlipUnexpectedState unless enabled.
+Status armFlipIntr(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   uint32_t stage, uint32_t *readback);
+
+struct FlipReport {
+    uint32_t inuseLo, inuseHi, pauses, msiPauses; // the poll's pauses, then those until the MSI
+    uint32_t frameCount;                           // OTG0's after the flip
+    uint32_t msiBefore, msiAfter;
+    uint32_t flipInterrupt, continue17; // after the flip
+    uint32_t ihStart, ihWriteback;      // IH_RB_RPTR before, the write-back after
+    uint32_t flipEntries, otherEntries; // new IH entries
+    uint32_t latencyMicroseconds;       // filled in by the kext: the address writes to the MSI
+    uint32_t entries[kFlipReportEntries * kIhEntryBytes / 4];
+};
+
+// flipDisplay to address, then up to kDisplayFlipPauses more pauses for an
+// MSI after msiBefore; then reads the new IH entries (from IH_RB_RPTR to the
+// write-back). The flip's status first; then kFlipIntrNotDelivered (no MSI),
+// or kFlipIntrVerifyFailed (not exactly one MSI and one HUBP0 flip entry).
+Status flipWithIntr(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                    const MemoryReader &gartRegion, const InterruptCounter &counter, uint32_t stage, uint64_t address,
+                    uint32_t msiBefore, FlipReport *report);
+
+// dal_irq_service_ack: SURFACE_FLIP_INTERRUPT <- clear | enable. readback is
+// the register afterwards.
+Status ackFlipIntr(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   uint32_t stage, uint32_t *readback);
+
+// Reads only: verifyDisplay against fillWord, and no MSI since msiAtAck
+// (kFlipVerifyFailed). msiChange is the count's change.
+Status verifyFlip(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &pattern,
+                  const uint32_t *display, uint32_t flipFrames, const InterruptCounter &counter, uint32_t msiAtAck,
+                  uint32_t stage, DisplayReport *report, uint32_t *msiChange);
+
+// The restore: flipWithIntr back to the GOP surface (its MSI recorded, not
+// required), dal_irq_service_set(false) (clear | enable, then 0), then pipe 0 at
+// boot 22 and SURFACE_FLIP_INTERRUPT 0 (index 11): kFlipNotRestored with the
+// index and value. The flip's status comes first.
+Status restoreFlip(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   const MemoryReader &gartRegion, const InterruptCounter &counter, uint32_t stage, uint32_t msiBefore,
+                   FlipReport *report, uint32_t *index, uint32_t *value);
 
 } // namespace cezanne
 

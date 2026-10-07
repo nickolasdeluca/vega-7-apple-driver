@@ -180,6 +180,50 @@ class CoreTests(unittest.TestCase):
             "report.inuseLo == 0": ("return inuse == kPatternGpuAddress && (report->flipControl",
                                      "return (inuse | 1) != 0 && (report->flipControl"),
             "kDisplayNotRestored": ("if ((*value & displayMask(i)) != (kDisplayPipe0Boot22[i] & displayMask(i))) return kDisplayNotRestored;", ""),
+            # Stage 20.
+            "!registerAllowed(offset, 19)": ("stage >= kFlipStage && i < kStage20RegisterCount",
+                                             "i < kStage20RegisterCount"),
+            "!writeAllowed(kRegHubpreq0DcsurfSurfaceFlipInterrupt, value, 19)": (
+                "if (stage >= kFlipStage && flipWriteListed(offset, value))",
+                "if (stage >= kDisplayStage && flipWriteListed(offset, value))"),
+            "!writeAllowed(kRegHubpreq0DcsurfSurfaceFlipInterrupt, 0x2, 20)": (
+                "        return false;\n    }\n    return offset == kRegSdma0GfxRbWptr && value == kFlipWptr;",
+                "        return value < 0x200;\n    }\n    return offset == kRegSdma0GfxRbWptr && value == kFlipWptr;"),
+            "!writeAllowed(kRegSdma0GfxRbWptr, 6144, 20)": (
+                "return offset == kRegSdma0GfxRbWptr && value == kFlipWptr;",
+                "return offset == kRegSdma0GfxRbWptr && value >= kFlipWptr;"),
+            "!sdmaWorkWriteAllowed(0, 11, 19)": (
+                "if (stage >= kFlipStage && offset < kSdmaFrameDwords * 4 && value == fillRingWord",
+                "if (offset < kSdmaFrameDwords * 4 && value == fillRingWord"),
+            "!patternWriteAllowed(8, 0, 19)": ("(stage >= kFlipStage && value == 0)", "(value == 0)"),
+            "fillRingWord(i) == first[i]": ("fillWord(offset), bytes - 1};", "fillWord(offset), bytes};"),
+            "fillRingWord(45 + i) == fence[i]": ("uint32_t(fence >> 32), 4};", "uint32_t(fence >> 32), 3};"),
+            # At stage 19 the allowlist still refuses frame 4's write pointer; at
+            # stage 18 the gate is what reports the frame as not allowed.
+            "18, 4, &observed) == kRegisterNotAllowed": ("(frame == 4 && stage < kFlipStage)", "false"),
+            "index == 0 && value == 1": ("    if (flipInterrupt != 0) {", "    if (false) {"),
+            "index == 1 && value == 0x41": ("    if ((*dest2 & kFlipIntDest) != 0) {", "    if (false) {"),
+            "== kFlipFillMismatch": ("return *unexpected == 0 ? kOK : kFlipFillMismatch;", "return kOK;"),
+            "clearPattern(g.pattern.reader(), g.pattern.writer(), 20) == kOK && g.pattern.words[5] == 0": (
+                "Status status = writePatternWord(writer, stage, offset, 0);", "Status status = ((void)writer, kOK);"),
+            "g.w.writes == before + 2": (
+                "    Status status = writeRegister(writer, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, kFlipIntClear);\n    if (status == kOK) status = writeRegister(writer, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, kFlipIntEnable);",
+                "    Status status = writeRegister(writer, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, kFlipIntEnable);"),
+            "g.show(&report) == kFlipIntrNotDelivered": (
+                "if (report->msiAfter == msiBefore) return kFlipIntrNotDelivered;", ""),
+            "g.show(&report) == kFlipIntrVerifyFailed": (
+                "report->msiAfter - msiBefore == 1 && report->flipEntries == 1", "report->flipEntries == 1"),
+            "report.ihStart == 0x20 && report.ihWriteback == 0x40 && report.flipEntries == 1": (
+                "((value >> 8) & 0xFF) == kIhSrcHubp0Flip", "((value >> 8) & 0xFF) == kIhSrcSdmaTrap"),
+            "report.msiPauses == kDisplayFlipPauses": (
+                "report->msiPauses < kDisplayFlipPauses", "report->msiPauses < 0"),
+            "kFlipVerifyFailed && msiChange == 1": ("(status == kOK && *msiChange != 0)", "false"),
+            "msiChange == 0 && hold.patternUnexpected == 0": ("stage, fillWord, report);", "stage, patternWord, report);"),
+            "g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] == 0": (
+                "    if (status == kOK) status = writeRegister(writer, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, 0);\n", ""),
+            "== kFlipNotRestored": ("if (restored == kOK && *value != 0) restored = kFlipNotRestored;", ""),
+            "g.r.msiCount, &report, &index, &value) == kOK": (
+                "if (flip == kFlipIntrNotDelivered || flip == kFlipIntrVerifyFailed) flip = kOK;", ""),
             # Stage 18.
             "!writeAllowed(kRegInterruptCntl2, kInterruptCntl2Dummy, 17)": (
                 "if (stage >= kIntrStage && intrWriteListed(offset, value))",
@@ -240,10 +284,12 @@ class CoreTests(unittest.TestCase):
         # and release, frame 2's write pointer, and their restores. Stage 18
         # adds the arm (two lists), the interrupt toggle, the acknowledgement,
         # the quiesce and INTERRUPT_CNTL2's restore. Stage 19 adds a flip's
-        # two address writes.
-        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 34)
+        # two address writes. Stage 20 adds the flip interrupt's arm (two),
+        # acknowledgement and disable (two).
+        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 39)
         allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
-        self.assertEqual(allow.count("return"), 17)
+        self.assertEqual(allow.count("return"), 18)
+        self.assertIn("if (stage >= kFlipStage && flipWriteListed(offset, value)) return true;", allow)
         self.assertIn("if (stage >= kDisplayStage && displayWriteListed(offset, value)) return true;", allow)
         self.assertIn("if (stage >= kGartStage && gartWriteListed(offset, value)) return true;", allow)
         self.assertIn("if (stage >= kIntrStage && intrWriteListed(offset, value)) return true;", allow)

@@ -99,6 +99,13 @@ const char *statusName(Status status)
     case kDisplayVerifyFailed: return "display-verify-failed";
     case kDisplayNotRestored: return "display-not-restored";
     case kDisplayOutOfOrder: return "display-out-of-order";
+    case kFlipUnexpectedState: return "flip-unexpected-state";
+    case kFlipFillMismatch: return "flip-fill-mismatch";
+    case kFlipIntrNotDelivered: return "flip-intr-not-delivered";
+    case kFlipIntrVerifyFailed: return "flip-intr-verify-failed";
+    case kFlipVerifyFailed: return "flip-verify-failed";
+    case kFlipNotRestored: return "flip-not-restored";
+    case kFlipOutOfOrder: return "flip-out-of-order";
     }
     return "unknown";
 }
@@ -194,6 +201,9 @@ bool registerAllowed(uint32_t offset, uint32_t stage)
     }
     for (uint32_t i = 0; stage >= kDisplayStage && i < kStage19RegisterCount; i++) {
         if (kStage19Registers[i] == offset) return true;
+    }
+    for (uint32_t i = 0; stage >= kFlipStage && i < kStage20RegisterCount; i++) {
+        if (kStage20Registers[i] == offset) return true;
     }
     return false;
 }
@@ -461,6 +471,7 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (stage >= kGartStage && gartWriteListed(offset, value)) return true;
     if (stage >= kIntrStage && intrWriteListed(offset, value)) return true;
     if (stage >= kDisplayStage && displayWriteListed(offset, value)) return true;
+    if (stage >= kFlipStage && flipWriteListed(offset, value)) return true;
     if (offset == kRegMp1C2PMsg90) return value == 0;
     if (offset == kRegMp1C2PMsg82)
         return value == 0 || (stage >= kMetricsStage && (value == uint32_t(kMetricsGpuAddress >> 32) ||
@@ -1239,6 +1250,8 @@ bool sdmaWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     // Stage 18: frame 3.
     if (offset >= 3 * kSdmaFrameDwords * 4 && offset < kSdmaRingDwords * 4)
         return stage >= kIntrStage && value == intrRingWord(offset / 4);
+    // Stage 20: frame 4, over the consumed frame 0.
+    if (stage >= kFlipStage && offset < kSdmaFrameDwords * 4 && value == fillRingWord(offset / 4)) return true;
     return offset >= kSdmaDst2Page && offset < kGartSdmaWorkSize && value == 0;
 }
 
@@ -1317,7 +1330,8 @@ Status submitSdma(const RegisterReader &registers, uint64_t apertureLength, cons
                   const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *observed)
 {
     *observed = 0;
-    if (stage < kSdmaCopyStage || frame > 3 || (frame == 2 && stage < kGartStage) || (frame == 3 && stage < kIntrStage))
+    if (stage < kSdmaCopyStage || frame > 4 || (frame == 2 && stage < kGartStage) || (frame == 3 && stage < kIntrStage) ||
+        (frame == 4 && stage < kFlipStage))
         return kRegisterNotAllowed;
     uint32_t pointer = 0;
     Status status = readRegister(registers, apertureLength, stage, kRegSdma0GfxRbWptr, &pointer);
@@ -1331,7 +1345,8 @@ Status submitSdma(const RegisterReader &registers, uint64_t apertureLength, cons
     const uint32_t at = kSdmaWbPage + (frame == 0   ? kSdmaWbTest
                                        : frame == 1 ? kSdmaWbFence
                                        : frame == 2 ? kSdmaWbFence2
-                                                    : kSdmaWbFence3);
+                                       : frame == 3 ? kSdmaWbFence3
+                                                    : kSdmaWbFence4);
     const uint32_t expected = frame == 0 ? kSdmaTestValue : frame;
     for (uint32_t i = 0; i <= kSdmaPollPauses; i++) {
         if (!work.read32(work.context, at, observed)) return kRegisterReadFailed;
@@ -2036,12 +2051,12 @@ uint32_t patternWord(uint32_t offset)
 bool patternWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
 {
     if (stage < kDisplayStage || (offset & 3) != 0 || offset >= kPatternSize) return false;
-    return value == patternWord(offset);
+    // Stage 20 also zeroes the region before SDMA fills it.
+    return value == patternWord(offset) || (stage >= kFlipStage && value == 0);
 }
 
-static Status writePatternWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset)
+static Status writePatternWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
 {
-    uint32_t value = patternWord(offset);
     if (!patternWriteAllowed(offset, value, stage)) return kRegisterNotAllowed;
     return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
 }
@@ -2093,7 +2108,7 @@ Status writePattern(const MemoryReader &pattern, const MemoryWriter &writer, uin
 {
     if (stage < kDisplayStage) return kRegisterNotAllowed;
     for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
-        Status status = writePatternWord(writer, stage, offset);
+        Status status = writePatternWord(writer, stage, offset, patternWord(offset));
         if (status != kOK) return status;
     }
     for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
@@ -2132,11 +2147,11 @@ Status flipDisplay(const RegisterReader &registers, uint64_t apertureLength, con
     }
 }
 
-Status verifyDisplay(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &pattern,
-                     const uint32_t *display, uint32_t flipFrames, uint32_t stage, DisplayReport *report)
+// verifyDisplay and verifyFlip: the region must hold word's image.
+static Status verifySurface(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &pattern,
+                            const uint32_t *display, uint32_t flipFrames, uint32_t stage, uint32_t (*word)(uint32_t),
+                            DisplayReport *report)
 {
-    *report = DisplayReport();
-    if (stage < kDisplayStage) return kRegisterNotAllowed;
     const struct {
         uint32_t offset;
         uint32_t *value;
@@ -2162,13 +2177,21 @@ Status verifyDisplay(const RegisterReader &registers, uint64_t apertureLength, c
     for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
         uint32_t value = 0;
         if (!pattern.read32(pattern.context, offset, &value)) return kRegisterReadFailed;
-        if (value != patternWord(offset) && report->patternUnexpected++ == 0) report->patternFirst = offset;
+        if (value != word(offset) && report->patternUnexpected++ == 0) report->patternFirst = offset;
     }
     const uint64_t inuse = (uint64_t(report->inuseHi) << 32) | report->inuseLo;
     return inuse == kPatternGpuAddress && (report->flipControl & kFlipPending) == 0 && report->framesAdvanced != 0 &&
                    report->displayChanged == 0 && report->patternUnexpected == 0
                ? kOK
                : kDisplayVerifyFailed;
+}
+
+Status verifyDisplay(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &pattern,
+                     const uint32_t *display, uint32_t flipFrames, uint32_t stage, DisplayReport *report)
+{
+    *report = DisplayReport();
+    if (stage < kDisplayStage) return kRegisterNotAllowed;
+    return verifySurface(registers, apertureLength, pattern, display, flipFrames, stage, patternWord, report);
 }
 
 Status checkDisplayRestored(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
@@ -2184,6 +2207,222 @@ Status checkDisplayRestored(const RegisterReader &registers, uint64_t apertureLe
     }
     *index = *value = 0;
     return kOK;
+}
+
+bool flipWriteListed(uint32_t offset, uint32_t value)
+{
+    if (offset == kRegHubpreq0DcsurfSurfaceFlipInterrupt) {
+        for (uint32_t write : kFlipIntWrites)
+            if (value == write) return true;
+        return false;
+    }
+    return offset == kRegSdma0GfxRbWptr && value == kFlipWptr;
+}
+
+uint32_t fillWord(uint32_t offset)
+{
+    return offset >= kFillTailOffset ? 0 : kPatternBands[7 - offset / kFillBandBytes];
+}
+
+uint32_t fillRingWord(uint32_t dword)
+{
+    if (dword >= kSdmaFrameDwords) return intrRingWord(dword);
+    if (dword < kFillCount * 5) {
+        // sdma_v4_0_emit_fill_buffer: the header has no fill size set.
+        const uint32_t fill = dword / 5, offset = fill * kFillBandBytes;
+        const uint64_t destination = kPatternGpuAddress + offset;
+        const uint32_t bytes = fill < 8 ? kFillBandBytes : kPatternSize - kFillTailOffset;
+        const uint32_t packet[] = {kSdmaOpConstFill, uint32_t(destination), uint32_t(destination >> 32),
+                                   fillWord(offset), bytes - 1};
+        return packet[dword % 5];
+    }
+    const uint64_t fence = kSdmaWorkGpuAddress + kSdmaWbPage + kSdmaWbFence4;
+    const uint32_t fenceWords[] = {kSdmaOpFence, uint32_t(fence), uint32_t(fence >> 32), 4};
+    if (dword < kSdmaFrame4Dwords) return fenceWords[dword - kFillCount * 5];
+    return kSdmaOpNop;
+}
+
+Status checkFlipIntr(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                     uint32_t *value, uint32_t *dest2, uint32_t *continue17)
+{
+    *index = *value = *dest2 = *continue17 = 0;
+    if (stage < kFlipStage) return kRegisterNotAllowed;
+    uint32_t flipInterrupt = 0;
+    Status status = readRegister(registers, apertureLength, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, &flipInterrupt);
+    if (status == kOK) status = readRegister(registers, apertureLength, stage, kRegDchubInterruptDest2, dest2);
+    if (status == kOK) status = readRegister(registers, apertureLength, stage, kRegDispInterruptStatusContinue17, continue17);
+    if (status != kOK) return status;
+    if (flipInterrupt != 0) {
+        *value = flipInterrupt;
+        return kFlipUnexpectedState;
+    }
+    if ((*dest2 & kFlipIntDest) != 0) {
+        *index = 1;
+        *value = *dest2;
+        return kFlipUnexpectedState;
+    }
+    return kOK;
+}
+
+Status clearPattern(const MemoryReader &pattern, const MemoryWriter &writer, uint32_t stage)
+{
+    if (stage < kFlipStage) return kRegisterNotAllowed;
+    for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
+        Status status = writePatternWord(writer, stage, offset, 0);
+        if (status != kOK) return status;
+    }
+    for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
+        uint32_t value = 0;
+        if (!pattern.read32(pattern.context, offset, &value)) return kRegisterReadFailed;
+        if (value != 0) return kPspReadbackMismatch;
+    }
+    return kOK;
+}
+
+Status writeSdmaFrame4(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage)
+{
+    if (stage < kFlipStage) return kRegisterNotAllowed;
+    for (uint32_t dword = 0; dword < kSdmaFrameDwords; dword++) {
+        Status status = writeSdmaWorkWord(writer, stage, dword * 4, fillRingWord(dword));
+        if (status != kOK) return status;
+    }
+    for (uint32_t dword = 0; dword < kSdmaFrameDwords; dword++) {
+        uint32_t value = 0;
+        if (!work.read32(work.context, dword * 4, &value)) return kRegisterReadFailed;
+        if (value != fillRingWord(dword)) return kPspReadbackMismatch;
+    }
+    return kOK;
+}
+
+Status checkFill(const MemoryReader &pattern, uint32_t stage, uint32_t *unexpected, uint32_t *first)
+{
+    *unexpected = *first = 0;
+    if (stage < kFlipStage) return kRegisterNotAllowed;
+    for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
+        uint32_t value = 0;
+        if (!pattern.read32(pattern.context, offset, &value)) return kRegisterReadFailed;
+        if (value != fillWord(offset) && (*unexpected)++ == 0) *first = offset;
+    }
+    return *unexpected == 0 ? kOK : kFlipFillMismatch;
+}
+
+Status armFlipIntr(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   uint32_t stage, uint32_t *readback)
+{
+    *readback = 0;
+    if (stage < kFlipStage) return kRegisterNotAllowed;
+    // dal_irq_service_set acknowledges, then enables.
+    Status status = writeRegister(writer, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, kFlipIntClear);
+    if (status == kOK) status = writeRegister(writer, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, kFlipIntEnable);
+    if (status == kOK)
+        status = readRegister(registers, apertureLength, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, readback);
+    if (status != kOK) return status;
+    return (*readback & kFlipIntEnable) != 0 ? kOK : kFlipUnexpectedState;
+}
+
+Status flipWithIntr(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                    const MemoryReader &gartRegion, const InterruptCounter &counter, uint32_t stage, uint64_t address,
+                    uint32_t msiBefore, FlipReport *report)
+{
+    *report = FlipReport();
+    if (stage < kFlipStage) return kRegisterNotAllowed;
+    report->msiBefore = msiBefore;
+    Status status = readRegister(registers, apertureLength, stage, kRegIhRbRptr, &report->ihStart);
+    if (status != kOK) return status;
+    uint64_t inuse = 0;
+    Status flip = flipDisplay(registers, apertureLength, writer, stage, address, &inuse, &report->pauses);
+    report->inuseLo = uint32_t(inuse);
+    report->inuseHi = uint32_t(inuse >> 32);
+    if (flip != kOK && flip != kDisplayFlipTimeout) return flip;
+    // The MSI may come before or after the poll sees the flip.
+    while (counter.count(counter.context) == msiBefore && report->msiPauses < kDisplayFlipPauses) {
+        writer.pause(writer.context);
+        report->msiPauses++;
+    }
+    report->msiAfter = counter.count(counter.context);
+    const struct {
+        uint32_t offset;
+        uint32_t *value;
+    } reads[] = {
+        {kRegOtg0OtgStatusFrameCount, &report->frameCount},
+        {kRegHubpreq0DcsurfSurfaceFlipInterrupt, &report->flipInterrupt},
+        {kRegDispInterruptStatusContinue17, &report->continue17},
+    };
+    for (const auto &read : reads) {
+        status = readRegister(registers, apertureLength, stage, read.offset, read.value);
+        if (status != kOK) return status;
+    }
+    // The new IH entries: from the read pointer to the write-back.
+    if (!gartRegion.read32(gartRegion.context, kIhWbPage, &report->ihWriteback)) return kRegisterReadFailed;
+    const uint32_t end = report->ihWriteback & kIhWptrOffsetMask & (kIhRingBytes - 1);
+    uint32_t at = report->ihStart & (kIhRingBytes - 1), entry = 0;
+    for (; at != end && entry < kIhRingBytes / kIhEntryBytes; at = (at + kIhEntryBytes) & (kIhRingBytes - 1), entry++) {
+        for (uint32_t word = 0; word < kIhEntryBytes / 4; word++) {
+            uint32_t value = 0;
+            if (!gartRegion.read32(gartRegion.context, kIhRingPage + at + word * 4, &value)) return kRegisterReadFailed;
+            if (entry < kFlipReportEntries) report->entries[entry * kIhEntryBytes / 4 + word] = value;
+            if (word != 0) continue;
+            // dw0: client_id 7:0, src_id 15:8 (vega10_ih_decode_iv).
+            if ((value & 0xFF) == kIhClientDce && ((value >> 8) & 0xFF) == kIhSrcHubp0Flip) report->flipEntries++;
+            else report->otherEntries++;
+        }
+    }
+    if (flip != kOK) return flip;
+    if (report->msiAfter == msiBefore) return kFlipIntrNotDelivered;
+    return report->msiAfter - msiBefore == 1 && report->flipEntries == 1 ? kOK : kFlipIntrVerifyFailed;
+}
+
+Status ackFlipIntr(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   uint32_t stage, uint32_t *readback)
+{
+    *readback = 0;
+    if (stage < kFlipStage) return kRegisterNotAllowed;
+    Status status =
+        writeRegister(writer, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, kFlipIntClear | kFlipIntEnable);
+    if (status != kOK) return status;
+    return readRegister(registers, apertureLength, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, readback);
+}
+
+Status verifyFlip(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &pattern,
+                  const uint32_t *display, uint32_t flipFrames, const InterruptCounter &counter, uint32_t msiAtAck,
+                  uint32_t stage, DisplayReport *report, uint32_t *msiChange)
+{
+    *report = DisplayReport();
+    *msiChange = 0;
+    if (stage < kFlipStage) return kRegisterNotAllowed;
+    Status status = verifySurface(registers, apertureLength, pattern, display, flipFrames, stage, fillWord, report);
+    *msiChange = counter.count(counter.context) - msiAtAck;
+    if (status == kDisplayVerifyFailed || (status == kOK && *msiChange != 0)) return kFlipVerifyFailed;
+    return status;
+}
+
+Status restoreFlip(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   const MemoryReader &gartRegion, const InterruptCounter &counter, uint32_t stage, uint32_t msiBefore,
+                   FlipReport *report, uint32_t *index, uint32_t *value)
+{
+    *index = *value = 0;
+    if (stage < kFlipStage) {
+        *report = FlipReport();
+        return kRegisterNotAllowed;
+    }
+    Status flip = flipWithIntr(registers, apertureLength, writer, gartRegion, counter, stage, kGopSurfaceAddress,
+                               msiBefore, report);
+    // The flip back's MSI is recorded, not required.
+    if (flip == kFlipIntrNotDelivered || flip == kFlipIntrVerifyFailed) flip = kOK;
+    // dal_irq_service_set(false): acknowledge (a read-modify-write that keeps
+    // the enable bit), then disable.
+    Status status =
+        writeRegister(writer, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, kFlipIntClear | kFlipIntEnable);
+    if (status == kOK) status = writeRegister(writer, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, 0);
+    Status restored = checkDisplayRestored(registers, apertureLength, stage, index, value);
+    if (restored == kDisplayNotRestored) restored = kFlipNotRestored;
+    if (restored == kOK) {
+        *index = 11;
+        restored = readRegister(registers, apertureLength, stage, kRegHubpreq0DcsurfSurfaceFlipInterrupt, value);
+        if (restored == kOK && *value != 0) restored = kFlipNotRestored;
+        if (restored == kOK) *index = 0;
+    }
+    return flip != kOK ? flip : status != kOK ? status : restored;
 }
 
 } // namespace cezanne

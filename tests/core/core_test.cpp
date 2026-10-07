@@ -147,6 +147,18 @@ struct FakeRegisters {
     // DCN pipe 0 (stage 19): a flip lands flipDelay pauses after the address
     // write (-1 never); OTG0's frame counter advances on every pause.
     int flipDelay = 1, flipPending = -1;
+    // Stage 20: the pattern region SDMA's CONST_FILL writes, and HUBP0's flip
+    // interrupt (posted to the IH when a flip lands while enabled).
+    std::vector<uint32_t> *patternWords = nullptr;
+    int fillSkip = -1;        // a CONST_FILL (by its order) the engine drops
+    bool flipIntDrop = false; // the flip interrupt never reaches the IH
+    bool flipIntSticky = false; // SURFACE_FLIP_CLEAR leaves the status set
+    void presetFlip()
+    {
+        gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] = 0;
+        gart[kRegDchubInterruptDest2] = 0x00000040; // another source's destination: not checked
+        gart[kRegDispInterruptStatusContinue17] = 0;
+    }
     void presetDisplay()
     {
         for (uint32_t i = 0; i < 11; i++) gart[kDisplayInventory[i]] = kDisplayPipe0Boot22[i];
@@ -850,6 +862,14 @@ struct FakeWriter {
             r->ackPending = r->ackDelay == 0 ? -1 : r->ackDelay;
             return;
         }
+        if (offset == kRegHubpreq0DcsurfSurfaceFlipInterrupt) {
+            // SURFACE_FLIP_CLEAR clears the status and reads back 0.
+            uint32_t status = r->gart[offset] & (kFlipIntOccurred | kFlipIntStatus);
+            if ((value & kFlipIntClear) != 0 && !r->flipIntSticky) status = 0;
+            r->gart[offset] = (value & kFlipIntEnable) | status;
+            if (status == 0) r->gart[kRegDispInterruptStatusContinue17] &= ~kFlipIntContinue17;
+            return;
+        }
         r->gart[offset] = value;
         if (offset == kRegIhRbRptr) r->msiArmed = true;
         if (offset == kRegHubpreq0DcsurfPrimarySurfaceAddress) {
@@ -898,23 +918,33 @@ struct FakeWriter {
             }
             return -1;
         };
+        // The ring's addressing wraps at its size; the pointers do not.
+        auto ring = [m](uint32_t i) { return m[i & (kSdmaRingDwords - 1)]; };
         uint32_t d = from / 4;
         while (d < to / 4) {
-            uint32_t op = m[d] & 0xff;
+            uint32_t op = ring(d) & 0xff;
             if (op == kSdmaOpWrite) {
-                int64_t w = at(m[d + 1], m[d + 2]);
-                if (w >= 0) m[w] = m[d + 4];
+                int64_t w = at(ring(d + 1), ring(d + 2));
+                if (w >= 0) m[w] = ring(d + 4);
                 d += 5;
             } else if (op == kSdmaOpCopy) {
-                int64_t src = at(m[d + 3], m[d + 4]), dst = at(m[d + 5], m[d + 6]);
-                for (uint32_t i = 0; src >= 0 && dst >= 0 && i < (m[d + 1] + 1) / 4; i++) m[dst + i] = m[src + i];
+                int64_t src = at(ring(d + 3), ring(d + 4)), dst = at(ring(d + 5), ring(d + 6));
+                for (uint32_t i = 0; src >= 0 && dst >= 0 && i < (ring(d + 1) + 1) / 4; i++) m[dst + i] = m[src + i];
                 if (r->sdmaCorruptCopy && dst >= 0) m[dst + 7] ^= 1;
                 if (r->sdmaStray) m[0x8000 / 4] ^= 1; // once, with the copy
                 d += 7;
             } else if (op == kSdmaOpFence) {
-                int64_t w = at(m[d + 1], m[d + 2]);
-                if (w >= 0) m[w] = m[d + 3];
+                int64_t w = at(ring(d + 1), ring(d + 2));
+                if (w >= 0) m[w] = ring(d + 3);
                 d += 4;
+            } else if (op == kSdmaOpConstFill) {
+                uint64_t a = (uint64_t(ring(d + 2)) << 32) | ring(d + 1);
+                uint64_t bytes = uint64_t(ring(d + 4)) + 1;
+                bool inside = a >= kPatternGpuAddress && a + bytes <= kPatternGpuAddress + kPatternSize;
+                if (!inside) r->gart[kRegVmL2ProtectionFaultStatus] = 1;
+                if (inside && r->patternWords != nullptr && r->fillSkip-- != 0)
+                    for (uint64_t i = 0; i < bytes / 4; i++) (*r->patternWords)[(a - kPatternGpuAddress) / 4 + i] = ring(d + 3);
+                d += 5;
             } else if (op == kSdmaOpTrap) {
                 if ((r->sdma[kRegSdma0Cntl] & 1) != 0 && !r->ihDropTrap) postIh(r, 0x0000E008u);
                 if (r->dummyStray && r->gartWork != nullptr) r->gartWork->words[kGartDummyPage / 4] = 1;
@@ -958,6 +988,12 @@ struct FakeWriter {
             r->gart[kRegHubpreq0DcsurfFlipControl] &= ~kFlipPending;
             r->gart[kRegHubpreq0DcsurfSurfaceEarliestInuse] = r->gart[kRegHubpreq0DcsurfPrimarySurfaceAddress];
             r->gart[kRegHubpreq0DcsurfSurfaceEarliestInuseHigh] = r->gart[kRegHubpreq0DcsurfPrimarySurfaceAddressHigh];
+            auto flipInt = r->gart.find(kRegHubpreq0DcsurfSurfaceFlipInterrupt);
+            if (flipInt != r->gart.end() && (flipInt->second & kFlipIntEnable) != 0) {
+                flipInt->second |= kFlipIntOccurred | kFlipIntStatus;
+                r->gart[kRegDispInterruptStatusContinue17] |= kFlipIntContinue17;
+                if (!r->flipIntDrop) postIh(r, 0x00004F04u);
+            }
         }
         r->pauses++;
     }
@@ -2617,6 +2653,212 @@ static void testDisplay()
     }
 }
 
+// A stage 20 rig: stage 18 through its acknowledgement, then pipe 0 at
+// boot 22 with the flip interrupt off, and the pattern region.
+struct FlipRig : IntrRig {
+    BigMemory pattern;
+    uint32_t msiAtAck = 0;
+    FlipRig()
+    {
+        uint32_t observed = 0, rptr = 0, before = 0, after = 0, writeback = 0;
+        IntrReport report;
+        CHECK(run(&observed) == kOK && verify18(&report) == kOK);
+        CHECK(ackIntr(gartWork.reader(), w.writer(), counter, 18, &rptr, &before, &after, &writeback) == kOK);
+        r.presetDisplay();
+        r.presetFlip();
+        r.patternWords = &pattern.words;
+        CHECK(readDisplayInventory(r.reader(), 0x80000, 20, display) == kOK);
+    }
+    // Clear, frame 4, submit.
+    Status fill(uint32_t *observed)
+    {
+        Status status = clearPattern(pattern.reader(), pattern.writer(), 20);
+        if (status == kOK) status = writeSdmaFrame4(work.reader(), work.writer(), 20);
+        if (status == kOK) status = submitSdma(r.reader(), 0x80000, w.writer(), work.reader(), 20, 4, observed);
+        return status;
+    }
+    Status show(FlipReport *report)
+    {
+        uint32_t readback = 0;
+        Status status = armFlipIntr(r.reader(), 0x80000, w.writer(), 20, &readback);
+        if (status != kOK) return status;
+        return flipWithIntr(r.reader(), 0x80000, w.writer(), gartWork.reader(), counter, 20, kPatternGpuAddress,
+                            r.msiCount, report);
+    }
+};
+
+static void testFlip()
+{
+    // The pinned values (docs/test-boot.md, stage 20).
+    CHECK(kRegHubpreq0DcsurfSurfaceFlipInterrupt == 0x0eb80 && kRegDchubInterruptDest2 == 0x0d83c &&
+          kRegDispInterruptStatusContinue17 == 0x0d7ec);
+    CHECK(kFlipWptr == 5120 && kSdmaWbFence4 == 0x20c && kSdmaFrame4Dwords == 49);
+    CHECK(kFillBandBytes == 0xfd200 && kFillTailOffset == 0x7e9000);
+    const uint32_t first[] = {11, 0x41000000u, 0xF4, 0xFF000000u, 0x000fd1ffu};
+    for (uint32_t i = 0; i < 5; i++) CHECK(fillRingWord(i) == first[i]);
+    const uint32_t tail[] = {11, 0x417e9000u, 0xF4, 0, 0x00016fffu};
+    for (uint32_t i = 0; i < 5; i++) CHECK(fillRingWord(40 + i) == tail[i]);
+    CHECK(fillRingWord(38) == 0xFFFFFFFFu); // the 8th band: white
+    const uint32_t fence[] = {5, 0x4030120cu, 0xF4, 4};
+    for (uint32_t i = 0; i < 4; i++) CHECK(fillRingWord(45 + i) == fence[i]);
+    for (uint32_t i = 49; i < 256; i++) CHECK(fillRingWord(i) == 0);
+    for (uint32_t i = 256; i < 1024; i++) CHECK(fillRingWord(i) == intrRingWord(i));
+    // The fills cover the region exactly, each below the packet's limit.
+    uint64_t next = kPatternGpuAddress;
+    for (uint32_t k = 0; k < kFillCount; k++) {
+        uint64_t at = (uint64_t(fillRingWord(5 * k + 2)) << 32) | fillRingWord(5 * k + 1);
+        uint32_t bytes = fillRingWord(5 * k + 4) + 1;
+        CHECK(at == next && bytes <= kFillMaxBytes && (fillRingWord(5 * k + 4) & ~0x3FFFFFu) == 0);
+        next = at + bytes;
+    }
+    CHECK(next == kPatternGpuAddress + kPatternSize);
+    CHECK(fillWord(0) == 0xFF000000u && fillWord(kFillTailOffset - 4) == 0xFFFFFFFFu && fillWord(kFillTailOffset) == 0);
+    CHECK(fillWord(kFillBandBytes) == 0xFF0000FFu && fillWord(kPatternSize - 4) == 0);
+
+    // Reads and writes from stage 20 only.
+    for (uint32_t offset : kStage20Registers) CHECK(registerAllowed(offset, 20) && !registerAllowed(offset, 19));
+    for (uint32_t value : kFlipIntWrites)
+        CHECK(writeAllowed(kRegHubpreq0DcsurfSurfaceFlipInterrupt, value, 20) &&
+              !writeAllowed(kRegHubpreq0DcsurfSurfaceFlipInterrupt, value, 19));
+    CHECK(!writeAllowed(kRegHubpreq0DcsurfSurfaceFlipInterrupt, 0x2, 20) &&
+          !writeAllowed(kRegHubpreq0DcsurfSurfaceFlipInterrupt, 0x4, 20) &&
+          !writeAllowed(kRegHubpreq0DcsurfSurfaceFlipInterrupt, 0x10101, 20));
+    CHECK(!writeAllowed(kRegDchubInterruptDest2, 0, 20) && !writeAllowed(kRegDispInterruptStatusContinue17, 0, 20));
+    CHECK(writeAllowed(kRegSdma0GfxRbWptr, 5120, 20) && !writeAllowed(kRegSdma0GfxRbWptr, 5120, 19) &&
+          !writeAllowed(kRegSdma0GfxRbWptr, 6144, 20));
+    CHECK(kRegHubpreq0DcsurfSurfaceFlipInterrupt / kPageSize * kPageSize == kDisplayPageOffset);
+    CHECK(sdmaWorkWriteAllowed(0, 11, 20) && !sdmaWorkWriteAllowed(0, 11, 19) && !sdmaWorkWriteAllowed(4, 0x41000001u, 20));
+    CHECK(sdmaWorkWriteAllowed(256 * 4, 0, 20) == sdmaWorkWriteAllowed(256 * 4, 0, 19));
+    CHECK(patternWriteAllowed(8, 0, 20) && !patternWriteAllowed(8, 0, 19) && !patternWriteAllowed(8, 1, 20));
+
+    // The whole stage against the fakes.
+    {
+        FlipRig g;
+        uint32_t index = 9, value = 9, dest2 = 0, continue17 = 9;
+        CHECK(checkFlipIntr(g.r.reader(), 0x80000, 20, &index, &value, &dest2, &continue17) == kOK);
+        CHECK(index == 0 && value == 0 && dest2 == 0x40 && continue17 == 0);
+        uint32_t frames = 0;
+        CHECK(checkDisplayBoot22(g.r.reader(), 0x80000, 20, &index, &value, &frames) == kOK);
+        uint32_t observed = 0, msi = g.r.msiCount;
+        CHECK(clearPattern(g.pattern.reader(), g.pattern.writer(), 20) == kOK && g.pattern.words[5] == 0);
+        CHECK(writeSdmaFrame4(g.work.reader(), g.work.writer(), 20) == kOK && g.work.words[0] == 11);
+        CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 20, 4, &observed) == kOK && observed == 4);
+        CHECK(g.r.sdma[kRegSdma0GfxRbWptr] == 5120 && g.r.sdma[kRegSdma0GfxRbRptr] == 5120 && g.r.msiCount == msi);
+        uint32_t unexpected = 9, firstOffset = 9;
+        CHECK(checkFill(g.pattern.reader(), 20, &unexpected, &firstOffset) == kOK && unexpected == 0);
+        CHECK(g.pattern.words[0] == 0xFF000000u && g.r.gart[kRegVmL2ProtectionFaultStatus] == 0);
+        int before = g.w.writes;
+        uint32_t readback = 0;
+        CHECK(armFlipIntr(g.r.reader(), 0x80000, g.w.writer(), 20, &readback) == kOK && readback == 1);
+        CHECK(g.w.writes == before + 2 && g.w.values[before] == 0x100 && g.w.values[before + 1] == 0x1);
+        FlipReport report;
+        CHECK(flipWithIntr(g.r.reader(), 0x80000, g.w.writer(), g.gartWork.reader(), g.counter, 20, kPatternGpuAddress,
+                           g.r.msiCount, &report) == kOK);
+        CHECK(report.inuseLo == 0x41000000u && report.inuseHi == 0xf4 && report.msiAfter == report.msiBefore + 1);
+        CHECK(report.ihStart == 0x20 && report.ihWriteback == 0x40 && report.flipEntries == 1 && report.otherEntries == 0);
+        CHECK((report.entries[0] & 0xFFFF) == 0x4F04 && (report.flipInterrupt & kFlipIntStatus) != 0);
+        CHECK((report.continue17 & kFlipIntContinue17) != 0);
+        CHECK(ackFlipIntr(g.r.reader(), 0x80000, g.w.writer(), 20, &readback) == kOK && readback == 1);
+        CHECK(g.r.gart[kRegDispInterruptStatusContinue17] == 0);
+        uint32_t rptr = 0, countBefore = 0, countAfter = 0, writeback = 0;
+        CHECK(ackIntr(g.gartWork.reader(), g.w.writer(), g.counter, 20, &rptr, &countBefore, &countAfter, &writeback) ==
+              kOK);
+        CHECK(rptr == 0x40 && g.r.msiArmed);
+        g.msiAtAck = g.r.msiCount;
+        uint32_t flipFrames = report.frameCount;
+        for (int i = 0; i < 20; i++) g.w.pause(&g.w); // the hold
+        DisplayReport hold;
+        uint32_t msiChange = 9;
+        CHECK(verifyFlip(g.r.reader(), 0x80000, g.pattern.reader(), g.display, flipFrames, g.counter, g.msiAtAck, 20,
+                         &hold, &msiChange) == kOK);
+        CHECK(msiChange == 0 && hold.patternUnexpected == 0 && hold.framesAdvanced >= 20);
+        before = g.w.writes;
+        CHECK(restoreFlip(g.r.reader(), 0x80000, g.w.writer(), g.gartWork.reader(), g.counter, 20, g.r.msiCount, &report,
+                          &index, &value) == kOK);
+        CHECK(report.inuseLo == 0 && report.inuseHi == 0xf4 && report.flipEntries == 1 && index == 0 && value == 0);
+        CHECK(g.w.values[g.w.writes - 2] == 0x101 && g.w.values[g.w.writes - 1] == 0 &&
+              g.w.offsets[g.w.writes - 1] == kRegHubpreq0DcsurfSurfaceFlipInterrupt);
+        CHECK(g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] == 0);
+        CHECK(ackIntr(g.gartWork.reader(), g.w.writer(), g.counter, 20, &rptr, &countBefore, &countAfter, &writeback) ==
+              kOK && rptr == 0x60);
+        // Then the stage 18 and 17 restores, as before.
+        CHECK(quiesceIntr(g.w.writer(), 20) == kOK);
+        CHECK(restoreIntr(g.r.reader(), 0x80000, g.w.writer(), 20, &index, &value) == kOK);
+        CHECK(restoreGart(g.r.reader(), 0x80000, g.w.writer(), 20, 3, &g.ack) == kOK);
+    }
+    {
+        // Preconditions: the interrupt already enabled, or routed away.
+        FlipRig g;
+        uint32_t index = 0, value = 0, dest2 = 0, continue17 = 0;
+        g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] = 0x1;
+        CHECK(checkFlipIntr(g.r.reader(), 0x80000, 20, &index, &value, &dest2, &continue17) == kFlipUnexpectedState);
+        CHECK(index == 0 && value == 1);
+        g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] = 0;
+        g.r.gart[kRegDchubInterruptDest2] = 0x41;
+        CHECK(checkFlipIntr(g.r.reader(), 0x80000, 20, &index, &value, &dest2, &continue17) == kFlipUnexpectedState);
+        CHECK(index == 1 && value == 0x41);
+        CHECK(checkFlipIntr(g.r.reader(), 0x80000, 19, &index, &value, &dest2, &continue17) == kRegisterNotAllowed);
+        // Stage gating and order.
+        uint32_t observed = 0;
+        CHECK(clearPattern(g.pattern.reader(), g.pattern.writer(), 19) == kRegisterNotAllowed);
+        CHECK(writeSdmaFrame4(g.work.reader(), g.work.writer(), 19) == kRegisterNotAllowed);
+        CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 19, 4, &observed) == kRegisterNotAllowed);
+        CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 20, 5, &observed) == kRegisterNotAllowed);
+        uint32_t readback = 0;
+        CHECK(armFlipIntr(g.r.reader(), 0x80000, g.w.writer(), 19, &readback) == kRegisterNotAllowed);
+        g.r.sdma[kRegSdma0GfxRbWptr] = 3072;
+        CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 20, 4, &observed) == kSdmaOutOfOrder);
+    }
+    {
+        // A dropped fill; a flip interrupt that never comes.
+        FlipRig g;
+        g.r.fillSkip = 2;
+        uint32_t observed = 0, unexpected = 0, firstOffset = 0;
+        CHECK(g.fill(&observed) == kOK && observed == 4);
+        CHECK(checkFill(g.pattern.reader(), 20, &unexpected, &firstOffset) == kFlipFillMismatch);
+        CHECK(unexpected == kFillBandBytes / 4 && firstOffset == 2 * kFillBandBytes);
+        g.r.flipIntDrop = true;
+        FlipReport report;
+        int pauses = g.r.pauses;
+        CHECK(g.show(&report) == kFlipIntrNotDelivered && report.inuseLo == 0x41000000u && report.flipEntries == 0);
+        CHECK(report.msiPauses == kDisplayFlipPauses && g.r.pauses == pauses + 1 + int(kDisplayFlipPauses));
+        // The restore still runs; its own MSI is not required.
+        uint32_t index = 0, value = 0;
+        CHECK(restoreFlip(g.r.reader(), 0x80000, g.w.writer(), g.gartWork.reader(), g.counter, 20, g.r.msiCount, &report,
+                          &index, &value) == kOK);
+        CHECK(report.inuseLo == 0 && g.r.gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] == 0);
+    }
+    {
+        // Two MSIs for one flip; an MSI during the hold; a status that stays.
+        FlipRig g;
+        uint32_t observed = 0;
+        CHECK(g.fill(&observed) == kOK);
+        g.r.msiRefire = true;
+        FlipReport report;
+        CHECK(g.show(&report) == kFlipIntrVerifyFailed && report.msiAfter > report.msiBefore + 1);
+        g.r.msiRefire = false;
+        DisplayReport hold;
+        uint32_t msiChange = 0;
+        g.w.pause(&g.w);
+        CHECK(verifyFlip(g.r.reader(), 0x80000, g.pattern.reader(), g.display, report.frameCount, g.counter,
+                         g.r.msiCount - 1, 20, &hold, &msiChange) == kFlipVerifyFailed && msiChange == 1);
+        CHECK(verifyFlip(g.r.reader(), 0x80000, g.pattern.reader(), g.display, report.frameCount, g.counter,
+                         g.r.msiCount, 20, &hold, &msiChange) == kOK);
+        g.pattern.words[7] ^= 1;
+        CHECK(verifyFlip(g.r.reader(), 0x80000, g.pattern.reader(), g.display, report.frameCount, g.counter,
+                         g.r.msiCount, 20, &hold, &msiChange) == kFlipVerifyFailed && hold.patternFirst == 28);
+        g.r.flipIntSticky = true;
+        uint32_t index = 0, value = 0;
+        CHECK(restoreFlip(g.r.reader(), 0x80000, g.w.writer(), g.gartWork.reader(), g.counter, 20, g.r.msiCount, &report,
+                          &index, &value) == kFlipNotRestored);
+        CHECK(index == 11 && (value & kFlipIntStatus) != 0 && (value & kFlipIntEnable) == 0);
+        // A restore that cannot write still disables nothing it cannot, and checks.
+        g.w.fail = true;
+        CHECK(restoreFlip(g.r.reader(), 0x80000, g.w.writer(), g.gartWork.reader(), g.counter, 20, g.r.msiCount, &report,
+                          &index, &value) == kRegisterWriteFailed);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -2644,6 +2886,7 @@ int main()
     testGart();
     testIntr();
     testDisplay();
+    testFlip();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }
