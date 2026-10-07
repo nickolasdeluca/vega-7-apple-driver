@@ -192,6 +192,17 @@ public:
     cezanne::Status displayVerify(const void *owner, cezanne::DisplayReport *report);
     cezanne::Status displayRestore(const void *owner, uint64_t *inuse, uint32_t *pauses, uint32_t *index,
                                    uint32_t *value);
+    // Stage 20.
+    cezanne::Status flipCheck(const void *owner, uint32_t *index, uint32_t *value, uint32_t *frames,
+                              uint64_t *checksum, uint32_t *dest2, uint32_t *continue17);
+    cezanne::Status flipFill(const void *owner, uint32_t *step, uint32_t *fence, uint32_t *rptr, uint32_t *unexpected,
+                             uint32_t *first, uint32_t *msiChange);
+    cezanne::Status flipShow(const void *owner, uint32_t *armed, cezanne::FlipReport *report);
+    cezanne::Status flipAck(const void *owner, uint32_t *flipInterrupt, uint32_t *rptr, uint32_t *countBefore,
+                            uint32_t *countAfter, uint32_t *writeback);
+    cezanne::Status flipVerify(const void *owner, uint32_t *msiChange, cezanne::DisplayReport *report);
+    cezanne::Status flipRestore(const void *owner, uint32_t *index, uint32_t *value, uint32_t *rptr,
+                                cezanne::FlipReport *report);
 
 private:
     enum ScratchState { kScratchIdle, kScratchChecked, kScratchWritten };
@@ -287,6 +298,26 @@ private:
     uint32_t displaySnapshot_[cezanne::kDisplayInventoryCount];
     uint32_t displayFlipFrames_ = 0;
     cezanne::Status displayRestoreLocked(uint64_t *inuse, uint32_t *pauses, uint32_t *index, uint32_t *value);
+    // Stage 20: the steps on the stage 18 connection; from the arm on, the
+    // flip interrupt may be enabled and the surface may be SDMA's until the
+    // restore, which runs before the stage 18 restore.
+    enum FlipState {
+        kFlipIdle,
+        kFlipChecked,
+        kFlipFilled,
+        kFlipShown, // the arm was started
+        kFlipAcked,
+        kFlipVerified,
+        kFlipRestored,
+        kFlipStopped, // a check or fill failed: nothing to undo
+    };
+    FlipState flipState_ = kFlipIdle;
+    bool intrAcked_ = false; // the stage 18 acknowledgement passed
+    bool flipPassed_ = false; // the last stage 20 step passed
+    uint32_t flipSnapshot_[cezanne::kDisplayInventoryCount];
+    uint32_t flipFrames_ = 0, msiAtFlipAck_ = 0;
+    bool flipUndone() const;
+    cezanne::Status flipRestoreLocked(uint32_t *index, uint32_t *value, uint32_t *rptr, cezanne::FlipReport *report);
     cezanne::Status sdmaStopLocked(uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence, uint32_t *ringResponse);
     cezanne::Status pspTeardownLocked(uint32_t *fence, uint32_t *tmrStatus, uint32_t *ringResponse,
                                       cezanne::PspMailbox *mailbox);
@@ -1999,6 +2030,8 @@ cezanne::Status CezanneGPU::sdmaStopLocked(uint32_t *f32Cntl, uint32_t *downResp
     gartVerified_ = false;
     intrState_ = kIntrIdle;
     intrVerified_ = false;
+    intrAcked_ = false;
+    flipState_ = kFlipIdle;
     copyVerified_ = false;
     CopyArgument copy = {nullptr, 0, nullptr, f32Cntl, downResponse, nullptr, nullptr, nullptr, 0, sdmaProgress_, false};
     cezanne::Status status = accessDevice(cezanne::kSdmaPageSet, copyStopOperation, &copy);
@@ -2485,6 +2518,7 @@ cezanne::Status CezanneGPU::intrAck(const void *owner, uint32_t *rptr, uint32_t 
                              nullptr};
         status = accessDevice(cezanne::kIntrPageSet, intrAckOperation, &intr);
         intrVerified_ = false;
+        intrAcked_ = status == cezanne::kOK;
         IOLog(LOG_PREFIX "interrupt acknowledge: %s, IH_RB_RPTR <- 0x%x, MSI %u then %u, write-back 0x%08x\n",
               cezanne::statusName(status), *rptr, *countBefore, *countAfter, *writeback);
     }
@@ -2494,8 +2528,15 @@ cezanne::Status CezanneGPU::intrAck(const void *owner, uint32_t *rptr, uint32_t 
 
 cezanne::Status CezanneGPU::intrRestoreLocked(uint32_t *index, uint32_t *value, uint32_t msi[4])
 {
-    // Caller holds lock_: the IH quiet, the handler removed, INTERRUPT_CNTL2
-    // back, in that order (vega10_ih_irq_disable before free_irq).
+    // Caller holds lock_: the stage 20 restore if needed, then the IH quiet,
+    // the handler removed, INTERRUPT_CNTL2 back, in that order
+    // (vega10_ih_irq_disable before free_irq).
+    if (!flipUndone()) {
+        uint32_t rptr = 0;
+        cezanne::FlipReport report;
+        flipRestoreLocked(index, value, &rptr, &report);
+        *index = *value = 0;
+    }
     IntrArgument intr = {index, value, nullptr, nullptr, nullptr, nullptr, nullptr, {nullptr, nullptr}, 0, nullptr};
     cezanne::Status quiesce = cezanne::kOK, restore = cezanne::kOK;
     if (intrProgress_ != 0) {
@@ -2513,6 +2554,7 @@ cezanne::Status CezanneGPU::intrRestoreLocked(uint32_t *index, uint32_t *value, 
     intrProgress_ = 0;
     intrState_ = kIntrRestored;
     intrVerified_ = false;
+    intrAcked_ = false;
     return status;
 }
 
@@ -2694,6 +2736,306 @@ cezanne::Status CezanneGPU::displayRestore(const void *owner, uint64_t *inuse, u
     return status;
 }
 
+struct FlipArgument {
+    const cezanne::Range *ranges;
+    uint32_t rangeCount;
+    uint32_t *display;
+    uint32_t *a, *b, *c, *d, *e; // per-step outputs
+    uint64_t *wide;
+    cezanne::InterruptCounter counter;
+    uint32_t msi; // the MSI count before the step
+    uint32_t flipFrames;
+    cezanne::FlipReport *report;
+    cezanne::DisplayReport *displayReport;
+};
+
+static cezanne::Status flipCheckOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                          const cezanne::RegisterWriter *writer, void *argument)
+{
+    FlipArgument *flip = static_cast<FlipArgument *>(argument);
+    cezanne::Status status = cezanne::checkDisplayBoot22(registers, length, stage, flip->a, flip->b, flip->c);
+    if (status == cezanne::kOK) {
+        status = cezanne::checkFlipIntr(registers, length, stage, flip->a, flip->b, flip->d, flip->e);
+        if (status != cezanne::kOK) {
+            // After stage 19's list in the tool's numbering.
+            *flip->a += cezanne::kDisplayCheckCount;
+        }
+    }
+    cezanne::MetricsTarget target;
+    if (status == cezanne::kOK) {
+        status = cezanne::checkPatternTarget(registers, length, stage, flip->ranges, flip->rangeCount, &target);
+    }
+    if (status == cezanne::kOK) {
+        uint64_t *sum = flip->wide;
+        status = withCarveoutMemory(cezanne::kPatternPhysical, cezanne::kPatternSize,
+                                    [writer, sum](const cezanne::MemoryReader &memory) {
+            return cezanne::regionChecksum(memory, cezanne::kPatternSize, *writer, cezanne::kMetricsStablePauses, sum);
+        });
+    }
+    if (status == cezanne::kOK) {
+        status = cezanne::readDisplayInventory(registers, length, stage, flip->display);
+    }
+    return status;
+}
+
+static cezanne::Status flipFillOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                         const cezanne::RegisterWriter *writer, void *argument)
+{
+    FlipArgument *flip = static_cast<FlipArgument *>(argument);
+    *flip->a = 1;
+    cezanne::Status status = withPattern(stage, [&](const cezanne::MemoryReader &pattern,
+                                                    const cezanne::MemoryWriter &memory) {
+        return cezanne::clearPattern(pattern, memory, stage);
+    });
+    if (status == cezanne::kOK) {
+        status = withSdmaWork(stage, [&](const cezanne::MemoryReader &work, const cezanne::MemoryWriter &memory) {
+            *flip->a = 2;
+            cezanne::Status written = cezanne::writeSdmaFrame4(work, memory, stage);
+            if (written != cezanne::kOK) {
+                return written;
+            }
+            *flip->a = 3;
+            return cezanne::submitSdma(registers, length, *writer, work, stage, 4, flip->b);
+        });
+    }
+    cezanne::readDiagnosticRegister(registers, length, stage, cezanne::kRegSdma0GfxRbRptr, flip->c);
+    if (status == cezanne::kOK) {
+        *flip->a = 4;
+        status = withCarveoutMemory(cezanne::kPatternPhysical, cezanne::kPatternSize,
+                                    [&](const cezanne::MemoryReader &pattern) {
+            return cezanne::checkFill(pattern, stage, flip->d, flip->e);
+        });
+    }
+    return status;
+}
+
+static cezanne::Status flipArmOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                        const cezanne::RegisterWriter *writer, void *argument)
+{
+    FlipArgument *flip = static_cast<FlipArgument *>(argument);
+    return cezanne::armFlipIntr(registers, length, *writer, stage, flip->a);
+}
+
+static cezanne::Status flipShowOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                         const cezanne::RegisterWriter *writer, void *argument)
+{
+    FlipArgument *flip = static_cast<FlipArgument *>(argument);
+    return withCarveoutMemory(cezanne::kGartWorkPhysical, cezanne::kGartWorkCheckSize,
+                              [&](const cezanne::MemoryReader &gartRegion) {
+        return cezanne::flipWithIntr(registers, length, *writer, gartRegion, flip->counter, stage,
+                                     cezanne::kPatternGpuAddress, flip->msi, flip->report);
+    });
+}
+
+static cezanne::Status flipAckOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                        const cezanne::RegisterWriter *writer, void *argument)
+{
+    FlipArgument *flip = static_cast<FlipArgument *>(argument);
+    return cezanne::ackFlipIntr(registers, length, *writer, stage, flip->a);
+}
+
+static cezanne::Status flipVerifyOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                           const cezanne::RegisterWriter *, void *argument)
+{
+    FlipArgument *flip = static_cast<FlipArgument *>(argument);
+    return withCarveoutMemory(cezanne::kPatternPhysical, cezanne::kPatternSize,
+                              [&](const cezanne::MemoryReader &pattern) {
+        return cezanne::verifyFlip(registers, length, pattern, flip->display, flip->flipFrames, flip->counter,
+                                   flip->msi, stage, flip->displayReport, flip->a);
+    });
+}
+
+static cezanne::Status flipRestoreOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                            const cezanne::RegisterWriter *writer, void *argument)
+{
+    FlipArgument *flip = static_cast<FlipArgument *>(argument);
+    return withCarveoutMemory(cezanne::kGartWorkPhysical, cezanne::kGartWorkCheckSize,
+                              [&](const cezanne::MemoryReader &gartRegion) {
+        return cezanne::restoreFlip(registers, length, *writer, gartRegion, flip->counter, stage, flip->msi,
+                                    flip->report, flip->a, flip->b);
+    });
+}
+
+bool CezanneGPU::flipUndone() const
+{
+    // Whether nothing of stage 20 is left to undo: before the arm, or after
+    // the restore.
+    return flipState_ != kFlipShown && flipState_ != kFlipAcked && flipState_ != kFlipVerified;
+}
+
+cezanne::Status CezanneGPU::flipCheck(const void *owner, uint32_t *index, uint32_t *value, uint32_t *frames,
+                                      uint64_t *checksum, uint32_t *dest2, uint32_t *continue17)
+{
+    *index = *value = *frames = *dest2 = *continue17 = 0;
+    *checksum = 0;
+    if (!diagnosticsReady_ || stage_ < cezanne::kFlipStage) {
+        return cezanne::kRegisterNotAllowed;
+    }
+    IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, getProvider());
+    OSData *assigned = pci != nullptr ? OSDynamicCast(OSData, pci->getProperty("assigned-addresses")) : nullptr;
+    cezanne::Range ranges[8];
+    uint32_t count = 0;
+    cezanne::Status status = cezanne::parseAssignedAddresses(
+        assigned != nullptr ? static_cast<const uint8_t *>(assigned->getBytesNoCopy()) : nullptr,
+        assigned != nullptr ? assigned->getLength() : 0, ranges, 8, &count);
+    if (status != cezanne::kOK) {
+        return status;
+    }
+    IOLockLock(lock_);
+    status = cezanne::kFlipOutOfOrder;
+    // Once, after a passing stage 18 acknowledgement on this connection, with
+    // no stage 19 pattern up.
+    if (flipState_ == kFlipIdle && intrState_ == kIntrVerified && intrAcked_ && intrProgress_ == 2 &&
+        pspOwner_ == owner && displayState_ != kDisplayFlipped && displayState_ != kDisplayVerified) {
+        FlipArgument flip = {ranges, count, flipSnapshot_, index, value, frames, dest2, continue17, checksum,
+                             {nullptr, nullptr}, 0, 0, nullptr, nullptr};
+        status = accessDevice(0, flipCheckOperation, &flip);
+        flipState_ = status == cezanne::kOK ? kFlipChecked : kFlipStopped;
+        IOLog(LOG_PREFIX "flip check: %s, index %u, value 0x%08x, frame count %u, DEST2 0x%08x, CONTINUE17 0x%08x\n",
+              cezanne::statusName(status), *index, *value, *frames, *dest2, *continue17);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::flipFill(const void *owner, uint32_t *step, uint32_t *fence, uint32_t *rptr,
+                                     uint32_t *unexpected, uint32_t *first, uint32_t *msiChange)
+{
+    *step = *fence = *rptr = *unexpected = *first = *msiChange = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kFlipOutOfOrder;
+    if (flipState_ == kFlipChecked && pspOwner_ == owner) {
+        uint32_t before = intrCount(this);
+        FlipArgument flip = {nullptr, 0, nullptr, step, fence, rptr, unexpected, first, nullptr,
+                             {nullptr, nullptr}, 0, 0, nullptr, nullptr};
+        status = accessDevice(cezanne::kSdmaPageSet, flipFillOperation, &flip);
+        *msiChange = intrCount(this) - before;
+        if (status == cezanne::kOK && *msiChange != 0) {
+            status = cezanne::kFlipFillMismatch;
+        }
+        flipState_ = status == cezanne::kOK ? kFlipFilled : kFlipStopped;
+        IOLog(LOG_PREFIX "flip fill: %s, step %u, fence 0x%08x, RPTR %u, %u unexpected words (first +0x%x), "
+                         "%u MSI\n",
+              cezanne::statusName(status), *step, *fence, *rptr, *unexpected, *first, *msiChange);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::flipShow(const void *owner, uint32_t *armed, cezanne::FlipReport *report)
+{
+    *armed = 0;
+    *report = cezanne::FlipReport();
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kFlipOutOfOrder;
+    if (flipState_ == kFlipFilled && pspOwner_ == owner) {
+        // From here the interrupt may be enabled until the restore.
+        flipState_ = kFlipShown;
+        FlipArgument flip = {nullptr, 0, nullptr, armed, nullptr, nullptr, nullptr, nullptr, nullptr,
+                             {intrCount, this}, 0, 0, report, nullptr};
+        status = accessDevice(cezanne::kDisplayPageOffset, flipArmOperation, &flip);
+        if (status == cezanne::kOK) {
+            flip.msi = intrCount(this);
+            UInt64 start = mach_absolute_time();
+            status = accessDevice(cezanne::kDisplayPageOffset, flipShowOperation, &flip);
+            if (report->msiAfter > flip.msi && flip.msi < cezanne::kIntrTimes) {
+                uint32_t at = sinceEnable(msiTimes_[flip.msi]), from = sinceEnable(start);
+                report->latencyMicroseconds = at > from ? at - from : 0;
+            }
+        }
+        flipFrames_ = report->frameCount;
+        flipPassed_ = status == cezanne::kOK;
+        IOLog(LOG_PREFIX "flip show: %s, armed 0x%08x, in use 0x%02x%08x, MSI %u -> %u in %u us, %u flip entries, "
+                         "%u other, SURFACE_FLIP_INTERRUPT 0x%08x\n",
+              cezanne::statusName(status), *armed, report->inuseHi, report->inuseLo, report->msiBefore,
+              report->msiAfter, report->latencyMicroseconds, report->flipEntries, report->otherEntries,
+              report->flipInterrupt);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::flipAck(const void *owner, uint32_t *flipInterrupt, uint32_t *rptr,
+                                    uint32_t *countBefore, uint32_t *countAfter, uint32_t *writeback)
+{
+    *flipInterrupt = *rptr = *countBefore = *countAfter = *writeback = 0;
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kFlipOutOfOrder;
+    // Once, after a passing show: the DCN acknowledgement, then the IH's.
+    if (flipState_ == kFlipShown && flipPassed_ && pspOwner_ == owner) {
+        FlipArgument flip = {nullptr, 0, nullptr, flipInterrupt, nullptr, nullptr, nullptr, nullptr, nullptr,
+                             {nullptr, nullptr}, 0, 0, nullptr, nullptr};
+        status = accessDevice(cezanne::kDisplayPageOffset, flipAckOperation, &flip);
+        if (status == cezanne::kOK) {
+            IntrArgument intr = {rptr, countBefore, countAfter, writeback, nullptr, nullptr, nullptr,
+                                 {intrCount, this}, 0, nullptr};
+            status = accessDevice(cezanne::kIntrPageSet, intrAckOperation, &intr);
+        }
+        flipState_ = kFlipAcked;
+        flipPassed_ = status == cezanne::kOK;
+        msiAtFlipAck_ = *countAfter;
+        IOLog(LOG_PREFIX "flip acknowledge: %s, SURFACE_FLIP_INTERRUPT 0x%08x, IH_RB_RPTR <- 0x%x, MSI %u then %u\n",
+              cezanne::statusName(status), *flipInterrupt, *rptr, *countBefore, *countAfter);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::flipVerify(const void *owner, uint32_t *msiChange, cezanne::DisplayReport *report)
+{
+    *msiChange = 0;
+    *report = cezanne::DisplayReport();
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kFlipOutOfOrder;
+    if (flipState_ == kFlipAcked && flipPassed_ && pspOwner_ == owner) {
+        FlipArgument flip = {nullptr, 0, flipSnapshot_, msiChange, nullptr, nullptr, nullptr, nullptr, nullptr,
+                             {intrCount, this}, msiAtFlipAck_, flipFrames_, nullptr, report};
+        status = accessDevice(0, flipVerifyOperation, &flip);
+        flipState_ = kFlipVerified;
+        IOLog(LOG_PREFIX "flip verify: %s, in use 0x%02x%08x, %u frames, %u MSI, %u display changes, "
+                         "%u pattern words\n",
+              cezanne::statusName(status), report->inuseHi, report->inuseLo, report->framesAdvanced, *msiChange,
+              report->displayChanged, report->patternUnexpected);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::flipRestoreLocked(uint32_t *index, uint32_t *value, uint32_t *rptr,
+                                              cezanne::FlipReport *report)
+{
+    // Caller holds lock_ (or the driver is stopping): the flip back and the
+    // interrupt off, then the IH acknowledgement.
+    FlipArgument flip = {nullptr, 0, nullptr, index, value, nullptr, nullptr, nullptr, nullptr,
+                         {intrCount, this}, intrCount(this), 0, report, nullptr};
+    cezanne::Status status = accessDevice(cezanne::kDisplayPageOffset, flipRestoreOperation, &flip);
+    uint32_t countBefore = 0, countAfter = 0, writeback = 0;
+    IntrArgument intr = {rptr, &countBefore, &countAfter, &writeback, nullptr, nullptr, nullptr,
+                         {intrCount, this}, 0, nullptr};
+    cezanne::Status ack = accessDevice(cezanne::kIntrPageSet, intrAckOperation, &intr);
+    IOLog(LOG_PREFIX "flip restore: %s, in use 0x%02x%08x, MSI %u -> %u, index %u, value 0x%08x; "
+                     "IH acknowledge %s (0x%x)\n",
+          cezanne::statusName(status), report->inuseHi, report->inuseLo, report->msiBefore, report->msiAfter, *index,
+          *value, cezanne::statusName(ack), *rptr);
+    setProperty("CezanneGPU flip restore", cezanne::statusName(status));
+    flipState_ = kFlipRestored;
+    return status;
+}
+
+cezanne::Status CezanneGPU::flipRestore(const void *owner, uint32_t *index, uint32_t *value, uint32_t *rptr,
+                                        cezanne::FlipReport *report)
+{
+    *index = *value = *rptr = 0;
+    *report = cezanne::FlipReport();
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kFlipOutOfOrder;
+    if (!flipUndone() && pspOwner_ == owner) {
+        status = flipRestoreLocked(index, value, rptr, report);
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
 void CezanneGPU::scratchAbandon(const void *owner)
 {
     if (lock_ == nullptr) {
@@ -2808,6 +3150,12 @@ private:
     static IOReturn displayFlip(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn displayVerify(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn displayRestore(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn flipCheck(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn flipFill(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn flipShow(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn flipAck(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn flipVerify(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn flipRestore(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPUUserClient, IOUserClient)
@@ -3258,6 +3606,71 @@ IOReturn CezanneGPUUserClient::displayRestore(OSObject *target, void *, IOExtern
     return putScalars(arguments, status, v, 5);
 }
 
+// Copies a report into the structure output, whose size the dispatch table fixes.
+template <typename Report> static void putStructure(IOExternalMethodArguments *arguments, const Report &report)
+{
+    UInt8 *out = static_cast<UInt8 *>(arguments->structureOutput);
+    const UInt8 *in = reinterpret_cast<const UInt8 *>(&report);
+    for (uint32_t i = 0; i < sizeof(report); i++) {
+        out[i] = in[i];
+    }
+}
+
+IOReturn CezanneGPUUserClient::flipCheck(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[7] = {};
+    uint64_t checksum = 0;
+    cezanne::Status status = self->gpu_->flipCheck(self, &v[0], &v[1], &v[2], &checksum, &v[5], &v[6]);
+    v[3] = static_cast<uint32_t>(checksum);
+    v[4] = static_cast<uint32_t>(checksum >> 32);
+    return putScalars(arguments, status, v, 7);
+}
+
+IOReturn CezanneGPUUserClient::flipFill(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[6] = {};
+    return putScalars(arguments, self->gpu_->flipFill(self, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]), v, 6);
+}
+
+IOReturn CezanneGPUUserClient::flipShow(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t armed = 0;
+    cezanne::FlipReport report;
+    cezanne::Status status = self->gpu_->flipShow(self, &armed, &report);
+    putStructure(arguments, report);
+    return putScalars(arguments, status, &armed, 1);
+}
+
+IOReturn CezanneGPUUserClient::flipAck(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[5] = {};
+    return putScalars(arguments, self->gpu_->flipAck(self, &v[0], &v[1], &v[2], &v[3], &v[4]), v, 5);
+}
+
+IOReturn CezanneGPUUserClient::flipVerify(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t msiChange = 0;
+    cezanne::DisplayReport report;
+    cezanne::Status status = self->gpu_->flipVerify(self, &msiChange, &report);
+    putStructure(arguments, report);
+    return putScalars(arguments, status, &msiChange, 1);
+}
+
+IOReturn CezanneGPUUserClient::flipRestore(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[3] = {};
+    cezanne::FlipReport report;
+    cezanne::Status status = self->gpu_->flipRestore(self, &v[0], &v[1], &v[2], &report);
+    putStructure(arguments, report);
+    return putScalars(arguments, status, v, 3);
+}
+
 IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                               IOExternalMethodDispatch *, OSObject *, void *reference)
 {
@@ -3302,6 +3715,12 @@ IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMetho
         {displayFlip, 0, 0, 5, 0},   // kDiagnosticDisplayFlip
         {displayVerify, 0, 0, 1, sizeof(cezanne::DisplayReport)}, // kDiagnosticDisplayVerify
         {displayRestore, 0, 0, 6, 0}, // kDiagnosticDisplayRestore
+        {flipCheck, 0, 0, 8, 0},      // kDiagnosticFlipCheck
+        {flipFill, 0, 0, 7, 0},       // kDiagnosticFlipFill
+        {flipShow, 0, 0, 2, sizeof(cezanne::FlipReport)}, // kDiagnosticFlipShow
+        {flipAck, 0, 0, 6, 0},        // kDiagnosticFlipAck
+        {flipVerify, 0, 0, 2, sizeof(cezanne::DisplayReport)}, // kDiagnosticFlipVerify
+        {flipRestore, 0, 0, 4, sizeof(cezanne::FlipReport)},   // kDiagnosticFlipRestore
     };
     if (selector >= cezanne::kDiagnosticSelectorCount) {
         return kIOReturnUnsupported;
@@ -3343,6 +3762,11 @@ void CezanneGPU::stop(IOService *provider)
     // outlive the driver in any case.
     if (lock_ != nullptr) {
         IOLockLock(lock_);
+        if (!flipUndone()) {
+            uint32_t index = 0, value = 0, rptr = 0;
+            cezanne::FlipReport report;
+            flipRestoreLocked(&index, &value, &rptr, &report);
+        }
         removeIntrSourceLocked();
         if (displayState_ == kDisplayFlipped || displayState_ == kDisplayVerified) {
             uint64_t inuse = 0;

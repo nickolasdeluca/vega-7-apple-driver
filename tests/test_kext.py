@@ -181,8 +181,8 @@ void f(IOPCIDevice *p, Aperture *a) {
                          ["gartEnableOperation", "gartRestoreOperation"])
         # The interrupt page set: only these operations, only these pages.
         self.assertEqual(sorted(re.findall(r"accessDevice\(cezanne::kIntrPageSet, (\w+)", source)),
-                         ["intrAckOperation", "intrArmOperation", "intrQuiesceOperation", "intrRestoreOperation",
-                          "intrStartOperation"])
+                         ["intrAckOperation", "intrAckOperation", "intrAckOperation", "intrArmOperation",
+                          "intrQuiesceOperation", "intrRestoreOperation", "intrStartOperation"])
         self.assertIn("const uint32_t kIntrPages[] = {0x3000, 0x4000};", (CORE / "cezanne_core.h").read_text())
         self.assertIn("const uint32_t kGartPages[] = {0x4000, 0x69000, 0x6a000};", (CORE / "cezanne_core.h").read_text())
         self.assertIn("Aperture aperture = {nullptr, 0, stage_, writablePage == cezanne::kGartPageSet};", source)
@@ -191,7 +191,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn("(aperture->semaphore && cezanne::semaphoreReadAllowed(offset, aperture->stage))", read)
         # The SDMA register page set: only these operations, only these pages.
         self.assertEqual(sorted(re.findall(r"accessDevice\(cezanne::kSdmaPageSet, (\w+)", source)),
-                         ["copyStartOperation", "copyStopOperation", "copySubmitOperation"])
+                         ["copyStartOperation", "copyStopOperation", "copySubmitOperation", "flipFillOperation"])
         header = (CORE / "cezanne_core.h").read_text()
         self.assertIn("const uint32_t kSdmaPages[] = {0x4000, 0x5000, 0x58000};", header)
         firmware = re.search(r"static bool firmwareWrite\(.*?\n}\n", source, re.S).group(0)
@@ -213,6 +213,10 @@ void f(IOPCIDevice *p, Aperture *a) {
         writable = sorted(re.findall(r"accessDevice\((cezanne::k\w+PageOffset), (\w+)", source))
         self.assertEqual(writable, [("cezanne::kDisplayPageOffset", "displayFlipOperation"),
                                     ("cezanne::kDisplayPageOffset", "displayRestoreOperation"),
+                                    ("cezanne::kDisplayPageOffset", "flipAckOperation"),
+                                    ("cezanne::kDisplayPageOffset", "flipArmOperation"),
+                                    ("cezanne::kDisplayPageOffset", "flipRestoreOperation"),
+                                    ("cezanne::kDisplayPageOffset", "flipShowOperation"),
                                     ("cezanne::kScratchPageOffset", "scratchRestoreOperation"),
                                     ("cezanne::kScratchPageOffset", "scratchRestoreOperation"),
                                     ("cezanne::kScratchPageOffset", "scratchWriteOperation"),
@@ -227,7 +231,8 @@ void f(IOPCIDevice *p, Aperture *a) {
                                     ("cezanne::kSmuPageOffset", "tmrTeardownOperation")])
         self.assertEqual(sorted(re.findall(r"accessDevice\(0, (\w+)", source)),
                          ["copyCheckOperation", "copyVerifyOperation", "displayCheckOperation",
-                          "displayVerifyOperation", "gartCheckOperation", "gartVerifyOperation",
+                          "displayVerifyOperation", "flipCheckOperation", "flipVerifyOperation",
+                          "gartCheckOperation", "gartVerifyOperation",
                           "intrCheckOperation", "intrVerifyOperation", "metricsCheckOperation", "metricsReadOperation", "pspCheckOperation", "pspObserveOperation",
                           "readOperation", "scratchCheckOperation", "sdmaObserveOperation", "smuCheckOperation",
                           "tmrObserveOperation"])
@@ -241,8 +246,11 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertEqual(sorted(re.findall(r"withCarveoutMemory\(cezanne::(\w+), cezanne::(\w+),", source)),
                          [("kGartWorkPhysical", "kGartWorkCheckSize"), ("kGartWorkPhysical", "kGartWorkCheckSize"),
                           ("kGartWorkPhysical", "kGartWorkCheckSize"), ("kGartWorkPhysical", "kGartWorkCheckSize"),
+                          ("kGartWorkPhysical", "kGartWorkCheckSize"), ("kGartWorkPhysical", "kGartWorkCheckSize"),
                           ("kMetricsPhysical", "kMetricsCheckSize"), ("kMetricsPhysical", "kPageSize"),
                           ("kPatternPhysical", "kPatternSize"), ("kPatternPhysical", "kPatternSize"),
+                          ("kPatternPhysical", "kPatternSize"), ("kPatternPhysical", "kPatternSize"),
+                          ("kPatternPhysical", "kPatternSize"),
                           ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
                           ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
                           ("kPspTmrPhysical", "kPspTmrSize"), ("kSdmaFwPhysical", "kSdmaFwCheckSize"),
@@ -324,6 +332,35 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn("cezanne::kPatternGpuAddress,", re.search(r"static cezanne::Status displayFlipOperation\(.*?\n}\n",
                                                                source, re.S).group(0))
 
+    def test_flip_interrupt_is_restored_on_every_path(self):
+        source = strip_comments((KEXT / "CezanneGPU.cpp").read_text())
+        # From the arm on, the restore is owed; it runs from its selector,
+        # before the stage 18 restore (so also on abandon and from the stop),
+        # and from stop() before the handler goes.
+        show = re.search(r"cezanne::Status CezanneGPU::flipShow\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(show.index("flipState_ = kFlipShown;"), show.index("flipArmOperation"))
+        self.assertLess(show.index("flipArmOperation"), show.index("flipShowOperation"))
+        self.assertIn("return flipState_ != kFlipShown && flipState_ != kFlipAcked && flipState_ != kFlipVerified;",
+                      source)
+        restore = re.search(r"cezanne::Status CezanneGPU::intrRestoreLocked\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(restore.index("flipRestoreLocked("), restore.index("intrQuiesceOperation"))
+        stop = re.search(r"void CezanneGPU::stop\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(stop.index("flipRestoreLocked("), stop.index("removeIntrSourceLocked()"))
+        # The flip goes only to the pattern; the restore uses the core's
+        # restore (back to the GOP surface, the interrupt off).
+        self.assertIn("cezanne::kPatternGpuAddress,", re.search(r"static cezanne::Status flipShowOperation\(.*?\n}\n",
+                                                               source, re.S).group(0))
+        self.assertIn("cezanne::restoreFlip(", re.search(r"static cezanne::Status flipRestoreOperation\(.*?\n}\n",
+                                                         source, re.S).group(0))
+        # Frame 4 is submitted only by the fill, never through selector 23.
+        submit = re.search(r"cezanne::Status CezanneGPU::sdmaSubmit\(.*?\n}\n", source, re.S).group(0)
+        self.assertNotIn("frame == 4", submit)
+        self.assertIn("cezanne::submitSdma(registers, length, *writer, work, stage, 4, flip->b)", source)
+        # The check needs the stage 18 acknowledgement on this connection.
+        check = re.search(r"cezanne::Status CezanneGPU::flipCheck\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("intrAcked_ && intrProgress_ == 2 &&", check)
+        self.assertIn("pspOwner_ == owner", check)
+
     def test_stage_interlock_and_identity_are_declared(self):
         info = plistlib.loads((KEXT / "Info.plist").read_bytes())
         personality = info["IOKitPersonalities"]["CezanneGPU"]
@@ -336,7 +373,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 19;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 20;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
