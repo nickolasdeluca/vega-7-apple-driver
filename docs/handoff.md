@@ -154,25 +154,22 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 21 again (boot 34, golden settings)
+## Next task: decide how to continue stage 21 (after boot 34)
 
-Boots 32 and 33 (2026-10-07; [test boot log](test-boot.md#test-boot-log))
-were the same: the CP ran our ring for 152 dwords, then its ring fetch
-waited on a memory read that never returned (`RING_FETCHING_DATA`). The
-fix within the stage is Linux's own first `hw_init` step, which this stage
-had deferred: Renoir's twelve golden settings (`golden_settings_gc_9_1_rn`).
-Three of them configure the GC's memory path, and they boot far from
-Linux's values (`GB_ADDR_CONFIG`, `TCP_CHAN_STEER`, `GCEA_PROBE_MAP`).
-Steps:
+Boots 32–34 (2026-10-07; [test boot log](test-boot.md#test-boot-log)) all
+stall at the same point. The CP runs 152 dwords of the clear-state preamble,
+then the PFP waits on a register read that never returns
+(`CP_STALLED_STAT2.PFP_RCIU_READ_PENDING`). There is no memory fault, and
+the golden settings (boot 34) did not change it. The user agreed the stage
+could be dialled down if it got tangled.
 
-1. The user runs `tools/update_stick.sh 21`, shuts down fully, cold boots
-   the stick, and runs
-   `tools/capture_boot.sh boot-34-stage21 --gfxoff-disallow --gfx-start --psp-state`.
-2. If the CP gets past dword 152, the stage may reach the drawing: red,
-   green and blue bands. If it stalls again, read the new UTCL1 and fault
-   status registers. The next candidates are `constants_init` and the GC
-   hub's own setup (`gfxhub_v1_0`); either may mean dialling the stage
-   down, with the user.
+The options put to the user:
+1. **Continue:** Linux's `constants_init` first step,
+   `GRBM_CNTL.READ_TIMEOUT` ← `0xff`, plus reads of `GRBM_READ_ERROR`/`2`.
+   The stuck read would then time out and name its register.
+2. **Dial down:** keep the passing parts (firmware load, RLC start, CP start
+   with a recorded stall) as stage 21's result, and propose the CP work as
+   its own stage.
 
 **Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, rebuilt
 after boot 33), `out/test-efi/driver`, `out/diag`. Earlier stage 21 builds:

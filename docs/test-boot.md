@@ -3550,8 +3550,9 @@ for a bolder stage) and approved by the user the same day; implemented and
 built (`out/test-efi/usb-stage21`) the same day. Boot 32: firmware loaded,
 the RLC and the CP started, and the CP fetched and ran commands. It then
 stalled in the clear-state preamble, and everything was restored. Boot 33:
-the stall is the CP's ring fetch waiting on memory. Rebuilt with Linux's
-Renoir golden settings first, for boot 34.**
+the stall is the CP's ring fetch waiting on memory. Boot 34, with the golden
+settings: the same stall; the PFP waits on a register read that never
+returns.**
 
 **Purpose.** This is the first time the main graphics engine (GC 9.3)
 executes commands from the driver. The user asked for visible progress, so
@@ -5360,6 +5361,33 @@ boot-33-stage21 --gfxoff-disallow --gfx-start --psp-state`; exit 1).
 
   The boot 33 build is kept as `superseded-*-stage21-fetch`.
 - Captures are in ignored `out/test-efi/boot-33-stage21/`.
+
+**Boot 34, 2026-10-07, stage 21 with the golden settings**
+(`out/test-efi/usb-stage21/`, rebuilt; cold boot; `tools/capture_boot.sh
+boot-34-stage21 --gfxoff-disallow --gfx-start --psp-state`; exit 1).
+
+- **The golden settings took:** `GB_ADDR_CONFIG` `0x24000042`,
+  `TCP_CHAN_STEER_LO`/`HI` `0x3120`/0, `GCEA_PROBE_MAP` `0xcccc`. The RLC
+  step made 23 writes.
+- **The CP stalled exactly as before:** `CP_RB0_RPTR` 152, PFP at `0x38`,
+  ME at `0xa`, CE at `0x4c`. So the golden settings were not the cause.
+- **No memory fault:** `CPF_`, `CPC_` and `CPG_UTCL1_STATUS` and the GC
+  hub's `VM_L2_PROTECTION_FAULT_STATUS` all read 0.
+- **New: `CP_STALLED_STAT2` `0x00000020`, `PFP_RCIU_READ_PENDING`.** The
+  PFP issued a register read through the RCIU, and the read never returns.
+  The fetcher's `RING_FETCHING_DATA` (boot 33) only follows from that: its
+  queue is full while the PFP is blocked.
+- **Restore and teardown: ok.** All 36 registers, the golden ones included,
+  are back at the snapshot.
+- **Reading:** a register read waits forever when the target block never
+  answers and `GRBM_CNTL.READ_TIMEOUT` is 0. Linux's `constants_init`, the
+  `hw_init` step after the golden settings, opens with
+  `GRBM_CNTL.READ_TIMEOUT` ← `0xff`. With a timeout the read would complete
+  (as an error), and `GRBM_READ_ERROR` (`0x08058`) would record the
+  address the PFP read.
+- Captures are in ignored `out/test-efi/boot-34-stage21/`.
+- **Next: to be decided with the user** (continue with `constants_init`, or
+  dial the stage down).
 
 ## Unknowns and limits
 
