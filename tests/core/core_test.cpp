@@ -1,6 +1,7 @@
 // Host unit tests for driver/core against fake configuration space and
 // registers. Built and run by tests/test_core.py; touches no hardware.
 #include "cezanne_core.h"
+#include "clearstate_gfx9.h"
 
 #include <cstdio>
 #include <cstring>
@@ -153,6 +154,33 @@ struct FakeRegisters {
     int fillSkip = -1;        // a CONST_FILL (by its order) the engine drops
     bool flipIntDrop = false; // the flip interrupt never reaches the IH
     bool flipIntStuck = false; // writes to SURFACE_FLIP_INTERRUPT are lost
+    // Stage 21: the GC registers, and a CP that runs its ring from gfxWork
+    // once the RLC and the CP run and the ring is set up.
+    std::map<uint32_t, uint32_t> gc;
+    FakeMemory *gfxWork = nullptr;
+    uint32_t cpPendingWptr = 0;      // the low dword, committed by the _HI write
+    bool cpHang = false;             // the CP never fetches
+    bool cpDropScratch = false;      // the ring test's write is lost
+    uint32_t gcStuck = 0;            // a GC register whose writes are lost
+    int fillDropGfx = -1;            // a DMA_DATA fill (by its order) the CP drops
+    void presetGfx()
+    {
+        for (uint32_t offset : kGfxStateRegisters) gc[offset] = 0;
+        gc[kRegCpMeCntl] = kCpMeHalts | 0x100; // another field the RMW must keep
+        gc[kRegCpMecCntl] = kCpMecHalts;
+        gc[kRegCpIntCntlRing0] = 0x00280001;
+        gc[kRegRlcSrmCntl] = 0x2;
+        gc[kRegRlcSpmMcCntl] = 0x30;
+        gc[kRegRlcCgcgCglsCtrl] = 0x0001003c; // boot 31
+        gc[kRegScratchReg0] = 0x12345678;
+        gc[kRegGcMxL1TlbCntl] = 0x00002501;
+        gc[kRegGcVmL2Cntl] = 0x00080602;
+        gc[kRegGcVmContext0Cntl] = 0x007ffe80;
+        gc[kRegGcFbLocationBase] = 0xf400;
+        gc[kRegGcFbLocationTop] = 0xf47f;
+        gc[kRegMcVmFbOffset] = 0x5c0;
+        gc[kRegGbAddrConfig] = 0x24000042;
+    }
     void presetFlip()
     {
         gart[kRegHubpreq0DcsurfSurfaceFlipInterrupt] = 0x00050000; // boot 29: the firmware's flips latched
@@ -206,6 +234,11 @@ struct FakeRegisters {
         auto vm = self->gart.find(offset);
         if (vm != self->gart.end()) {
             *value = vm->second;
+            return true;
+        }
+        auto gc = self->gc.find(offset);
+        if (gc != self->gc.end()) {
+            *value = gc->second;
             return true;
         }
         *value = offset == kRegC2PMsg33        ? self->c2pmsg33
@@ -816,6 +849,7 @@ struct FakeWriter {
                 runSdma(r, old, r->sdmaPendingWptr);
             }
         }
+        if (r->gc.count(offset) != 0 && offset != r->gcStuck) gcWrite(r, offset, value);
         if (offset == kRegMp0C2PMsg67) {
             r->frameStart = r->psp67;
             r->psp67 = value;
@@ -959,6 +993,58 @@ struct FakeWriter {
         }
         r->sdma[kRegSdma0GfxRbRptr] = to;
         m[(kSdmaWbPage + kSdmaWbRptr) / 4] = to;
+    }
+    // GC registers; CP_RB0_WPTR is committed by the _HI write, which runs the
+    // ring as far as the new pointer.
+    static void gcWrite(FakeRegisters *r, uint32_t offset, uint32_t value)
+    {
+        if (offset == kRegCpRb0Wptr) {
+            r->cpPendingWptr = value;
+            return;
+        }
+        r->gc[offset] = value;
+        if (offset == kRegCpRb0WptrHi) {
+            uint32_t from = r->gc[kRegCpRb0Wptr];
+            r->gc[kRegCpRb0Wptr] = r->cpPendingWptr;
+            runCp(r, from, r->cpPendingWptr);
+        }
+    }
+    // The CP: SET_UCONFIG_REG (SCRATCH_REG0), RELEASE_MEM (32-bit data into the
+    // work area), DMA_DATA (immediate fills of the pattern region) and NOP;
+    // other packets are skipped. Then the read pointer and its write-back.
+    static void runCp(FakeRegisters *r, uint32_t from, uint32_t to)
+    {
+        if (r->gfxWork == nullptr || r->cpHang || to <= from) return;
+        if ((r->gc[kRegCpMeCntl] & kCpMeHalts) != 0 || (r->gc[kRegRlcCntl] & kRlcEnableF32) == 0 ||
+            r->gc[kRegCpRb0Cntl] != kCpRb0Cntl || r->gc[kRegCpRb0Base] != uint32_t(kGfxWorkGpuAddress >> 8))
+            return;
+        uint32_t *m = r->gfxWork->words;
+        auto ring = [m](uint32_t i) { return m[i & (kGfxRingDwords - 1)]; };
+        int fills = 0;
+        for (uint32_t d = from; d < to;) {
+            uint32_t header = ring(d);
+            if ((header >> 30) != 3) {
+                d++;
+                continue;
+            }
+            uint32_t op = (header >> 8) & 0xff, length = ((header >> 16) & 0x3fff) + 2;
+            if (op == kPm4SetUconfigReg && ring(d + 1) == kRegScratchReg0 / 4 - 0xc000 && !r->cpDropScratch) {
+                r->gc[kRegScratchReg0] = ring(d + 2);
+            } else if (op == kPm4ReleaseMem) {
+                uint64_t a = (uint64_t(ring(d + 4)) << 32) | ring(d + 3);
+                if (a >= kGfxWorkGpuAddress && a < kGfxWorkGpuAddress + kGfxWorkSize)
+                    m[(a - kGfxWorkGpuAddress) / 4] = ring(d + 5);
+            } else if (op == kPm4DmaData) {
+                uint64_t a = (uint64_t(ring(d + 5)) << 32) | ring(d + 4);
+                uint64_t bytes = ring(d + 6) & 0x1fffff;
+                bool inside = a >= kPatternGpuAddress && a + bytes <= kPatternGpuAddress + kPatternSize;
+                if (inside && r->patternWords != nullptr && fills++ != r->fillDropGfx)
+                    for (uint64_t i = 0; i < bytes / 4; i++) (*r->patternWords)[(a - kPatternGpuAddress) / 4 + i] = ring(d + 2);
+            }
+            d += length;
+        }
+        m[(kGfxWbPage + kGfxWbRptr) / 4] = to;
+        r->gc[kRegCpRb0Rptr] = to;
     }
     // Processes the frame at frameStart if it names the command and fence
     // buffers: writes the response status and the fence value.
@@ -2868,6 +2954,317 @@ static void testFlip()
     }
 }
 
+// The five GFX files: the pinned lengths and header words, a counting
+// payload elsewhere.
+struct GfxFileSet {
+    std::vector<uint8_t> bytes[kGfxFileCount];
+    GfxFiles files;
+    GfxFileSet()
+    {
+        for (uint32_t f = 0; f < kGfxFileCount; f++) {
+            bytes[f].resize(kGfxFileLengths[f]);
+            for (uint32_t i = 0; i < kGfxFileLengths[f]; i++) bytes[f][i] = uint8_t(i * 7 + f * 31 + 1);
+        }
+        for (const GfxHeaderPin &pin : kGfxHeaderPins)
+            for (uint32_t b = 0; b < 4; b++) bytes[pin.file][pin.offset + b] = uint8_t(pin.value >> (8 * b));
+        for (uint32_t f = 0; f < kGfxFileCount; f++) {
+            files.data[f] = bytes[f].data();
+            files.length[f] = kGfxFileLengths[f];
+        }
+    }
+};
+
+// A stage 21 rig: the PSP with SETUP_TMR fenced, the GC at its boot values,
+// display pipe 0 at boot 22, and the work areas.
+struct GfxRig {
+    FakeRegisters r;
+    FakeWriter w{&r};
+    FakeMemory pspWork, gfxWork;
+    std::vector<uint32_t> fw = std::vector<uint32_t>(kGfxFwCheckSize / 4, 0x5A5A5A5Au);
+    BigMemory pattern;
+    GfxFileSet set;
+    uint32_t snapshot[kGfxSnapshotCount] = {};
+    uint32_t display[kDisplayInventoryCount] = {};
+    static bool fwRead(void *c, uint32_t o, uint32_t *v)
+    {
+        auto *self = static_cast<GfxRig *>(c);
+        if (o / 4 >= self->fw.size()) return false;
+        *v = self->fw[o / 4];
+        return true;
+    }
+    static bool fwWrite(void *c, uint32_t o, uint32_t v)
+    {
+        auto *self = static_cast<GfxRig *>(c);
+        if (o / 4 >= self->fw.size()) return false;
+        self->fw[o / 4] = v;
+        return true;
+    }
+    GfxRig()
+    {
+        r.fbOffset = 0x5c0;
+        r.presetDisplay();
+        r.presetGfx();
+        r.work = &pspWork;
+        r.gfxWork = &gfxWork;
+        r.patternWords = &pattern.words;
+        uint32_t fence = 0;
+        CHECK(writePspCommand(pspWork.reader(), pspWork.writer(), 21, kGfxCmdSetupTmr, 0) == kOK);
+        CHECK(submitPspFrame(r.reader(), 0x80000, w.writer(), pspWork.reader(), 21, 0, &fence) == kOK && fence == 1);
+        CHECK(readDisplayInventory(r.reader(), 0x80000, 21, display) == kOK);
+    }
+    MemoryReader fwReader() { return MemoryReader{fwRead, this}; }
+    MemoryWriter fwWriter() { return MemoryWriter{fwWrite, this}; }
+    // The check, the firmware copy and the nine loads.
+    Status load()
+    {
+        uint32_t index = 0, value = 0, fence = 0;
+        Status status = checkGfxBoot(r.reader(), 0x80000, 21, snapshot, &index, &value);
+        if (status == kOK) status = writeGfxFirmware(set.files, fwReader(), fwWriter(), 21);
+        if (status == kOK) status = writeGfxWork(gfxWork.reader(), gfxWork.writer(), 21);
+        for (uint32_t k = 0; status == kOK && k < kGfxImageCount; k++) {
+            status = writePspCommand(pspWork.reader(), pspWork.writer(), 21, kPspGfxLoad + k, k + 1);
+            if (status == kOK) status = submitPspFrame(r.reader(), 0x80000, w.writer(), pspWork.reader(), 21, k + 1, &fence);
+        }
+        return status;
+    }
+    Status start()
+    {
+        uint32_t writes = 0, cu = 0, noncu = 0, rptr = 0, cpRptr = 0;
+        Status status = startRlc(r.reader(), 0x80000, w.writer(), 21, snapshot, &writes, &cu, &noncu);
+        if (status == kOK)
+            status = startCp(r.reader(), 0x80000, w.writer(), gfxWork.reader(), 21, snapshot, &writes, &rptr, &cpRptr);
+        return status;
+    }
+};
+
+static void testGfx()
+{
+    // The pinned values (docs/test-boot.md, stage 21).
+    CHECK(kGfxFwGpuAddress == 0xF440900000ull && kGfxFwPhysical == 0x600900000ull);
+    CHECK(kGfxWorkGpuAddress == 0xF440A00000ull && kGfxWorkPhysical == 0x600A00000ull);
+    CHECK(kGfxFwPhysical >= kGartWorkPhysical + kGartWorkCheckSize && kGfxFwPhysical + kGfxFwCheckSize <= kGfxWorkPhysical);
+    CHECK(kGfxWorkPhysical + kGfxWorkCheckSize <= kPatternPhysical);
+    uint32_t next = 0;
+    for (const GfxImage &image : kGfxImages) {
+        CHECK(image.slot == next && image.payloadSize % 4 == 0);
+        next = image.slot + ((image.payloadSize + 0xFFF) & ~0xFFFu);
+    }
+    CHECK(next == kGfxFwBufferSize && kGfxImages[3].payloadSize + kGfxImages[4].payloadSize == 267968);
+    CHECK(kGfxImages[4].payloadOffset == 256 + 66768 * 4 && kGfxImages[4].payloadSize == 224 * 4);
+    CHECK(kGfxImages[kGfxImageCount - 1].fwType == 8 && kGfxDestroyFrame == 10);
+    // The clear-state buffer: 904 dwords, ending with CLEAR_STATE.
+    uint32_t values = 0;
+    for (uint32_t e = 0; e < kGfx9ContextExtentCount; e++) values += kGfx9ContextExtents[e].count;
+    CHECK(values == 879 && kGfxCsbDwords == 5 + 2 * kGfx9ContextExtentCount + values + 4);
+    CHECK(gfxCsbWord(0) == 0xC0004A00u && gfxCsbWord(1) == 0x20000000u && gfxCsbWord(2) == 0xC0012800u);
+    CHECK(gfxCsbWord(5) == pm4(kPm4SetContextReg, 212) && gfxCsbWord(6) == 0);
+    CHECK(gfxCsbWord(900) == 0xC0004A00u && gfxCsbWord(901) == 0x30000000u && gfxCsbWord(902) == 0xC0001200u);
+    CHECK(gfxCsbWord(903) == 0 && gfxCsbWord(904) == 0);
+    // The ring: frame 0's tail, the ring test, fence 1, the fills and fence 2.
+    CHECK(gfxRingWord(904) == 0xC0021100u && gfxRingWord(905) == 3 && gfxRingWord(908) == 0xC0017900u);
+    CHECK(gfxRingWord(909) == 0x20000243u && gfxRingWord(911) == pm4(kPm4Nop, 1024 - 911 - 2));
+    const uint32_t test[] = {0xC0017900u, 0x40, 0xDEADBEEFu};
+    for (uint32_t i = 0; i < 3; i++) CHECK(gfxRingWord(1024 + i) == test[i]);
+    const uint32_t fence1[] = {0xC0064900u, 0x00238514u, 0x20000000u, 0x40A02100u, 0xF4, 1, 0, 0};
+    for (uint32_t i = 0; i < 8; i++) CHECK(gfxRingWord(1280 + i) == fence1[i]);
+    const uint32_t fill0[] = {0xC0055000u, 0xC0300000u, 0xFFFF0000u, 0, 0x41000000u, 0xF4, 1382400};
+    for (uint32_t i = 0; i < 7; i++) CHECK(gfxRingWord(1536 + i) == fill0[i]);
+    CHECK(gfxRingWord(1536 + 35 + 2) == 0xFF0000FFu && gfxRingWord(1536 + 35 + 4) == 0x41000000u + 5 * 1382400);
+    CHECK(gfxRingWord(1578) == 0xC0064900u && gfxRingWord(1578 + 3) == 0x40A02108u && gfxRingWord(1578 + 5) == 2);
+    CHECK(gfxRingWord(1586) == pm4(kPm4Nop, 2048 - 1586 - 2) && gfxRingWord(2047) == 0);
+    // Walking the packets lands on every frame start.
+    for (uint32_t d = 0, f = 1; d < kGfxRingDwords;) {
+        d += ((gfxRingWord(d) >> 16) & 0x3fff) + 2;
+        if (d >= kGfxFrameStarts[f]) CHECK(d == kGfxFrameStarts[f++]);
+    }
+    CHECK(kGfxDrawFills * kGfxDrawBytes == kPatternWidth * kPatternHeight * 4 && kGfxDrawBytes < (1u << 21));
+    CHECK(gfxWord(0) == 0xFFFF0000u && gfxWord(359 * 7680) == 0xFFFF0000u && gfxWord(360 * 7680) == 0xFF00FF00u);
+    CHECK(gfxWord(720 * 7680) == 0xFF0000FFu && gfxWord(1080 * 7680 - 4) == 0xFF0000FFu && gfxWord(1080 * 7680) == 0);
+    CHECK(gfxWorkWord(kGfxCsbPage) == gfxCsbWord(0) && gfxWorkWord(kGfxWbPage) == 0 && gfxWorkWord(4) == gfxRingWord(1));
+
+    // Reads and writes from stage 21 only.
+    for (uint32_t offset : kStage21Registers) CHECK(registerAllowed(offset, 21) && !registerAllowed(offset, 20) && gfxGated(offset));
+    for (uint32_t offset : kGfxStateRegisters) CHECK(registerAllowed(offset, 21));
+    for (uint32_t offset : kGfxSnapshotRegisters) {
+        bool paged = false;
+        for (uint32_t page : kGfxPages) paged = paged || (offset >= page && offset + 4 <= page + kPageSize);
+        CHECK(paged);
+    }
+    uint32_t snap[kGfxSnapshotCount];
+    for (uint32_t i = 0; i < kGfxSnapshotCount; i++) snap[i] = 0x100u * i + 0x15000000u;
+    CHECK(gfxWriteAllowed(kRegRlcCntl, snap[0] | 1, 21, snap) && gfxWriteAllowed(kRegRlcCntl, snap[0], 21, snap));
+    CHECK(!gfxWriteAllowed(kRegRlcCntl, snap[0] | 2, 21, snap) && !gfxWriteAllowed(kRegRlcCntl, snap[0] | 1, 20, snap));
+    CHECK(!gfxWriteAllowed(kRegRlcCntl, snap[0] | 1, 21, nullptr));
+    CHECK(gfxWriteAllowed(kRegCpMeCntl, snap[22] & ~kCpMeHalts, 21, snap) && !gfxWriteAllowed(kRegCpMeCntl, 0, 21, snap));
+    CHECK(gfxWriteAllowed(kRegCpRb0Wptr, 2048, 21, snap) && !gfxWriteAllowed(kRegCpRb0Wptr, 2049, 21, snap));
+    CHECK(gfxWriteAllowed(kRegCpRb0Base, 0xF440A000u, 21, snap) && !gfxWriteAllowed(kRegCpRb0Base, 0xF440B000u, 21, snap));
+    CHECK(gfxWriteAllowed(kRegRlcSpmMcCntl, (snap[8] & ~0xFu) | 0xF, 21, snap));
+    CHECK(!gfxWriteAllowed(kRegCpMecCntl, 0, 21, snap) && !gfxWriteAllowed(kRegGcVmL2Cntl, 0, 21, snap));
+    CHECK(!writeAllowed(kRegCpRb0Wptr, 1024, 21) && !writeAllowed(kRegRlcCntl, 1, 21) && !writeAllowed(kRegCpMeCntl, 0, 21));
+    CHECK(writeAllowed(kRegMp0C2PMsg67, 176, 21) && !writeAllowed(kRegMp0C2PMsg67, 192, 21) &&
+          !writeAllowed(kRegMp0C2PMsg67, 64, 20) && !writeAllowed(kRegMp0C2PMsg67, 170, 21));
+    CHECK(gfxWorkWriteAllowed(0, gfxRingWord(0), 21) && !gfxWorkWriteAllowed(0, gfxRingWord(0), 20) &&
+          !gfxWorkWriteAllowed(kGfxWbPage, 1, 21) && !gfxWorkWriteAllowed(kGfxWorkSize, 0, 21));
+
+    // The PSP commands for the nine images.
+    const uint32_t mec[] = {0, 0, 6, 0, 0, 0, 0, 0x4092F000u, 0xF4, 267072, 4, 0};
+    for (uint32_t i = 0; i < 12; i++) CHECK(pspCommandWord(kPspGfxLoad + 3, i) == mec[i]);
+    CHECK(pspCommandWord(kPspGfxLoad + 8, 9) == 16896 && pspCommandWord(kPspGfxLoad + 8, 10) == 8);
+    CHECK(pspWorkWriteAllowed(kPspCmdPage + 40, 4, 21) && pspWorkWriteAllowed(10 * 64 + 20, 11, 21) &&
+          !pspWorkWriteAllowed(11 * 64 + 20, 12, 21) && !pspWorkWriteAllowed(5 * 64 + 20, 6, 13));
+    {
+        FakeMemory work;
+        CHECK(writePspCommand(work.reader(), work.writer(), 21, kPspGfxLoad + 2, 2) == kRegisterNotAllowed);
+        CHECK(writePspCommand(work.reader(), work.writer(), 20, kPspGfxLoad + 2, 3) == kRegisterNotAllowed);
+        CHECK(writePspCommand(work.reader(), work.writer(), 13, kGfxCmdDestroyTmr, 5) == kRegisterNotAllowed);
+        CHECK(work.writes == 0);
+        CHECK(writePspCommand(work.reader(), work.writer(), 21, kGfxCmdDestroyTmr, 5) == kOK);
+    }
+
+    // The two new buffers' placement.
+    {
+        FakeRegisters r;
+        r.fbOffset = 0x5c0;
+        uint8_t data[20];
+        putCells(data, 0x82000024u, 0xfca00000ull, 0x80000ull);
+        Range ranges[1];
+        uint32_t count = 0;
+        CHECK(parseAssignedAddresses(data, sizeof(data), ranges, 1, &count) == kOK);
+        CHECK(checkGfxTargets(r.reader(), 0x80000, 21, ranges, count) == kOK);
+        CHECK(checkGfxTargets(r.reader(), 0x80000, 20, ranges, count) == kRegisterNotAllowed);
+        r.fbOffset = 0x5c1;
+        CHECK(checkGfxTargets(r.reader(), 0x80000, 21, ranges, count) != kOK);
+    }
+
+    // The files.
+    {
+        GfxFileSet s;
+        uint32_t index = 9;
+        CHECK(checkGfxFiles(s.files, &index) == kOK && index == 0);
+        s.bytes[kGfxFileMec][36] ^= 1; // jt_offset
+        CHECK(checkGfxFiles(s.files, &index) == kGfxImageInvalid && index == kGfxFileMec);
+        s.bytes[kGfxFileMec][36] ^= 1;
+        s.files.length[kGfxFileRlc]--;
+        CHECK(checkGfxFiles(s.files, &index) == kGfxImageInvalid && index == kGfxFileRlc);
+        s.files.length[kGfxFileRlc]++;
+        CHECK(gfxFirmwareWord(s.files, 0x2f000) == gfxFirmwareWord(s.files, 0x2f000) &&
+              gfxFirmwareWord(s.files, 0x71000) ==
+                  (uint32_t(s.bytes[3][267328]) | uint32_t(s.bytes[3][267329]) << 8 |
+                   uint32_t(s.bytes[3][267330]) << 16 | uint32_t(s.bytes[3][267331]) << 24));
+        CHECK(gfxFirmwareWord(s.files, 0x71000 + 896) == 0 && gfxFirmwareWord(s.files, kGfxFwBufferSize) == 0);
+        CHECK(!gfxFirmwareWriteAllowed(s.files, 0, gfxFirmwareWord(s.files, 0), 20) &&
+              !gfxFirmwareWriteAllowed(s.files, 0, gfxFirmwareWord(s.files, 0) ^ 1, 21) &&
+              !gfxFirmwareWriteAllowed(s.files, kGfxFwBufferSize, 0, 21));
+    }
+
+    // The whole stage against the fakes.
+    {
+        GfxRig g;
+        CHECK(g.load() == kOK);
+        CHECK(g.r.psp67 == 160 && g.snapshot[0] == 0 && g.snapshot[22] == (kCpMeHalts | 0x100));
+        CHECK(g.fw[0x77000 / 4] == gfxFirmwareWord(g.set.files, 0x77000) && g.fw[kGfxFwBufferSize / 4] == 0x5A5A5A5Au);
+        uint32_t writes = 0, cu = 9, noncu = 9;
+        int before = g.w.writes;
+        CHECK(startRlc(g.r.reader(), 0x80000, g.w.writer(), 21, g.snapshot, &writes, &cu, &noncu) == kOK);
+        CHECK(writes == 11 && g.w.writes == before + 11 && cu == 0 && noncu == 0);
+        CHECK(g.w.offsets[before] == kRegRlcCntl && g.w.values[before] == 0);
+        CHECK(g.w.values[before + 1] == 0x00000001u && g.w.values[before + 2] == kGrbmSelectSe0Sh0);
+        CHECK(g.r.gc[kRegRlcCntl] == 1 && g.r.gc[kRegRlcSrmCntl] == 3 && g.r.gc[kRegRlcSpmMcCntl] == 0x3f);
+        CHECK(g.r.gc[kRegRlcCsibAddrLo] == 0x40A03000u && g.r.gc[kRegRlcCsibLength] == 904 && g.r.gc[kRegRlcCgcgCglsCtrl] == 0);
+        uint32_t rptr = 0, cpRptr = 0;
+        CHECK(startCp(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.reader(), 21, g.snapshot, &writes, &rptr, &cpRptr) ==
+              kOK);
+        CHECK(writes == 15 && rptr == 1024 && cpRptr == 1024 && g.r.gc[kRegCpMeCntl] == 0x100);
+        uint32_t scratch = 0, fence = 0;
+        CHECK(testGfxRing(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.reader(), 21, g.snapshot, &scratch, &fence, &rptr) ==
+              kOK);
+        CHECK(scratch == 0xDEADBEEFu && fence == 1 && rptr == 1536);
+        CHECK(clearPattern(g.pattern.reader(), g.pattern.writer(), 21) == kOK);
+        CHECK(submitGfxDraw(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.reader(), 21, g.snapshot, &fence) == kOK &&
+              fence == 2);
+        uint32_t unexpected = 9, first = 9, firstValue = 9;
+        CHECK(checkGfxDraw(g.pattern.reader(), 21, &unexpected, &first, &firstValue) == kOK && unexpected == 0);
+        uint64_t inuse = 0;
+        uint32_t pauses = 0;
+        CHECK(flipDisplay(g.r.reader(), 0x80000, g.w.writer(), 21, kPatternGpuAddress, &inuse, &pauses) == kOK);
+        uint32_t flipFrames = g.r.gart[kRegOtg0OtgStatusFrameCount];
+        for (int i = 0; i < 5; i++) g.w.pause(&g.w);
+        DisplayReport report;
+        CHECK(verifyGfxDraw(g.r.reader(), 0x80000, g.pattern.reader(), g.display, flipFrames, 21, &report) == kOK);
+        CHECK(flipDisplay(g.r.reader(), 0x80000, g.w.writer(), 21, kGopSurfaceAddress, &inuse, &pauses) == kOK);
+        GfxState state;
+        CHECK(readGfxState(g.r.reader(), 0x80000, 21, &state) == kOK && state.values[0] == 1 && state.values[32] == 2048);
+        uint32_t index = 9, value = 9;
+        CHECK(restoreGfx(g.r.reader(), 0x80000, g.w.writer(), 21, g.snapshot, &index, &value) == kOK);
+        CHECK(index == 0 && value == 0);
+        for (uint32_t i = 0; i < kGfxSnapshotCount; i++) CHECK(g.r.gc[kGfxSnapshotRegisters[i]] == g.snapshot[i]);
+        CHECK(g.r.gc[kRegCpMeCntl] == (kCpMeHalts | 0x100) && g.r.gc[kRegRlcCntl] == 0);
+        // Then DESTROY_TMR as frame 10.
+        CHECK(writePspCommand(g.pspWork.reader(), g.pspWork.writer(), 21, kGfxCmdDestroyTmr, 10) == kOK);
+        CHECK(submitPspFrame(g.r.reader(), 0x80000, g.w.writer(), g.pspWork.reader(), 21, 10, &fence) == kOK && fence == 11);
+    }
+    {
+        // Preconditions: GFX off, the CP running, the GC hub not as MMHUB.
+        const struct {
+            uint32_t offset, value, index;
+        } bad[] = {
+            {kRegRlcCntl, 1, 0}, {kRegCpMeCntl, 0x100, 1}, {kRegCpMecCntl, 0, 2},
+            {kRegCpRbDoorbellControl, kCpDoorbellEnable, 3}, {kRegGcMxL1TlbCntl, 0x2500, 4},
+            {kRegGcVmContext0Cntl, 0x007ffe81, 6},
+        };
+        for (const auto &b : bad) {
+            GfxRig g;
+            g.r.gc[b.offset] = b.value;
+            uint32_t index = 0, value = 0;
+            CHECK(checkGfxBoot(g.r.reader(), 0x80000, 21, g.snapshot, &index, &value) == kGfxUnexpectedState);
+            CHECK(index == b.index && value == b.value);
+        }
+        GfxRig g;
+        uint32_t index = 0, value = 0;
+        g.r.gfxMisc = 0;
+        CHECK(checkGfxBoot(g.r.reader(), 0x80000, 21, g.snapshot, &index, &value) == kGfxNotOn);
+        CHECK(checkGfxBoot(g.r.reader(), 0x80000, 20, g.snapshot, &index, &value) == kRegisterNotAllowed);
+        uint32_t writes = 0, cu = 0, noncu = 0;
+        CHECK(startRlc(g.r.reader(), 0x80000, g.w.writer(), 20, g.snapshot, &writes, &cu, &noncu) == kRegisterNotAllowed);
+    }
+    {
+        // A CP that never fetches; a lost ring-test write; a dropped fill.
+        GfxRig g;
+        g.r.cpHang = true;
+        CHECK(g.load() == kOK);
+        int pauses = g.r.pauses;
+        CHECK(g.start() == kGfxCpTimeout && g.r.pauses >= pauses + int(kGfxPollPauses));
+        uint32_t index = 0, value = 0;
+        CHECK(restoreGfx(g.r.reader(), 0x80000, g.w.writer(), 21, g.snapshot, &index, &value) == kOK);
+    }
+    {
+        GfxRig g;
+        g.r.cpDropScratch = true;
+        CHECK(g.load() == kOK && g.start() == kOK);
+        uint32_t scratch = 0, fence = 0, rptr = 0;
+        CHECK(testGfxRing(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.reader(), 21, g.snapshot, &scratch, &fence, &rptr) ==
+              kGfxRingTestFailed);
+        CHECK(scratch == 0xCAFEDEADu);
+    }
+    {
+        GfxRig g;
+        g.r.fillDropGfx = 3;
+        CHECK(g.load() == kOK && g.start() == kOK);
+        uint32_t scratch = 0, fence = 0, rptr = 0, unexpected = 0, first = 0, firstValue = 0;
+        CHECK(testGfxRing(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.reader(), 21, g.snapshot, &scratch, &fence, &rptr) ==
+              kOK);
+        CHECK(clearPattern(g.pattern.reader(), g.pattern.writer(), 21) == kOK);
+        CHECK(submitGfxDraw(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.reader(), 21, g.snapshot, &fence) == kOK);
+        CHECK(checkGfxDraw(g.pattern.reader(), 21, &unexpected, &first, &firstValue) == kGfxDrawMismatch);
+        CHECK(unexpected == kGfxDrawBytes / 4 && first == 3 * kGfxDrawBytes && firstValue == 0);
+        // A register that does not take the restore.
+        g.r.gcStuck = kRegRlcCsibLength;
+        uint32_t index = 0, value = 0;
+        CHECK(restoreGfx(g.r.reader(), 0x80000, g.w.writer(), 21, g.snapshot, &index, &value) == kGfxNotRestored);
+        CHECK(index == 6 && value == 904);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -2896,6 +3293,7 @@ int main()
     testIntr();
     testDisplay();
     testFlip();
+    testGfx();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

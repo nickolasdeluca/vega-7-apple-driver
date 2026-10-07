@@ -31,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 20;
+const uint32_t kMaxStage = 21;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -1016,6 +1016,251 @@ const uint32_t kFlipWptr = 5 * kSdmaFrameDwords * 4;
 // How many new IH entries a flip report keeps.
 const uint32_t kFlipReportEntries = 4;
 
+// Stage 21: the graphics engine (docs/test-boot.md, stage 21). The PSP loads
+// the GFX firmware, the RLC and the CP start, the CP runs a ring test, a
+// fence and DMA fills shown on pipe 0, then every GC register written goes
+// back to the value the check read. Offsets from gc_9_0_offset.h (GC bases
+// 0x2000 and 0xA000).
+const uint32_t kGfxStage = 21;
+const uint32_t kRegCpIntCntlRing0 = 0x0c1a8; // CP_INT_CNTL_RING0: gfx_v9_0_enable_gui_idle_interrupt
+const uint32_t kRegRlcCsibAddrHi = 0x3b28c; // RLC_CSIB_ADDR_HI: gfx_v9_0_init_csb
+const uint32_t kRegRlcCsibAddrLo = 0x3b288; // RLC_CSIB_ADDR_LO: gfx_v9_0_init_csb
+const uint32_t kRegRlcCsibLength = 0x3b290; // RLC_CSIB_LENGTH: gfx_v9_0_init_csb
+const uint32_t kRegRlcSrmCntl = 0x3b200; // RLC_SRM_CNTL: gfx_v9_0_enable_save_restore_machine
+const uint32_t kRegRlcSpmMcCntl = 0x3b1c4; // RLC_SPM_MC_CNTL: gfx_v9_0_update_spm_vmid_internal
+const uint32_t kRegRlcSerdesCuMasterBusy = 0x3b184; // RLC_SERDES_CU_MASTER_BUSY: gfx_v9_0_wait_for_rlc_serdes
+const uint32_t kRegRlcSerdesNoncuMasterBusy = 0x3b188; // RLC_SERDES_NONCU_MASTER_BUSY: gfx_v9_0_wait_for_rlc_serdes
+const uint32_t kRegCpRbWptrDelay = 0x08704; // CP_RB_WPTR_DELAY: gfx_v9_0_cp_gfx_resume
+const uint32_t kRegCpRbVmid = 0x0c144; // CP_RB_VMID: gfx_v9_0_cp_gfx_resume
+const uint32_t kRegCpRb0Cntl = 0x0c104; // CP_RB0_CNTL: gfx_v9_0_cp_gfx_resume
+const uint32_t kRegCpRb0Wptr = 0x0c150; // CP_RB0_WPTR: gfx_v9_0_ring_set_wptr_gfx
+const uint32_t kRegCpRb0WptrHi = 0x0c154; // CP_RB0_WPTR_HI: gfx_v9_0_ring_set_wptr_gfx
+const uint32_t kRegCpRb0RptrAddr = 0x0c10c; // CP_RB0_RPTR_ADDR: gfx_v9_0_cp_gfx_resume
+const uint32_t kRegCpRb0RptrAddrHi = 0x0c110; // CP_RB0_RPTR_ADDR_HI: gfx_v9_0_cp_gfx_resume
+const uint32_t kRegCpRbWptrPollAddrLo = 0x0c118; // CP_RB_WPTR_POLL_ADDR_LO: gfx_v9_0_cp_gfx_resume
+const uint32_t kRegCpRbWptrPollAddrHi = 0x0c11c; // CP_RB_WPTR_POLL_ADDR_HI: gfx_v9_0_cp_gfx_resume
+const uint32_t kRegCpRb0Base = 0x0c100; // CP_RB0_BASE: gfx_v9_0_cp_gfx_resume
+const uint32_t kRegCpRb0BaseHi = 0x0c2c4; // CP_RB0_BASE_HI: gfx_v9_0_cp_gfx_resume
+const uint32_t kRegCpMaxContext = 0x0c2b8; // CP_MAX_CONTEXT: gfx_v9_0_cp_gfx_start
+const uint32_t kRegCpDeviceId = 0x0c12c; // CP_DEVICE_ID: gfx_v9_0_cp_gfx_start
+const uint32_t kRegCpRb0Rptr = 0x08700; // CP_RB0_RPTR: gfx_v9_0_ring_get_rptr_gfx (read)
+const uint32_t kRegCpRbDoorbellControl = 0x0c164; // CP_RB_DOORBELL_CONTROL: gfx_v9_0_cp_gfx_resume (read)
+const uint32_t kRegGcMxL1TlbCntl = 0x0a61c; // MC_VM_MX_L1_TLB_CNTL: gfxhub_v1_0 (GC hub, read)
+const uint32_t kRegGcVmL2Cntl = 0x0a100; // VM_L2_CNTL: gfxhub_v1_0 (GC hub, read)
+const uint32_t kRegGcVmContext0Cntl = 0x0a200; // VM_CONTEXT0_CNTL: gfxhub_v1_0 (GC hub, read)
+const uint32_t kRegCpStat = 0x08680; // CP_STAT: gc_reg_list_9 (IP dump)
+const uint32_t kRegCpCpcStatus = 0x08210; // CP_CPC_STATUS: gc_reg_list_9 (IP dump)
+const uint32_t kRegCpCeInstrPntr = 0x0869c; // CP_CE_INSTR_PNTR: gc_reg_list_9 (IP dump)
+const uint32_t kRegCbHwControl = 0x09a00; // CB_HW_CONTROL: golden_settings_gc_9_1_rn (read)
+const uint32_t kRegCbHwControl2 = 0x09a08; // CB_HW_CONTROL_2: golden_settings_gc_9_1_rn (read)
+const uint32_t kRegDbDebug2 = 0x09834; // DB_DEBUG2: golden_settings_gc_9_1_rn (read)
+const uint32_t kRegGbAddrConfigRead = 0x09908; // GB_ADDR_CONFIG_READ: golden_settings_gc_9_1_rn (read)
+const uint32_t kRegPaScEnhance = 0x08bf0; // PA_SC_ENHANCE: golden_settings_gc_9_1_rn (read)
+const uint32_t kRegPaScEnhance1 = 0x08bf4; // PA_SC_ENHANCE_1: golden_settings_gc_9_1_rn (read)
+const uint32_t kRegPaScLineStippleState = 0x30a04; // PA_SC_LINE_STIPPLE_STATE: golden_settings_gc_9_1_rn (read)
+const uint32_t kRegTaCntlAux = 0x09508; // TA_CNTL_AUX: golden_settings_gc_9_1_rn (read)
+const uint32_t kRegTcpChanSteerHi = 0x0ac10; // TCP_CHAN_STEER_HI: golden_settings_gc_9_1_rn (read)
+const uint32_t kRegTcpChanSteerLo = 0x0ac0c; // TCP_CHAN_STEER_LO: golden_settings_gc_9_1_rn (read)
+// Read from stage 21 on (all GFX-gated), in addition to the earlier lists.
+const uint32_t kStage21Registers[] = {
+    kRegCpIntCntlRing0,     kRegRlcCsibAddrHi,      kRegRlcCsibAddrLo,      kRegRlcCsibLength,
+    kRegRlcSrmCntl,         kRegRlcSpmMcCntl,       kRegRlcSerdesCuMasterBusy, kRegRlcSerdesNoncuMasterBusy,
+    kRegCpRbWptrDelay,      kRegCpRbVmid,           kRegCpRb0Cntl,          kRegCpRb0Wptr,
+    kRegCpRb0WptrHi,        kRegCpRb0RptrAddr,      kRegCpRb0RptrAddrHi,    kRegCpRbWptrPollAddrLo,
+    kRegCpRbWptrPollAddrHi, kRegCpRb0Base,          kRegCpRb0BaseHi,        kRegCpMaxContext,
+    kRegCpDeviceId,         kRegCpRb0Rptr,          kRegCpRbDoorbellControl, kRegGcMxL1TlbCntl,
+    kRegGcVmL2Cntl,         kRegGcVmContext0Cntl,   kRegCpStat,             kRegCpCpcStatus,
+    kRegCpCeInstrPntr,      kRegCbHwControl,        kRegCbHwControl2,       kRegDbDebug2,
+    kRegGbAddrConfigRead,   kRegPaScEnhance,        kRegPaScEnhance1,       kRegPaScLineStippleState,
+    kRegTaCntlAux,          kRegTcpChanSteerHi,     kRegTcpChanSteerLo};
+const uint32_t kStage21RegisterCount = sizeof(kStage21Registers) / sizeof(kStage21Registers[0]);
+
+// Part A: the GFX firmware. The pinned linux-firmware 20260916 files (their
+// SHA-256 in driver/kext/build.sh), and the nine images
+// psp_load_non_psp_fw loads, in AMDGPU_UCODE_ID order
+// (amdgpu_ucode_init_single_fw cuts them; psp_gfx_if.h gives the types).
+enum GfxFile : uint32_t { kGfxFileCe, kGfxFilePfp, kGfxFileMe, kGfxFileMec, kGfxFileRlc, kGfxFileCount };
+struct GfxFiles {
+    const uint8_t *data[kGfxFileCount];
+    uint32_t length[kGfxFileCount];
+};
+// Header words the core requires (file, byte offset, value): the common
+// header (size, version 1.0 or 2.1, IP 9.3, ucode version, size, offset 256),
+// MEC's jump table and RLC v2.1's save/restore lists.
+struct GfxHeaderPin {
+    uint32_t file, offset, value;
+};
+const GfxHeaderPin kGfxHeaderPins[] = {
+    {kGfxFileCe, 0, 36608},   {kGfxFileCe, 8, 0x00000001},   {kGfxFileCe, 12, 0x00030009},
+    {kGfxFileCe, 16, 80},     {kGfxFileCe, 20, 36352},       {kGfxFileCe, 24, 256},
+    {kGfxFilePfp, 0, 85760},  {kGfxFilePfp, 8, 0x00000001},  {kGfxFilePfp, 12, 0x00030009},
+    {kGfxFilePfp, 16, 197},   {kGfxFilePfp, 20, 85504},      {kGfxFilePfp, 24, 256},
+    {kGfxFileMe, 0, 69376},   {kGfxFileMe, 8, 0x00000001},   {kGfxFileMe, 12, 0x00030009},
+    {kGfxFileMe, 16, 167},    {kGfxFileMe, 20, 69120},       {kGfxFileMe, 24, 256},
+    {kGfxFileMec, 0, 268224}, {kGfxFileMec, 8, 0x00000001},  {kGfxFileMec, 12, 0x00030009},
+    {kGfxFileMec, 16, 483},   {kGfxFileMec, 20, 267968},     {kGfxFileMec, 24, 256},
+    {kGfxFileMec, 36, 66768}, {kGfxFileMec, 40, 224},
+    {kGfxFileRlc, 0, 39928},  {kGfxFileRlc, 8, 0x00010002},  {kGfxFileRlc, 12, 0x00030009},
+    {kGfxFileRlc, 16, 60},    {kGfxFileRlc, 20, 16896},      {kGfxFileRlc, 24, 256},
+    {kGfxFileRlc, 116, 592},  {kGfxFileRlc, 120, 26832},     {kGfxFileRlc, 132, 2560},
+    {kGfxFileRlc, 136, 27424}, {kGfxFileRlc, 148, 9944},     {kGfxFileRlc, 152, 29984},
+};
+const uint32_t kGfxHeaderPinCount = sizeof(kGfxHeaderPins) / sizeof(kGfxHeaderPins[0]);
+const uint32_t kGfxFileLengths[kGfxFileCount] = {36608, 85760, 69376, 268224, 39928};
+struct GfxImage {
+    uint32_t file, payloadOffset, payloadSize, fwType, slot; // slot: offset in the firmware buffer
+};
+const GfxImage kGfxImages[] = {
+    {kGfxFileCe, 256, 36352, 3, 0x00000},     // CP_CE
+    {kGfxFilePfp, 256, 85504, 2, 0x09000},    // CP_PFP
+    {kGfxFileMe, 256, 69120, 1, 0x1e000},     // CP_ME
+    {kGfxFileMec, 256, 267072, 4, 0x2f000},   // CP_MEC1: ucode_size_bytes - jt_size * 4
+    {kGfxFileMec, 267328, 896, 5, 0x71000},   // CP_MEC1_JT: at jt_offset * 4 from the ucode
+    {kGfxFileRlc, 26832, 592, 22, 0x72000},   // RLC_RESTORE_LIST_CNTL
+    {kGfxFileRlc, 27424, 2560, 20, 0x73000},  // RLC_RESTORE_LIST_GPM_MEM
+    {kGfxFileRlc, 29984, 9944, 21, 0x74000},  // RLC_RESTORE_LIST_SRM_MEM
+    {kGfxFileRlc, 256, 16896, 8, 0x77000},    // RLC_G, last
+};
+const uint32_t kGfxImageCount = sizeof(kGfxImages) / sizeof(kGfxImages[0]);
+const uint64_t kGfxFwCarveoutOffset = 0x40900000ull;
+const uint64_t kGfxFwGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kGfxFwCarveoutOffset;
+const uint64_t kGfxFwPhysical = (uint64_t(kExpectedFbOffset) << 24) + kGfxFwCarveoutOffset;
+const uint32_t kGfxFwBufferSize = 0x7c000; // 124 pages
+const uint32_t kGfxFwCheckSize = 0x100000;
+// The PSP work area's command for image k is the pseudo command
+// kPspGfxLoad + k (GFX_CMD_ID_LOAD_IP_FW with that image's fields), sent as
+// frame k + 1; DESTROY_TMR follows as frame 10.
+const uint32_t kPspGfxLoad = 0x100;
+const uint32_t kGfxDestroyFrame = kGfxImageCount + 1;
+
+// Parts B-D: the GFX work area (ring, write-back, clear-state buffer).
+const uint64_t kGfxWorkCarveoutOffset = 0x40a00000ull;
+const uint64_t kGfxWorkGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kGfxWorkCarveoutOffset;
+const uint64_t kGfxWorkPhysical = (uint64_t(kExpectedFbOffset) << 24) + kGfxWorkCarveoutOffset;
+const uint32_t kGfxWorkSize = 0x4000;
+const uint32_t kGfxWorkCheckSize = 0x10000;
+const uint32_t kGfxWbPage = 0x2000, kGfxCsbPage = 0x3000;
+const uint32_t kGfxWbRptr = 0x000, kGfxWbPoll = 0x008, kGfxWbFence1 = 0x100, kGfxWbFence2 = 0x108;
+const uint32_t kGfxRingDwords = 2048; // 8 KiB: RB_BUFSZ 10
+const uint32_t kGfxFrameStarts[] = {0, 1024, 1280, 1536, 2048}; // frame k: dwords [start k, start k+1)
+const uint32_t kGfxCsbDwords = 904; // gfx_v9_0_get_csb_size
+const uint32_t kGfxStartDwords = kGfxCsbDwords + 4 + 3; // cp_gfx_start: + SET_BASE, VGT_INDEX_TYPE
+const uint32_t kGfxPollPauses = 100, kGfxDrawPauses = 1000;
+// PM4 (soc15d.h).
+const uint32_t kPm4Nop = 0x10, kPm4SetBase = 0x11, kPm4ClearState = 0x12, kPm4ContextControl = 0x28,
+               kPm4ReleaseMem = 0x49, kPm4PreambleCntl = 0x4a, kPm4DmaData = 0x50, kPm4SetContextReg = 0x69,
+               kPm4SetUconfigReg = 0x79;
+inline uint32_t pm4(uint32_t op, uint32_t count)
+{
+    return (3u << 30) | ((count & 0x3fff) << 16) | ((op & 0xff) << 8);
+}
+// gfx_v9_0_ring_emit_fence: CACHE_FLUSH_AND_INV_TS_EVENT (0x14), index 5,
+// TCL1, TC, TC_MD and TC_WB actions; DATA_SEL 1 (32 bits), INT_SEL 0.
+const uint32_t kReleaseMemEvent = 0x00238514, kReleaseMemData = 0x20000000;
+// DMA_DATA: CP_SYNC, SRC_SEL 2 (data), DST_SEL 3 (through L2), engine ME.
+const uint32_t kDmaDataFill = 0xc0300000;
+const uint32_t kGfxDrawBytes = 1382400; // 180 lines of 7680 bytes, below the 21-bit count
+const uint32_t kGfxDrawFills = 6;
+const uint32_t kGfxBands[] = {0xFFFF0000, 0xFF00FF00, 0xFF0000FF}; // red, green, blue: 360 lines each
+const uint32_t kScratchRingTest = 0xDEADBEEF, kScratchBefore = 0xCAFEDEAD; // gfx_v9_0_ring_test_ring
+// CP_RB0_CNTL: RB_BUFSZ 10, RB_BLKSZ 8; CP_MAX_CONTEXT max_hw_contexts - 1.
+const uint32_t kCpRb0Cntl = 0x0000080a, kCpMaxContext = 7, kCpDeviceId = 1;
+const uint32_t kCpGuiIdleInts = 0x003c0000; // CP_INT_CNTL_RING0 bits 18-21
+const uint32_t kRlcEnableF32 = 0x1, kRlcSrmEnable = 0x1, kRlcSpmVmidMask = 0xf;
+const uint32_t kGrbmSelectSe0Sh0 = 0x40000000, kGrbmBroadcast = 0xe0000000;
+const uint32_t kRlcSerdesNoncuMask = 0x000dffff;
+const uint32_t kCpDoorbellEnable = 0x40000000;
+
+// The registers this stage writes, in Linux's order, and SCRATCH_REG0: the
+// check snapshots them, the restore writes the snapshot back in this order.
+const uint32_t kGfxSnapshotRegisters[] = {
+    kRegRlcCntl,          kRegCpIntCntlRing0,  kRegGrbmGfxIndex,       kRegRlcCgcgCglsCtrl,
+    kRegRlcCsibAddrHi,    kRegRlcCsibAddrLo,   kRegRlcCsibLength,      kRegRlcSrmCntl,
+    kRegRlcSpmMcCntl,     kRegCpRbWptrDelay,   kRegCpRbVmid,           kRegCpRb0Cntl,
+    kRegCpRb0Wptr,        kRegCpRb0WptrHi,     kRegCpRb0RptrAddr,      kRegCpRb0RptrAddrHi,
+    kRegCpRbWptrPollAddrLo, kRegCpRbWptrPollAddrHi, kRegCpRb0Base,     kRegCpRb0BaseHi,
+    kRegCpMaxContext,     kRegCpDeviceId,      kRegCpMeCntl,           kRegScratchReg0};
+const uint32_t kGfxSnapshotCount = sizeof(kGfxSnapshotRegisters) / sizeof(kGfxSnapshotRegisters[0]);
+// The values written besides the snapshot: (snapshot & ~mask) | value; a
+// mask of all ones is a fixed value.
+struct GfxWrite {
+    uint32_t offset, mask, value;
+};
+const uint64_t kGfxCsbGpuAddress = kGfxWorkGpuAddress + kGfxCsbPage;
+const uint64_t kGfxRptrGpuAddress = kGfxWorkGpuAddress + kGfxWbPage + kGfxWbRptr;
+const uint64_t kGfxPollGpuAddress = kGfxWorkGpuAddress + kGfxWbPage + kGfxWbPoll;
+const GfxWrite kGfxWrites[] = {
+    {kRegRlcCntl, kRlcEnableF32, 0},                 // rlc_stop
+    {kRegRlcCntl, kRlcEnableF32, kRlcEnableF32},     // rlc_start
+    {kRegCpIntCntlRing0, kCpGuiIdleInts, 0},         // enable_gui_idle_interrupt(false)
+    {kRegGrbmGfxIndex, 0xFFFFFFFF, kGrbmSelectSe0Sh0}, // wait_for_rlc_serdes
+    {kRegGrbmGfxIndex, 0xFFFFFFFF, kGrbmBroadcast},
+    {kRegRlcCgcgCglsCtrl, 0xFFFFFFFF, 0},            // rlc_resume: disable CG
+    {kRegRlcCsibAddrHi, 0xFFFFFFFF, uint32_t(kGfxCsbGpuAddress >> 32)},
+    {kRegRlcCsibAddrLo, 0xFFFFFFFF, uint32_t(kGfxCsbGpuAddress) & 0xfffffffc},
+    {kRegRlcCsibLength, 0xFFFFFFFF, kGfxCsbDwords},
+    {kRegRlcSrmCntl, kRlcSrmEnable, kRlcSrmEnable},
+    {kRegRlcSpmMcCntl, kRlcSpmVmidMask, 0xf},
+    {kRegCpRbWptrDelay, 0xFFFFFFFF, 0},
+    {kRegCpRbVmid, 0xFFFFFFFF, 0},
+    {kRegCpRb0Cntl, 0xFFFFFFFF, kCpRb0Cntl},
+    {kRegCpRb0Wptr, 0xFFFFFFFF, 0},
+    {kRegCpRb0Wptr, 0xFFFFFFFF, 1024},
+    {kRegCpRb0Wptr, 0xFFFFFFFF, 1280},
+    {kRegCpRb0Wptr, 0xFFFFFFFF, 1536},
+    {kRegCpRb0Wptr, 0xFFFFFFFF, 2048},
+    {kRegCpRb0WptrHi, 0xFFFFFFFF, 0},
+    {kRegCpRb0RptrAddr, 0xFFFFFFFF, uint32_t(kGfxRptrGpuAddress)},
+    {kRegCpRb0RptrAddrHi, 0xFFFFFFFF, uint32_t(kGfxRptrGpuAddress >> 32) & 0xffff},
+    {kRegCpRbWptrPollAddrLo, 0xFFFFFFFF, uint32_t(kGfxPollGpuAddress)},
+    {kRegCpRbWptrPollAddrHi, 0xFFFFFFFF, uint32_t(kGfxPollGpuAddress >> 32)},
+    {kRegCpRb0Base, 0xFFFFFFFF, uint32_t(kGfxWorkGpuAddress >> 8)},
+    {kRegCpRb0BaseHi, 0xFFFFFFFF, uint32_t(kGfxWorkGpuAddress >> 40)},
+    {kRegCpMaxContext, 0xFFFFFFFF, kCpMaxContext},
+    {kRegCpDeviceId, 0xFFFFFFFF, kCpDeviceId},
+    {kRegCpMeCntl, kCpMeHalts, 0},                   // cp_gfx_enable(true)
+};
+const uint32_t kGfxWriteCount = sizeof(kGfxWrites) / sizeof(kGfxWrites[0]);
+// The precondition list (offset, mask, value), after the image headers and
+// GFX on: RLC off, CP and MEC halted, no doorbell, and the GC hub as MMHUB
+// read at boot 22 with the FB aperture of stage 10.
+struct GfxExpect {
+    uint32_t offset, mask, value;
+};
+const GfxExpect kGfxExpect[] = {
+    {kRegRlcCntl, 0xFFFFFFFF, 0},
+    {kRegCpMeCntl, kCpMeHalts, kCpMeHalts},
+    {kRegCpMecCntl, kCpMecHalts, kCpMecHalts},
+    {kRegCpRbDoorbellControl, kCpDoorbellEnable, 0},
+    {kRegGcMxL1TlbCntl, 0xFFFFFFFF, 0x00002501},
+    {kRegGcVmL2Cntl, 0xFFFFFFFF, 0x00080602},
+    {kRegGcVmContext0Cntl, 0xFFFFFFFF, 0x007ffe80},
+    {kRegGcFbLocationBase, 0xFFFFFFFF, kExpectedFbLocationBase},
+    {kRegGcFbLocationTop, 0xFFFFFFFF, 0x0000f47f},
+    {kRegMcVmFbOffset, 0xFFFFFFFF, kExpectedFbOffset},
+};
+const uint32_t kGfxExpectCount = sizeof(kGfxExpect) / sizeof(kGfxExpect[0]);
+// Every register a stage 21 report shows: the snapshot list, then status,
+// instruction pointers, the serdes, doorbell and GC hub, and the golden
+// registers (recorded for the shader stage).
+const uint32_t kGfxStateRegisters[] = {
+    kRegRlcCntl, kRegCpIntCntlRing0, kRegGrbmGfxIndex, kRegRlcCgcgCglsCtrl, kRegRlcCsibAddrHi, kRegRlcCsibAddrLo,
+    kRegRlcCsibLength, kRegRlcSrmCntl, kRegRlcSpmMcCntl, kRegCpRbWptrDelay, kRegCpRbVmid, kRegCpRb0Cntl,
+    kRegCpRb0Wptr, kRegCpRb0WptrHi, kRegCpRb0RptrAddr, kRegCpRb0RptrAddrHi, kRegCpRbWptrPollAddrLo,
+    kRegCpRbWptrPollAddrHi, kRegCpRb0Base, kRegCpRb0BaseHi, kRegCpMaxContext, kRegCpDeviceId, kRegCpMeCntl,
+    kRegScratchReg0, kRegRlcStat, kRegGrbmStatus, kRegGrbmStatus2, kRegCpStat, kRegCpCpfStatus, kRegCpCpcStatus,
+    kRegCpBusyStat, kRegCpMecCntl, kRegCpRb0Rptr, kRegCpPfpInstrPntr, kRegCpMeInstrPntr, kRegCpCeInstrPntr,
+    kRegCpMec1InstrPntr, kRegRlcSerdesCuMasterBusy, kRegRlcSerdesNoncuMasterBusy, kRegCpRbDoorbellControl,
+    kRegGcMxL1TlbCntl, kRegGcVmL2Cntl, kRegGcVmContext0Cntl, kRegCbHwControl, kRegCbHwControl2, kRegDbDebug2,
+    kRegGbAddrConfig, kRegGbAddrConfigRead, kRegPaScEnhance, kRegPaScEnhance1, kRegPaScLineStippleState,
+    kRegTaCntlAux, kRegTcpChanSteerHi, kRegTcpChanSteerLo};
+const uint32_t kGfxStateCount = sizeof(kGfxStateRegisters) / sizeof(kGfxStateRegisters[0]);
+// The BAR5 pages the stage 21 register writes use: CP_ME_CNTL and
+// CP_RB_WPTR_DELAY; the CP ring registers; GRBM_GFX_INDEX and SCRATCH_REG0;
+// the RLC. The adapter maps these four for kGfxPageSet.
+const uint32_t kGfxPageSet = 0x8000;
+const uint32_t kGfxPages[] = {0x8000, 0xc000, 0x30000, 0x3b000};
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -1138,6 +1383,16 @@ enum Status : uint32_t {
     kFlipVerifyFailed,
     kFlipNotRestored,
     kFlipOutOfOrder,
+    // Stage 21.
+    kGfxImageInvalid,
+    kGfxUnexpectedState,
+    kGfxCpTimeout,
+    kGfxRingTestFailed,
+    kGfxFenceTimeout,
+    kGfxDrawMismatch,
+    kGfxVerifyFailed,
+    kGfxNotRestored,
+    kGfxOutOfOrder,
 };
 
 const char *statusName(Status status);
@@ -1256,7 +1511,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 16;
+const uint32_t kDiagnosticVersion = 17;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -1326,7 +1581,17 @@ enum DiagnosticSelector : uint32_t {
                                  // write-back after
     kDiagnosticFlipVerify = 43,  // out: Status, MSI change during the hold; structure: DisplayReport
     kDiagnosticFlipRestore = 44, // out: Status, index, value, IH_RB_RPTR written; structure: FlipReport
-    kDiagnosticSelectorCount = 45,
+    // Stage 21, after a passing SETUP_TMR (selector 15) for the check's
+    // owner, in this order; every step returns a GfxState as its structure.
+    kDiagnosticGfxCheck = 45,   // out: Status, index into the check list, value
+    kDiagnosticGfxLoad = 46,    // out: Status, images loaded, last fence, last response status, fw_addr lo, hi
+    kDiagnosticGfxRlc = 47,     // out: Status, writes made, serdes CU busy, NONCU busy
+    kDiagnosticGfxCp = 48,      // out: Status, writes made, read-pointer write-back, CP_RB0_RPTR
+    kDiagnosticGfxTest = 49,    // out: Status, SCRATCH_REG0, fence 1, read-pointer write-back
+    kDiagnosticGfxDraw = 50,    // out: Status, step, fence 2, unexpected words, first offset, its value
+    kDiagnosticGfxVerify = 51,  // out: Status; structure: DisplayReport (not a GfxState)
+    kDiagnosticGfxRestore = 52, // out: Status, index into the snapshot list, value, flip-back status
+    kDiagnosticSelectorCount = 53,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -1936,6 +2201,88 @@ Status verifyFlip(const RegisterReader &registers, uint64_t apertureLength, cons
 Status restoreFlip(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                    const MemoryReader &gartRegion, const InterruptCounter &counter, uint32_t stage, uint32_t msiBefore,
                    FlipReport *report, uint32_t *index, uint32_t *value);
+
+// Stage 21. The checks on the five firmware files (kGfxImageInvalid with the
+// file in index): their lengths and kGfxHeaderPins.
+Status checkGfxFiles(const GfxFiles &files, uint32_t *index);
+
+// The firmware buffer's word at a byte offset: each image's payload in its
+// slot, zero elsewhere.
+uint32_t gfxFirmwareWord(const GfxFiles &files, uint32_t offset);
+bool gfxFirmwareWriteAllowed(const GfxFiles &files, uint32_t offset, uint32_t value, uint32_t stage);
+
+// Writes the whole firmware buffer, then reads it back (kPspReadbackMismatch).
+Status writeGfxFirmware(const GfxFiles &files, const MemoryReader &buffer, const MemoryWriter &writer,
+                        uint32_t stage);
+
+// The ring's dwords (four frames, NOP-padded), the clear-state buffer's, and
+// the work area's (ring, zeroed write-back page, clear-state buffer).
+uint32_t gfxRingWord(uint32_t dword);
+uint32_t gfxCsbWord(uint32_t dword);
+uint32_t gfxWorkWord(uint32_t offset);
+bool gfxWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage);
+Status writeGfxWork(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage);
+
+// The image the CP draws: three bands of 360 lines, zero past the image.
+uint32_t gfxWord(uint32_t offset);
+
+// Whether a register write is a stage 21 value given the check's snapshot
+// (kGfxSnapshotCount values in kGfxSnapshotRegisters order): the snapshot
+// value itself (the restore), or a kGfxWrites value.
+bool gfxWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage, const uint32_t *snapshot);
+
+// The stage 9 page checks for the firmware buffer (1 MiB) and the work area
+// (64 KiB).
+Status checkGfxTargets(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                       const Range *ranges, uint32_t rangeCount);
+
+// No writes. GFX on, then kGfxExpect (kGfxUnexpectedState with the index and
+// value); then snapshots kGfxSnapshotRegisters.
+Status checkGfxBoot(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *snapshot,
+                    uint32_t *index, uint32_t *value);
+
+// Reads kGfxStateRegisters into values.
+struct GfxState {
+    uint32_t values[kGfxStateCount];
+};
+Status readGfxState(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, GfxState *state);
+
+// gfx_v9_0_rlc_resume as it applies to GC 9.3.0 (part B). writes counts the
+// writes made; cuBusy and noncuBusy are the serdes readings (Linux logs a
+// timeout and continues, as here).
+Status startRlc(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                uint32_t stage, const uint32_t *snapshot, uint32_t *writes, uint32_t *cuBusy, uint32_t *noncuBusy);
+
+// gfx_v9_0_cp_gfx_resume and cp_gfx_start without a doorbell (part C), then
+// frame 0: polls the read-pointer write-back for 1024 (kGfxCpTimeout).
+Status startCp(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+               const MemoryReader &work, uint32_t stage, const uint32_t *snapshot, uint32_t *writes, uint32_t *rptr,
+               uint32_t *cpRptr);
+
+// gfx_v9_0_ring_test_ring (frame 1: kGfxRingTestFailed), then fence 1
+// (frame 2: kGfxFenceTimeout).
+Status testGfxRing(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   const MemoryReader &work, uint32_t stage, const uint32_t *snapshot, uint32_t *scratch,
+                   uint32_t *fence, uint32_t *rptr);
+
+// Frame 3 (the fills and fence 2: kGfxFenceTimeout), after the CPU clear.
+Status submitGfxDraw(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                     const MemoryReader &work, uint32_t stage, const uint32_t *snapshot, uint32_t *fence);
+
+// Reads the pattern region against gfxWord (kGfxDrawMismatch).
+Status checkGfxDraw(const MemoryReader &pattern, uint32_t stage, uint32_t *unexpected, uint32_t *first,
+                    uint32_t *firstValue);
+
+// Reads only: verifyDisplay against gfxWord (kGfxVerifyFailed).
+Status verifyGfxDraw(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &pattern,
+                     const uint32_t *display, uint32_t flipFrames, uint32_t stage, DisplayReport *report);
+
+// The restore: CP_ME_CNTL <- the snapshot (halted), rlc_stop, every
+// kGfxSnapshotRegisters entry <- its snapshot in list order, then all read
+// back (kGfxNotRestored with the index and value). The first write error is
+// returned before that.
+Status restoreGfx(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                  uint32_t stage, const uint32_t *snapshot, uint32_t *index, uint32_t *value);
 
 } // namespace cezanne
 

@@ -1,4 +1,5 @@
 #include "cezanne_core.h"
+#include "clearstate_gfx9.h"
 
 namespace cezanne {
 
@@ -106,6 +107,15 @@ const char *statusName(Status status)
     case kFlipVerifyFailed: return "flip-verify-failed";
     case kFlipNotRestored: return "flip-not-restored";
     case kFlipOutOfOrder: return "flip-out-of-order";
+    case kGfxImageInvalid: return "gfx-image-invalid";
+    case kGfxUnexpectedState: return "gfx-unexpected-state";
+    case kGfxCpTimeout: return "gfx-cp-timeout";
+    case kGfxRingTestFailed: return "gfx-ring-test-failed";
+    case kGfxFenceTimeout: return "gfx-fence-timeout";
+    case kGfxDrawMismatch: return "gfx-draw-mismatch";
+    case kGfxVerifyFailed: return "gfx-verify-failed";
+    case kGfxNotRestored: return "gfx-not-restored";
+    case kGfxOutOfOrder: return "gfx-out-of-order";
     }
     return "unknown";
 }
@@ -205,6 +215,9 @@ bool registerAllowed(uint32_t offset, uint32_t stage)
     for (uint32_t i = 0; stage >= kFlipStage && i < kStage20RegisterCount; i++) {
         if (kStage20Registers[i] == offset) return true;
     }
+    for (uint32_t i = 0; stage >= kGfxStage && i < kStage21RegisterCount; i++) {
+        if (kStage21Registers[i] == offset) return true;
+    }
     return false;
 }
 
@@ -229,6 +242,9 @@ bool gfxGated(uint32_t offset)
     }
     for (uint32_t i = 0; i < kStage10GfxGatedRegisterCount; i++) {
         if (kStage10GfxGatedRegisters[i] == offset) return true;
+    }
+    for (uint32_t i = 0; i < kStage21RegisterCount; i++) {
+        if (kStage21Registers[i] == offset) return true;
     }
     return false;
 }
@@ -492,7 +508,10 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (stage < kPspTmrStage) return false;
     if (offset == kRegMp0C2PMsg67)
         return value == kPspFrameDwords || value == 2 * kPspFrameDwords ||
-               (stage >= kPspSdmaStage && value == 3 * kPspFrameDwords);
+               (stage >= kPspSdmaStage && value == 3 * kPspFrameDwords) ||
+               // Stage 21: frames 0-10.
+               (stage >= kGfxStage && value % kPspFrameDwords == 0 && value != 0 &&
+                value <= (kGfxDestroyFrame + 1) * kPspFrameDwords);
     return false;
 }
 
@@ -887,9 +906,26 @@ Status destroyPspRing(const RegisterReader &registers, uint64_t apertureLength, 
     return sendPspCommand(registers, apertureLength, writer, stage, kPspCmdDestroyRings, 0, 0, 0, response, &written);
 }
 
+static bool gfxLoadCommand(uint32_t command)
+{
+    return command >= kPspGfxLoad && command < kPspGfxLoad + kGfxImageCount;
+}
+
 uint32_t pspCommandWord(uint32_t command, uint32_t word)
 {
-    if (word == kPspCmdIdOffset / 4) return command;
+    if (word == kPspCmdIdOffset / 4) return gfxLoadCommand(command) ? kGfxCmdLoadIpFw : command;
+    if (gfxLoadCommand(command)) {
+        // Stage 21: psp_prep_load_ip_fw_cmd_buf for one GFX image.
+        const GfxImage &image = kGfxImages[command - kPspGfxLoad];
+        const uint64_t at = kGfxFwGpuAddress + image.slot;
+        switch (word - kPspCmdFieldsOffset / 4) {
+        case 0: return uint32_t(at);
+        case 1: return uint32_t(at >> 32);
+        case 2: return image.payloadSize;
+        case 3: return image.fwType;
+        default: return 0;
+        }
+    }
     if (command == kGfxCmdLoadIpFw) {
         // psp_prep_load_ip_fw_cmd_buf: psp_gfx_cmd_load_ip_fw at +28.
         switch (word - kPspCmdFieldsOffset / 4) {
@@ -932,12 +968,17 @@ bool pspWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (offset >= kPspFencePage) return value == 0;
     if (offset >= kPspCmdPage) {
         uint32_t word = (offset - kPspCmdPage) / 4;
-        return value == 0 || value == pspCommandWord(kGfxCmdSetupTmr, word) ||
-               value == pspCommandWord(kGfxCmdDestroyTmr, word) ||
-               (stage >= kPspSdmaStage && value == pspCommandWord(kGfxCmdLoadIpFw, word));
+        if (value == 0 || value == pspCommandWord(kGfxCmdSetupTmr, word) ||
+            value == pspCommandWord(kGfxCmdDestroyTmr, word) ||
+            (stage >= kPspSdmaStage && value == pspCommandWord(kGfxCmdLoadIpFw, word)))
+            return true;
+        for (uint32_t k = 0; stage >= kGfxStage && k < kGfxImageCount; k++) {
+            if (value == pspCommandWord(kPspGfxLoad + k, word)) return true;
+        }
+        return false;
     }
     uint32_t frame = offset / kPspFrameSize;
-    uint32_t frames = stage >= kPspSdmaStage ? 3 : 2;
+    uint32_t frames = stage >= kGfxStage ? kGfxDestroyFrame + 1 : stage >= kPspSdmaStage ? 3 : 2;
     return frame < frames && (value == 0 || value == pspFrameWord(frame, (offset % kPspFrameSize) / 4));
 }
 
@@ -988,9 +1029,12 @@ static bool commandFrameAllowed(uint32_t command, uint32_t frame, uint32_t stage
     if (stage < kPspTmrStage) return false;
     switch (command) {
     case kGfxCmdSetupTmr: return frame == 0;
-    case kGfxCmdDestroyTmr: return frame == 1 || (stage >= kPspSdmaStage && frame == 2);
+    // Stage 21: after any of the GFX loads, which may stop early.
+    case kGfxCmdDestroyTmr:
+        return frame == 1 || (stage >= kPspSdmaStage && frame == 2) ||
+               (stage >= kGfxStage && frame >= 1 && frame <= kGfxDestroyFrame);
     case kGfxCmdLoadIpFw: return stage >= kPspSdmaStage && frame == 1;
-    default: return false;
+    default: return stage >= kGfxStage && gfxLoadCommand(command) && frame == command - kPspGfxLoad + 1;
     }
 }
 
@@ -1042,7 +1086,8 @@ Status submitPspFrame(const RegisterReader &registers, uint64_t apertureLength, 
                       const MemoryReader &work, uint32_t stage, uint32_t frame, uint32_t *fence)
 {
     *fence = 0;
-    if (stage < kPspTmrStage || frame > (stage >= kPspSdmaStage ? 2u : 1u)) return kRegisterNotAllowed;
+    if (stage < kPspTmrStage || frame > (stage >= kGfxStage ? kGfxDestroyFrame : stage >= kPspSdmaStage ? 2u : 1u))
+        return kRegisterNotAllowed;
     uint32_t pointer = 0;
     Status status = readRegister(registers, apertureLength, stage, kRegMp0C2PMsg67, &pointer);
     if (status != kOK) return status;
@@ -2427,6 +2472,483 @@ Status restoreFlip(const RegisterReader &registers, uint64_t apertureLength, con
         if (restored == kOK) *index = *value = 0;
     }
     return flip != kOK ? flip : status != kOK ? status : restored;
+}
+
+Status checkGfxFiles(const GfxFiles &files, uint32_t *index)
+{
+    *index = 0;
+    for (uint32_t file = 0; file < kGfxFileCount; file++) {
+        *index = file;
+        if (files.data[file] == nullptr || files.length[file] != kGfxFileLengths[file]) return kGfxImageInvalid;
+    }
+    for (const GfxHeaderPin &pin : kGfxHeaderPins) {
+        *index = pin.file;
+        if (le32(files.data[pin.file] + pin.offset) != pin.value) return kGfxImageInvalid;
+    }
+    for (const GfxImage &image : kGfxImages) {
+        *index = image.file;
+        if (uint64_t(image.payloadOffset) + image.payloadSize > files.length[image.file]) return kGfxImageInvalid;
+    }
+    *index = 0;
+    return kOK;
+}
+
+uint32_t gfxFirmwareWord(const GfxFiles &files, uint32_t offset)
+{
+    for (const GfxImage &image : kGfxImages) {
+        if (offset >= image.slot && offset - image.slot + 4 <= image.payloadSize)
+            return files.data[image.file] == nullptr
+                       ? 0
+                       : le32(files.data[image.file] + image.payloadOffset + (offset - image.slot));
+    }
+    return 0;
+}
+
+bool gfxFirmwareWriteAllowed(const GfxFiles &files, uint32_t offset, uint32_t value, uint32_t stage)
+{
+    if (stage < kGfxStage || (offset & 3) != 0 || offset >= kGfxFwBufferSize) return false;
+    return value == gfxFirmwareWord(files, offset);
+}
+
+static Status writeGfxFirmwareWord(const GfxFiles &files, const MemoryWriter &writer, uint32_t stage,
+                                   uint32_t offset, uint32_t value)
+{
+    if (!gfxFirmwareWriteAllowed(files, offset, value, stage)) return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+Status writeGfxFirmware(const GfxFiles &files, const MemoryReader &buffer, const MemoryWriter &writer,
+                        uint32_t stage)
+{
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    uint32_t index = 0;
+    Status status = checkGfxFiles(files, &index);
+    if (status != kOK) return status;
+    for (uint32_t offset = 0; offset < kGfxFwBufferSize; offset += 4) {
+        status = writeGfxFirmwareWord(files, writer, stage, offset, gfxFirmwareWord(files, offset));
+        if (status != kOK) return status;
+    }
+    for (uint32_t offset = 0; offset < kGfxFwBufferSize; offset += 4) {
+        uint32_t value = 0;
+        if (!buffer.read32(buffer.context, offset, &value)) return kRegisterReadFailed;
+        if (value != gfxFirmwareWord(files, offset)) return kPspReadbackMismatch;
+    }
+    return kOK;
+}
+
+uint32_t gfxCsbWord(uint32_t dword)
+{
+    // gfx_v9_0_get_csb_buffer.
+    const uint32_t head[] = {pm4(kPm4PreambleCntl, 0), 2u << 28, pm4(kPm4ContextControl, 1), 0x80000000, 0x80000000};
+    if (dword < 5) return head[dword];
+    uint32_t at = 5;
+    for (uint32_t e = 0; e < kGfx9ContextExtentCount; e++) {
+        const CsExtent &ext = kGfx9ContextExtents[e];
+        if (dword == at) return pm4(kPm4SetContextReg, ext.count);
+        if (dword == at + 1) return ext.regIndex - 0xa000; // PACKET3_SET_CONTEXT_REG_START
+        if (dword < at + 2 + ext.count) return ext.values[dword - at - 2];
+        at += 2 + ext.count;
+    }
+    const uint32_t tail[] = {pm4(kPm4PreambleCntl, 0), 3u << 28, pm4(kPm4ClearState, 0), 0};
+    return dword < at + 4 ? tail[dword - at] : 0;
+}
+
+// One NOP packet filling dwords [start, end): its header, then ignored zeros.
+static uint32_t nopWord(uint32_t dword, uint32_t start, uint32_t end)
+{
+    return dword == start ? pm4(kPm4Nop, end - start - 2) : 0;
+}
+
+// gfx_v9_0_ring_emit_fence: RELEASE_MEM writing seq at the write-back offset.
+static uint32_t fenceWord(uint32_t i, uint32_t at, uint32_t seq)
+{
+    const uint64_t address = kGfxWorkGpuAddress + kGfxWbPage + at;
+    const uint32_t words[] = {pm4(kPm4ReleaseMem, 6), kReleaseMemEvent, kReleaseMemData, uint32_t(address),
+                              uint32_t(address >> 32), seq, 0, 0};
+    return words[i];
+}
+
+uint32_t gfxRingWord(uint32_t dword)
+{
+    if (dword < kGfxFrameStarts[1]) {
+        // Frame 0: gfx_v9_0_cp_gfx_start's commands.
+        if (dword < kGfxCsbDwords) return gfxCsbWord(dword);
+        const uint32_t vgtIndexType = 0x3090c / 4 - 0xc000; // VGT_INDEX_TYPE - PACKET3_SET_UCONFIG_REG_START
+        const uint32_t rest[] = {pm4(kPm4SetBase, 2), 3, 0x8000, 0x8000, pm4(kPm4SetUconfigReg, 1),
+                                 (2u << 28) | vgtIndexType, 0};
+        if (dword < kGfxStartDwords) return rest[dword - kGfxCsbDwords];
+        return nopWord(dword, kGfxStartDwords, kGfxFrameStarts[1]);
+    }
+    if (dword < kGfxFrameStarts[2]) {
+        // Frame 1: gfx_v9_0_ring_test_ring.
+        const uint32_t i = dword - kGfxFrameStarts[1];
+        const uint32_t test[] = {pm4(kPm4SetUconfigReg, 1), kRegScratchReg0 / 4 - 0xc000, kScratchRingTest};
+        return i < 3 ? test[i] : nopWord(dword, kGfxFrameStarts[1] + 3, kGfxFrameStarts[2]);
+    }
+    if (dword < kGfxFrameStarts[3]) {
+        // Frame 2: fence 1.
+        const uint32_t i = dword - kGfxFrameStarts[2];
+        return i < 8 ? fenceWord(i, kGfxWbFence1, 1) : nopWord(dword, kGfxFrameStarts[2] + 8, kGfxFrameStarts[3]);
+    }
+    if (dword < kGfxFrameStarts[4]) {
+        // Frame 3: the fills, then fence 2.
+        const uint32_t i = dword - kGfxFrameStarts[3];
+        if (i < kGfxDrawFills * 7) {
+            const uint32_t fill = i / 7;
+            const uint64_t destination = kPatternGpuAddress + uint64_t(fill) * kGfxDrawBytes;
+            const uint32_t packet[] = {pm4(kPm4DmaData, 5), kDmaDataFill, kGfxBands[fill / 2], 0, uint32_t(destination),
+                                       uint32_t(destination >> 32), kGfxDrawBytes};
+            return packet[i % 7];
+        }
+        const uint32_t j = i - kGfxDrawFills * 7;
+        return j < 8 ? fenceWord(j, kGfxWbFence2, 2)
+                     : nopWord(dword, kGfxFrameStarts[3] + kGfxDrawFills * 7 + 8, kGfxFrameStarts[4]);
+    }
+    return 0;
+}
+
+uint32_t gfxWorkWord(uint32_t offset)
+{
+    if (offset < kGfxWbPage) return gfxRingWord(offset / 4);
+    if (offset < kGfxCsbPage) return 0;
+    return offset < kGfxWorkSize ? gfxCsbWord((offset - kGfxCsbPage) / 4) : 0;
+}
+
+bool gfxWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
+{
+    if (stage < kGfxStage || (offset & 3) != 0 || offset >= kGfxWorkSize) return false;
+    return value == gfxWorkWord(offset);
+}
+
+static Status writeGfxWorkWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
+{
+    if (!gfxWorkWriteAllowed(offset, value, stage)) return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+Status writeGfxWork(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage)
+{
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    for (uint32_t offset = 0; offset < kGfxWorkSize; offset += 4) {
+        Status status = writeGfxWorkWord(writer, stage, offset, gfxWorkWord(offset));
+        if (status != kOK) return status;
+    }
+    for (uint32_t offset = 0; offset < kGfxWorkSize; offset += 4) {
+        uint32_t value = 0;
+        if (!work.read32(work.context, offset, &value)) return kRegisterReadFailed;
+        if (value != gfxWorkWord(offset)) return kPspReadbackMismatch;
+    }
+    return kOK;
+}
+
+uint32_t gfxWord(uint32_t offset)
+{
+    const uint32_t line = offset / (kPatternWidth * 4);
+    return line < kPatternHeight ? kGfxBands[line / (kPatternHeight / 3)] : 0;
+}
+
+bool gfxWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage, const uint32_t *snapshot)
+{
+    if (stage < kGfxStage || snapshot == nullptr) return false;
+    for (uint32_t i = 0; i < kGfxSnapshotCount; i++) {
+        if (kGfxSnapshotRegisters[i] != offset) continue;
+        if (value == snapshot[i]) return true; // the restore
+        for (const GfxWrite &write : kGfxWrites) {
+            if (write.offset == offset && value == ((snapshot[i] & ~write.mask) | (write.value & write.mask)))
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+static Status writeGfxRegister(const RegisterWriter &writer, uint32_t stage, const uint32_t *snapshot,
+                               uint32_t offset, uint32_t value)
+{
+    if (!writeAllowed(offset, value, stage) && !gfxWriteAllowed(offset, value, stage, snapshot))
+        return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+static uint32_t snapshotOf(const uint32_t *snapshot, uint32_t offset)
+{
+    for (uint32_t i = 0; i < kGfxSnapshotCount; i++) {
+        if (kGfxSnapshotRegisters[i] == offset) return snapshot[i];
+    }
+    return 0;
+}
+
+Status checkGfxTargets(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                       const Range *ranges, uint32_t rangeCount)
+{
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    const struct {
+        uint64_t offset, gpu, physical;
+        uint32_t size;
+    } buffers[] = {{kGfxFwCarveoutOffset, kGfxFwGpuAddress, kGfxFwPhysical, kGfxFwCheckSize},
+                   {kGfxWorkCarveoutOffset, kGfxWorkGpuAddress, kGfxWorkPhysical, kGfxWorkCheckSize}};
+    for (const auto &buffer : buffers) {
+        MetricsTarget target;
+        Status status = checkCarveoutPage(registers, apertureLength, stage, buffer.offset, buffer.size, ranges, rangeCount,
+                                          &target);
+        if (status != kOK) return status;
+        if (target.gpuAddress != buffer.gpu || target.physical != buffer.physical) return kMetricsAddressMismatch;
+    }
+    return kOK;
+}
+
+Status checkGfxBoot(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *snapshot,
+                    uint32_t *index, uint32_t *value)
+{
+    *index = *value = 0;
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    uint32_t misc = 0;
+    Status status = readRegister(registers, apertureLength, stage, kRegSmuioGfxMiscCntl, &misc);
+    if (status != kOK) return status;
+    if (((misc & kGfxOffStatusMask) >> kGfxOffStatusShift) != kGfxOffStatusOn) return kGfxNotOn;
+    for (uint32_t i = 0; i < kGfxExpectCount; i++) {
+        *index = i;
+        status = readRegister(registers, apertureLength, stage, kGfxExpect[i].offset, value);
+        if (status != kOK) return status;
+        if ((*value & kGfxExpect[i].mask) != kGfxExpect[i].value) return kGfxUnexpectedState;
+    }
+    *index = *value = 0;
+    for (uint32_t i = 0; i < kGfxSnapshotCount; i++) {
+        status = readRegister(registers, apertureLength, stage, kGfxSnapshotRegisters[i], &snapshot[i]);
+        if (status != kOK) return status;
+    }
+    return kOK;
+}
+
+Status readGfxState(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, GfxState *state)
+{
+    *state = GfxState();
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    for (uint32_t i = 0; i < kGfxStateCount; i++) {
+        Status status = readRegister(registers, apertureLength, stage, kGfxStateRegisters[i], &state->values[i]);
+        if (status != kOK) return status;
+    }
+    return kOK;
+}
+
+// gfx_v9_0_wait_for_rlc_serdes for the one SE and SH: select them, poll the
+// CU masters, back to broadcast, poll the non-CU masters.
+static Status waitRlcSerdes(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                            uint32_t stage, const uint32_t *snapshot, uint32_t *writes, uint32_t *cuBusy,
+                            uint32_t *noncuBusy)
+{
+    Status status = writeGfxRegister(writer, stage, snapshot, kRegGrbmGfxIndex, kGrbmSelectSe0Sh0);
+    if (status != kOK) return status;
+    (*writes)++;
+    for (uint32_t i = 0; i <= kGfxPollPauses; i++) {
+        status = readRegister(registers, apertureLength, stage, kRegRlcSerdesCuMasterBusy, cuBusy);
+        if (status != kOK || *cuBusy == 0 || i == kGfxPollPauses) break;
+        writer.pause(writer.context);
+    }
+    Status broadcast = writeGfxRegister(writer, stage, snapshot, kRegGrbmGfxIndex, kGrbmBroadcast);
+    if (broadcast == kOK) (*writes)++;
+    if (status != kOK) return status;
+    if (broadcast != kOK) return broadcast;
+    for (uint32_t i = 0; i <= kGfxPollPauses; i++) {
+        status = readRegister(registers, apertureLength, stage, kRegRlcSerdesNoncuMasterBusy, noncuBusy);
+        if (status != kOK || (*noncuBusy & kRlcSerdesNoncuMask) == 0 || i == kGfxPollPauses) break;
+        writer.pause(writer.context);
+    }
+    return status;
+}
+
+Status startRlc(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                uint32_t stage, const uint32_t *snapshot, uint32_t *writes, uint32_t *cuBusy, uint32_t *noncuBusy)
+{
+    *writes = *cuBusy = *noncuBusy = 0;
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    const uint32_t rlc = snapshotOf(snapshot, kRegRlcCntl);
+    const SdmaWrite before[] = {
+        {kRegRlcCntl, rlc & ~kRlcEnableF32}, // rlc_stop
+        {kRegCpIntCntlRing0, snapshotOf(snapshot, kRegCpIntCntlRing0) & ~kCpGuiIdleInts},
+    };
+    for (const SdmaWrite &write : before) {
+        Status status = writeGfxRegister(writer, stage, snapshot, write.offset, write.value);
+        if (status != kOK) return status;
+        (*writes)++;
+    }
+    Status status = waitRlcSerdes(registers, apertureLength, writer, stage, snapshot, writes, cuBusy, noncuBusy);
+    if (status != kOK) return status;
+    const SdmaWrite after[] = {
+        {kRegRlcCgcgCglsCtrl, 0}, // disable CG
+        {kRegRlcCsibAddrHi, uint32_t(kGfxCsbGpuAddress >> 32)},
+        {kRegRlcCsibAddrLo, uint32_t(kGfxCsbGpuAddress) & 0xfffffffc},
+        {kRegRlcCsibLength, kGfxCsbDwords},
+        {kRegRlcSrmCntl, snapshotOf(snapshot, kRegRlcSrmCntl) | kRlcSrmEnable},
+        {kRegRlcSpmMcCntl, (snapshotOf(snapshot, kRegRlcSpmMcCntl) & ~kRlcSpmVmidMask) | 0xf},
+        {kRegRlcCntl, (rlc & ~kRlcEnableF32) | kRlcEnableF32}, // rlc_start
+    };
+    for (const SdmaWrite &write : after) {
+        status = writeGfxRegister(writer, stage, snapshot, write.offset, write.value);
+        if (status != kOK) return status;
+        (*writes)++;
+    }
+    writer.pause(writer.context); // udelay(50)
+    return kOK;
+}
+
+// gfx_v9_0_ring_set_wptr_gfx without a doorbell.
+static Status commitGfx(const RegisterWriter &writer, uint32_t stage, const uint32_t *snapshot, uint32_t wptr)
+{
+    Status status = writeGfxRegister(writer, stage, snapshot, kRegCpRb0Wptr, wptr);
+    return status == kOK ? writeGfxRegister(writer, stage, snapshot, kRegCpRb0WptrHi, 0) : status;
+}
+
+// Polls a write-back dword for a value.
+static Status pollGfxWork(const MemoryReader &work, const RegisterWriter &writer, uint32_t at, uint32_t expected,
+                          uint32_t pauses, uint32_t *value)
+{
+    for (uint32_t i = 0; i <= pauses; i++) {
+        if (!work.read32(work.context, kGfxWbPage + at, value)) return kRegisterReadFailed;
+        if (*value == expected) return kOK;
+        if (i == pauses) break;
+        writer.pause(writer.context);
+    }
+    return kGfxFenceTimeout;
+}
+
+Status startCp(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+               const MemoryReader &work, uint32_t stage, const uint32_t *snapshot, uint32_t *writes, uint32_t *rptr,
+               uint32_t *cpRptr)
+{
+    *writes = *rptr = *cpRptr = 0;
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    const SdmaWrite resume[] = {
+        {kRegCpRbWptrDelay, 0},
+        {kRegCpRbVmid, 0},
+        {kRegCpRb0Cntl, kCpRb0Cntl},
+        {kRegCpRb0Wptr, 0},
+        {kRegCpRb0WptrHi, 0},
+        {kRegCpRb0RptrAddr, uint32_t(kGfxRptrGpuAddress)},
+        {kRegCpRb0RptrAddrHi, uint32_t(kGfxRptrGpuAddress >> 32) & 0xffff},
+        {kRegCpRbWptrPollAddrLo, uint32_t(kGfxPollGpuAddress)},
+        {kRegCpRbWptrPollAddrHi, uint32_t(kGfxPollGpuAddress >> 32)},
+    };
+    const SdmaWrite start[] = {
+        {kRegCpRb0Cntl, kCpRb0Cntl}, // after mdelay(1)
+        {kRegCpRb0Base, uint32_t(kGfxWorkGpuAddress >> 8)},
+        {kRegCpRb0BaseHi, uint32_t(kGfxWorkGpuAddress >> 40)},
+        {kRegCpMaxContext, kCpMaxContext}, // cp_gfx_start
+        {kRegCpDeviceId, kCpDeviceId},
+        {kRegCpMeCntl, snapshotOf(snapshot, kRegCpMeCntl) & ~kCpMeHalts}, // cp_gfx_enable(true)
+    };
+    for (const SdmaWrite &write : resume) {
+        Status status = writeGfxRegister(writer, stage, snapshot, write.offset, write.value);
+        if (status != kOK) return status;
+        (*writes)++;
+    }
+    writer.pause(writer.context);
+    for (const SdmaWrite &write : start) {
+        Status status = writeGfxRegister(writer, stage, snapshot, write.offset, write.value);
+        if (status != kOK) return status;
+        (*writes)++;
+    }
+    writer.pause(writer.context); // udelay(50)
+    // Frame 0, the clear-state preamble.
+    Status status = commitGfx(writer, stage, snapshot, kGfxFrameStarts[1]);
+    if (status != kOK) return status;
+    for (uint32_t i = 0; i <= kGfxPollPauses; i++) {
+        if (!work.read32(work.context, kGfxWbPage + kGfxWbRptr, rptr)) return kRegisterReadFailed;
+        status = readRegister(registers, apertureLength, stage, kRegCpRb0Rptr, cpRptr);
+        if (status != kOK) return status;
+        if (*rptr == kGfxFrameStarts[1] || *cpRptr == kGfxFrameStarts[1]) return kOK;
+        if (i == kGfxPollPauses) break;
+        writer.pause(writer.context);
+    }
+    return kGfxCpTimeout;
+}
+
+Status testGfxRing(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   const MemoryReader &work, uint32_t stage, const uint32_t *snapshot, uint32_t *scratch,
+                   uint32_t *fence, uint32_t *rptr)
+{
+    *scratch = *fence = *rptr = 0;
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    Status status = writeGfxRegister(writer, stage, snapshot, kRegScratchReg0, kScratchBefore);
+    if (status == kOK) status = commitGfx(writer, stage, snapshot, kGfxFrameStarts[2]);
+    if (status != kOK) return status;
+    for (uint32_t i = 0;; i++) {
+        status = readRegister(registers, apertureLength, stage, kRegScratchReg0, scratch);
+        if (status != kOK) return status;
+        if (*scratch == kScratchRingTest) break;
+        if (i == kGfxPollPauses) return kGfxRingTestFailed;
+        writer.pause(writer.context);
+    }
+    status = commitGfx(writer, stage, snapshot, kGfxFrameStarts[3]);
+    if (status != kOK) return status;
+    status = pollGfxWork(work, writer, kGfxWbFence1, 1, kGfxPollPauses, fence);
+    if (!work.read32(work.context, kGfxWbPage + kGfxWbRptr, rptr)) return kRegisterReadFailed;
+    return status;
+}
+
+Status submitGfxDraw(const RegisterReader &, uint64_t, const RegisterWriter &writer, const MemoryReader &work,
+                     uint32_t stage, const uint32_t *snapshot, uint32_t *fence)
+{
+    *fence = 0;
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    Status status = commitGfx(writer, stage, snapshot, kGfxFrameStarts[4]);
+    if (status != kOK) return status;
+    return pollGfxWork(work, writer, kGfxWbFence2, 2, kGfxDrawPauses, fence);
+}
+
+Status checkGfxDraw(const MemoryReader &pattern, uint32_t stage, uint32_t *unexpected, uint32_t *first,
+                    uint32_t *firstValue)
+{
+    *unexpected = *first = *firstValue = 0;
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
+        uint32_t value = 0;
+        if (!pattern.read32(pattern.context, offset, &value)) return kRegisterReadFailed;
+        if (value != gfxWord(offset) && (*unexpected)++ == 0) {
+            *first = offset;
+            *firstValue = value;
+        }
+    }
+    return *unexpected == 0 ? kOK : kGfxDrawMismatch;
+}
+
+Status verifyGfxDraw(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &pattern,
+                     const uint32_t *display, uint32_t flipFrames, uint32_t stage, DisplayReport *report)
+{
+    *report = DisplayReport();
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    Status status = verifySurface(registers, apertureLength, pattern, display, flipFrames, stage, gfxWord, report);
+    return status == kDisplayVerifyFailed ? kGfxVerifyFailed : status;
+}
+
+Status restoreGfx(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                  uint32_t stage, const uint32_t *snapshot, uint32_t *index, uint32_t *value)
+{
+    *index = *value = 0;
+    if (stage < kGfxStage) return kRegisterNotAllowed;
+    Status first = kOK;
+    auto note = [&first](Status status) {
+        if (first == kOK) first = status;
+    };
+    // cp_gfx_enable(false), then rlc_stop, as gfx_v9_0_hw_fini.
+    note(writeGfxRegister(writer, stage, snapshot, kRegCpMeCntl, snapshotOf(snapshot, kRegCpMeCntl)));
+    note(writeGfxRegister(writer, stage, snapshot, kRegRlcCntl, snapshotOf(snapshot, kRegRlcCntl) & ~kRlcEnableF32));
+    note(writeGfxRegister(writer, stage, snapshot, kRegCpIntCntlRing0,
+                          snapshotOf(snapshot, kRegCpIntCntlRing0) & ~kCpGuiIdleInts));
+    uint32_t writes = 0, cuBusy = 0, noncuBusy = 0;
+    note(waitRlcSerdes(registers, apertureLength, writer, stage, snapshot, &writes, &cuBusy, &noncuBusy));
+    // In Linux's order, so CP_RB0_WPTR_HI follows CP_RB0_WPTR (it commits it).
+    for (uint32_t i = 0; i < kGfxSnapshotCount; i++)
+        note(writeGfxRegister(writer, stage, snapshot, kGfxSnapshotRegisters[i], snapshot[i]));
+    if (first != kOK) return first;
+    for (uint32_t i = 0; i < kGfxSnapshotCount; i++) {
+        *index = i;
+        Status status = readRegister(registers, apertureLength, stage, kGfxSnapshotRegisters[i], value);
+        if (status != kOK) return status;
+        if (*value != snapshot[i]) return kGfxNotRestored;
+    }
+    *index = *value = 0;
+    return kOK;
 }
 
 } // namespace cezanne

@@ -1,4 +1,4 @@
-"""Recompute every stage 16, 17, 19 and 20 register offset from the pinned Linux v6.12 headers.
+"""Recompute every stage 16, 17, 19, 20 and 21 register offset from the pinned Linux v6.12 headers.
 
 The headers live in ignored out/references (docs/test-boot.md, stage 16); the
 test skips when they are absent, as in a fresh clone.
@@ -43,6 +43,10 @@ def stage20_constants():
     return block_constants("// Stage 20:", "// Read from stage 20 on")
 
 
+def stage21_constants():
+    return block_constants("// Stage 21:", "// Read from stage 21 on")
+
+
 @unittest.skipUnless(all((REFS / name).is_file() for name, _ in SOURCES), "pinned headers not in out/references")
 class Inventory16OffsetTests(unittest.TestCase):
     def test_every_offset_matches_its_header(self):
@@ -70,6 +74,17 @@ class Inventory16OffsetTests(unittest.TestCase):
         self.assertEqual([name for name, _ in stage20],
                          ["HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT", "DCHUB_INTERRUPT_DEST2",
                           "DISP_INTERRUPT_STATUS_CONTINUE17"])
+        # Stage 21's GC registers, from the GC header only: the GC hub's names
+        # (VM_L2_CNTL and others) are MMHUB's too.
+        gc = (REFS / "gc_9_0_offset.h").read_text()
+        gc_regs = {m.group(1): int(m.group(2), 16)
+                   for m in re.finditer(r"#define mm(\w+)\s+0x([0-9a-fA-F]+)\b", gc) if not m.group(1).endswith("_BASE_IDX")}
+        gc_idx = {m.group(1): int(m.group(2)) for m in re.finditer(r"#define mm(\w+)_BASE_IDX\s+(\d+)", gc)}
+        stage21 = stage21_constants()
+        self.assertEqual(len(stage21), 39)
+        for name, offset in stage21:
+            with self.subTest(name):
+                self.assertEqual(((0x2000, 0xA000)[gc_idx[name]] + gc_regs[name]) * 4, offset)
         for name, offset in constants + stage17 + stage19 + stage20:
             with self.subTest(name):
                 found = [(bases[idx[name]] + regs[name]) * 4 for regs, idx, bases in tables if name in regs]

@@ -105,8 +105,8 @@ class CoreTests(unittest.TestCase):
             "!sdmaFirmwareWriteAllowed(image, kSdmaFwBufferSize, 0, 13)": (
                 "if (stage < kPspSdmaStage || (offset & 3) != 0 || offset >= kSdmaFwBufferSize) return false;",
                 "if (stage < kPspSdmaStage || (offset & 3) != 0) return false;"),
-            "!writeAllowed(kRegMp0C2PMsg67, 64, 13)": ("(stage >= kPspSdmaStage && value == 3 * kPspFrameDwords);",
-                                                       "(stage >= kPspSdmaStage && value >= 3 * kPspFrameDwords);"),
+            "!writeAllowed(kRegMp0C2PMsg67, 64, 13)": ("(stage >= kPspSdmaStage && value == 3 * kPspFrameDwords) ||",
+                                                       "(stage >= kPspSdmaStage && value >= 3 * kPspFrameDwords) ||"),
             "!smuArgumentAllowed(kSmuMsgPowerUpSdma, 1, 14)": (
                 "case kSmuMsgPowerDownSdma: return stage >= kSdmaInventoryStage && argument == 0;",
                 "case kSmuMsgPowerDownSdma: return stage >= kSdmaInventoryStage;"),
@@ -180,6 +180,45 @@ class CoreTests(unittest.TestCase):
             "report.inuseLo == 0": ("return inuse == kPatternGpuAddress && (report->flipControl",
                                      "return (inuse | 1) != 0 && (report->flipControl"),
             "kDisplayNotRestored": ("if ((*value & displayMask(i)) != (kDisplayPipe0Boot22[i] & displayMask(i))) return kDisplayNotRestored;", ""),
+            # Stage 21.
+            "registerAllowed(offset, 21) && !registerAllowed(offset, 20) && gfxGated(offset)": (
+                "stage >= kGfxStage && i < kStage21RegisterCount", "i < kStage21RegisterCount"),
+            "!gfxWriteAllowed(kRegRlcCntl, snap[0] | 1, 20, snap)": (
+                "if (stage < kGfxStage || snapshot == nullptr) return false;",
+                "if (((void)stage, snapshot == nullptr)) return false;"),
+            "!gfxWriteAllowed(kRegCpMeCntl, 0, 21, snap)": (
+                "value == ((snapshot[i] & ~write.mask) | (write.value & write.mask))",
+                "(value & write.mask) == (write.value & write.mask)"),
+            "!writeAllowed(kRegMp0C2PMsg67, 192, 21)": (
+                "value <= (kGfxDestroyFrame + 1) * kPspFrameDwords", "value <= 0xffff"),
+            "writePspCommand(work.reader(), work.writer(), 21, kPspGfxLoad + 2, 2) == kRegisterNotAllowed": (
+                "gfxLoadCommand(command) && frame == command - kPspGfxLoad + 1", "gfxLoadCommand(command)"),
+            "pspCommandWord(kPspGfxLoad + 3, i) == mec[i]": ("case 3: return image.fwType;",
+                                                             "case 3: return image.fwType + 1;"),
+            "index == kGfxFileMec": (
+                "if (le32(files.data[pin.file] + pin.offset) != pin.value) return kGfxImageInvalid;", ""),
+            # A word past the jump table's end reads past the MEC file: ASan stops it.
+            "AddressSanitizer: heap-buffer-overflow": (
+                "offset - image.slot + 4 <= image.payloadSize", "offset - image.slot < image.payloadSize + 4"),
+            "writes == 11 && g.w.writes == before + 11": ("        {kRegRlcCntl, rlc & ~kRlcEnableF32}, // rlc_stop\n", ""),
+            "g.r.gc[kRegRlcCntl] == 1": ("{kRegRlcCntl, (rlc & ~kRlcEnableF32) | kRlcEnableF32}, // rlc_start",
+                                         "{kRegRlcCntl, rlc & ~kRlcEnableF32}, // rlc_start"),
+            "writes == 15 && rptr == 1024": (
+                "{kRegCpMeCntl, snapshotOf(snapshot, kRegCpMeCntl) & ~kCpMeHalts}, // cp_gfx_enable(true)",
+                "{kRegCpMeCntl, snapshotOf(snapshot, kRegCpMeCntl)}, // cp_gfx_enable(true)"),
+            "rptr == 1024": (
+                "    Status status = writeGfxRegister(writer, stage, snapshot, kRegCpRb0Wptr, wptr);\n    return status == kOK ? writeGfxRegister(writer, stage, snapshot, kRegCpRb0WptrHi, 0) : status;",
+                "    Status status = writeGfxRegister(writer, stage, snapshot, kRegCpRb0WptrHi, 0);\n    return status == kOK ? writeGfxRegister(writer, stage, snapshot, kRegCpRb0Wptr, wptr) : status;"),
+            "== kGfxRingTestFailed": ("if (i == kGfxPollPauses) return kGfxRingTestFailed;",
+                                      "if (i == kGfxPollPauses) break;"),
+            "== kGfxDrawMismatch": ("return *unexpected == 0 ? kOK : kGfxDrawMismatch;", "return kOK;"),
+            "index == 6 && value == 904": ("if (*value != snapshot[i]) return kGfxNotRestored;", ""),
+            "g.snapshot, &index, &value) == kOK": (
+                "    for (uint32_t i = 0; i < kGfxSnapshotCount; i++)\n        note(writeGfxRegister",
+                "    for (uint32_t i = kGfxSnapshotCount; i-- > 0;)\n        note(writeGfxRegister"),
+            "21, &unexpected, &first, &firstValue) == kOK && unexpected == 0": ("kGfxBands[fill / 2]", "kGfxBands[fill % 3]"),
+            "21, g.snapshot, &index, &value) == kGfxUnexpectedState": (
+                "if ((*value & kGfxExpect[i].mask) != kGfxExpect[i].value) return kGfxUnexpectedState;", ""),
             # Stage 20.
             "!registerAllowed(offset, 19)": ("stage >= kFlipStage && i < kStage20RegisterCount",
                                              "i < kStage20RegisterCount"),
@@ -268,10 +307,16 @@ class CoreTests(unittest.TestCase):
         # register allowlist, writeWork after the work-area allowlist,
         # writeFirmwareWord after the firmware-buffer allowlist, and the SDMA
         # and GART work-area words after theirs.
-        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 6)
+        # Stage 21 adds the GFX firmware buffer, the GFX work area and the
+        # snapshot-relative GC registers.
+        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 9)
         for helper, check in (("writeSdmaWorkWord", "sdmaWorkWriteAllowed(offset, value, stage)"),
                               ("writeGartWorkWord", "gartWorkWriteAllowed(offset, value, stage)"),
-                              ("writePatternWord", "patternWriteAllowed(offset, value, stage)")):
+                              ("writePatternWord", "patternWriteAllowed(offset, value, stage)"),
+                              ("writeGfxFirmwareWord", "gfxFirmwareWriteAllowed(files, offset, value, stage)"),
+                              ("writeGfxWorkWord", "gfxWorkWriteAllowed(offset, value, stage)"),
+                              ("writeGfxRegister",
+                               "if (!writeAllowed(offset, value, stage) && !gfxWriteAllowed(offset, value, stage, snapshot))")):
             body = re.search(r"static Status %s\(.*?\n}\n" % helper, source, re.S).group(0)
             self.assertLess(body.index(check), body.index("write32"), helper)
         firmware = re.search(r"static Status writeFirmwareWord\(.*?\n}\n", source, re.S).group(0)
