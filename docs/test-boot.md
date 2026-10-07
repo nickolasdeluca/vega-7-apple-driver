@@ -3336,7 +3336,12 @@ connection runs it, and so does the kext's `stop()` if needed.
 implemented and built (`out/test-efi/usb-stage20`) the same day. Boot 29
 stopped at the check, before any stage 20 write: the flip-interrupt
 register held the firmware's status latches. The check and the restore now
-look at the enables only (fix within the stage), rebuilt for boot 30.** The user chose to combine
+look at the enables only (fix within the stage). Boot 30 filled the region
+but only the white band came out right: the fill packet filled bytes. It
+now sets `FILLSIZE` 2 (dword fills), as Mesa's RADV does; rebuilt for
+boot 31.**
+
+The user chose to combine
 two steps in this stage: the GPU drawing what is shown, and the display's
 flip interrupt. Starting the main graphics engine is stage 21, proposed
 after this stage boots, and probably split over several stages as SDMA was
@@ -3377,11 +3382,16 @@ it is not wrapped to 0.
 
 | Dwords | Packet | Values |
 | --- | --- | --- |
-| 9 × 5 | `CONST_FILL`: header `0x0000000b`, destination low, high, data, byte count − 1 | bands 0–7: destination `0xF441000000` + k × `0xfd200` (135 lines × 7680 bytes), count `0x000fd1ff`, data the band's colour; the 9th: the tail `0xF4417e9000`, count `0x00016fff`, data 0 |
+| 9 × 5 | `CONST_FILL`: header `0x8000000b` (`FILLSIZE` 2; `0x0000000b` before boot 30), destination low, high, data, byte count − 1 | bands 0–7: destination `0xF441000000` + k × `0xfd200` (135 lines × 7680 bytes), count `0x000fd1ff`, data the band's colour; the 9th: the tail `0xF4417e9000`, count `0x00016fff`, data 0 |
 | 4 | `FENCE` 4 | write-back `+0x20c` |
 | rest | `NOP` | to dword 255 |
 
-Linux's header has no fill size field set, as here. Each count is below
+**Fill size (revised after boot 30).** Linux's header leaves `FILLSIZE`
+(bits 31:30) at 0, which fills bytes with the data's low byte. Linux fills
+only with 0, where that makes no difference. Mesa's RADV
+(`radv_sdma_fill_memory`, Mesa 25.2) sets `FILLSIZE` 2, "the count is in
+dwords", with the count still in bytes − 1. Frame 4 now does the same.
+Each count is below
 the 4 MiB limit (`fill_max_bytes` `0x400000`; the count field is 22 bits).
 Frame 4 has no `TRAP`, so the only interrupt this stage expects is the
 display's.
@@ -3494,7 +3504,7 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
 | Step | Selector | What it does |
 | --- | --- | --- |
 | check | 39 `FlipCheck` | Only after a passing stage 18 acknowledgement, with no stage 19 pattern up. Stage 19's check (pipe 0, `kDisplayExpect`, the region placed, the 1 s checksum, a pipe 0 snapshot), then `SURFACE_FLIP_INTERRUPT`'s enables (bits 0 and 2) 0 and `DCHUB_INTERRUPT_DEST2` bit 0 = 0. A failing flip register is reported as index 19 or 20, after stage 19's 19 entries. No write. |
-| fill | 40 `FlipFill` | The CPU zeroes the 8 MiB region through the stage 19 mapping and reads it back. Then frame 4 is written to ring dwords 0–255 and read back, and submitted (`submitSdma` frame 4: `GFX_RB_WPTR` must read 4096; ← 5120, `_HI` ← 0; fence 4 polled for 100 ms). Then the whole region is read against the reversed bands. Any MSI during the step fails it. Reports the step reached (1 clear, 2 frame written, 3 submitted, 4 checked). |
+| fill | 40 `FlipFill` | The CPU zeroes the 8 MiB region through the stage 19 mapping and reads it back. Then frame 4 is written to ring dwords 0–255 and read back, and submitted (`submitSdma` frame 4: `GFX_RB_WPTR` must read 4096; ← 5120, `_HI` ← 0; fence 4 polled for 100 ms). Then the whole region is read against the reversed bands. Any MSI during the step fails it. Reports the step reached (1 clear, 2 frame written, 3 submitted, 4 checked), and the value at the first unexpected word (added after boot 30). |
 | show | 41 `FlipShow` | The arm (`0x100`, `0x1`, read back: enable set), then `flipWithIntr`: stage 19's two writes and poll, then up to 100 more pauses for the MSI, then the new IH entries from `IH_RB_RPTR` to the write-back. Returns a `FlipReport`, with the latency from just before the flip's operation to the handler's time for that MSI. |
 | acknowledge | 42 `FlipAck` | `SURFACE_FLIP_INTERRUPT` ← `0x101`, then stage 18's `ackIntr` (`IH_RB_RPTR` ← the write-back, 100 ms, no re-fire). |
 | verify | 43 `FlipVerify` | Reads only: stage 19's verify against the reversed bands, and the MSI count unchanged since the acknowledgement. |
@@ -4808,6 +4818,35 @@ build; cold boot; `tools/capture_boot.sh boot-29-stage20 --gfxoff-disallow
   arm's first write. Rebuilt for boot 30; the first build is kept as
   `superseded-*-stage20-latch`.
 - Captures are in ignored `out/test-efi/boot-29-stage20/`.
+
+**Boot 30, 2026-10-07, stage 20 with the enables-only check**
+(`out/test-efi/usb-stage20/`, rebuilt; cold boot; `tools/capture_boot.sh
+boot-30-stage20 --gfxoff-disallow --sdma-flip --psp-state`; exit 1).
+
+- Stages 15, 17 and 18 passed as before.
+- **Flip check: ok.** Region checksum `0x01c004dc69efe5a2`, frame count
+  7852. `DCHUB_INTERRUPT_DEST2` and `DISP_INTERRUPT_STATUS_CONTINUE17` read 0.
+- **Fill: `flip-fill-mismatch` at step 4.** This is the first CPU read of
+  SDMA's work:
+  - the clear and frame 4 passed;
+  - fence 4 arrived, with `GFX_RB_RPTR` 5120 and no MSI;
+  - **1,814,400 words were wrong, first at `+0x0`.**
+
+  That count is exactly 7 bands of 259,200 words: one band was right.
+- **Cause.** Frame 4's header left `FILLSIZE` 0, as Linux does, and that
+  fills bytes with the data's low byte. Of the eight colours only white
+  (`0xFFFFFFFF`) has the same low byte in every position, so only the white
+  band was right. The black band at `+0x0` was filled with `0x00` bytes.
+- **No display write was made.** The show step never ran, and the user saw
+  no pattern. The stage 18 restore, the stage 17 restore and the stage 15
+  stop all reported ok.
+- **Fix (within the stage):**
+  - the header is `0x8000000b` (`FILLSIZE` 2, dword fills), as RADV writes
+    it;
+  - the fill step now also reports the value read at the first wrong word.
+
+  The second build is kept as `superseded-*-stage20-fill`.
+- Captures are in ignored `out/test-efi/boot-30-stage20/`.
 
 ## Unknowns and limits
 
