@@ -11,13 +11,14 @@
 // the stage 17 GART and interrupt ring (--gart-ih), and the stage 18 MSI
 // delivery (--ih-intr), and the stage 19 display test pattern
 // (--display-pattern), and the stage 20 SDMA fill and flip interrupt
-// (--sdma-flip).
+// (--sdma-flip), and the stage 21 graphics engine start and drawing
+// (--gfx-start).
 // --psp-state (stage 10) and --inventory16 (stage 16) only read.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
 //                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--sdma-inventory]
-//                          [--sdma-copy] [--gart-ih] [--ih-intr] [--sdma-flip] [--display-pattern]
-//                          [--psp-state] [--inventory16]
+//                          [--sdma-copy] [--gart-ih] [--ih-intr] [--sdma-flip] [--gfx-start]
+//                          [--display-pattern] [--psp-state] [--inventory16]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -247,9 +248,49 @@ const Named kRegisters[] = {
     {"HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT", kRegHubpreq0DcsurfSurfaceFlipInterrupt},
     {"DCHUB_INTERRUPT_DEST2", kRegDchubInterruptDest2},
     {"DISP_INTERRUPT_STATUS_CONTINUE17", kRegDispInterruptStatusContinue17},
+    {"CP_INT_CNTL_RING0", kRegCpIntCntlRing0},
+    {"RLC_CSIB_ADDR_HI", kRegRlcCsibAddrHi},
+    {"RLC_CSIB_ADDR_LO", kRegRlcCsibAddrLo},
+    {"RLC_CSIB_LENGTH", kRegRlcCsibLength},
+    {"RLC_SRM_CNTL", kRegRlcSrmCntl},
+    {"RLC_SPM_MC_CNTL", kRegRlcSpmMcCntl},
+    {"RLC_SERDES_CU_MASTER_BUSY", kRegRlcSerdesCuMasterBusy},
+    {"RLC_SERDES_NONCU_MASTER_BUSY", kRegRlcSerdesNoncuMasterBusy},
+    {"CP_RB_WPTR_DELAY", kRegCpRbWptrDelay},
+    {"CP_RB_VMID", kRegCpRbVmid},
+    {"CP_RB0_CNTL", kRegCpRb0Cntl},
+    {"CP_RB0_WPTR", kRegCpRb0Wptr},
+    {"CP_RB0_WPTR_HI", kRegCpRb0WptrHi},
+    {"CP_RB0_RPTR_ADDR", kRegCpRb0RptrAddr},
+    {"CP_RB0_RPTR_ADDR_HI", kRegCpRb0RptrAddrHi},
+    {"CP_RB_WPTR_POLL_ADDR_LO", kRegCpRbWptrPollAddrLo},
+    {"CP_RB_WPTR_POLL_ADDR_HI", kRegCpRbWptrPollAddrHi},
+    {"CP_RB0_BASE", kRegCpRb0Base},
+    {"CP_RB0_BASE_HI", kRegCpRb0BaseHi},
+    {"CP_MAX_CONTEXT", kRegCpMaxContext},
+    {"CP_DEVICE_ID", kRegCpDeviceId},
+    {"CP_RB0_RPTR", kRegCpRb0Rptr},
+    {"CP_RB_DOORBELL_CONTROL", kRegCpRbDoorbellControl},
+    {"MC_VM_MX_L1_TLB_CNTL_GC", kRegGcMxL1TlbCntl},
+    {"VM_L2_CNTL_GC", kRegGcVmL2Cntl},
+    {"VM_CONTEXT0_CNTL_GC", kRegGcVmContext0Cntl},
+    {"CP_STAT", kRegCpStat},
+    {"CP_CPC_STATUS", kRegCpCpcStatus},
+    {"CP_CE_INSTR_PNTR", kRegCpCeInstrPntr},
+    {"CB_HW_CONTROL", kRegCbHwControl},
+    {"CB_HW_CONTROL_2", kRegCbHwControl2},
+    {"DB_DEBUG2", kRegDbDebug2},
+    {"GB_ADDR_CONFIG_READ", kRegGbAddrConfigRead},
+    {"PA_SC_ENHANCE", kRegPaScEnhance},
+    {"PA_SC_ENHANCE_1", kRegPaScEnhance1},
+    {"PA_SC_LINE_STIPPLE_STATE", kRegPaScLineStippleState},
+    {"TA_CNTL_AUX", kRegTaCntlAux},
+    {"TCP_CHAN_STEER_HI", kRegTcpChanSteerHi},
+    {"TCP_CHAN_STEER_LO", kRegTcpChanSteerLo},
 };
-static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) ==
-                  kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount + kStage20RegisterCount,
+static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage16RegisterCount + kStage17RegisterCount +
+                                                                kStage19RegisterCount + kStage20RegisterCount +
+                                                                kStage21RegisterCount,
               "one name per register");
 
 const char *registerName(uint32_t offset)
@@ -265,7 +306,8 @@ void usage(FILE *out)
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
                       "                         [--psp-sdma] [--sdma-inventory] [--sdma-copy] [--gart-ih]\n"
-                      "                         [--ih-intr] [--sdma-flip] [--display-pattern] [--psp-state]\n"
+                      "                         [--ih-intr] [--sdma-flip] [--gfx-start] [--display-pattern]\n"
+                      "                         [--psp-state]\n"
                       "                         [--inventory16]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
@@ -291,6 +333,9 @@ void usage(FILE *out)
                       "--sdma-flip does --ih-intr up to its acknowledgement, then has SDMA0 fill a pattern in the\n"
                       "carveout, shows it on pipe 0 for 5 s with HUBP0's flip interrupt on, verifies, flips back,\n"
                       "and finishes as --ih-intr.\n"
+                      "--gfx-start creates the PSP ring and TMR, loads the GFX firmware, starts the RLC and the CP,\n"
+                      "runs a ring test and a fence, has the CP draw three bands shown on pipe 0 for 5 s, restores\n"
+                      "every GC register written, and tears down.\n"
                       "--display-pattern draws a test pattern in the carveout, shows it on pipe 0 for 5 s by\n"
                       "flipping its surface address, verifies, and flips back to the boot framebuffer.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n"
@@ -1263,9 +1308,139 @@ bool sdmaCopy(io_connect_t connection, bool *stopped, bool gart, bool intr, bool
     return ok && halted;
 }
 
+// Prints a stage 21 report: every register of kGfxStateRegisters.
+void printGfxState(const GfxState &state)
+{
+    for (uint32_t i = 0; i < kGfxStateCount; i++)
+        std::printf("    %-30s 0x%08x%s", registerName(kGfxStateRegisters[i]), state.values[i],
+                    i % 2 == 1 || i + 1 == kGfxStateCount ? "\n" : "");
+}
+
+// The stage 21 steps after a passing SETUP_TMR: check, load, RLC start, CP
+// start, ring test and fence, draw (and flip), a 5 s hold, verify, restore.
+// The restore runs whenever the RLC start or the flip was sent; the PSP
+// teardown that follows would also run it.
+bool gfxEngine(io_connect_t connection)
+{
+    static const char *const files[] = {"green_sardine_ce.bin", "green_sardine_pfp.bin", "green_sardine_me.bin",
+                                        "green_sardine_mec.bin", "green_sardine_rlc.bin"};
+    uint64_t check[3] = {};
+    GfxState checked = {};
+    step("gfx 1/8 check: nine firmware headers; GFX on, RLC off, CP and MEC halted, no doorbell, GC hub as MMHUB at\n"
+         "  boot 22; pipe 0 at boot 22; firmware buffer, work area and pattern region placed and stable");
+    if (!callReport(connection, kDiagnosticGfxCheck, check, 3, &checked)) return false;
+    std::printf("%s", statusName(static_cast<Status>(check[0])));
+    if (check[0] == kGfxImageInvalid && check[1] < kGfxFileCount) std::printf(" (%s)", files[check[1]]);
+    if (check[0] == kGfxUnexpectedState && check[1] < kGfxExpectCount)
+        std::printf(" (%s reads 0x%08llx; expected 0x%08x under mask 0x%08x)", registerName(kGfxExpect[check[1]].offset),
+                    static_cast<unsigned long long>(check[2]), kGfxExpect[check[1]].value, kGfxExpect[check[1]].mask);
+    if (check[0] == kDisplayUnexpectedState) printDisplayCheckEntry(check[1], check[2]);
+    std::printf("\n  GC state at the check (the first %u are the snapshot):\n", kGfxSnapshotCount);
+    printGfxState(checked);
+    if (check[0] != kOK) return false;
+
+    uint64_t load[6] = {};
+    GfxState state = {};
+    step("gfx 2/8 load: copy the nine images (496 KiB) to 0xf440900000, then LOAD_IP_FW as frames 1-9\n"
+         "  (CE, PFP, ME, MEC1, MEC1 jump table, RLC lists CNTL, GPM, SRM, RLC_G)");
+    if (!callReport(connection, kDiagnosticGfxLoad, load, 6, &state)) return false;
+    std::printf("%s, %llu images loaded, last fence %llu, status 0x%08llx, fw_addr 0x%08llx%08llx\n",
+                statusName(static_cast<Status>(load[0])), static_cast<unsigned long long>(load[1]),
+                static_cast<unsigned long long>(load[2]), static_cast<unsigned long long>(load[3]),
+                static_cast<unsigned long long>(load[5]), static_cast<unsigned long long>(load[4]));
+    std::printf("  GC state after the loads:\n");
+    printGfxState(state);
+    if (load[0] != kOK) return false;
+
+    // From here the restore is owed.
+    uint64_t rlc[4] = {};
+    step("gfx 3/8 RLC start: rlc_stop, serdes, CG off, clear-state buffer, save/restore machine, SPM VMID 0xf,\n"
+         "  RLC_ENABLE_F32");
+    bool ok = callReport(connection, kDiagnosticGfxRlc, rlc, 4, &state);
+    if (ok) {
+        std::printf("%s, %llu writes, serdes CU 0x%08llx, NONCU 0x%08llx\n", statusName(static_cast<Status>(rlc[0])),
+                    static_cast<unsigned long long>(rlc[1]), static_cast<unsigned long long>(rlc[2]),
+                    static_cast<unsigned long long>(rlc[3]));
+        printGfxState(state);
+        ok = rlc[0] == kOK;
+    }
+    if (ok) {
+        uint64_t cp[4] = {};
+        step("gfx 4/8 CP start: ring 0xf440a00000 (8 KiB), no doorbell, CP_ME_CNTL halts cleared; frame 0 (clear\n"
+             "  state), CP_RB0_WPTR <- 1024, _HI <- 0");
+        ok = callReport(connection, kDiagnosticGfxCp, cp, 4, &state);
+        if (ok) {
+            std::printf("%s, %llu writes, read-pointer write-back %llu, CP_RB0_RPTR %llu\n",
+                        statusName(static_cast<Status>(cp[0])), static_cast<unsigned long long>(cp[1]),
+                        static_cast<unsigned long long>(cp[2]), static_cast<unsigned long long>(cp[3]));
+            printGfxState(state);
+            ok = cp[0] == kOK;
+        }
+    }
+    if (ok) {
+        uint64_t test[4] = {};
+        step("gfx 5/8 ring test and fence: SCRATCH_REG0 <- 0xcafedead, SET_UCONFIG_REG SCRATCH_REG0 0xdeadbeef\n"
+             "  (WPTR 1280); RELEASE_MEM fence 1 (WPTR 1536)");
+        ok = callReport(connection, kDiagnosticGfxTest, test, 4, &state);
+        if (ok) {
+            std::printf("%s, SCRATCH_REG0 0x%08llx, fence 1 %llu, read pointer %llu\n",
+                        statusName(static_cast<Status>(test[0])), static_cast<unsigned long long>(test[1]),
+                        static_cast<unsigned long long>(test[2]), static_cast<unsigned long long>(test[3]));
+            ok = test[0] == kOK;
+            if (!ok) printGfxState(state);
+        }
+    }
+    if (ok) {
+        uint64_t draw[6] = {};
+        step("gfx 6/8 draw: zero the region; 6 DMA_DATA fills and fence 2 (WPTR 2048); read the region back; flip\n"
+             "  pipe 0 to it");
+        ok = callReport(connection, kDiagnosticGfxDraw, draw, 6, &state);
+        if (ok) {
+            std::printf("%s, step %llu, fence 2 %llu; %llu unexpected words (first +0x%llx reads 0x%08llx)\n",
+                        statusName(static_cast<Status>(draw[0])), static_cast<unsigned long long>(draw[1]),
+                        static_cast<unsigned long long>(draw[2]), static_cast<unsigned long long>(draw[3]),
+                        static_cast<unsigned long long>(draw[4]), static_cast<unsigned long long>(draw[5]));
+            ok = draw[0] == kOK;
+            if (!ok) printGfxState(state);
+        }
+    }
+    if (ok) {
+        std::printf("  The CP's image is on screen for 5 s: red, green and blue, top to bottom.\n");
+        std::fflush(stdout);
+        sleep(5);
+        uint64_t scalar = 0;
+        DisplayReport report = {};
+        step("gfx 7/8 verify: still the CP's image, frames advanced, pipe 0 otherwise unchanged");
+        ok = callReport(connection, kDiagnosticGfxVerify, &scalar, 1, &report);
+        if (ok) {
+            std::printf("%s\n  in use 0x%02x%08x, %u frames since the flip; display: %u changed; image: %u unexpected "
+                        "words (first +0x%x)\n",
+                        statusName(static_cast<Status>(scalar)), report.inuseHi, report.inuseLo, report.framesAdvanced,
+                        report.displayChanged, report.patternUnexpected, report.patternFirst);
+            ok = scalar == kOK;
+        }
+    }
+    uint64_t restore[4] = {};
+    step("gfx 8/8 restore: flip back; CP_ME_CNTL halted, rlc_stop, every written GC register back to the check's\n"
+         "  reading");
+    bool restored = callReport(connection, kDiagnosticGfxRestore, restore, 4, &state);
+    if (restored) {
+        std::printf("%s, flip back %s", statusName(static_cast<Status>(restore[0])),
+                    statusName(static_cast<Status>(restore[3])));
+        if (restore[0] == kGfxNotRestored && restore[1] < kGfxSnapshotCount)
+            std::printf(" (%s reads 0x%08llx, the check read 0x%08x)", registerName(kGfxSnapshotRegisters[restore[1]]),
+                        static_cast<unsigned long long>(restore[2]), checked.values[restore[1]]);
+        std::printf("\n");
+        printGfxState(state);
+        restored = restore[0] == kOK;
+    }
+    return ok && restored;
+}
+
 // mode: 0 load only, 1 with the stage 14 inventory, 2 with the stage 15 copy,
 // 3 with the copy and the stage 17 GART and interrupt ring, 4 with those and
-// the stage 18 MSI delivery, 5 with those and the stage 20 SDMA fill and flip.
+// the stage 18 MSI delivery, 5 with those and the stage 20 SDMA fill and flip;
+// 6 the stage 21 graphics engine after SETUP_TMR, without SDMA.
 bool pspSdma(io_connect_t connection, int mode)
 {
     uint64_t check[7] = {};
@@ -1308,6 +1483,13 @@ bool pspSdma(io_connect_t connection, int mode)
     if (submitted[0] != kOK) {
         tmrTeardown(connection, "sdma teardown: DESTROY_TMR if fenced, then DESTROY_RINGS");
         return false;
+    }
+    if (mode == 6) {
+        // Stage 21 instead of the SDMA load.
+        bool started = gfxEngine(connection);
+        bool torn = tmrTeardown(connection, "gfx teardown: DESTROY_TMR as the next frame if the last fenced, then "
+                                            "DESTROY_RINGS");
+        return started && torn;
     }
 
     uint64_t loaded[6] = {};
@@ -1438,7 +1620,7 @@ int main(int argc, char **argv)
     unsigned long repeat = 1, interval = 1000;
     bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
          inventory = false, copy = false, psp = false, inventory16Flag = false, gartFlag = false,
-         intrFlag = false, displayFlag = false, flipFlag = false;
+         intrFlag = false, displayFlag = false, flipFlag = false, gfxFlag = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -1482,6 +1664,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--ih-intr") == 0) {
             intrFlag = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--gfx-start") == 0) {
+            gfxFlag = true;
             continue;
         }
         if (std::strcmp(argv[i], "--sdma-flip") == 0) {
@@ -1544,7 +1730,9 @@ int main(int argc, char **argv)
     std::printf("CezanneGPU diagnostics v%llu, driver stage %llu\n", static_cast<unsigned long long>(info[0]),
                 static_cast<unsigned long long>(info[1]));
 
-    const uint32_t count = info[1] >= 20  ? kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount +
+    const uint32_t count = info[1] >= 21  ? kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount +
+                                                kStage20RegisterCount + kStage21RegisterCount
+                           : info[1] >= 20 ? kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount +
                                                 kStage20RegisterCount
                            : info[1] >= 19 ? kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount
                            : info[1] >= 17 ? kStage16RegisterCount + kStage17RegisterCount
@@ -1651,6 +1839,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!pspSdma(connection, 5)) failures++;
+    }
+    if (gfxFlag) {
+        if (info[1] < kGfxStage) {
+            std::fprintf(stderr, "cezanne-diag: --gfx-start needs driver stage %u\n", kGfxStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspSdma(connection, 6)) failures++;
     }
     if (displayFlag) {
         if (info[1] < kDisplayStage) {

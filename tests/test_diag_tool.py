@@ -39,7 +39,15 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(ring\) \{[^}]*info\[1\] < kPspRingStage")
         self.assertEqual(len(re.findall(r"\bpspTmr\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(tmr\) \{[^}]*info\[1\] < kPspTmrStage")
-        self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["0", "1", "2", "3", "4", "5"])
+        self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["0", "1", "2", "3", "4", "5", "6"])
+        self.assertRegex(source, r"if \(gfxFlag\) \{[^}]*info\[1\] < kGfxStage")
+        # The stage 21 restore runs whenever the RLC start was sent; the PSP
+        # teardown follows it.
+        gfx = re.search(r"bool gfxEngine\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(gfx.index("kDiagnosticGfxRlc"), gfx.index("kDiagnosticGfxRestore"))
+        self.assertNotRegex(gfx[gfx.index("kDiagnosticGfxRlc"):gfx.index("kDiagnosticGfxRestore")], r"\breturn\b")
+        psp = re.search(r"bool pspSdma\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(psp.index("gfxEngine(connection)"), psp.index("gfx teardown"))
         self.assertRegex(source, r"if \(flipFlag\) \{[^}]*info\[1\] < kFlipStage")
         self.assertRegex(source, r"if \(gartFlag\) \{[^}]*info\[1\] < kGartStage")
         self.assertRegex(source, r"if \(intrFlag\) \{[^}]*info\[1\] < kIntrStage")
@@ -88,7 +96,8 @@ class DiagSourceTests(unittest.TestCase):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
         expected = []
-        for name in ("kStage16Registers", "kStage17Registers", "kStage19Registers", "kStage20Registers"):
+        for name in ("kStage16Registers", "kStage17Registers", "kStage19Registers", "kStage20Registers",
+                     "kStage21Registers"):
             listed = re.search(r"%s\[\] = \{([^}]*)\}" % name, header).group(1)
             expected += [entry.strip() for entry in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
