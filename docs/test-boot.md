@@ -3178,8 +3178,9 @@ also removes the event source if it is still registered.
 ### Stage 19: display test pattern (proposal)
 
 **Status: proposed 2026-10-06 and approved by the user the same day;
-implemented and built (`out/test-efi/usb-stage19`) on 2026-10-07. Not yet
-booted.**
+implemented and built (`out/test-efi/usb-stage19`) on 2026-10-07.
+Succeeded in boot 28 the same day; the grey lines were straight, so the
+hardware reads 1920 pixels per line.**
 
 **Purpose.** The first write that changes what is on screen. Pipe 0 keeps
 the firmware's mode and everything else it set up. Only its surface address
@@ -4365,7 +4366,8 @@ with `tools/update_stick.sh 16`; cold boot, kernel up 10:39:35 local).
       than Linux would write for a 1920-pixel surface. The tool decodes it
       the Linux way and prints 1921. This is recorded as an open
       observation, since the framebuffer is exactly 1920 × 1080 × 4 bytes
-      (boot 12).
+      (boot 12). Boot 28 settled it: the hardware reads 1920 pixels per
+      line.
   - **Pipes 1–3:** OTG off (`0x80000300`), HUBP blanked, no surface.
   - **Connector:** `DIG0_DIG_BE_CNTL` `0x00020100`: front-end source 1,
     `DIG_MODE` 2. DIG1–4 read `0x00010000`.
@@ -4542,6 +4544,42 @@ boot-27-stage18 --gfxoff-disallow --ih-intr --psp-state`; exit 0).
     measured with the handler's `mach_absolute_time()`.
 - Captures are in ignored `out/test-efi/boot-27-stage18/`.
 - Result: **stage 18 succeeded.**
+
+**Boot 28, 2026-10-07, stage 19** (`out/test-efi/usb-stage19/`; cold boot;
+`tools/capture_boot.sh boot-28-stage19 --display-pattern --psp-state`;
+exit 0).
+
+- **Check: ok.** Pipe 0 matched boot 22, the 8 precondition registers
+  matched, and the pattern region was placed and stable (checksum
+  `0x556749721d2b9d98`). Frame count 11238.
+- **Flip: ok.** The pattern was written and read back, then
+  `EARLIEST_INUSE` reached `0xF441000000` after 13 ms, within one frame.
+  Frame count 11357: the 1 s checksum and the 8 MiB write and read-back
+  took about 2 s (119 frames).
+- **What the user saw:** eight horizontal colour bands, and grey lines that
+  **looked straight**.
+- **Verify after 5 s: ok.** Still the pattern; 300 frames since the flip
+  (60 Hz); `DCSURF_FLIP_CONTROL` `0x04100000`. Pipe 0 unchanged apart from
+  the address, and no unexpected pattern words.
+- **Restore: ok.** Back to `0xF400000000` after 4 ms. Pipe 0 matched boot 22,
+  and the user saw the desktop return unchanged.
+- **Final dump against boot 22:** apart from the 9 new registers, it differs
+  only in the PSP counter `C2PMSG_81`, `DCHUBP_CNTL`'s live status bits
+  (`0x000e0000`, inside `kHubpLiveStatus`) and
+  `VM_INVALIDATE_ENG17_ACK` (0), which stage 19 does not touch.
+- **First readings of the new registers:**
+  - `DCSURF_FLIP_CONTROL` `0x04100000`, the same during the hold and after;
+  - `DCSURF_TILING_CONFIG` `0x00000080` (`SW_MODE` 0, linear);
+  - `SURFACE_CONTROL`, metadata and `VMID_SETTINGS_0` all 0.
+- **The pitch question (open since boot 22):** with `DCSURF_SURFACE_PITCH`
+  `0x780`, a 1921-pixel pitch would have shifted each line one pixel
+  further, so the lines would lean by the full screen height (1080
+  pixels). They were straight, so the hardware reads 1920 pixels per line:
+  the register holds the pitch itself. Why Linux's `hubp2_program_size`
+  writes `surface_pitch - 1` is not resolved here. `cezanne-diag`'s
+  inventory decode still adds 1 and prints 1921.
+- Captures are in ignored `out/test-efi/boot-28-stage19/`.
+- Result: **stage 19 succeeded.**
 
 ## Unknowns and limits
 

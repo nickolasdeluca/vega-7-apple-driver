@@ -6,8 +6,8 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current checkpoint, 2026-10-06, branch `cezanne-discovery`: **driver stages
-0–18 succeeded on the USB test EFI** (boots 1–27; see the
+Current checkpoint, 2026-10-07, branch `cezanne-discovery`: **driver stages
+0–19 succeeded on the USB test EFI** (boots 1–28; see the
 [test boot log](test-boot.md#test-boot-log)). The driver can do the
 following:
 - read the GPU, the discovery table and the engine state;
@@ -19,14 +19,18 @@ following:
 - enable the MMHUB GART and IH ring 0, copy through the GART and receive the
   SDMA0 trap, then restore (boot 25);
 - deliver that trap as an MSI to a kext handler, acknowledge it, then
-  restore (boot 27).
+  restore (boot 27);
+- show its own test pattern on display pipe 0 by flipping the surface
+  address, then flip back (boot 28).
 
 Stage 17 (GART and the IH ring) succeeded in boot 25: an SDMA copy read
 through a driver-built GART page table, its trap arrived in IH ring 0, and
 everything was restored. Stage 18 (MSI interrupt delivery) succeeded in
 boot 27: the trap reached the kext's handler 31 µs after the write pointer,
 with no re-fire after the acknowledgement. Stage 19 (display test pattern)
-is approved, implemented and built, waiting for boot 28; see "Next task" below. The sections that follow are the earlier discovery record and
+succeeded in boot 28: the flip landed in 13 ms, the pattern showed for 5 s
+with straight grey lines (the hardware reads 1920 pixels per line), and the
+desktop came back unchanged. See "Next task" below. The sections that follow are the earlier discovery record and
 still apply.
 
 Completed work:
@@ -140,31 +144,26 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 19 (display test pattern)
+## Next task: choose stage 20
 
-Stage 19 was approved on 2026-10-06 (the
-[proposal](test-boot.md#stage-19-display-test-pattern-proposal)) and
-implemented and built on 2026-10-07; the implementation notes are in that
-section. Steps:
+Stages 0–19 succeeded (boot 28, 2026-10-07, in the
+[test boot log](test-boot.md#test-boot-log)). Stage 20 is not chosen yet.
+Ask the user which direction to take next, then write its proposal in
+`test-boot.md`. Nothing is built until the user approves it.
 
-1. Make a Time Machine backup (the proposal's risks).
-2. The user runs `tools/update_stick.sh 19` (the stick holds stage 18), cold
-   boots the stick, and runs
-   `tools/capture_boot.sh boot-28-stage19 --display-pattern --psp-state`.
-3. The user reports what the screen showed for those 5 seconds: eight
-   horizontal colour bands, and whether the grey lines were **straight or
-   leaning** (the pitch question from boot 22). Then whether the desktop
-   came back unchanged.
-4. Read the output against "Stage 19 succeeds when" in
-   [test-boot.md](test-boot.md) and record boot 28 in the log. Follow the
-   [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
-   for defects. If the screen stays wrong after the tool ends, the user
-   shuts down fully; a cold boot resets the display.
+**Builds:** `out/test-efi/usb-stage19` (`usb-stage19-build.json`, on the
+stick), `out/test-efi/driver`, `out/diag`. The stage 18 builds are kept as
+`out/test-efi/superseded-driver-stage18` and `superseded-diag-stage18`.
 
-**Builds:** `out/test-efi/usb-stage19` (`usb-stage19-build.json`),
-`out/test-efi/driver`, `out/diag`. The stage 18 builds that passed boot 27
-are kept as `out/test-efi/superseded-driver-stage18` and
-`superseded-diag-stage18`, with `out/test-efi/usb-stage18`.
+**Open, small:** `cezanne-diag`'s stage 16 inventory decodes
+`DCSURF_SURFACE_PITCH` the Linux way (value + 1) and prints 1921; boot 28
+showed the hardware reads 1920.
+
+### Earlier: booting stage 19
+
+The user ran `tools/update_stick.sh 19` and
+`tools/capture_boot.sh boot-28-stage19 --display-pattern --psp-state`
+(boot 28), and reported the bands, straight lines and an unchanged desktop.
 
 ### Earlier: booting stage 18
 
