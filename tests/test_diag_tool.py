@@ -16,10 +16,10 @@ class DiagSourceTests(unittest.TestCase):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         calls = re.findall(r"IOConnect\w+\s*\(\s*connection\s*,\s*(\w+)", source)
         self.assertEqual(sorted(set(calls)),
-                         ["kDiagnosticGartVerify", "kDiagnosticGetInfo", "kDiagnosticIntrVerify", "kDiagnosticMetricsRead",
+                         ["kDiagnosticDisplayVerify", "kDiagnosticGartVerify", "kDiagnosticGetInfo", "kDiagnosticIntrVerify", "kDiagnosticMetricsRead",
                           "kDiagnosticReadRegister", "kDiagnosticSdmaInventory", "selector"])
         helper = re.findall(r"\bcall\(connection, (\w+)", source)
-        self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore", "kDiagnosticSmuCheck", "kDiagnosticSmuQuery", "kDiagnosticSmuCheck", "kDiagnosticGfxOffDisallow", "kDiagnosticMetricsCheck", "kDiagnosticMetricsTransfer", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspRingObserve", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticPspTmrObserve", "kDiagnosticPspTmrTeardown", "kDiagnosticPspTmrTeardown", "kDiagnosticSdmaStop", "kDiagnosticIntrCheck", "kDiagnosticIntrEnable", "kDiagnosticSdmaSubmit", "kDiagnosticIntrAck", "kDiagnosticIntrRestore", "kDiagnosticGartCheck", "kDiagnosticGartEnable", "kDiagnosticSdmaSubmit", "kDiagnosticGartRestore", "kDiagnosticSdmaCopyCheck", "kDiagnosticSdmaStart", "kDiagnosticSdmaSubmit", "kDiagnosticSdmaVerify", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticSdmaLoad", "kDiagnosticSdmaObserve"])
+        self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore", "kDiagnosticSmuCheck", "kDiagnosticSmuQuery", "kDiagnosticSmuCheck", "kDiagnosticGfxOffDisallow", "kDiagnosticMetricsCheck", "kDiagnosticMetricsTransfer", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspRingObserve", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticPspTmrObserve", "kDiagnosticPspTmrTeardown", "kDiagnosticPspTmrTeardown", "kDiagnosticSdmaStop", "kDiagnosticIntrCheck", "kDiagnosticIntrEnable", "kDiagnosticSdmaSubmit", "kDiagnosticIntrAck", "kDiagnosticIntrRestore", "kDiagnosticGartCheck", "kDiagnosticGartEnable", "kDiagnosticSdmaSubmit", "kDiagnosticGartRestore", "kDiagnosticDisplayCheck", "kDiagnosticDisplayFlip", "kDiagnosticDisplayRestore", "kDiagnosticSdmaCopyCheck", "kDiagnosticSdmaStart", "kDiagnosticSdmaSubmit", "kDiagnosticSdmaVerify", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticSdmaLoad", "kDiagnosticSdmaObserve"])
 
         # The only messages the tool can ask for are the two version queries.
         self.assertEqual(re.findall(r'\{"smu \d/3 query: \w+ \(0x\d\)", (\w+)\}', source),
@@ -42,6 +42,13 @@ class DiagSourceTests(unittest.TestCase):
         self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["0", "1", "2", "3", "4"])
         self.assertRegex(source, r"if \(gartFlag\) \{[^}]*info\[1\] < kGartStage")
         self.assertRegex(source, r"if \(intrFlag\) \{[^}]*info\[1\] < kIntrStage")
+        self.assertRegex(source, r"if \(displayFlag\) \{[^}]*info\[1\] < kDisplayStage")
+        self.assertEqual(len(re.findall(r"\bdisplayPattern\(connection\)", source)), 1)
+        # The display restore runs whenever the flip was sent.
+        display = re.search(r"bool displayPattern\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(display.index("kDiagnosticDisplayFlip"), display.index("kDiagnosticDisplayRestore"))
+        self.assertNotRegex(display[display.index("kDiagnosticDisplayFlip"):display.index("kDiagnosticDisplayRestore")],
+                            r"\breturn\b")
         # The interrupt steps run only after a passing stage 17 verify, inside
         # its restore, and their own restore whenever the enable was sent.
         self.assertIn("if (ok && intr) ok = intrIh(connection);", source)
@@ -71,7 +78,7 @@ class DiagSourceTests(unittest.TestCase):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
         expected = []
-        for name in ("kStage16Registers", "kStage17Registers"):
+        for name in ("kStage16Registers", "kStage17Registers", "kStage19Registers"):
             listed = re.search(r"%s\[\] = \{([^}]*)\}" % name, header).group(1)
             expected += [entry.strip() for entry in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)

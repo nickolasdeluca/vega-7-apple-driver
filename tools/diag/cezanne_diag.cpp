@@ -9,12 +9,14 @@
 // (--psp-sdma), and the stage 14 SDMA power-up register inventory
 // (--sdma-inventory), and the stage 15 first SDMA copy (--sdma-copy), and
 // the stage 17 GART and interrupt ring (--gart-ih), and the stage 18 MSI
-// delivery (--ih-intr).
+// delivery (--ih-intr), and the stage 19 display test pattern
+// (--display-pattern).
 // --psp-state (stage 10) and --inventory16 (stage 16) only read.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
 //                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--sdma-inventory]
-//                          [--sdma-copy] [--gart-ih] [--ih-intr] [--psp-state] [--inventory16]
+//                          [--sdma-copy] [--gart-ih] [--ih-intr] [--display-pattern] [--psp-state]
+//                          [--inventory16]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -232,8 +234,18 @@ const Named kRegisters[] = {
     {"BIF_IH_DOORBELL_RANGE", kRegBifIhDoorbellRange},
     {"VM_INVALIDATE_ENG17_ADDR_RANGE_LO32", kRegVmInvalidateEng17AddrRangeLo32},
     {"VM_INVALIDATE_ENG17_ADDR_RANGE_HI32", kRegVmInvalidateEng17AddrRangeHi32},
+    {"HUBPREQ0_DCSURF_FLIP_CONTROL", kRegHubpreq0DcsurfFlipControl},
+    {"HUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE", kRegHubpreq0DcsurfSurfaceEarliestInuse},
+    {"HUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE_HIGH", kRegHubpreq0DcsurfSurfaceEarliestInuseHigh},
+    {"HUBP0_DCSURF_TILING_CONFIG", kRegHubp0DcsurfTilingConfig},
+    {"HUBPREQ0_DCSURF_SURFACE_CONTROL", kRegHubpreq0DcsurfSurfaceControl},
+    {"HUBPREQ0_DCSURF_PRIMARY_META_SURFACE_ADDRESS", kRegHubpreq0DcsurfPrimaryMetaSurfaceAddress},
+    {"HUBPREQ0_DCSURF_PRIMARY_META_SURFACE_ADDRESS_HIGH", kRegHubpreq0DcsurfPrimaryMetaSurfaceAddressHigh},
+    {"HUBPREQ0_VMID_SETTINGS_0", kRegHubpreq0VmidSettings0},
+    {"OTG0_OTG_STATUS_FRAME_COUNT", kRegOtg0OtgStatusFrameCount},
 };
-static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage16RegisterCount + kStage17RegisterCount,
+static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) ==
+                  kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount,
               "one name per register");
 
 const char *registerName(uint32_t offset)
@@ -249,7 +261,7 @@ void usage(FILE *out)
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
                       "                         [--psp-sdma] [--sdma-inventory] [--sdma-copy] [--gart-ih]\n"
-                      "                         [--ih-intr] [--psp-state] [--inventory16]\n"
+                      "                         [--ih-intr] [--display-pattern] [--psp-state] [--inventory16]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
@@ -271,6 +283,8 @@ void usage(FILE *out)
                       "through the GART with a fence and a TRAP, verifies, restores every register, and stops.\n"
                       "--ih-intr does --gart-ih up to its verify, then turns on MSI delivery, runs a fence and a\n"
                       "TRAP, counts the interrupt, acknowledges it, restores, and finishes as --gart-ih.\n"
+                      "--display-pattern draws a test pattern in the carveout, shows it on pipe 0 for 5 s by\n"
+                      "flipping its surface address, verifies, and flips back to the boot framebuffer.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n"
                       "--inventory16 first reads the display, memory-hub VM and interrupt registers (reads only).\n");
 }
@@ -969,6 +983,85 @@ bool gartIh(io_connect_t connection, bool intr)
     return ok && restored;
 }
 
+// Prints the stage 19 precondition list's entry at index (display pipe 0,
+// then kDisplayExpect).
+void printDisplayCheckEntry(uint64_t index, uint64_t value)
+{
+    if (index < 11) {
+        std::printf(" (%s reads 0x%08llx, boot 22 0x%08x)", registerName(kDisplayInventory[index]),
+                    static_cast<unsigned long long>(value), kDisplayPipe0Boot22[index]);
+    } else if (index < kDisplayCheckCount) {
+        const DisplayExpect &e = kDisplayExpect[index - 11];
+        std::printf(" (%s reads 0x%08llx; expected 0x%08x under mask 0x%08x)", registerName(e.offset),
+                    static_cast<unsigned long long>(value), e.value, e.mask);
+    }
+}
+
+// The stage 19 steps: check, pattern and flip, a 5 s hold, verify, restore.
+// The restore runs whenever the flip was sent; closing the connection would
+// also run it.
+bool displayPattern(io_connect_t connection)
+{
+    uint64_t check[6] = {};
+    step("display 1/4 check: pipe 0 at boot 22, linear ARGB8888 without DCC, no flip pending, scanning out\n"
+         "  0xf400000000; pattern region 0xf441000000 (8 MiB) placed and stable");
+    if (!call(connection, kDiagnosticDisplayCheck, check, 6)) return false;
+    std::printf("%s", statusName(static_cast<Status>(check[0])));
+    if (check[0] == kDisplayUnexpectedState) printDisplayCheckEntry(check[1], check[2]);
+    std::printf("\n  OTG0 frame count %llu, region checksum 0x%08llx%08llx\n", static_cast<unsigned long long>(check[3]),
+                static_cast<unsigned long long>(check[5]), static_cast<unsigned long long>(check[4]));
+    if (check[0] != kOK) return false;
+
+    uint64_t flip[5] = {};
+    step("display 2/4 flip: write the pattern, PRIMARY_SURFACE_ADDRESS_HIGH <- 0xf4, PRIMARY_SURFACE_ADDRESS <-\n"
+         "  0x41000000, wait for the flip");
+    bool ok = call(connection, kDiagnosticDisplayFlip, flip, 5);
+    if (ok) {
+        std::printf("%s, in use 0x%02llx%08llx after %llu ms, frame count %llu\n",
+                    statusName(static_cast<Status>(flip[0])), static_cast<unsigned long long>(flip[2]),
+                    static_cast<unsigned long long>(flip[1]), static_cast<unsigned long long>(flip[3]),
+                    static_cast<unsigned long long>(flip[4]));
+        ok = flip[0] == kOK;
+    }
+    if (ok) {
+        std::printf("  the pattern is on screen for 5 s: 8 horizontal colour bands and 9 grey lines.\n"
+                    "  Note whether the grey lines are straight and vertical, or lean.\n");
+        std::fflush(stdout);
+        sleep(5);
+        step("display 3/4 verify: still the pattern, frames advanced, pipe 0 otherwise unchanged, pattern intact");
+        uint64_t scalar = 0;
+        uint32_t scalarCount = 1;
+        DisplayReport report = {};
+        size_t size = sizeof(report);
+        kern_return_t result = IOConnectCallMethod(connection, kDiagnosticDisplayVerify, nullptr, 0, nullptr, 0,
+                                                   &scalar, &scalarCount, &report, &size);
+        ok = result == KERN_SUCCESS && scalarCount == 1 && size == sizeof(report);
+        if (!ok) {
+            std::printf("call failed 0x%08x\n", result);
+        } else {
+            std::printf("%s\n  in use 0x%02x%08x, DCSURF_FLIP_CONTROL 0x%08x; frame count %u, %u frames since the flip\n"
+                        "  display: %u changed",
+                        statusName(static_cast<Status>(scalar)), report.inuseHi, report.inuseLo, report.flipControl,
+                        report.frameCount, report.framesAdvanced, report.displayChanged);
+            if (report.displayChanged != 0) std::printf(" (first %s)", registerName(kDisplayInventory[report.displayFirst]));
+            std::printf("; pattern: %u unexpected words (first +0x%x)\n", report.patternUnexpected, report.patternFirst);
+            ok = scalar == kOK;
+        }
+    }
+    uint64_t restore[6] = {};
+    step("display 4/4 restore: PRIMARY_SURFACE_ADDRESS_HIGH <- 0xf4, PRIMARY_SURFACE_ADDRESS <- 0, wait for the flip");
+    bool restored = call(connection, kDiagnosticDisplayRestore, restore, 6);
+    if (restored) {
+        std::printf("%s, in use 0x%02llx%08llx after %llu ms", statusName(static_cast<Status>(restore[0])),
+                    static_cast<unsigned long long>(restore[2]), static_cast<unsigned long long>(restore[1]),
+                    static_cast<unsigned long long>(restore[3]));
+        if (restore[0] == kDisplayNotRestored) printDisplayCheckEntry(restore[4], restore[5]);
+        std::printf("\n");
+        restored = restore[0] == kOK;
+    }
+    return ok && restored;
+}
+
 // The stage 15 copy, after the stage 13 load: check, start, ring test,
 // copy, verify, stop; with gart, the stage 17 steps between verify and stop,
 // and with intr also the stage 18 steps inside them.
@@ -1201,7 +1294,7 @@ int main(int argc, char **argv)
     unsigned long repeat = 1, interval = 1000;
     bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
          inventory = false, copy = false, psp = false, inventory16Flag = false, gartFlag = false,
-         intrFlag = false;
+         intrFlag = false, displayFlag = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -1245,6 +1338,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--ih-intr") == 0) {
             intrFlag = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--display-pattern") == 0) {
+            displayFlag = true;
             continue;
         }
         if (std::strcmp(argv[i], "--inventory16") == 0) {
@@ -1299,7 +1396,8 @@ int main(int argc, char **argv)
     std::printf("CezanneGPU diagnostics v%llu, driver stage %llu\n", static_cast<unsigned long long>(info[0]),
                 static_cast<unsigned long long>(info[1]));
 
-    const uint32_t count = info[1] >= 17  ? kStage16RegisterCount + kStage17RegisterCount
+    const uint32_t count = info[1] >= 19  ? kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount
+                           : info[1] >= 17 ? kStage16RegisterCount + kStage17RegisterCount
                            : info[1] >= 16 ? kStage16RegisterCount
                            : info[1] >= 14 ? kStage14RegisterCount
                            : info[1] >= 13 ? kStage13RegisterCount
@@ -1395,6 +1493,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!pspSdma(connection, 4)) failures++;
+    }
+    if (displayFlag) {
+        if (info[1] < kDisplayStage) {
+            std::fprintf(stderr, "cezanne-diag: --display-pattern needs driver stage %u\n", kDisplayStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!displayPattern(connection)) failures++;
     }
     if (inventory16Flag) {
         if (info[1] < kInventory16Stage) {
