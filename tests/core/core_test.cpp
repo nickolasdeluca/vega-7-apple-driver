@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <vector>
 
 using namespace cezanne;
 
@@ -143,6 +144,17 @@ struct FakeRegisters {
     // RPTR_REARM, none again until IH_RB_RPTR is written.
     uint32_t msiCount = 0;
     bool msiArmed = true, msiDrop = false, msiRefire = false;
+    // DCN pipe 0 (stage 19): a flip lands flipDelay pauses after the address
+    // write (-1 never); OTG0's frame counter advances on every pause.
+    int flipDelay = 1, flipPending = -1;
+    void presetDisplay()
+    {
+        for (uint32_t i = 0; i < 11; i++) gart[kDisplayInventory[i]] = kDisplayPipe0Boot22[i];
+        for (const DisplayExpect &e : kDisplayExpect) gart[e.offset] = e.value;
+        gart[kRegHubpreq0DcsurfFlipControl] = 0x00000010; // a VUPDATE skip count: not checked
+        gart[kRegHubp0DcsurfTilingConfig] = 0x00000600;   // aligned bits: only SW_MODE is checked
+        gart[kRegOtg0OtgStatusFrameCount] = 0x00fffff0;   // wraps during the hold
+    }
     void presetBoot22()
     {
         for (const GartWrite &w : kGartEnable) gart[w.offset] = w.boot22;
@@ -840,6 +852,10 @@ struct FakeWriter {
         }
         r->gart[offset] = value;
         if (offset == kRegIhRbRptr) r->msiArmed = true;
+        if (offset == kRegHubpreq0DcsurfPrimarySurfaceAddress) {
+            r->gart[kRegHubpreq0DcsurfFlipControl] |= kFlipPending;
+            r->flipPending = r->flipDelay;
+        }
         if (offset == kRegIhRbCntl && (value & 1) != 0 && r->ihOtherEntry) postIh(r, 0x1234);
     }
     // Writes one IH entry at the write pointer and the pointer's write-back.
@@ -936,6 +952,13 @@ struct FakeWriter {
         if (r->ackPending > 0 && --r->ackPending == 0) r->gart[kRegVmInvalidateEng17Ack] = 1;
         if (r->displayFlip != 0) r->gart[kRegHubp0DchubpCntl] ^= r->displayFlip;
         if (r->msiRefire) r->msiCount++;
+        if (r->gart.count(kRegOtg0OtgStatusFrameCount) != 0)
+            r->gart[kRegOtg0OtgStatusFrameCount] = (r->gart[kRegOtg0OtgStatusFrameCount] + 1) & kOtgFrameCountMask;
+        if (r->flipPending > 0 && --r->flipPending == 0) {
+            r->gart[kRegHubpreq0DcsurfFlipControl] &= ~kFlipPending;
+            r->gart[kRegHubpreq0DcsurfSurfaceEarliestInuse] = r->gart[kRegHubpreq0DcsurfPrimarySurfaceAddress];
+            r->gart[kRegHubpreq0DcsurfSurfaceEarliestInuseHigh] = r->gart[kRegHubpreq0DcsurfPrimarySurfaceAddressHigh];
+        }
         r->pauses++;
     }
     RegisterWriter writer() { return RegisterWriter{write32, pause, this}; }
@@ -2413,6 +2436,187 @@ static void testIntr()
     }
 }
 
+// An 8 MiB fake memory (the stage 19 pattern region).
+struct BigMemory {
+    std::vector<uint32_t> words = std::vector<uint32_t>(kPatternSize / 4, 0xA5A5A5A5u);
+    int stuckOffset = -1;
+    static bool read32(void *context, uint32_t offset, uint32_t *value)
+    {
+        BigMemory *self = static_cast<BigMemory *>(context);
+        if (offset / 4 >= self->words.size()) return false;
+        *value = self->words[offset / 4];
+        return true;
+    }
+    static bool write32(void *context, uint32_t offset, uint32_t value)
+    {
+        BigMemory *self = static_cast<BigMemory *>(context);
+        if (offset / 4 >= self->words.size()) return false;
+        if (int(offset) != self->stuckOffset) self->words[offset / 4] = value;
+        return true;
+    }
+    MemoryReader reader() { return MemoryReader{read32, this}; }
+    MemoryWriter writer() { return MemoryWriter{write32, this}; }
+};
+
+// A stage 19 rig: the fake DCN pipe 0 at boot 22.
+struct DisplayRig {
+    FakeRegisters r;
+    FakeWriter w{&r};
+    BigMemory pattern;
+    uint32_t display[kDisplayInventoryCount];
+    DisplayRig()
+    {
+        r.presetDisplay();
+        r.fbOffset = 0x5c0;
+    }
+};
+
+static void testDisplay()
+{
+    // The pinned values (docs/test-boot.md, stage 19).
+    CHECK(kPatternGpuAddress == 0xF441000000ull && kPatternPhysical == 0x601000000ull);
+    CHECK(kGopSurfaceAddress == 0xF400000000ull && kPatternSize == 0x800000);
+    CHECK(kPatternGpuAddress + kPatternSize <= kGopSurfaceAddress + (0x80ull << 24)); // inside DCN's FB aperture
+    CHECK(kGartWorkPhysical + kGartWorkCheckSize <= kPatternPhysical);
+    CHECK(kDisplayInventory[kDisplayAddressIndex] == kRegHubpreq0DcsurfPrimarySurfaceAddress);
+    CHECK(kDisplayInventory[kDisplayAddressHighIndex] == kRegHubpreq0DcsurfPrimarySurfaceAddressHigh);
+    CHECK(kDisplayPipe0Boot22[kDisplayAddressIndex] == 0 && kDisplayPipe0Boot22[kDisplayAddressHighIndex] == 0xf4);
+    CHECK(kPatternWidth * kPatternHeight * 4 <= kPatternSize && kPatternBandLines * 8 == kPatternHeight);
+
+    // Reads from stage 19 only; writes: the two address registers, three values.
+    for (uint32_t offset : kStage19Registers) CHECK(registerAllowed(offset, 19) && !registerAllowed(offset, 18));
+    CHECK(writeAllowed(kRegHubpreq0DcsurfPrimarySurfaceAddress, 0x41000000u, 19));
+    CHECK(writeAllowed(kRegHubpreq0DcsurfPrimarySurfaceAddress, 0, 19));
+    CHECK(writeAllowed(kRegHubpreq0DcsurfPrimarySurfaceAddressHigh, 0xf4, 19));
+    CHECK(!writeAllowed(kRegHubpreq0DcsurfPrimarySurfaceAddress, 0x41000000u, 18));
+    CHECK(!writeAllowed(kRegHubpreq0DcsurfPrimarySurfaceAddress, 0x41010000u, 19));
+    CHECK(!writeAllowed(kRegHubpreq0DcsurfPrimarySurfaceAddressHigh, 0xf5, 19));
+    CHECK(!writeAllowed(kRegHubpreq0DcsurfFlipControl, 0, 19) && !writeAllowed(kRegHubpreq1DcsurfPrimarySurfaceAddress, 0, 19));
+    CHECK(kRegHubpreq0DcsurfPrimarySurfaceAddress / kPageSize * kPageSize == kDisplayPageOffset);
+    CHECK(kRegHubpreq0DcsurfPrimarySurfaceAddressHigh / kPageSize * kPageSize == kDisplayPageOffset);
+
+    // The pattern image.
+    CHECK(patternWord(0) == kPatternLine && patternWord(4 * 1) == kPatternLine && patternWord(4 * 2) == 0xFFFFFFFF);
+    CHECK(patternWord(4 * 240) == kPatternLine && patternWord(4 * 1680) == kPatternLine && patternWord(4 * 1919) == kPatternLine);
+    CHECK(patternWord(4 * 1917) == 0xFFFFFFFF && patternWord(4 * 1918) == kPatternLine);
+    CHECK(patternWord(4 * (135 * 1920 + 100)) == 0xFFFFFF00 && patternWord(4 * (1079 * 1920 + 100)) == 0xFF000000);
+    CHECK(patternWord(4 * 1920 * 1080) == 0 && patternWord(kPatternSize - 4) == 0);
+    CHECK(patternWriteAllowed(8, 0xFFFFFFFF, 19) && !patternWriteAllowed(8, 0xFFFFFFFF, 18) &&
+          !patternWriteAllowed(8, 0, 19) && !patternWriteAllowed(kPatternSize, 0, 19) && !patternWriteAllowed(9, 0, 19));
+    {
+        FakeRegisters r;
+        r.fbOffset = 0x5c0;
+        uint8_t data[20];
+        putCells(data, 0x82000024u, 0xfca00000ull, 0x80000ull);
+        Range ranges[1];
+        uint32_t count = 0;
+        MetricsTarget t;
+        CHECK(parseAssignedAddresses(data, sizeof(data), ranges, 1, &count) == kOK);
+        CHECK(checkPatternTarget(r.reader(), 0x80000, 19, ranges, count, &t) == kOK && t.physical == 0x601000000ull);
+        CHECK(checkPatternTarget(r.reader(), 0x80000, 18, ranges, count, &t) == kRegisterNotAllowed);
+    }
+
+    // The whole stage against the fakes.
+    {
+        DisplayRig g;
+        uint32_t index = 9, value = 9, frames = 0, pauses = 0;
+        uint64_t sum = 0, inuse = 0;
+        CHECK(checkDisplayBoot22(g.r.reader(), 0x80000, 19, &index, &value, &frames) == kOK && frames == 0x00fffff0);
+        CHECK(regionChecksum(g.pattern.reader(), kPatternSize, g.w.writer(), 3, &sum) == kOK && sum != 0);
+        CHECK(readDisplayInventory(g.r.reader(), 0x80000, 19, g.display) == kOK);
+        CHECK(writePattern(g.pattern.reader(), g.pattern.writer(), 19) == kOK);
+        CHECK(g.pattern.words[2] == 0xFFFFFFFF && g.pattern.words[kPatternSize / 4 - 1] == 0);
+        int before = g.w.writes;
+        CHECK(flipDisplay(g.r.reader(), 0x80000, g.w.writer(), 19, kPatternGpuAddress, &inuse, &pauses) == kOK);
+        CHECK(g.w.writes == before + 2 && inuse == kPatternGpuAddress && pauses == 1);
+        CHECK(g.w.offsets[before] == kRegHubpreq0DcsurfPrimarySurfaceAddressHigh && g.w.values[before] == 0xf4);
+        CHECK(g.w.offsets[before + 1] == kRegHubpreq0DcsurfPrimarySurfaceAddress && g.w.values[before + 1] == 0x41000000u);
+        uint32_t flipFrames = g.r.gart[kRegOtg0OtgStatusFrameCount];
+        for (int i = 0; i < 20; i++) g.w.pause(&g.w); // the hold
+        DisplayReport report;
+        CHECK(verifyDisplay(g.r.reader(), 0x80000, g.pattern.reader(), g.display, flipFrames, 19, &report) == kOK);
+        CHECK(report.inuseLo == 0x41000000u && report.inuseHi == 0xf4 && report.framesAdvanced == 20);
+        CHECK(report.displayChanged == 0 && report.patternUnexpected == 0);
+        CHECK(flipDisplay(g.r.reader(), 0x80000, g.w.writer(), 19, kGopSurfaceAddress, &inuse, &pauses) == kOK);
+        CHECK(inuse == kGopSurfaceAddress && g.r.gart[kRegHubpreq0DcsurfPrimarySurfaceAddress] == 0);
+        CHECK(checkDisplayRestored(g.r.reader(), 0x80000, 19, &index, &value) == kOK);
+        CHECK(checkDisplayBoot22(g.r.reader(), 0x80000, 19, &index, &value, &frames) == kOK);
+    }
+    {
+        // Preconditions: tiling, DCC, a pending flip, a different surface; pipe 0.
+        const struct {
+            uint32_t offset, value, index;
+        } bad[] = {
+            {kRegHubp0DcsurfTilingConfig, 0x00000609, 14},
+            {kRegHubpreq0DcsurfSurfaceControl, 0x2, 15},
+            {kRegHubpreq0DcsurfFlipControl, 0x110, 11},
+            {kRegHubpreq0DcsurfFlipControl, 0x12, 11},
+            {kRegHubpreq0DcsurfSurfaceEarliestInuse, 0x1000, 12},
+            {kRegHubpreq0VmidSettings0, 1, 18},
+            {kRegHubpreq0DcsurfSurfacePitch, 0x77f, 8},
+        };
+        for (const auto &b : bad) {
+            DisplayRig g;
+            g.r.gart[b.offset] = b.value;
+            uint32_t index = 0, value = 0, frames = 0;
+            CHECK(checkDisplayBoot22(g.r.reader(), 0x80000, 19, &index, &value, &frames) == kDisplayUnexpectedState);
+            CHECK(index == b.index && value == b.value);
+        }
+        DisplayRig g;
+        uint32_t index = 0, value = 0, frames = 0;
+        g.r.gart[kRegHubp0DchubpCntl] = 0x000e0000; // live bits only (boot 24)
+        CHECK(checkDisplayBoot22(g.r.reader(), 0x80000, 18, &index, &value, &frames) == kRegisterNotAllowed);
+        CHECK(checkDisplayBoot22(g.r.reader(), 0x80000, 19, &index, &value, &frames) == kOK);
+    }
+    {
+        // A flip that never lands; a verify that finds the old surface, a
+        // stopped counter, a changed register or a changed pattern.
+        DisplayRig g;
+        uint32_t pauses = 0;
+        uint64_t inuse = 0;
+        g.r.flipDelay = -1;
+        CHECK(flipDisplay(g.r.reader(), 0x80000, g.w.writer(), 19, kPatternGpuAddress, &inuse, &pauses) == kDisplayFlipTimeout);
+        CHECK(pauses == kDisplayFlipPauses && inuse == kGopSurfaceAddress);
+        CHECK(flipDisplay(g.r.reader(), 0x80000, g.w.writer(), 19, kPatternGpuAddress + 0x1000, &inuse, &pauses) ==
+              kRegisterNotAllowed);
+        CHECK(flipDisplay(g.r.reader(), 0x80000, g.w.writer(), 18, kPatternGpuAddress, &inuse, &pauses) == kRegisterNotAllowed);
+    }
+    {
+        DisplayRig g;
+        uint32_t pauses = 0, frames = 0, index = 0, value = 0;
+        uint64_t inuse = 0;
+        CHECK(checkDisplayBoot22(g.r.reader(), 0x80000, 19, &index, &value, &frames) == kOK);
+        CHECK(readDisplayInventory(g.r.reader(), 0x80000, 19, g.display) == kOK);
+        CHECK(writePattern(g.pattern.reader(), g.pattern.writer(), 19) == kOK);
+        CHECK(flipDisplay(g.r.reader(), 0x80000, g.w.writer(), 19, kPatternGpuAddress, &inuse, &pauses) == kOK);
+        uint32_t flipFrames = g.r.gart[kRegOtg0OtgStatusFrameCount];
+        DisplayReport report;
+        CHECK(verifyDisplay(g.r.reader(), 0x80000, g.pattern.reader(), g.display, flipFrames, 19, &report) ==
+              kDisplayVerifyFailed && report.framesAdvanced == 0);
+        g.w.pause(&g.w);
+        g.r.gart[kRegHubp0DcsurfSurfaceConfig] = 0xa;
+        CHECK(verifyDisplay(g.r.reader(), 0x80000, g.pattern.reader(), g.display, flipFrames, 19, &report) ==
+              kDisplayVerifyFailed && report.displayChanged == 1 && report.displayFirst == 6);
+        g.r.gart[kRegHubp0DcsurfSurfaceConfig] = 0x8;
+        g.pattern.words[1000] ^= 1;
+        CHECK(verifyDisplay(g.r.reader(), 0x80000, g.pattern.reader(), g.display, flipFrames, 19, &report) ==
+              kDisplayVerifyFailed && report.patternUnexpected == 1 && report.patternFirst == 4000);
+        g.pattern.words[1000] ^= 1;
+        g.r.gart[kRegHubpreq0DcsurfSurfaceEarliestInuse] = 0;
+        CHECK(verifyDisplay(g.r.reader(), 0x80000, g.pattern.reader(), g.display, flipFrames, 19, &report) ==
+              kDisplayVerifyFailed && report.inuseLo == 0);
+        // The restore check names a pipe 0 register still off boot 22.
+        CHECK(checkDisplayRestored(g.r.reader(), 0x80000, 19, &index, &value) == kDisplayNotRestored);
+        CHECK(index == kDisplayAddressIndex && value == 0x41000000u);
+        // A stuck word fails the pattern's read-back; a changing region its checksum.
+        g.pattern.stuckOffset = 8;
+        CHECK(writePattern(g.pattern.reader(), g.pattern.writer(), 19) == kOK); // already written
+        g.pattern.words[2] = 0;
+        CHECK(writePattern(g.pattern.reader(), g.pattern.writer(), 19) == kPspReadbackMismatch);
+        CHECK(writePattern(g.pattern.reader(), g.pattern.writer(), 18) == kRegisterNotAllowed);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -2439,6 +2643,7 @@ int main()
     testInventory16();
     testGart();
     testIntr();
+    testDisplay();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

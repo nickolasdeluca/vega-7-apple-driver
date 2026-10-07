@@ -1,4 +1,4 @@
-"""Recompute every stage 16 and 17 register offset from the pinned Linux v6.12 headers.
+"""Recompute every stage 16, 17 and 19 register offset from the pinned Linux v6.12 headers.
 
 The headers live in ignored out/references (docs/test-boot.md, stage 16); the
 test skips when they are absent, as in a fresh clone.
@@ -35,6 +35,10 @@ def stage17_constants():
     return block_constants("// Stage 17:", "// Read from stage 17 on")
 
 
+def stage19_constants():
+    return block_constants("// Stage 19:", "// Read from stage 19 on")
+
+
 @unittest.skipUnless(all((REFS / name).is_file() for name, _ in SOURCES), "pinned headers not in out/references")
 class Inventory16OffsetTests(unittest.TestCase):
     def test_every_offset_matches_its_header(self):
@@ -54,7 +58,10 @@ class Inventory16OffsetTests(unittest.TestCase):
         self.assertEqual([name for name, _ in stage17],
                          ["VM_INVALIDATE_ENG17_SEM", "VM_INVALIDATE_ENG17_REQ", "VM_INVALIDATE_ENG17_ADDR_RANGE_LO32",
                           "VM_INVALIDATE_ENG17_ADDR_RANGE_HI32"])
-        for name, offset in constants + stage17:
+        # Stage 19's flip status, surface state and frame counter.
+        stage19 = stage19_constants()
+        self.assertEqual(len(stage19), 9)
+        for name, offset in constants + stage17 + stage19:
             with self.subTest(name):
                 found = [(bases[idx[name]] + regs[name]) * 4 for regs, idx, bases in tables if name in regs]
                 self.assertEqual(found, [offset])

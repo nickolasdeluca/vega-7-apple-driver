@@ -94,6 +94,11 @@ const char *statusName(Status status)
     case kIntrRefired: return "intr-refired";
     case kIntrNotRestored: return "intr-not-restored";
     case kIntrOutOfOrder: return "intr-out-of-order";
+    case kDisplayUnexpectedState: return "display-unexpected-state";
+    case kDisplayFlipTimeout: return "display-flip-timeout";
+    case kDisplayVerifyFailed: return "display-verify-failed";
+    case kDisplayNotRestored: return "display-not-restored";
+    case kDisplayOutOfOrder: return "display-out-of-order";
     }
     return "unknown";
 }
@@ -186,6 +191,9 @@ bool registerAllowed(uint32_t offset, uint32_t stage)
     }
     for (uint32_t i = 0; stage >= kGartStage && i < kStage17RegisterCount; i++) {
         if (kStage17Registers[i] == offset) return true;
+    }
+    for (uint32_t i = 0; stage >= kDisplayStage && i < kStage19RegisterCount; i++) {
+        if (kStage19Registers[i] == offset) return true;
     }
     return false;
 }
@@ -452,6 +460,7 @@ bool writeAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (stage >= kSdmaCopyStage && sdmaWriteListed(offset, value)) return true;
     if (stage >= kGartStage && gartWriteListed(offset, value)) return true;
     if (stage >= kIntrStage && intrWriteListed(offset, value)) return true;
+    if (stage >= kDisplayStage && displayWriteListed(offset, value)) return true;
     if (offset == kRegMp1C2PMsg90) return value == 0;
     if (offset == kRegMp1C2PMsg82)
         return value == 0 || (stage >= kMetricsStage && (value == uint32_t(kMetricsGpuAddress >> 32) ||
@@ -2006,6 +2015,175 @@ Status restoreIntr(const RegisterReader &registers, uint64_t apertureLength, con
     }
     *index = *value = 0;
     return status;
+}
+
+bool displayWriteListed(uint32_t offset, uint32_t value)
+{
+    return (offset == kRegHubpreq0DcsurfPrimarySurfaceAddressHigh && value == uint32_t(kGopSurfaceAddress >> 32)) ||
+           (offset == kRegHubpreq0DcsurfPrimarySurfaceAddress &&
+            (value == uint32_t(kPatternGpuAddress) || value == uint32_t(kGopSurfaceAddress)));
+}
+
+uint32_t patternWord(uint32_t offset)
+{
+    const uint32_t pixel = offset / 4;
+    if (pixel >= kPatternWidth * kPatternHeight) return 0;
+    const uint32_t x = pixel % kPatternWidth, y = pixel / kPatternWidth;
+    if (x % kPatternLineSpacing < 2 || x >= kPatternWidth - 2) return kPatternLine;
+    return kPatternBands[y / kPatternBandLines];
+}
+
+bool patternWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
+{
+    if (stage < kDisplayStage || (offset & 3) != 0 || offset >= kPatternSize) return false;
+    return value == patternWord(offset);
+}
+
+static Status writePatternWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset)
+{
+    uint32_t value = patternWord(offset);
+    if (!patternWriteAllowed(offset, value, stage)) return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+Status checkPatternTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                          const Range *ranges, uint32_t rangeCount, MetricsTarget *target)
+{
+    *target = MetricsTarget();
+    if (stage < kDisplayStage) return kRegisterNotAllowed;
+    Status status = checkCarveoutPage(registers, apertureLength, stage, kPatternCarveoutOffset, kPatternSize, ranges,
+                                      rangeCount, target);
+    if (status != kOK) return status;
+    if (target->gpuAddress != kPatternGpuAddress || target->physical != kPatternPhysical)
+        return kMetricsAddressMismatch;
+    return kOK;
+}
+
+Status regionChecksum(const MemoryReader &memory, uint32_t length, const RegisterWriter &writer, uint32_t pauses,
+                      uint64_t *sum)
+{
+    uint64_t second = 0;
+    Status status = regionSum(memory, length, sum);
+    if (status != kOK) return status;
+    for (uint32_t i = 0; i < pauses; i++) writer.pause(writer.context);
+    status = regionSum(memory, length, &second);
+    if (status != kOK) return status;
+    return *sum == second ? kOK : kTableRegionInUse;
+}
+
+Status checkDisplayBoot22(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                          uint32_t *value, uint32_t *frameCount)
+{
+    *index = *value = *frameCount = 0;
+    if (stage < kDisplayStage) return kRegisterNotAllowed;
+    for (uint32_t i = 0; i < kDisplayCheckCount; i++) {
+        *index = i;
+        uint32_t offset = i < 11 ? kDisplayInventory[i] : kDisplayExpect[i - 11].offset;
+        Status status = readRegister(registers, apertureLength, stage, offset, value);
+        if (status != kOK) return status;
+        bool ok = i < 11 ? (*value & displayMask(i)) == (kDisplayPipe0Boot22[i] & displayMask(i))
+                         : (*value & kDisplayExpect[i - 11].mask) == kDisplayExpect[i - 11].value;
+        if (!ok) return kDisplayUnexpectedState;
+    }
+    *index = *value = 0;
+    return readRegister(registers, apertureLength, stage, kRegOtg0OtgStatusFrameCount, frameCount);
+}
+
+Status writePattern(const MemoryReader &pattern, const MemoryWriter &writer, uint32_t stage)
+{
+    if (stage < kDisplayStage) return kRegisterNotAllowed;
+    for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
+        Status status = writePatternWord(writer, stage, offset);
+        if (status != kOK) return status;
+    }
+    for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
+        uint32_t value = 0;
+        if (!pattern.read32(pattern.context, offset, &value)) return kRegisterReadFailed;
+        if (value != patternWord(offset)) return kPspReadbackMismatch;
+    }
+    return kOK;
+}
+
+Status flipDisplay(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   uint32_t stage, uint64_t address, uint64_t *inuse, uint32_t *pauses)
+{
+    *inuse = 0;
+    *pauses = 0;
+    if (stage < kDisplayStage || (address != kPatternGpuAddress && address != kGopSurfaceAddress))
+        return kRegisterNotAllowed;
+    // program_surface_flip_and_addr's order: the high dword, then the low
+    // one, which latches the flip at the next vertical sync.
+    Status status = writeRegister(writer, stage, kRegHubpreq0DcsurfPrimarySurfaceAddressHigh, uint32_t(address >> 32));
+    if (status == kOK) status = writeRegister(writer, stage, kRegHubpreq0DcsurfPrimarySurfaceAddress, uint32_t(address));
+    if (status != kOK) return status;
+    // hubp2_is_flip_pending.
+    for (uint32_t i = 0;; i++) {
+        uint32_t control = 0, low = 0, high = 0;
+        status = readRegister(registers, apertureLength, stage, kRegHubpreq0DcsurfFlipControl, &control);
+        if (status == kOK) status = readRegister(registers, apertureLength, stage, kRegHubpreq0DcsurfSurfaceEarliestInuse, &low);
+        if (status == kOK)
+            status = readRegister(registers, apertureLength, stage, kRegHubpreq0DcsurfSurfaceEarliestInuseHigh, &high);
+        if (status != kOK) return status;
+        *inuse = (uint64_t(high) << 32) | low;
+        if ((control & kFlipPending) == 0 && *inuse == address) return kOK;
+        if (i == kDisplayFlipPauses) return kDisplayFlipTimeout;
+        writer.pause(writer.context);
+        (*pauses)++;
+    }
+}
+
+Status verifyDisplay(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &pattern,
+                     const uint32_t *display, uint32_t flipFrames, uint32_t stage, DisplayReport *report)
+{
+    *report = DisplayReport();
+    if (stage < kDisplayStage) return kRegisterNotAllowed;
+    const struct {
+        uint32_t offset;
+        uint32_t *value;
+    } reads[] = {
+        {kRegHubpreq0DcsurfSurfaceEarliestInuse, &report->inuseLo},
+        {kRegHubpreq0DcsurfSurfaceEarliestInuseHigh, &report->inuseHi},
+        {kRegHubpreq0DcsurfFlipControl, &report->flipControl},
+        {kRegOtg0OtgStatusFrameCount, &report->frameCount},
+    };
+    for (const auto &read : reads) {
+        Status status = readRegister(registers, apertureLength, stage, read.offset, read.value);
+        if (status != kOK) return status;
+    }
+    report->framesAdvanced = (report->frameCount - flipFrames) & kOtgFrameCountMask;
+    for (uint32_t i = 0; i < kDisplayInventoryCount; i++) {
+        uint32_t value = 0;
+        Status status = readRegister(registers, apertureLength, stage, kDisplayInventory[i], &value);
+        if (status != kOK) return status;
+        uint32_t expected = i == kDisplayAddressIndex ? uint32_t(kPatternGpuAddress) : display[i];
+        if ((value & displayMask(i)) != (expected & displayMask(i)) && report->displayChanged++ == 0)
+            report->displayFirst = i;
+    }
+    for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
+        uint32_t value = 0;
+        if (!pattern.read32(pattern.context, offset, &value)) return kRegisterReadFailed;
+        if (value != patternWord(offset) && report->patternUnexpected++ == 0) report->patternFirst = offset;
+    }
+    const uint64_t inuse = (uint64_t(report->inuseHi) << 32) | report->inuseLo;
+    return inuse == kPatternGpuAddress && (report->flipControl & kFlipPending) == 0 && report->framesAdvanced != 0 &&
+                   report->displayChanged == 0 && report->patternUnexpected == 0
+               ? kOK
+               : kDisplayVerifyFailed;
+}
+
+Status checkDisplayRestored(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                            uint32_t *index, uint32_t *value)
+{
+    *index = *value = 0;
+    if (stage < kDisplayStage) return kRegisterNotAllowed;
+    for (uint32_t i = 0; i < 11; i++) {
+        *index = i;
+        Status status = readRegister(registers, apertureLength, stage, kDisplayInventory[i], value);
+        if (status != kOK) return status;
+        if ((*value & displayMask(i)) != (kDisplayPipe0Boot22[i] & displayMask(i))) return kDisplayNotRestored;
+    }
+    *index = *value = 0;
+    return kOK;
 }
 
 } // namespace cezanne

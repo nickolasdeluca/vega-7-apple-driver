@@ -31,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 18;
+const uint32_t kMaxStage = 19;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -906,6 +906,70 @@ const uint32_t kIntrPages[] = {0x3000, 0x4000};
 // PCI configuration space: the MSI capability, read only.
 const uint8_t kCapabilityMsi = 0x05;
 
+// Stage 19: a display test pattern by flipping pipe 0's surface
+// (docs/test-boot.md, stage 19). Offsets from dcn_2_1_0_offset.h (DCN base
+// segment 2, 0x34C0); none measured before this stage.
+const uint32_t kDisplayStage = 19;
+const uint32_t kRegHubpreq0DcsurfFlipControl = 0x0eb6c; // HUBPREQ0_DCSURF_FLIP_CONTROL: hubp2_is_flip_pending
+const uint32_t kRegHubpreq0DcsurfSurfaceEarliestInuse = 0x0eb94; // HUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE: hubp2_is_flip_pending
+const uint32_t kRegHubpreq0DcsurfSurfaceEarliestInuseHigh = 0x0eb98; // HUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE_HIGH: hubp2_is_flip_pending
+const uint32_t kRegHubp0DcsurfTilingConfig = 0x0ea9c; // HUBP0_DCSURF_TILING_CONFIG: hubp2_read_state
+const uint32_t kRegHubpreq0DcsurfSurfaceControl = 0x0eb68; // HUBPREQ0_DCSURF_SURFACE_CONTROL: program_surface_flip_and_addr
+const uint32_t kRegHubpreq0DcsurfPrimaryMetaSurfaceAddress = 0x0eb48; // HUBPREQ0_DCSURF_PRIMARY_META_SURFACE_ADDRESS: program_surface_flip_and_addr
+const uint32_t kRegHubpreq0DcsurfPrimaryMetaSurfaceAddressHigh = 0x0eb4c; // HUBPREQ0_DCSURF_PRIMARY_META_SURFACE_ADDRESS_HIGH: program_surface_flip_and_addr
+const uint32_t kRegHubpreq0VmidSettings0 = 0x0eb24; // HUBPREQ0_VMID_SETTINGS_0: program_surface_flip_and_addr
+const uint32_t kRegOtg0OtgStatusFrameCount = 0x14030; // OTG0_OTG_STATUS_FRAME_COUNT: optc1_get_vblank_counter
+// Read from stage 19 on, in addition to kStage16Registers and kStage17Registers.
+const uint32_t kStage19Registers[] = {kRegHubpreq0DcsurfFlipControl,
+                                      kRegHubpreq0DcsurfSurfaceEarliestInuse,
+                                      kRegHubpreq0DcsurfSurfaceEarliestInuseHigh,
+                                      kRegHubp0DcsurfTilingConfig,
+                                      kRegHubpreq0DcsurfSurfaceControl,
+                                      kRegHubpreq0DcsurfPrimaryMetaSurfaceAddress,
+                                      kRegHubpreq0DcsurfPrimaryMetaSurfaceAddressHigh,
+                                      kRegHubpreq0VmidSettings0,
+                                      kRegOtg0OtgStatusFrameCount};
+const uint32_t kStage19RegisterCount = sizeof(kStage19Registers) / sizeof(kStage19Registers[0]);
+// DCSURF_FLIP_CONTROL: SURFACE_UPDATE_LOCK (0), SURFACE_FLIP_TYPE (1),
+// SURFACE_FLIP_PENDING (8); TILING_CONFIG.SW_MODE (4:0).
+const uint32_t kFlipUpdateLock = 0x1, kFlipTypeImmediate = 0x2, kFlipPending = 0x100;
+const uint32_t kTilingSwMode = 0x1f;
+const uint32_t kOtgFrameCountMask = 0x00ffffff;
+// The pattern surface: carveout 0x41000000, 8 MiB, inside DCN's FB aperture.
+const uint64_t kPatternCarveoutOffset = 0x41000000ull;
+const uint64_t kPatternGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kPatternCarveoutOffset;
+const uint64_t kPatternPhysical = (uint64_t(kExpectedFbOffset) << 24) + kPatternCarveoutOffset;
+const uint32_t kPatternSize = 8u << 20;
+// 1920 x 1080 ARGB8888, 1920 pixels per line: 8 bands of 135 lines, grey
+// lines 2 pixels wide at x = 0, 240, ..., 1680 and 1918.
+const uint32_t kPatternWidth = 1920, kPatternHeight = 1080, kPatternBandLines = 135;
+const uint32_t kPatternBands[] = {0xFFFFFFFF, 0xFFFFFF00, 0xFF00FFFF, 0xFF00FF00,
+                                  0xFFFF00FF, 0xFFFF0000, 0xFF0000FF, 0xFF000000};
+const uint32_t kPatternLine = 0xFF808080, kPatternLineSpacing = 240;
+// The GOP surface, as boot 22 read it.
+const uint64_t kGopSurfaceAddress = uint64_t(kExpectedFbLocationBase) << 24;
+const uint32_t kDisplayFlipPauses = 100; // ~100 ms, about 6 frames at 60 Hz
+// The BAR5 page the stage 19 flips write (HUBPREQ0).
+const uint32_t kDisplayPageOffset = 0xe000;
+// Pipe 0's surface-address entries in kDisplayInventory.
+const uint32_t kDisplayAddressIndex = 9, kDisplayAddressHighIndex = 10;
+// The precondition list: display pipe 0 at boot 22, then these.
+struct DisplayExpect {
+    uint32_t offset, mask, value;
+};
+const DisplayExpect kDisplayExpect[] = {
+    {kRegHubpreq0DcsurfFlipControl, kFlipUpdateLock | kFlipTypeImmediate | kFlipPending, 0},
+    {kRegHubpreq0DcsurfSurfaceEarliestInuse, 0xFFFFFFFF, uint32_t(kGopSurfaceAddress)},
+    {kRegHubpreq0DcsurfSurfaceEarliestInuseHigh, 0xFFFFFFFF, uint32_t(kGopSurfaceAddress >> 32)},
+    {kRegHubp0DcsurfTilingConfig, kTilingSwMode, 0},
+    {kRegHubpreq0DcsurfSurfaceControl, 0xFFFFFFFF, 0},
+    {kRegHubpreq0DcsurfPrimaryMetaSurfaceAddress, 0xFFFFFFFF, 0},
+    {kRegHubpreq0DcsurfPrimaryMetaSurfaceAddressHigh, 0xFFFFFFFF, 0},
+    {kRegHubpreq0VmidSettings0, 0xFFFFFFFF, 0},
+};
+const uint32_t kDisplayExpectCount = sizeof(kDisplayExpect) / sizeof(kDisplayExpect[0]);
+const uint32_t kDisplayCheckCount = 11 + kDisplayExpectCount;
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -1014,6 +1078,12 @@ enum Status : uint32_t {
     kIntrRefired,
     kIntrNotRestored,
     kIntrOutOfOrder,
+    // Stage 19.
+    kDisplayUnexpectedState,
+    kDisplayFlipTimeout,
+    kDisplayVerifyFailed,
+    kDisplayNotRestored,
+    kDisplayOutOfOrder,
 };
 
 const char *statusName(Status status);
@@ -1132,7 +1202,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 14;
+const uint32_t kDiagnosticVersion = 15;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -1187,7 +1257,12 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticIntrVerify = 32,  // out: Status; structure: IntrReport
     kDiagnosticIntrAck = 33,     // out: Status, IH_RB_RPTR written, MSI count before, after, write-back after
     kDiagnosticIntrRestore = 34, // out: Status, index, value, MSI control, address lo, hi, data
-    kDiagnosticSelectorCount = 35,
+    // Stage 19, in this order on one connection; independent of the others.
+    kDiagnosticDisplayCheck = 35,   // out: Status, index, value, frame count, checksum lo, hi
+    kDiagnosticDisplayFlip = 36,    // out: Status, in-use lo, hi, pauses, frame count
+    kDiagnosticDisplayVerify = 37,  // out: Status; structure: DisplayReport
+    kDiagnosticDisplayRestore = 38, // out: Status, in-use lo, hi, pauses, index, value
+    kDiagnosticSelectorCount = 39,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -1669,6 +1744,62 @@ Status quiesceIntr(const RegisterWriter &writer, uint32_t stage);
 // kIntrCheck at boot 22 (kIntrNotRestored with the index and value).
 Status restoreIntr(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                    uint32_t stage, uint32_t *index, uint32_t *value);
+
+// Stage 19. Whether a register write is a flip's: PRIMARY_SURFACE_ADDRESS_HIGH
+// to the unchanged 0xf4, PRIMARY_SURFACE_ADDRESS to the pattern or the GOP
+// surface.
+bool displayWriteListed(uint32_t offset, uint32_t value);
+
+// The pattern region's word at a byte offset; zero past the 1920 x 1080 image.
+uint32_t patternWord(uint32_t offset);
+
+// Pattern writes allowed from stage 19: only its own word.
+bool patternWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage);
+
+// The pattern region: the stage 9 page checks for 8 MiB.
+Status checkPatternTarget(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                          const Range *ranges, uint32_t rangeCount, MetricsTarget *target);
+
+// Reads the region twice, pauses apart; kTableRegionInUse if the sums
+// differ. sum is the first.
+Status regionChecksum(const MemoryReader &memory, uint32_t length, const RegisterWriter &writer, uint32_t pauses,
+                      uint64_t *sum);
+
+// No writes. Display pipe 0 at boot 22 (live DCHUBP_CNTL bits ignored), then
+// kDisplayExpect: kDisplayUnexpectedState with the index into that list and
+// the value read. frameCount is OTG0's.
+Status checkDisplayBoot22(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, uint32_t *index,
+                          uint32_t *value, uint32_t *frameCount);
+
+// Writes the whole pattern region, then reads every word back
+// (kPspReadbackMismatch).
+Status writePattern(const MemoryReader &pattern, const MemoryWriter &writer, uint32_t stage);
+
+// hubp21_program_surface_flip_and_addr for a linear surface: ADDRESS_HIGH,
+// then ADDRESS (which latches at the next vsync); then polls up to
+// kDisplayFlipPauses until FLIP_PENDING is 0 and EARLIEST_INUSE is address
+// (kDisplayFlipTimeout). address is kPatternGpuAddress or kGopSurfaceAddress.
+Status flipDisplay(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   uint32_t stage, uint64_t address, uint64_t *inuse, uint32_t *pauses);
+
+struct DisplayReport {
+    uint32_t inuseLo, inuseHi, flipControl;
+    uint32_t frameCount, framesAdvanced; // OTG0's, and since the flip (24-bit)
+    uint32_t displayChanged, displayFirst; // against the check's reading, the address excepted
+    uint32_t patternUnexpected, patternFirst;
+};
+
+// Reads only. EARLIEST_INUSE must be the pattern, the frame count must have
+// advanced since flipFrames, the display inventory must match display
+// except pipe 0's address (now the pattern), and the region must hold the
+// pattern. kDisplayVerifyFailed otherwise.
+Status verifyDisplay(const RegisterReader &registers, uint64_t apertureLength, const MemoryReader &pattern,
+                     const uint32_t *display, uint32_t flipFrames, uint32_t stage, DisplayReport *report);
+
+// No writes. Pipe 0 back at boot 22 (kDisplayNotRestored with the index and
+// value).
+Status checkDisplayRestored(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage,
+                            uint32_t *index, uint32_t *value);
 
 } // namespace cezanne
 

@@ -154,6 +154,32 @@ class CoreTests(unittest.TestCase):
             "kRegMmhubVmContext0Cntl && g.w.values[before + 10]": (
                 "        note(writeRegister(writer, stage, context.offset, context.boot22));\n", "        (void)context;\n"),
             "ihWptr == 0x20": ("        if (offset == kRegIhRbWptr) {", "        if (false) {"),
+            # Stage 19.
+            "!registerAllowed(offset, 18)": ("stage >= kDisplayStage && i < kStage19RegisterCount",
+                                             "i < kStage19RegisterCount"),
+            "!writeAllowed(kRegHubpreq0DcsurfPrimarySurfaceAddress, 0x41000000u, 18)": (
+                "if (stage >= kDisplayStage && displayWriteListed(offset, value))",
+                "if (stage >= kIntrStage && displayWriteListed(offset, value))"),
+            "!writeAllowed(kRegHubpreq0DcsurfPrimarySurfaceAddress, 0x41010000u, 19)": (
+                "(value == uint32_t(kPatternGpuAddress) || value == uint32_t(kGopSurfaceAddress))",
+                "(value & 0xFFFF) == 0"),
+            "!patternWriteAllowed(kPatternSize, 0, 19)": (
+                "if (stage < kDisplayStage || (offset & 3) != 0 || offset >= kPatternSize) return false;",
+                "if (stage < kDisplayStage || (offset & 3) != 0) return false;"),
+            "patternWord(4 * 1917) == 0xFFFFFFFF && patternWord(4 * 1918) == kPatternLine": (
+                "x >= kPatternWidth - 2", "x >= kPatternWidth - 3"),
+            "index == b.index && value == b.value": ("if (!ok) return kDisplayUnexpectedState;", "(void)ok;"),
+            "kDisplayFlipTimeout": ("if (i == kDisplayFlipPauses) return kDisplayFlipTimeout;",
+                                    "if (i == kDisplayFlipPauses) return kOK;"),
+            "g.w.offsets[before] == kRegHubpreq0DcsurfPrimarySurfaceAddressHigh": (
+                "    Status status = writeRegister(writer, stage, kRegHubpreq0DcsurfPrimarySurfaceAddressHigh, uint32_t(address >> 32));\n    if (status == kOK) status = writeRegister(writer, stage, kRegHubpreq0DcsurfPrimarySurfaceAddress, uint32_t(address));",
+                "    Status status = writeRegister(writer, stage, kRegHubpreq0DcsurfPrimarySurfaceAddress, uint32_t(address));\n    if (status == kOK) status = writeRegister(writer, stage, kRegHubpreq0DcsurfPrimarySurfaceAddressHigh, uint32_t(address >> 32));"),
+            "report.framesAdvanced == 0": ("report->framesAdvanced != 0 &&", ""),
+            "report.patternUnexpected == 1": ("report->displayChanged == 0 && report->patternUnexpected == 0",
+                                              "report->displayChanged == 0"),
+            "report.inuseLo == 0": ("return inuse == kPatternGpuAddress && (report->flipControl",
+                                     "return (inuse | 1) != 0 && (report->flipControl"),
+            "kDisplayNotRestored": ("if ((*value & displayMask(i)) != (kDisplayPipe0Boot22[i] & displayMask(i))) return kDisplayNotRestored;", ""),
             # Stage 18.
             "!writeAllowed(kRegInterruptCntl2, kInterruptCntl2Dummy, 17)": (
                 "if (stage >= kIntrStage && intrWriteListed(offset, value))",
@@ -194,9 +220,10 @@ class CoreTests(unittest.TestCase):
         # register allowlist, writeWork after the work-area allowlist,
         # writeFirmwareWord after the firmware-buffer allowlist, and the SDMA
         # and GART work-area words after theirs.
-        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 5)
+        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 6)
         for helper, check in (("writeSdmaWorkWord", "sdmaWorkWriteAllowed(offset, value, stage)"),
-                              ("writeGartWorkWord", "gartWorkWriteAllowed(offset, value, stage)")):
+                              ("writeGartWorkWord", "gartWorkWriteAllowed(offset, value, stage)"),
+                              ("writePatternWord", "patternWriteAllowed(offset, value, stage)")):
             body = re.search(r"static Status %s\(.*?\n}\n" % helper, source, re.S).group(0)
             self.assertLess(body.index(check), body.index("write32"), helper)
         firmware = re.search(r"static Status writeFirmwareWord\(.*?\n}\n", source, re.S).group(0)
@@ -212,10 +239,12 @@ class CoreTests(unittest.TestCase):
         # Stage 17 adds the GART, IH and SDMA0_CNTL writes, the flush's request
         # and release, frame 2's write pointer, and their restores. Stage 18
         # adds the arm (two lists), the interrupt toggle, the acknowledgement,
-        # the quiesce and INTERRUPT_CNTL2's restore.
-        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 32)
+        # the quiesce and INTERRUPT_CNTL2's restore. Stage 19 adds a flip's
+        # two address writes.
+        self.assertEqual(len(re.findall(r"\bwriteRegister\s*\(writer", source)), 34)
         allow = re.search(r"bool writeAllowed\(.*?\n}\n", source, re.S).group(0)
-        self.assertEqual(allow.count("return"), 16)
+        self.assertEqual(allow.count("return"), 17)
+        self.assertIn("if (stage >= kDisplayStage && displayWriteListed(offset, value)) return true;", allow)
         self.assertIn("if (stage >= kGartStage && gartWriteListed(offset, value)) return true;", allow)
         self.assertIn("if (stage >= kIntrStage && intrWriteListed(offset, value)) return true;", allow)
         # The semaphore is read only by the flush, through the reader directly
