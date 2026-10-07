@@ -10,13 +10,14 @@
 // (--sdma-inventory), and the stage 15 first SDMA copy (--sdma-copy), and
 // the stage 17 GART and interrupt ring (--gart-ih), and the stage 18 MSI
 // delivery (--ih-intr), and the stage 19 display test pattern
-// (--display-pattern).
+// (--display-pattern), and the stage 20 SDMA fill and flip interrupt
+// (--sdma-flip).
 // --psp-state (stage 10) and --inventory16 (stage 16) only read.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
 //                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--sdma-inventory]
-//                          [--sdma-copy] [--gart-ih] [--ih-intr] [--display-pattern] [--psp-state]
-//                          [--inventory16]
+//                          [--sdma-copy] [--gart-ih] [--ih-intr] [--sdma-flip] [--display-pattern]
+//                          [--psp-state] [--inventory16]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -243,9 +244,12 @@ const Named kRegisters[] = {
     {"HUBPREQ0_DCSURF_PRIMARY_META_SURFACE_ADDRESS_HIGH", kRegHubpreq0DcsurfPrimaryMetaSurfaceAddressHigh},
     {"HUBPREQ0_VMID_SETTINGS_0", kRegHubpreq0VmidSettings0},
     {"OTG0_OTG_STATUS_FRAME_COUNT", kRegOtg0OtgStatusFrameCount},
+    {"HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT", kRegHubpreq0DcsurfSurfaceFlipInterrupt},
+    {"DCHUB_INTERRUPT_DEST2", kRegDchubInterruptDest2},
+    {"DISP_INTERRUPT_STATUS_CONTINUE17", kRegDispInterruptStatusContinue17},
 };
 static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) ==
-                  kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount,
+                  kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount + kStage20RegisterCount,
               "one name per register");
 
 const char *registerName(uint32_t offset)
@@ -261,7 +265,8 @@ void usage(FILE *out)
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
                       "                         [--psp-sdma] [--sdma-inventory] [--sdma-copy] [--gart-ih]\n"
-                      "                         [--ih-intr] [--display-pattern] [--psp-state] [--inventory16]\n"
+                      "                         [--ih-intr] [--sdma-flip] [--display-pattern] [--psp-state]\n"
+                      "                         [--inventory16]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
                       "then restores its original value.\n"
@@ -283,6 +288,9 @@ void usage(FILE *out)
                       "through the GART with a fence and a TRAP, verifies, restores every register, and stops.\n"
                       "--ih-intr does --gart-ih up to its verify, then turns on MSI delivery, runs a fence and a\n"
                       "TRAP, counts the interrupt, acknowledges it, restores, and finishes as --gart-ih.\n"
+                      "--sdma-flip does --ih-intr up to its acknowledgement, then has SDMA0 fill a pattern in the\n"
+                      "carveout, shows it on pipe 0 for 5 s with HUBP0's flip interrupt on, verifies, flips back,\n"
+                      "and finishes as --ih-intr.\n"
                       "--display-pattern draws a test pattern in the carveout, shows it on pipe 0 for 5 s by\n"
                       "flipping its surface address, verifies, and flips back to the boot framebuffer.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n"
@@ -800,10 +808,142 @@ void printMsi(const char *when, const uint64_t *msi)
                 static_cast<unsigned long long>(msi[3]));
 }
 
+void printDisplayCheckEntry(uint64_t index, uint64_t value);
+
+// Prints a stage 20 flip: the poll, the MSI and the new IH entries.
+void printFlip(const FlipReport &r)
+{
+    std::printf("  in use 0x%02x%08x after %u ms; MSI %u -> %u (%u ms more), %u us after the address writes\n"
+                "  SURFACE_FLIP_INTERRUPT 0x%08x, DISP_INTERRUPT_STATUS_CONTINUE17 0x%08x, frame count %u\n"
+                "  IH from 0x%x to write-back 0x%08x: %u HUBP0 flip entries, %u other\n",
+                r.inuseHi, r.inuseLo, r.pauses, r.msiBefore, r.msiAfter, r.msiPauses, r.latencyMicroseconds,
+                r.flipInterrupt, r.continue17, r.frameCount, r.ihStart, r.ihWriteback, r.flipEntries, r.otherEntries);
+    for (uint32_t entry = 0; entry < r.flipEntries + r.otherEntries && entry < kFlipReportEntries; entry++) {
+        const uint32_t *dw = r.entries + entry * kIhEntryBytes / 4;
+        std::printf("  IH +%u: client %3u source %3u ring %u vmid %u | %08x %08x %08x %08x %08x %08x %08x %08x\n", entry,
+                    dw[0] & 0xFF, (dw[0] >> 8) & 0xFF, (dw[0] >> 16) & 0xFF, (dw[0] >> 24) & 0xF, dw[0], dw[1], dw[2],
+                    dw[3], dw[4], dw[5], dw[6], dw[7]);
+    }
+}
+
+// Calls a selector that returns scalars and a FlipReport or DisplayReport.
+template <typename Report>
+bool callReport(io_connect_t connection, uint32_t selector, uint64_t *scalars, uint32_t count, Report *report)
+{
+    uint32_t scalarCount = count;
+    size_t size = sizeof(*report);
+    kern_return_t result =
+        IOConnectCallMethod(connection, selector, nullptr, 0, nullptr, 0, scalars, &scalarCount, report, &size);
+    if (result != KERN_SUCCESS || scalarCount != count || size != sizeof(*report)) {
+        std::printf("call failed 0x%08x\n", result);
+        return false;
+    }
+    return true;
+}
+
+// The stage 20 steps after a passing stage 18 acknowledgement: check, fill,
+// show (arm and flip), acknowledge, a 5 s hold, verify, restore. The restore
+// runs whenever the show was sent; the stage 18 restore would also run it.
+bool sdmaFlip(io_connect_t connection)
+{
+    uint64_t check[8] = {};
+    step("flip 1/6 check: pipe 0 at boot 22, linear ARGB8888, scanning out 0xf400000000; flip interrupt off and\n"
+         "  routed to the host; pattern region 0xf441000000 (8 MiB) placed and stable");
+    if (!call(connection, kDiagnosticFlipCheck, check, 8)) return false;
+    std::printf("%s", statusName(static_cast<Status>(check[0])));
+    if (check[0] == kDisplayUnexpectedState) printDisplayCheckEntry(check[1], check[2]);
+    if (check[0] == kFlipUnexpectedState)
+        std::printf(" (%s reads 0x%08llx)",
+                    check[1] == kDisplayCheckCount ? "HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT" : "DCHUB_INTERRUPT_DEST2",
+                    static_cast<unsigned long long>(check[2]));
+    std::printf("\n  OTG0 frame count %llu, region checksum 0x%08llx%08llx; DCHUB_INTERRUPT_DEST2 0x%08llx,\n"
+                "  DISP_INTERRUPT_STATUS_CONTINUE17 0x%08llx\n",
+                static_cast<unsigned long long>(check[3]), static_cast<unsigned long long>(check[5]),
+                static_cast<unsigned long long>(check[4]), static_cast<unsigned long long>(check[6]),
+                static_cast<unsigned long long>(check[7]));
+    if (check[0] != kOK) return false;
+
+    uint64_t fill[7] = {};
+    step("flip 2/6 fill: zero the region, frame 4 (9 CONST_FILL, FENCE 4), GFX_RB_WPTR <- 5120, _HI <- 0;\n"
+         "  read the region back");
+    if (!call(connection, kDiagnosticFlipFill, fill, 7)) return false;
+    std::printf("%s, step %llu, fence 4 0x%08llx, GFX_RB_RPTR %llu; %llu unexpected words (first +0x%llx), "
+                "%llu MSI\n",
+                statusName(static_cast<Status>(fill[0])), static_cast<unsigned long long>(fill[1]),
+                static_cast<unsigned long long>(fill[2]), static_cast<unsigned long long>(fill[3]),
+                static_cast<unsigned long long>(fill[4]), static_cast<unsigned long long>(fill[5]),
+                static_cast<unsigned long long>(fill[6]));
+    if (fill[0] != kOK) return false;
+
+    uint64_t show[2] = {};
+    FlipReport report = {};
+    step("flip 3/6 show: SURFACE_FLIP_INTERRUPT <- 0x100, <- 0x1; PRIMARY_SURFACE_ADDRESS_HIGH <- 0xf4,\n"
+         "  PRIMARY_SURFACE_ADDRESS <- 0x41000000; wait for the flip and its MSI");
+    bool ok = callReport(connection, kDiagnosticFlipShow, show, 2, &report);
+    if (ok) {
+        std::printf("%s, SURFACE_FLIP_INTERRUPT after the arm 0x%08llx\n", statusName(static_cast<Status>(show[0])),
+                    static_cast<unsigned long long>(show[1]));
+        printFlip(report);
+        ok = show[0] == kOK;
+    }
+    if (ok) {
+        uint64_t ack[6] = {};
+        step("flip 4/6 acknowledge: SURFACE_FLIP_INTERRUPT <- 0x101, IH_RB_RPTR <- the write pointer, wait 100 ms");
+        ok = call(connection, kDiagnosticFlipAck, ack, 6);
+        if (ok) {
+            std::printf("%s, SURFACE_FLIP_INTERRUPT 0x%08llx, IH_RB_RPTR <- 0x%llx; MSI count %llu, after 100 ms %llu;\n"
+                        "  IH write-back 0x%08llx\n",
+                        statusName(static_cast<Status>(ack[0])), static_cast<unsigned long long>(ack[1]),
+                        static_cast<unsigned long long>(ack[2]), static_cast<unsigned long long>(ack[3]),
+                        static_cast<unsigned long long>(ack[4]), static_cast<unsigned long long>(ack[5]));
+            ok = ack[0] == kOK;
+        }
+    }
+    if (ok) {
+        std::printf("  SDMA's pattern is on screen for 5 s: 8 horizontal bands, black at the top and white at the\n"
+                    "  bottom, no grey lines.\n");
+        std::fflush(stdout);
+        sleep(5);
+        uint64_t verify[2] = {};
+        DisplayReport hold = {};
+        step("flip 5/6 verify: still SDMA's pattern, frames advanced, pipe 0 otherwise unchanged, no MSI");
+        ok = callReport(connection, kDiagnosticFlipVerify, verify, 2, &hold);
+        if (ok) {
+            std::printf("%s\n  in use 0x%02x%08x, DCSURF_FLIP_CONTROL 0x%08x; frame count %u, %u frames since the flip;\n"
+                        "  %llu MSI during the hold; display: %u changed",
+                        statusName(static_cast<Status>(verify[0])), hold.inuseHi, hold.inuseLo, hold.flipControl,
+                        hold.frameCount, hold.framesAdvanced, static_cast<unsigned long long>(verify[1]),
+                        hold.displayChanged);
+            if (hold.displayChanged != 0) std::printf(" (first %s)", registerName(kDisplayInventory[hold.displayFirst]));
+            std::printf("; pattern: %u unexpected words (first +0x%x)\n", hold.patternUnexpected, hold.patternFirst);
+            ok = verify[0] == kOK;
+        }
+    }
+    uint64_t restore[4] = {};
+    FlipReport back = {};
+    step("flip 6/6 restore: PRIMARY_SURFACE_ADDRESS_HIGH <- 0xf4, PRIMARY_SURFACE_ADDRESS <- 0, wait;\n"
+         "  SURFACE_FLIP_INTERRUPT <- 0x101, <- 0; IH_RB_RPTR <- the write pointer");
+    bool restored = callReport(connection, kDiagnosticFlipRestore, restore, 4, &back);
+    if (restored) {
+        std::printf("%s, IH_RB_RPTR <- 0x%llx", statusName(static_cast<Status>(restore[0])),
+                    static_cast<unsigned long long>(restore[3]));
+        if (restore[0] == kFlipNotRestored) {
+            if (restore[1] < 11) printDisplayCheckEntry(restore[1], restore[2]);
+            else std::printf(" (HUBPREQ0_DCSURF_SURFACE_FLIP_INTERRUPT reads 0x%08llx)",
+                             static_cast<unsigned long long>(restore[2]));
+        }
+        std::printf("\n");
+        printFlip(back);
+        restored = restore[0] == kOK;
+    }
+    return ok && restored;
+}
+
 // The stage 18 steps after a verified stage 17 run: check, enable, frame 3,
-// verify, acknowledge, restore. The restore runs whenever the enable was
-// sent; the stage 17 restore that follows would also run it.
-bool intrIh(io_connect_t connection)
+// verify, acknowledge, (with flip, the stage 20 steps), restore. The restore
+// runs whenever the enable was sent; the stage 17 restore that follows would
+// also run it.
+bool intrIh(io_connect_t connection, bool flip)
 {
     uint64_t check[8] = {};
     step("intr 1/6 check: INTERRUPT_CNTL, INTERRUPT_CNTL2, BIF_IH_DOORBELL_RANGE at boot 22; find the MSI vector");
@@ -889,6 +1029,7 @@ bool intrIh(io_connect_t connection)
             ok = ack[0] == kOK;
         }
     }
+    if (ok && flip) ok = sdmaFlip(connection);
     uint64_t restore[7] = {};
     step("intr 6/6 restore: IH_RB_CNTL <- 0xc0310114, pointers 0, remove the handler, INTERRUPT_CNTL2 <- 0");
     bool restored = call(connection, kDiagnosticIntrRestore, restore, 7);
@@ -907,7 +1048,7 @@ bool intrIh(io_connect_t connection)
 // The stage 17 steps after a verified copy: check, enable, frame 2, verify,
 // restore. The restore runs whenever the enable was sent; the stage 15 stop
 // that follows would also run it.
-bool gartIh(io_connect_t connection, bool intr)
+bool gartIh(io_connect_t connection, bool intr, bool flip)
 {
     uint64_t check[3] = {};
     step("gart 1/5 check: GART and IH registers and display pipe 0 at boot 22; area 0xf440800000 placed and stable");
@@ -969,7 +1110,7 @@ bool gartIh(io_connect_t connection, bool intr)
             ok = scalar == kOK;
         }
     }
-    if (ok && intr) ok = intrIh(connection);
+    if (ok && intr) ok = intrIh(connection, flip);
     uint64_t restore[4] = {};
     step("gart 5/5 restore: IH ring off, IH and SDMA0_CNTL to boot 22, VM_CONTEXT0_CNTL then GART to boot 22, flush");
     bool restored = call(connection, kDiagnosticGartRestore, restore, 4);
@@ -1067,7 +1208,7 @@ bool displayPattern(io_connect_t connection)
 // and with intr also the stage 18 steps inside them.
 // Returns whether every step passed; the caller's teardown is skipped once
 // the check passed (stop does it).
-bool sdmaCopy(io_connect_t connection, bool *stopped, bool gart, bool intr)
+bool sdmaCopy(io_connect_t connection, bool *stopped, bool gart, bool intr, bool flip)
 {
     *stopped = false;
     uint64_t check[3] = {};
@@ -1116,14 +1257,14 @@ bool sdmaCopy(io_connect_t connection, bool *stopped, bool gart, bool intr)
             ok = verify[0] == kOK;
         }
     }
-    if (ok && gart) ok = gartIh(connection, intr);
+    if (ok && gart) ok = gartIh(connection, intr, flip);
     bool halted = copyStop(connection);
     return ok && halted;
 }
 
 // mode: 0 load only, 1 with the stage 14 inventory, 2 with the stage 15 copy,
 // 3 with the copy and the stage 17 GART and interrupt ring, 4 with those and
-// the stage 18 MSI delivery.
+// the stage 18 MSI delivery, 5 with those and the stage 20 SDMA fill and flip.
 bool pspSdma(io_connect_t connection, int mode)
 {
     uint64_t check[7] = {};
@@ -1206,7 +1347,7 @@ bool pspSdma(io_connect_t connection, int mode)
             std::printf("copy: skipped, LOAD_IP_FW did not fence\n");
         } else {
             bool stopped = false;
-            bool copied = sdmaCopy(connection, &stopped, mode >= 3, mode == 4);
+            bool copied = sdmaCopy(connection, &stopped, mode >= 3, mode >= 4, mode == 5);
             if (stopped) return copied && loaded[0] == kOK;
         }
         inventoried = false;
@@ -1278,12 +1419,14 @@ bool inventory16(io_connect_t connection)
         uint32_t blank = r[5] & 1, format = r[6] & 0x7F, width = r[7] & 0x3FFF, height = (r[7] >> 16) & 0x3FFF,
                  pitch = r[8] & 0x3FFF;
         uint64_t surface = (uint64_t(r[10]) << 32) | r[9];
+        // The pitch as the hardware uses it: boot 28 showed DCSURF_SURFACE_PITCH
+        // 0x780 scanning out 1920 pixels per line, not Linux's value + 1.
         std::printf("pipe %u: OTG %s, total %ux%u, active %ux%u; HUBP %s, surface 0x%010llx%s, viewport %ux%u,"
                     " pitch %u, format %u\n",
                     pipe, (control & kOtgMasterEn) ? "enabled" : "off", hTotal + 1, vTotal + 1, hStart - hEnd,
                     vStart - vEnd, blank ? "blanked" : "unblanked", static_cast<unsigned long long>(surface),
                     surface == (uint64_t(kExpectedFbLocationBase) << 24) ? " (GOP framebuffer, carveout offset 0)" : "",
-                    width, height, pitch + 1, format);
+                    width, height, pitch, format);
     }
     std::printf("%d failed reads\n", failed);
     return failed == 0;
@@ -1294,7 +1437,7 @@ int main(int argc, char **argv)
     unsigned long repeat = 1, interval = 1000;
     bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
          inventory = false, copy = false, psp = false, inventory16Flag = false, gartFlag = false,
-         intrFlag = false, displayFlag = false;
+         intrFlag = false, displayFlag = false, flipFlag = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -1338,6 +1481,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--ih-intr") == 0) {
             intrFlag = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--sdma-flip") == 0) {
+            flipFlag = true;
             continue;
         }
         if (std::strcmp(argv[i], "--display-pattern") == 0) {
@@ -1396,7 +1543,9 @@ int main(int argc, char **argv)
     std::printf("CezanneGPU diagnostics v%llu, driver stage %llu\n", static_cast<unsigned long long>(info[0]),
                 static_cast<unsigned long long>(info[1]));
 
-    const uint32_t count = info[1] >= 19  ? kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount
+    const uint32_t count = info[1] >= 20  ? kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount +
+                                                kStage20RegisterCount
+                           : info[1] >= 19 ? kStage16RegisterCount + kStage17RegisterCount + kStage19RegisterCount
                            : info[1] >= 17 ? kStage16RegisterCount + kStage17RegisterCount
                            : info[1] >= 16 ? kStage16RegisterCount
                            : info[1] >= 14 ? kStage14RegisterCount
@@ -1493,6 +1642,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!pspSdma(connection, 4)) failures++;
+    }
+    if (flipFlag) {
+        if (info[1] < kFlipStage) {
+            std::fprintf(stderr, "cezanne-diag: --sdma-flip needs driver stage %u\n", kFlipStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspSdma(connection, 5)) failures++;
     }
     if (displayFlag) {
         if (info[1] < kDisplayStage) {

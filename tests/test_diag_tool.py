@@ -19,7 +19,7 @@ class DiagSourceTests(unittest.TestCase):
                          ["kDiagnosticDisplayVerify", "kDiagnosticGartVerify", "kDiagnosticGetInfo", "kDiagnosticIntrVerify", "kDiagnosticMetricsRead",
                           "kDiagnosticReadRegister", "kDiagnosticSdmaInventory", "selector"])
         helper = re.findall(r"\bcall\(connection, (\w+)", source)
-        self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore", "kDiagnosticSmuCheck", "kDiagnosticSmuQuery", "kDiagnosticSmuCheck", "kDiagnosticGfxOffDisallow", "kDiagnosticMetricsCheck", "kDiagnosticMetricsTransfer", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspRingObserve", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticPspTmrObserve", "kDiagnosticPspTmrTeardown", "kDiagnosticPspTmrTeardown", "kDiagnosticSdmaStop", "kDiagnosticIntrCheck", "kDiagnosticIntrEnable", "kDiagnosticSdmaSubmit", "kDiagnosticIntrAck", "kDiagnosticIntrRestore", "kDiagnosticGartCheck", "kDiagnosticGartEnable", "kDiagnosticSdmaSubmit", "kDiagnosticGartRestore", "kDiagnosticDisplayCheck", "kDiagnosticDisplayFlip", "kDiagnosticDisplayRestore", "kDiagnosticSdmaCopyCheck", "kDiagnosticSdmaStart", "kDiagnosticSdmaSubmit", "kDiagnosticSdmaVerify", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticSdmaLoad", "kDiagnosticSdmaObserve"])
+        self.assertEqual(helper, ["kDiagnosticScratchCheck", "kDiagnosticScratchWrite", "kDiagnosticScratchRestore", "kDiagnosticSmuCheck", "kDiagnosticSmuQuery", "kDiagnosticSmuCheck", "kDiagnosticGfxOffDisallow", "kDiagnosticMetricsCheck", "kDiagnosticMetricsTransfer", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspRingObserve", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingDestroy", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticPspTmrObserve", "kDiagnosticPspTmrTeardown", "kDiagnosticPspTmrTeardown", "kDiagnosticSdmaStop", "kDiagnosticFlipCheck", "kDiagnosticFlipFill", "kDiagnosticFlipAck", "kDiagnosticIntrCheck", "kDiagnosticIntrEnable", "kDiagnosticSdmaSubmit", "kDiagnosticIntrAck", "kDiagnosticIntrRestore", "kDiagnosticGartCheck", "kDiagnosticGartEnable", "kDiagnosticSdmaSubmit", "kDiagnosticGartRestore", "kDiagnosticDisplayCheck", "kDiagnosticDisplayFlip", "kDiagnosticDisplayRestore", "kDiagnosticSdmaCopyCheck", "kDiagnosticSdmaStart", "kDiagnosticSdmaSubmit", "kDiagnosticSdmaVerify", "kDiagnosticPspRingCheck", "kDiagnosticPspRingCreate", "kDiagnosticPspTmrSubmit", "kDiagnosticSdmaLoad", "kDiagnosticSdmaObserve"])
 
         # The only messages the tool can ask for are the two version queries.
         self.assertEqual(re.findall(r'\{"smu \d/3 query: \w+ \(0x\d\)", (\w+)\}', source),
@@ -39,7 +39,8 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(ring\) \{[^}]*info\[1\] < kPspRingStage")
         self.assertEqual(len(re.findall(r"\bpspTmr\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(tmr\) \{[^}]*info\[1\] < kPspTmrStage")
-        self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["0", "1", "2", "3", "4"])
+        self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["0", "1", "2", "3", "4", "5"])
+        self.assertRegex(source, r"if \(flipFlag\) \{[^}]*info\[1\] < kFlipStage")
         self.assertRegex(source, r"if \(gartFlag\) \{[^}]*info\[1\] < kGartStage")
         self.assertRegex(source, r"if \(intrFlag\) \{[^}]*info\[1\] < kIntrStage")
         self.assertRegex(source, r"if \(displayFlag\) \{[^}]*info\[1\] < kDisplayStage")
@@ -51,16 +52,25 @@ class DiagSourceTests(unittest.TestCase):
                             r"\breturn\b")
         # The interrupt steps run only after a passing stage 17 verify, inside
         # its restore, and their own restore whenever the enable was sent.
-        self.assertIn("if (ok && intr) ok = intrIh(connection);", source)
+        self.assertIn("if (ok && intr) ok = intrIh(connection, flip);", source)
         gart = re.search(r"bool gartIh\(.*?\n}\n", source, re.S).group(0)
-        self.assertLess(gart.index("intrIh(connection)"), gart.index("kDiagnosticGartRestore"))
+        self.assertLess(gart.index("intrIh(connection, flip)"), gart.index("kDiagnosticGartRestore"))
         intr = re.search(r"bool intrIh\(.*?\n}\n", source, re.S).group(0)
         self.assertLess(intr.index("kDiagnosticIntrEnable"), intr.index("kDiagnosticIntrRestore"))
         self.assertNotRegex(intr[intr.index("kDiagnosticIntrEnable"):intr.index("kDiagnosticIntrRestore")], r"\breturn\b")
         self.assertLess(intr.index("kDiagnosticIntrVerify"), intr.index("kDiagnosticIntrAck"))
+        # The stage 20 steps run only after a passing stage 18 acknowledgement,
+        # inside its restore, and their own restore whenever the show was sent.
+        self.assertIn("if (ok && flip) ok = sdmaFlip(connection);", intr)
+        self.assertLess(intr.index("kDiagnosticIntrAck"), intr.index("sdmaFlip(connection)"))
+        self.assertLess(intr.index("sdmaFlip(connection)"), intr.index("kDiagnosticIntrRestore"))
+        flip = re.search(r"bool sdmaFlip\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(flip.index("kDiagnosticFlipShow"), flip.index("kDiagnosticFlipRestore"))
+        self.assertNotRegex(flip[flip.index("kDiagnosticFlipShow"):flip.index("kDiagnosticFlipRestore")], r"\breturn\b")
+        self.assertLess(flip.index("kDiagnosticFlipFill"), flip.index("kDiagnosticFlipShow"))
         # The GART steps run only after a passing stage 15 verify, and the
         # restore whenever the enable was sent.
-        self.assertIn("if (ok && gart) ok = gartIh(connection, intr);", source)
+        self.assertIn("if (ok && gart) ok = gartIh(connection, intr, flip);", source)
         gart = re.search(r"bool gartIh\(.*?\n}\n", source, re.S).group(0)
         self.assertLess(gart.index("kDiagnosticGartEnable"), gart.index("kDiagnosticGartRestore"))
         self.assertNotRegex(gart[gart.index("kDiagnosticGartEnable"):gart.index("kDiagnosticGartRestore")], r"\breturn\b")
@@ -78,7 +88,7 @@ class DiagSourceTests(unittest.TestCase):
         source = (DIAG / "cezanne_diag.cpp").read_text()
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
         expected = []
-        for name in ("kStage16Registers", "kStage17Registers", "kStage19Registers"):
+        for name in ("kStage16Registers", "kStage17Registers", "kStage19Registers", "kStage20Registers"):
             listed = re.search(r"%s\[\] = \{([^}]*)\}" % name, header).group(1)
             expected += [entry.strip() for entry in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
