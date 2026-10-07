@@ -73,11 +73,17 @@ GART_WORK_MAP = "gartWorkMemory->map(kIOMapInhibitCache)"
 GART_WORK_STORE = "gartWork->base[offset / 4] = value;"
 PATTERN_MAP = "patternMemory->map(kIOMapInhibitCache)"
 PATTERN_STORE = "pattern->base[offset / 4] = value;"
-ALLOWED_MAPS = (SCRATCH_MAP, WORK_MAP, FIRMWARE_MAP, SDMA_WORK_MAP, GART_WORK_MAP, PATTERN_MAP)
-ALLOWED_STORES = (SCRATCH_STORE, WORK_STORE, FIRMWARE_STORE, SDMA_WORK_STORE, GART_WORK_STORE, PATTERN_STORE)
+# Stage 21: the GFX firmware buffer and work area share one mapping helper.
+GFX_MAP = "gfxMemory->map(kIOMapInhibitCache)"
+GFX_FIRMWARE_STORE = "gfxFirmware->base[offset / 4] = value;"
+GFX_WORK_STORE = "gfxWork->base[offset / 4] = value;"
+ALLOWED_MAPS = (SCRATCH_MAP, WORK_MAP, FIRMWARE_MAP, SDMA_WORK_MAP, GART_WORK_MAP, PATTERN_MAP, GFX_MAP)
+ALLOWED_STORES = (SCRATCH_STORE, WORK_STORE, FIRMWARE_STORE, SDMA_WORK_STORE, GART_WORK_STORE, PATTERN_STORE,
+                  GFX_FIRMWARE_STORE, GFX_WORK_STORE)
 ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize", "cezanne::kPspWorkSize",
-                       "cezanne::kSdmaFwBufferSize", "cezanne::kGartWorkSize", "cezanne::kPatternSize", "length")
-ALLOWED_VOLATILE = 12
+                       "cezanne::kSdmaFwBufferSize", "cezanne::kGartWorkSize", "cezanne::kPatternSize",
+                       "cezanne::kGfxWorkSize", "cezanne::kGfxFwBufferSize", "length")
+ALLOWED_VOLATILE = 14
 SDMA_FIRMWARE = ROOT / "out" / "firmware-provenance" / "fw" / "green_sardine_sdma.bin"
 
 
@@ -217,9 +223,12 @@ void f(IOPCIDevice *p, Aperture *a) {
                                     ("cezanne::kDisplayPageOffset", "flipArmOperation"),
                                     ("cezanne::kDisplayPageOffset", "flipRestoreOperation"),
                                     ("cezanne::kDisplayPageOffset", "flipShowOperation"),
+                                    ("cezanne::kDisplayPageOffset", "gfxFlipOperation"),
+                                    ("cezanne::kDisplayPageOffset", "gfxFlipOperation"),
                                     ("cezanne::kScratchPageOffset", "scratchRestoreOperation"),
                                     ("cezanne::kScratchPageOffset", "scratchRestoreOperation"),
                                     ("cezanne::kScratchPageOffset", "scratchWriteOperation"),
+                                    ("cezanne::kSmuPageOffset", "gfxLoadOperation"),
                                     ("cezanne::kSmuPageOffset", "gfxOffOperation"),
                                     ("cezanne::kSmuPageOffset", "metricsTransferOperation"),
                                     ("cezanne::kSmuPageOffset", "pspCreateOperation"),
@@ -232,7 +241,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertEqual(sorted(re.findall(r"accessDevice\(0, (\w+)", source)),
                          ["copyCheckOperation", "copyVerifyOperation", "displayCheckOperation",
                           "displayVerifyOperation", "flipCheckOperation", "flipVerifyOperation",
-                          "gartCheckOperation", "gartVerifyOperation",
+                          "gartCheckOperation", "gartVerifyOperation", "gfxCheckOperation", "gfxVerifyOperation",
                           "intrCheckOperation", "intrVerifyOperation", "metricsCheckOperation", "metricsReadOperation", "pspCheckOperation", "pspObserveOperation",
                           "readOperation", "scratchCheckOperation", "sdmaObserveOperation", "smuCheckOperation",
                           "tmrObserveOperation"])
@@ -242,15 +251,20 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn("if (physical != cezanne::kMetricsPhysical && physical != cezanne::kPspRingPhysical &&\n"
                       "        physical != cezanne::kPspTmrPhysical && physical != cezanne::kSdmaFwPhysical &&\n"
                       "        physical != cezanne::kSdmaWorkPhysical && physical != cezanne::kGartWorkPhysical &&\n"
-                      "        physical != cezanne::kPatternPhysical) {", source)
+                      "        physical != cezanne::kPatternPhysical && physical != cezanne::kGfxFwPhysical &&\n"
+                      "        physical != cezanne::kGfxWorkPhysical) {", source)
         self.assertEqual(sorted(re.findall(r"withCarveoutMemory\(cezanne::(\w+), cezanne::(\w+),", source)),
                          [("kGartWorkPhysical", "kGartWorkCheckSize"), ("kGartWorkPhysical", "kGartWorkCheckSize"),
                           ("kGartWorkPhysical", "kGartWorkCheckSize"), ("kGartWorkPhysical", "kGartWorkCheckSize"),
                           ("kGartWorkPhysical", "kGartWorkCheckSize"), ("kGartWorkPhysical", "kGartWorkCheckSize"),
+                          ("kGfxFwPhysical", "kGfxFwCheckSize"), ("kGfxWorkPhysical", "kGfxWorkCheckSize"),
+                          ("kGfxWorkPhysical", "kGfxWorkCheckSize"), ("kGfxWorkPhysical", "kGfxWorkCheckSize"),
+                          ("kGfxWorkPhysical", "kGfxWorkCheckSize"),
                           ("kMetricsPhysical", "kMetricsCheckSize"), ("kMetricsPhysical", "kPageSize"),
                           ("kPatternPhysical", "kPatternSize"), ("kPatternPhysical", "kPatternSize"),
                           ("kPatternPhysical", "kPatternSize"), ("kPatternPhysical", "kPatternSize"),
-                          ("kPatternPhysical", "kPatternSize"),
+                          ("kPatternPhysical", "kPatternSize"), ("kPatternPhysical", "kPatternSize"),
+                          ("kPatternPhysical", "kPatternSize"), ("kPatternPhysical", "kPatternSize"),
                           ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
                           ("kPspRingPhysical", "kPspRingCheckSize"), ("kPspRingPhysical", "kPspRingCheckSize"),
                           ("kPspTmrPhysical", "kPspTmrSize"), ("kSdmaFwPhysical", "kSdmaFwCheckSize"),
@@ -269,7 +283,8 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn("writablePage != 0 && writablePage != cezanne::kScratchPageOffset && "
                       "writablePage != cezanne::kSmuPageOffset &&\n        writablePage != cezanne::kSdmaPageSet && "
                       "writablePage != cezanne::kGartPageSet &&\n        writablePage != cezanne::kIntrPageSet && "
-                      "writablePage != cezanne::kDisplayPageOffset) {", source)
+                      "writablePage != cezanne::kDisplayPageOffset &&\n        writablePage != cezanne::kGfxPageSet) {",
+                      source)
         page = re.search(r"IODeviceMemory::withRange\(\(state\.bar5 & ~0xFull\) \+ page\.pageOffset\[i\], "
                          r"cezanne::kPageSize\)", source)
         self.assertIsNotNone(page)
@@ -361,6 +376,51 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn("intrAcked_ && intrProgress_ == 2 &&", check)
         self.assertIn("pspOwner_ == owner", check)
 
+    def test_gfx_engine_writes_are_confined_and_restored(self):
+        source = strip_comments((KEXT / "CezanneGPU.cpp").read_text())
+        header = (CORE / "cezanne_core.h").read_text()
+        # The GC page set: only these operations, only these pages; the
+        # snapshot-relative allowlist only for it.
+        self.assertEqual(sorted(re.findall(r"accessDevice\(cezanne::kGfxPageSet, (\w+)", source)),
+                         ["gfxCpOperation", "gfxDrawOperation", "gfxRestoreOperation", "gfxRlcOperation",
+                          "gfxTestOperation"])
+        self.assertIn("const uint32_t kGfxPages[] = {0x8000, 0xc000, 0x30000, 0x3b000};", header)
+        self.assertEqual(source.count("page.gfxSnapshot = gfxSnapshot_;"), 1)
+        write = re.search(r"static bool registerWrite\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("(page->gfxSnapshot != nullptr && cezanne::gfxWriteAllowed(offset, value, page->stage, "
+                      "page->gfxSnapshot))", write)
+        self.assertLess(write.index("gfxWriteAllowed"), write.index(SCRATCH_STORE))
+        # The GFX firmware buffer and work area: fixed ranges, written only
+        # after the core's allowlists, from stage 21.
+        self.assertEqual(source.count(GFX_MAP), 1)
+        for store, check in ((GFX_FIRMWARE_STORE, "gfxFirmwareWriteAllowed(gfxFirmware->files, offset, value, "
+                                                  "gfxFirmware->stage)"),
+                             (GFX_WORK_STORE, "gfxWorkWriteAllowed(offset, value, gfxWork->stage)")):
+            self.assertEqual(source.count(store), 1)
+            self.assertLess(source.index(check), source.index(store))
+        helper = re.search(r"static cezanne::Status withGfxMemory\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("if (stage < cezanne::kGfxStage) {", helper)
+        self.assertIn("IODeviceMemory::withRange(cezanne::kGfxWorkPhysical, cezanne::kGfxWorkSize)", helper)
+        self.assertIn("IODeviceMemory::withRange(cezanne::kGfxFwPhysical, cezanne::kGfxFwBufferSize)", helper)
+        # The restore is owed before the RLC start writes anything, and the
+        # GOP surface before the flip; it runs from its selector, before the
+        # PSP teardown (so on abandon too) and from stop().
+        rlc = re.search(r"cezanne::Status CezanneGPU::gfxRlc\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(rlc.index("gfxStep_ = kGfxRlcStarted;"), rlc.index("gfxRlcOperation"))
+        draw = re.search(r"cezanne::Status CezanneGPU::gfxDraw\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(draw.index("gfxFlipped_ = true;"), draw.index("gfxFlipOperation"))
+        teardown = re.search(r"cezanne::Status CezanneGPU::pspTeardownLocked\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(teardown.index("gfxRestoreLocked(out, &state)"), teardown.index("tmrTeardownOperation"))
+        stop = re.search(r"void CezanneGPU::stop\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(stop.index("gfxRestoreLocked(out, &state)"), stop.index("IOService::stop(provider)"))
+        abandon = re.search(r"void CezanneGPU::scratchAbandon\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("pspState_ == kPspGfxLoaded", abandon)
+        restore = re.search(r"cezanne::Status CezanneGPU::gfxRestoreLocked\(.*?\n}\n", source, re.S).group(0)
+        self.assertLess(restore.index("gfxFlipOperation"), restore.index("gfxRestoreOperation"))
+        # The check needs a passing SETUP_TMR by this connection.
+        check = re.search(r"cezanne::Status CezanneGPU::gfxCheck\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("pspState_ == kPspTmrSubmitted && pspTmrOk_ && pspOwner_ == owner", check)
+
     def test_stage_interlock_and_identity_are_declared(self):
         info = plistlib.loads((KEXT / "Info.plist").read_bytes())
         personality = info["IOKitPersonalities"]["CezanneGPU"]
@@ -373,7 +433,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 20;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 21;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
