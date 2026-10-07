@@ -123,8 +123,8 @@ struct Aperture {
 // kSdmaPages set for stage 15, the kGartPages set for stage 17, the
 // kIntrPages set (two) for stage 18.
 struct WritePage {
-    volatile UInt32 *base[4];
-    uint32_t pageOffset[4];
+    volatile UInt32 *base[6];
+    uint32_t pageOffset[6];
     uint32_t count;
     UInt32 stage;
     const uint32_t *gfxSnapshot; // stage 21: the check's snapshot, for kGfxPageSet only
@@ -759,9 +759,9 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
         aperture.length = map->getLength();
         status = cezanne::checkAperture(state, map->getPhysicalAddress(), aperture.length);
     }
-    IODeviceMemory *pageMemories[4] = {nullptr, nullptr, nullptr, nullptr};
-    IOMemoryMap *pageMaps[4] = {nullptr, nullptr, nullptr, nullptr};
-    WritePage page = {{nullptr, nullptr, nullptr, nullptr}, {0, 0, 0, 0}, 0, stage_, nullptr};
+    IODeviceMemory *pageMemories[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    IOMemoryMap *pageMaps[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    WritePage page = {{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}, {0, 0, 0, 0, 0, 0}, 0, stage_, nullptr};
     if (writablePage == cezanne::kSdmaPageSet || writablePage == cezanne::kGartPageSet) {
         page.count = 3;
         for (uint32_t i = 0; i < 3; i++) {
@@ -774,8 +774,8 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
             page.pageOffset[i] = cezanne::kIntrPages[i];
         }
     } else if (writablePage == cezanne::kGfxPageSet) {
-        page.count = 4;
-        for (uint32_t i = 0; i < 4; i++) {
+        page.count = cezanne::kGfxPageCount;
+        for (uint32_t i = 0; i < cezanne::kGfxPageCount; i++) {
             page.pageOffset[i] = cezanne::kGfxPages[i];
         }
         page.gfxSnapshot = gfxSnapshot_;
@@ -801,7 +801,7 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
         cezanne::RegisterWriter writer = {writablePage != 0 ? registerWrite : refuseWrite, pauseOneMillisecond, &page};
         status = operation(stage_, registers, aperture.length, &writer, argument);
     }
-    for (uint32_t i = 0; i < 4; i++) {
+    for (uint32_t i = 0; i < 6; i++) {
         if (pageMaps[i] != nullptr) {
             pageMaps[i]->release();
         }

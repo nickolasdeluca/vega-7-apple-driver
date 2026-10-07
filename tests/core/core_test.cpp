@@ -179,7 +179,10 @@ struct FakeRegisters {
         gc[kRegGcFbLocationBase] = 0xf400;
         gc[kRegGcFbLocationTop] = 0xf47f;
         gc[kRegMcVmFbOffset] = 0x5c0;
-        gc[kRegGbAddrConfig] = 0x24000042;
+        gc[kRegGbAddrConfig] = gc[kRegGbAddrConfigRead] = 0x24000011; // boot 32
+        gc[kRegTcpChanSteerLo] = 0x76543210;
+        gc[kRegTcpChanSteerHi] = 0xfedcba98;
+        gc[kRegCbHwControl] = 0x00014107;
     }
     void presetFlip()
     {
@@ -3166,9 +3169,14 @@ static void testGfx()
         uint32_t writes = 0, cu = 9, noncu = 9;
         int before = g.w.writes;
         CHECK(startRlc(g.r.reader(), 0x80000, g.w.writer(), 21, g.snapshot, &writes, &cu, &noncu) == kOK);
-        CHECK(writes == 11 && g.w.writes == before + 11 && cu == 0 && noncu == 0);
-        CHECK(g.w.offsets[before] == kRegRlcCntl && g.w.values[before] == 0);
-        CHECK(g.w.values[before + 1] == 0x00000001u && g.w.values[before + 2] == kGrbmSelectSe0Sh0);
+        CHECK(writes == 23 && g.w.writes == before + 23 && cu == 0 && noncu == 0);
+        // The golden settings first, in Linux's order and masks.
+        CHECK(g.w.offsets[before] == kRegCbHwControl && g.w.values[before] == 0x00014104u);
+        CHECK(g.r.gc[kRegGbAddrConfig] == 0x24000042u && g.r.gc[kRegTcpChanSteerLo] == 0x3120 &&
+              g.r.gc[kRegTcpChanSteerHi] == 0 && g.r.gc[kRegGceaProbeMap] == 0xcccc);
+        CHECK(g.w.offsets[before + 11] == kRegGceaProbeMap);
+        CHECK(g.w.offsets[before + 12] == kRegRlcCntl && g.w.values[before + 12] == 0);
+        CHECK(g.w.values[before + 13] == 0x00000001u && g.w.values[before + 14] == kGrbmSelectSe0Sh0);
         CHECK(g.r.gc[kRegRlcCntl] == 1 && g.r.gc[kRegRlcSrmCntl] == 3 && g.r.gc[kRegRlcSpmMcCntl] == 0x3f);
         CHECK(g.r.gc[kRegRlcCsibAddrLo] == 0x40A03000u && g.r.gc[kRegRlcCsibLength] == 904 && g.r.gc[kRegRlcCgcgCglsCtrl] == 0);
         uint32_t rptr = 0, cpRptr = 0;
@@ -3193,12 +3201,17 @@ static void testGfx()
         CHECK(verifyGfxDraw(g.r.reader(), 0x80000, g.pattern.reader(), g.display, flipFrames, 21, &report) == kOK);
         CHECK(flipDisplay(g.r.reader(), 0x80000, g.w.writer(), 21, kGopSurfaceAddress, &inuse, &pauses) == kOK);
         GfxState state;
-        CHECK(readGfxState(g.r.reader(), 0x80000, 21, &state) == kOK && state.values[0] == 1 && state.values[32] == 2048);
+        uint32_t rptrAt = 0;
+        while (kGfxStateRegisters[rptrAt] != kRegCpRb0Rptr) rptrAt++;
+        CHECK(readGfxState(g.r.reader(), 0x80000, 21, &state) == kOK && state.values[0] == 1 &&
+              state.values[rptrAt] == 2048);
+        for (uint32_t i = 0; i < kGfxSnapshotCount; i++) CHECK(kGfxStateRegisters[i] == kGfxSnapshotRegisters[i]);
         uint32_t index = 9, value = 9;
         CHECK(restoreGfx(g.r.reader(), 0x80000, g.w.writer(), 21, g.snapshot, &index, &value) == kOK);
         CHECK(index == 0 && value == 0);
         for (uint32_t i = 0; i < kGfxSnapshotCount; i++) CHECK(g.r.gc[kGfxSnapshotRegisters[i]] == g.snapshot[i]);
         CHECK(g.r.gc[kRegCpMeCntl] == (kCpMeHalts | 0x100) && g.r.gc[kRegRlcCntl] == 0);
+        CHECK(g.r.gc[kRegGbAddrConfig] == 0x24000011u && g.r.gc[kRegTcpChanSteerLo] == 0x76543210u);
         // Then DESTROY_TMR as frame 10.
         CHECK(writePspCommand(g.pspWork.reader(), g.pspWork.writer(), 21, kGfxCmdDestroyTmr, 10) == kOK);
         CHECK(submitPspFrame(g.r.reader(), 0x80000, g.w.writer(), g.pspWork.reader(), 21, 10, &fence) == kOK && fence == 11);

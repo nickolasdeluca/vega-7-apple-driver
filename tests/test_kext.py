@@ -384,7 +384,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertEqual(sorted(re.findall(r"accessDevice\(cezanne::kGfxPageSet, (\w+)", source)),
                          ["gfxCpOperation", "gfxDrawOperation", "gfxRestoreOperation", "gfxRlcOperation",
                           "gfxTestOperation"])
-        self.assertIn("const uint32_t kGfxPages[] = {0x8000, 0xc000, 0x30000, 0x3b000};", header)
+        self.assertIn("const uint32_t kGfxPages[] = {0x8000, 0x9000, 0xa000, 0xc000, 0x30000, 0x3b000};", header)
         self.assertEqual(source.count("page.gfxSnapshot = gfxSnapshot_;"), 1)
         write = re.search(r"static bool registerWrite\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("(page->gfxSnapshot != nullptr && cezanne::gfxWriteAllowed(offset, value, page->stage, "

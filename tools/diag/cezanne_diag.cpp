@@ -298,6 +298,11 @@ const Named kRegisters[] = {
     {"RLC_GPM_GENERAL_6", kRegRlcGpmGeneral6},
     {"RLC_SAFE_MODE", kRegRlcSafeMode},
     {"RLC_INT_STAT", kRegRlcIntStat},
+    {"GCEA_PROBE_MAP", kRegGceaProbeMap},
+    {"CPF_UTCL1_STATUS", kRegCpfUtcl1Status},
+    {"CPC_UTCL1_STATUS", kRegCpcUtcl1Status},
+    {"CPG_UTCL1_STATUS", kRegCpgUtcl1Status},
+    {"VM_L2_PROTECTION_FAULT_STATUS_GC", kRegGcVmL2ProtectionFaultStatus},
 };
 static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage16RegisterCount + kStage17RegisterCount +
                                                                 kStage19RegisterCount + kStage20RegisterCount +
@@ -1365,8 +1370,8 @@ bool gfxEngine(io_connect_t connection)
 
     // From here the restore is owed.
     uint64_t rlc[4] = {};
-    step("gfx 3/8 RLC start: rlc_stop, serdes, CG off, clear-state buffer, save/restore machine, SPM VMID 0xf,\n"
-         "  RLC_ENABLE_F32");
+    step("gfx 3/8 RLC start: the 12 golden settings, rlc_stop, serdes, CG off, clear-state buffer, save/restore\n"
+         "  machine, SPM VMID 0xf, RLC_ENABLE_F32");
     bool ok = callReport(connection, kDiagnosticGfxRlc, rlc, 4, &state);
     if (ok) {
         std::printf("%s, %llu writes, serdes CU 0x%08llx, NONCU 0x%08llx\n", statusName(static_cast<Status>(rlc[0])),

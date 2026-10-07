@@ -1072,9 +1072,15 @@ const uint32_t kRegCpMeHeaderDump = 0x08684; // CP_ME_HEADER_DUMP: gc_reg_list_9
 const uint32_t kRegRlcGpmGeneral6 = 0x3b1a4; // RLC_GPM_GENERAL_6: gc_reg_list_9 (IP dump), after boot 32
 const uint32_t kRegRlcSafeMode = 0x3b014; // RLC_SAFE_MODE: gc_reg_list_9 (IP dump), after boot 32
 const uint32_t kRegRlcIntStat = 0x3b060; // RLC_INT_STAT: gc_reg_list_9 (IP dump), after boot 32
+const uint32_t kRegGceaProbeMap = 0x09c30; // GCEA_PROBE_MAP: golden_settings_gc_9_1_rn (gfx_v9_0.c defines it), after boot 33
+const uint32_t kRegCpfUtcl1Status = 0x0c6d8; // CPF_UTCL1_STATUS: gc_reg_list_9 (IP dump), after boot 33
+const uint32_t kRegCpcUtcl1Status = 0x0c6d4; // CPC_UTCL1_STATUS: gc_reg_list_9 (IP dump), after boot 33
+const uint32_t kRegCpgUtcl1Status = 0x0c6d0; // CPG_UTCL1_STATUS: gc_reg_list_9 (IP dump), after boot 33
+const uint32_t kRegGcVmL2ProtectionFaultStatus = 0x0a12c; // VM_L2_PROTECTION_FAULT_STATUS: gc_reg_list_9 (GC hub), after boot 33
 // Read from stage 21 on (all GFX-gated), in addition to the earlier lists.
 // The last 11 were added after boot 32 (the CP stalled): stall reasons and
-// the last packet headers.
+// the last packet headers; then, after boot 33 (the CP waited on its ring
+// fetch), GCEA_PROBE_MAP and the CP's memory-path status.
 const uint32_t kStage21Registers[] = {
     kRegCpIntCntlRing0,     kRegRlcCsibAddrHi,      kRegRlcCsibAddrLo,      kRegRlcCsibLength,
     kRegRlcSrmCntl,         kRegRlcSpmMcCntl,       kRegRlcSerdesCuMasterBusy, kRegRlcSerdesNoncuMasterBusy,
@@ -1086,7 +1092,8 @@ const uint32_t kStage21Registers[] = {
     kRegCpCeInstrPntr,      kRegCbHwControl,        kRegCbHwControl2,       kRegDbDebug2,
     kRegGbAddrConfigRead,   kRegPaScEnhance,        kRegPaScEnhance1,       kRegPaScLineStippleState,
     kRegTaCntlAux,          kRegTcpChanSteerHi,     kRegTcpChanSteerLo,
-    kRegCpStalledStat1, kRegCpStalledStat2, kRegCpCpfStalledStat1, kRegCpCpfBusyStat, kRegCpGfxError, kRegCpCeHeaderDump, kRegCpPfpHeaderDump, kRegCpMeHeaderDump, kRegRlcGpmGeneral6, kRegRlcSafeMode, kRegRlcIntStat};
+    kRegCpStalledStat1, kRegCpStalledStat2, kRegCpCpfStalledStat1, kRegCpCpfBusyStat, kRegCpGfxError, kRegCpCeHeaderDump, kRegCpPfpHeaderDump, kRegCpMeHeaderDump, kRegRlcGpmGeneral6, kRegRlcSafeMode, kRegRlcIntStat,
+    kRegGceaProbeMap, kRegCpfUtcl1Status, kRegCpcUtcl1Status, kRegCpgUtcl1Status, kRegGcVmL2ProtectionFaultStatus};
 const uint32_t kStage21RegisterCount = sizeof(kStage21Registers) / sizeof(kStage21Registers[0]);
 
 // Part A: the GFX firmware. The pinned linux-firmware 20260916 files (their
@@ -1193,7 +1200,10 @@ const uint32_t kGfxSnapshotRegisters[] = {
     kRegRlcSpmMcCntl,     kRegCpRbWptrDelay,   kRegCpRbVmid,           kRegCpRb0Cntl,
     kRegCpRb0Wptr,        kRegCpRb0WptrHi,     kRegCpRb0RptrAddr,      kRegCpRb0RptrAddrHi,
     kRegCpRbWptrPollAddrLo, kRegCpRbWptrPollAddrHi, kRegCpRb0Base,     kRegCpRb0BaseHi,
-    kRegCpMaxContext,     kRegCpDeviceId,      kRegCpMeCntl,           kRegScratchReg0};
+    kRegCpMaxContext,     kRegCpDeviceId,      kRegCpMeCntl,           kRegScratchReg0,
+    kRegCbHwControl,      kRegCbHwControl2,    kRegDbDebug2,           kRegGbAddrConfig,
+    kRegGbAddrConfigRead, kRegPaScEnhance,     kRegPaScEnhance1,       kRegPaScLineStippleState,
+    kRegTaCntlAux,        kRegTcpChanSteerHi,  kRegTcpChanSteerLo,     kRegGceaProbeMap};
 const uint32_t kGfxSnapshotCount = sizeof(kGfxSnapshotRegisters) / sizeof(kGfxSnapshotRegisters[0]);
 // The values written besides the snapshot: (snapshot & ~mask) | value; a
 // mask of all ones is a fixed value.
@@ -1233,7 +1243,22 @@ const GfxWrite kGfxWrites[] = {
     {kRegCpMaxContext, 0xFFFFFFFF, kCpMaxContext},
     {kRegCpDeviceId, 0xFFFFFFFF, kCpDeviceId},
     {kRegCpMeCntl, kCpMeHalts, 0},                   // cp_gfx_enable(true)
+    // golden_settings_gc_9_1_rn (after boot 33), soc15_program_register_sequence.
+    {kRegCbHwControl, 0xfffdf3cf, 0x00014104},
+    {kRegCbHwControl2, 0xff7fffff, 0x0a000000},
+    {kRegDbDebug2, 0xf00fffff, 0x00000400},
+    {kRegGbAddrConfig, 0xf3e777ff, 0x24000042},
+    {kRegGbAddrConfigRead, 0xf3e777ff, 0x24000042},
+    {kRegPaScEnhance, 0x3fffffff, 0x00000001},
+    {kRegPaScEnhance1, 0xffffffff, 0x04040000},
+    {kRegPaScLineStippleState, 0x0000ff0f, 0x00000000},
+    {kRegTaCntlAux, 0xfffffeef, 0x010b0000},
+    {kRegTcpChanSteerHi, 0xffffffff, 0x00000000},
+    {kRegTcpChanSteerLo, 0xffffffff, 0x00003120},
+    {kRegGceaProbeMap, 0xffffffff, 0x0000cccc},
 };
+// The golden writes are kGfxWrites' last kGfxGoldenCount entries, in Linux's order.
+const uint32_t kGfxGoldenCount = 12;
 const uint32_t kGfxWriteCount = sizeof(kGfxWrites) / sizeof(kGfxWrites[0]);
 // The precondition list (offset, mask, value), after the image headers and
 // GFX on: RLC off, CP and MEC halted, no doorbell, and the GC hub as MMHUB
@@ -1262,18 +1287,25 @@ const uint32_t kGfxStateRegisters[] = {
     kRegRlcCsibLength, kRegRlcSrmCntl, kRegRlcSpmMcCntl, kRegCpRbWptrDelay, kRegCpRbVmid, kRegCpRb0Cntl,
     kRegCpRb0Wptr, kRegCpRb0WptrHi, kRegCpRb0RptrAddr, kRegCpRb0RptrAddrHi, kRegCpRbWptrPollAddrLo,
     kRegCpRbWptrPollAddrHi, kRegCpRb0Base, kRegCpRb0BaseHi, kRegCpMaxContext, kRegCpDeviceId, kRegCpMeCntl,
-    kRegScratchReg0, kRegRlcStat, kRegGrbmStatus, kRegGrbmStatus2, kRegCpStat, kRegCpCpfStatus, kRegCpCpcStatus,
-    kRegCpBusyStat, kRegCpMecCntl, kRegCpRb0Rptr, kRegCpPfpInstrPntr, kRegCpMeInstrPntr, kRegCpCeInstrPntr,
-    kRegCpMec1InstrPntr, kRegRlcSerdesCuMasterBusy, kRegRlcSerdesNoncuMasterBusy, kRegCpRbDoorbellControl,
-    kRegGcMxL1TlbCntl, kRegGcVmL2Cntl, kRegGcVmContext0Cntl, kRegCbHwControl, kRegCbHwControl2, kRegDbDebug2,
-    kRegGbAddrConfig, kRegGbAddrConfigRead, kRegPaScEnhance, kRegPaScEnhance1, kRegPaScLineStippleState,
-    kRegTaCntlAux, kRegTcpChanSteerHi, kRegTcpChanSteerLo, kRegCpStalledStat1, kRegCpStalledStat2, kRegCpCpfStalledStat1, kRegCpCpfBusyStat, kRegCpGfxError, kRegCpCeHeaderDump, kRegCpPfpHeaderDump, kRegCpMeHeaderDump, kRegRlcGpmGeneral6, kRegRlcSafeMode, kRegRlcIntStat};
+    kRegScratchReg0, kRegCbHwControl, kRegCbHwControl2, kRegDbDebug2, kRegGbAddrConfig, kRegGbAddrConfigRead,
+    kRegPaScEnhance, kRegPaScEnhance1, kRegPaScLineStippleState, kRegTaCntlAux, kRegTcpChanSteerHi,
+    kRegTcpChanSteerLo, kRegGceaProbeMap, kRegRlcStat, kRegGrbmStatus, kRegGrbmStatus2, kRegCpStat,
+    kRegCpCpfStatus, kRegCpCpcStatus, kRegCpBusyStat, kRegCpMecCntl, kRegCpRb0Rptr, kRegCpPfpInstrPntr,
+    kRegCpMeInstrPntr, kRegCpCeInstrPntr, kRegCpMec1InstrPntr, kRegRlcSerdesCuMasterBusy,
+    kRegRlcSerdesNoncuMasterBusy, kRegCpRbDoorbellControl, kRegGcMxL1TlbCntl, kRegGcVmL2Cntl,
+    kRegGcVmContext0Cntl, kRegCpStalledStat1, kRegCpStalledStat2, kRegCpCpfStalledStat1, kRegCpCpfBusyStat,
+    kRegCpGfxError, kRegCpCeHeaderDump, kRegCpPfpHeaderDump, kRegCpMeHeaderDump, kRegRlcGpmGeneral6,
+    kRegRlcSafeMode, kRegRlcIntStat, kRegCpfUtcl1Status, kRegCpcUtcl1Status, kRegCpgUtcl1Status,
+    kRegGcVmL2ProtectionFaultStatus};
 const uint32_t kGfxStateCount = sizeof(kGfxStateRegisters) / sizeof(kGfxStateRegisters[0]);
-// The BAR5 pages the stage 21 register writes use: CP_ME_CNTL and
-// CP_RB_WPTR_DELAY; the CP ring registers; GRBM_GFX_INDEX and SCRATCH_REG0;
-// the RLC. The adapter maps these four for kGfxPageSet.
+// The BAR5 pages the stage 21 register writes use: CP_ME_CNTL,
+// CP_RB_WPTR_DELAY and PA_SC_ENHANCE(_1); CB, DB, GB_ADDR_CONFIG, TA and
+// GCEA; TCP_CHAN_STEER; the CP ring registers; GRBM_GFX_INDEX,
+// SCRATCH_REG0 and PA_SC_LINE_STIPPLE_STATE; the RLC. The adapter maps these
+// six for kGfxPageSet.
 const uint32_t kGfxPageSet = 0x8000;
-const uint32_t kGfxPages[] = {0x8000, 0xc000, 0x30000, 0x3b000};
+const uint32_t kGfxPages[] = {0x8000, 0x9000, 0xa000, 0xc000, 0x30000, 0x3b000};
+const uint32_t kGfxPageCount = sizeof(kGfxPages) / sizeof(kGfxPages[0]);
 
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
@@ -2261,6 +2293,7 @@ struct GfxState {
 };
 Status readGfxState(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, GfxState *state);
 
+// golden_settings_gc_9_1_rn (gfx_v9_0_init_golden_registers), then
 // gfx_v9_0_rlc_resume as it applies to GC 9.3.0 (part B). writes counts the
 // writes made; cuBusy and noncuBusy are the serdes readings (Linux logs a
 // timeout and continues, as here).
