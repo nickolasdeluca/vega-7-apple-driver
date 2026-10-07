@@ -154,27 +154,27 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: decide how to continue stage 21 (after boot 34)
+## Next task: boot stage 21 again (boot 35, GRBM read timeout)
 
 Boots 32–34 (2026-10-07; [test boot log](test-boot.md#test-boot-log)) all
 stall at the same point. The CP runs 152 dwords of the clear-state preamble,
 then the PFP waits on a register read that never returns
-(`CP_STALLED_STAT2.PFP_RCIU_READ_PENDING`). There is no memory fault, and
-the golden settings (boot 34) did not change it. The user agreed the stage
-could be dialled down if it got tangled.
+(`PFP_RCIU_READ_PENDING`); there is no memory fault. The user chose to
+continue. The rebuild adds Linux's `constants_init` first write,
+`GRBM_CNTL.READ_TIMEOUT` ← `0xff`, and reads of `GRBM_READ_ERROR`/`2`.
+Steps:
 
-The options put to the user:
-1. **Continue:** Linux's `constants_init` first step,
-   `GRBM_CNTL.READ_TIMEOUT` ← `0xff`, plus reads of `GRBM_READ_ERROR`/`2`.
-   The stuck read would then time out and name its register.
-2. **Dial down:** keep the passing parts (firmware load, RLC start, CP start
-   with a recorded stall) as stage 21's result, and propose the CP work as
-   its own stage.
+1. The user runs `tools/update_stick.sh 21`, shuts down fully, cold boots
+   the stick, and runs
+   `tools/capture_boot.sh boot-35-stage21 --gfxoff-disallow --gfx-start --psp-state`.
+2. Read `GRBM_READ_ERROR` from the CP step's report. The address names the
+   register that does not answer, which tells which block is missing its
+   setup. Also note whether the CP got past dword 152.
 
 **Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, rebuilt
-after boot 33), `out/test-efi/driver`, `out/diag`. Earlier stage 21 builds:
-`superseded-*-stage21-stall` (boot 32), `superseded-*-stage21-fetch`
-(boot 33). The stage 20 builds are kept as `superseded-driver-stage20` and
+after boot 34), `out/test-efi/driver`, `out/diag`. Earlier stage 21 builds:
+`superseded-*-stage21-stall` (boot 32), `-fetch` (boot 33), `-golden`
+(boot 34). The stage 20 builds are kept as `superseded-driver-stage20` and
 `superseded-diag-stage20`.
 
 ### Earlier: booting stage 19

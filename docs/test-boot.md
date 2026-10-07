@@ -3552,7 +3552,8 @@ the RLC and the CP started, and the CP fetched and ran commands. It then
 stalled in the clear-state preamble, and everything was restored. Boot 33:
 the stall is the CP's ring fetch waiting on memory. Boot 34, with the golden
 settings: the same stall; the PFP waits on a register read that never
-returns.**
+returns. Rebuilt with Linux's GRBM read timeout (`constants_init`'s first
+write) for boot 35.**
 
 **Purpose.** This is the first time the main graphics engine (GC 9.3)
 executes commands from the driver. The user asked for visible progress, so
@@ -5386,8 +5387,15 @@ boot-34-stage21 --gfxoff-disallow --gfx-start --psp-state`; exit 1).
   (as an error), and `GRBM_READ_ERROR` (`0x08058`) would record the
   address the PFP read.
 - Captures are in ignored `out/test-efi/boot-34-stage21/`.
-- **Next: to be decided with the user** (continue with `constants_init`, or
-  dial the stage down).
+- **Next (the user chose to continue):** the fix within the stage is
+  `constants_init`'s first write, `GRBM_CNTL.READ_TIMEOUT` ← `0xff`, a
+  masked write placed after the golden settings and before the RLC start,
+  as in `gfx_v9_0_hw_init`. It joins the snapshot (37 registers) and the
+  restore, and the RLC step makes 24 writes. The reports add `GRBM_CNTL`
+  and `GRBM_READ_ERROR`/`2`. If the stuck read now times out, the error
+  register gives its address (`READ_ADDRESS`, bits 17:2) and requester
+  (`READ_MEID`, `READ_PIPEID`). The boot 34 build is kept as
+  `superseded-*-stage21-golden`.
 
 ## Unknowns and limits
 
