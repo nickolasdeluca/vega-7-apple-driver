@@ -3543,24 +3543,40 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
   (bit 18) has its own clear bit, which this stage does not write, so it
   stays set after the restore.
 
-### Stage 21: GFX firmware load, engines halted (proposal)
+### Stage 21: the graphics engine runs our commands and draws (proposal)
 
-**Status: proposed 2026-10-07. Not approved.**
+**Status: proposed 2026-10-07 (revised the same day at the user's request
+for a bolder stage). Not approved.**
 
-**Purpose.** This is the first step towards the main graphics engine (GC
-9.3), which the user chose as the next direction on 2026-10-07. Like SDMA
-(stages 13–15), it is split into small stages:
-- **Stage 21 (this one):** the PSP loads the GFX firmware (the command
-  processor's CE, PFP, ME and MEC, and the RLC with its save/restore
-  lists). Every engine stays halted, as stage 13 did for SDMA.
-- **Next stages (proposed only after this boots):**
-  - the RLC start and the command processor's unhalt (`gfx_v9_0_rlc_resume`,
-    `gfx_v9_0_cp_resume`);
-  - then a GFX ring test: a scratch-register write through the ring, as
-    `gfx_v9_0_ring_test_ring` does;
-  - then a fence and an interrupt from GFX.
+**Purpose.** This is the first time the main graphics engine (GC 9.3)
+executes commands from the driver. The user asked for visible progress, so
+one stage goes from firmware to a picture on screen, in steps that each
+run only if the previous one passed (as stage 20 did):
+1. **load the GFX firmware** through the PSP;
+2. **start the RLC**, the GC's control microcontroller;
+3. **start the command processor (CP)** with a GFX ring;
+4. **ring test:** a register write executed by the CP (Linux's
+   `gfx_v9_0_ring_test_ring`);
+5. **fence:** the CP writes a value to memory;
+6. **the CP draws the screen:** its DMA fills the pattern region with three
+   bands (red, green, blue), and pipe 0 shows them for 5 s;
+7. **restore:** CP halted, RLC stopped, every GC register written back to
+   the value the check read, then the PSP teardown.
 
-**Linux v6.12:**
+**Not in this stage:**
+- **shaders** (real rendering): the golden settings, `constants_init`
+  (shader apertures, GDS, per-VMID setup), the KIQ and the compute queues
+  come with the first shader stage;
+- **the EOP interrupt:** fences are polled, and no IH work is needed;
+- **doorbells:** the write pointer is a register write, as for SDMA in
+  stage 15 (`gfx_v9_0_ring_set_wptr_gfx` without a doorbell).
+
+**It stands alone.** `sudo cezanne-diag --gfxoff-disallow --gfx-start
+--psp-state` runs stage 12's ring and TMR, then this stage, then stage 12's
+teardown. It needs no SDMA, GART or IH step. GFXOFF must be disallowed
+first: GC must stay powered, and its registers are GFX-gated reads.
+
+**Part A, the firmware load (Linux v6.12):**
 
 - **Images and order.** `gfx_v9_0_init_microcode` registers these for GC
   9.3.0 with PSP loading:
@@ -3621,101 +3637,212 @@ TMR (`0x40400000`, 4 MiB) are unchanged.
 SDMA. `build.sh` checks each file's SHA-256 against the pin above and
 generates the arrays; the files stay in ignored `out/`.
 
-**New reads**, all GFX-gated and all in Linux's `gc_reg_list_9` (the GC IP
-dump). They are read before and after the loads, and recorded:
+**Part B, the RLC start (Linux `gfx_v9_0_rlc_resume`, GC 9.3.0, bare
+metal).** The RLC firmware is loaded by the PSP, so
+`gfx_v9_0_rlc_load_microcode` is skipped. Renoir's `pg_flags` (`soc15.c`)
+have no GFX power gating, so `init_pg` writes no jump table and runs no
+`init_gfx_power_gating`. GC 9.3.0 is neither 9.2.1 nor Raven2, so the
+save/restore lists are not written by MMIO (the PSP loaded them).
 
-| Register | Offset |
-| --- | --- |
-| `GRBM_STATUS2` | `0x08008` |
-| `CP_STAT` | `0x08680` |
-| `CP_CPF_STATUS` | `0x0821c` |
-| `CP_CPC_STATUS` | `0x08210` |
-| `RLC_STAT` | `0x3b010` |
-| `CP_PFP_INSTR_PNTR` | `0x08694` |
-| `CP_ME_INSTR_PNTR` | `0x08698` |
-| `CP_CE_INSTR_PNTR` | `0x0869c` |
-| `CP_MEC1_INSTR_PNTR` | `0x086a0` |
+| # | Linux | Register (byte offset) | Value |
+| --- | --- | --- | --- |
+| B1 | `rlc_stop` | `RLC_CNTL` (`0x3b000`) | `RLC_ENABLE_F32` ← 0: the value read with bit 0 clear (boot: 0) |
+| B2 | `enable_gui_idle_interrupt(false)` | `CP_INT_CNTL_RING0` (`0x0c1a8`) | the value read with bits 18–21 clear |
+| B3 | `wait_for_rlc_serdes` | `GRBM_GFX_INDEX` (`0x30800`) | `0x40000000` (SE 0, SH 0, instances broadcast); poll `RLC_SERDES_CU_MASTER_BUSY` = 0; then `0xe0000000` (broadcast); poll `RLC_SERDES_NONCU_MASTER_BUSY` & `0x000dffff` = 0 |
+| B4 | disable CG | `RLC_CGCG_CGLS_CTRL` (`0x3b124`) | 0 |
+| B5 | `init_csb` | the clear-state buffer, then `RLC_CSIB_ADDR_HI` (`0x3b28c`), `_LO` (`0x3b288`), `RLC_CSIB_LENGTH` (`0x3b290`) | `0xf4`, `0x40a03000`, 904 (dwords) |
+| B6 | `enable_save_restore_machine` | `RLC_SRM_CNTL` (`0x3b200`) | the value read with `SRM_ENABLE` (bit 0) set |
+| B7 | `update_spm_vmid_internal(0xf)` | `RLC_SPM_MC_CNTL` (`0x3b1c4`) | the value read with `RLC_SPM_VMID` (bits 3:0) = `0xf` |
+| B8 | `rlc_start` | `RLC_CNTL` | `RLC_ENABLE_F32` ← 1; 50 µs. On an APU Linux does not re-enable the GUI-idle interrupt here |
 
-`CP_ME_CNTL`, `CP_MEC_CNTL`, `RLC_CNTL` and `GRBM_STATUS` are already
-allowed (stage 6). The `*_UCODE_ADDR`/`_DATA` pairs are never read: they
-are Linux's direct-load interface, and a data read moves the address.
+The clear-state buffer is `gfx_v9_0_get_csb_buffer`'s 904 dwords, built
+from `clearstate_gfx9.h` (`gfx9_cs_data`: 8 context extents, 879 register
+defaults). That table is under AMD's MIT licence, so it is carried in the
+core.
 
-**Steps** (on request only: `sudo cezanne-diag --gfxoff-disallow --psp-gfx
---psp-state`, each printed first, ordered selectors):
+**Part C, the CP start (Linux `gfx_v9_0_cp_gfx_resume` and
+`gfx_v9_0_cp_gfx_start`, without a doorbell).** The ring is 8 KiB (2048
+dwords), as Linux sizes its GFX ring (1024 dwords × 2 submissions).
 
-1. **Check (no writes):**
-   - stage 12's check;
-   - the nine embedded images' headers match the pinned values;
-   - the firmware buffer is placed and stable;
-   - GFX is on (`--gfxoff-disallow` first);
-   - `CP_ME_CNTL` reads its boot value with ME, PFP and CE halted, and
-     `CP_MEC_CNTL` with both MECs halted;
-   - `RLC_CNTL` reads 0 (RLC off);
-   - the nine new registers are read.
-2. **Create the ring** (stage 11).
-3. **`SETUP_TMR`** as frame 0, fence 1 (stage 12).
-4. **Copy the firmware.** The nine payloads go into their slots, with zero
-   padding to each slot's end, through a writable, uncached mapping of
-   exactly the 124 pages. Then everything is read back; any mismatch stops
-   the step.
-5. **Nine `LOAD_IP_FW`s** as frames 1–9, in the order above
-   (`C2PMSG_67` ← 32 … 160, fences 2–10). After each: the response status
-   and `fw_addr`. The first non-zero status stops the loads, and the
-   teardown follows.
-6. **Observe (no writes):**
-   - the registers of step 1 again: CP still halted, RLC still off;
-   - the work area against stage 12's rules, now with frames 0–9;
-   - the firmware buffer: the images, then the snapshot.
-7. **Teardown:** `DESTROY_TMR` as frame 10 (`C2PMSG_67` ← 176, fence 11),
-   then `DESTROY_RINGS`. An abandoned connection after step 3 does the
-   same.
+| # | Register (byte offset) | Value |
+| --- | --- | --- |
+| C1 | `CP_RB_WPTR_DELAY` (`0x08704`) | 0 |
+| C2 | `CP_RB_VMID` (`0x0c144`) | 0 |
+| C3 | `CP_RB0_CNTL` (`0x0c104`) | `0x0000080a` (`RB_BUFSZ` 10, `RB_BLKSZ` 8) |
+| C4 | `CP_RB0_WPTR` (`0x0c150`), `_HI` (`0x0c154`) | 0, 0 |
+| C5 | `CP_RB0_RPTR_ADDR` (`0x0c10c`), `_HI` (`0x0c110`) | `0x40a02000`, `0xf4` |
+| C6 | `CP_RB_WPTR_POLL_ADDR_LO` (`0x0c118`), `_HI` (`0x0c11c`) | `0x40a02008`, `0xf4` |
+| C7 | 1 ms, then `CP_RB0_CNTL` again | `0x0000080a` |
+| C8 | `CP_RB0_BASE` (`0x0c100`), `_HI` (`0x0c2c4`) | `0xf440a000`, 0 |
+| C9 | `CP_MAX_CONTEXT` (`0x0c2b8`), `CP_DEVICE_ID` (`0x0c12c`) | 7 (`max_hw_contexts` − 1), 1 |
+| C10 | `CP_ME_CNTL` (`0x086d8`) | the value read with `ME_HALT`, `PFP_HALT`, `CE_HALT` (bits 28, 26, 24) clear: the CP runs |
+
+`CP_RB_DOORBELL_CONTROL` must read `DOORBELL_EN` 0, and it is not written.
+The doorbell range registers are not written either. The MEC stays halted
+(`CP_MEC_CNTL` is not written).
+
+**The ring's frames** are each padded with one `NOP` packet to a 256-dword
+boundary (Linux's `align_mask` 0xff). The write pointer is in dwords,
+unmasked, as in stage 15:
+
+| Frame | Dwords | Contents | `CP_RB0_WPTR` | Done when |
+| --- | --- | --- | --- | --- |
+| 0 | 0–1023 | `cp_gfx_start`'s 911 dwords: the clear-state preamble (the same 904 as the buffer), `SET_BASE` CE partition `0x8000`/`0x8000`, `SET_UCONFIG_REG VGT_INDEX_TYPE` 0 | 1024 | the read pointer's write-back reaches 1024 (100 ms) |
+| 1 | 1024–1279 | ring test: `SET_UCONFIG_REG SCRATCH_REG0` ← `0xdeadbeef` (after `SCRATCH_REG0` ← `0xcafedead` by MMIO) | 1280 | `SCRATCH_REG0` reads `0xdeadbeef` (100 ms) |
+| 2 | 1280–1535 | fence 1: `RELEASE_MEM` (`gfx_v9_0_ring_emit_fence`: `CACHE_FLUSH_AND_INV_TS_EVENT`, index 5, TC/TCL1/TC_MD/TC_WB actions, `DATA_SEL` 1, `INT_SEL` 0), value 1 at write-back `+0x100` | 1536 | memory reads 1 (100 ms) |
+| 3 | 1536–2047 | the drawing: 6 `DMA_DATA` fills, then fence 2 (value 2 at `+0x108`) | 2048 | memory reads 2 (1 s) |
+
+The `PACKET3` encodings come from `soc15d.h`. `RELEASE_MEM` dw2 is
+`0x00238514` and dw3 is `0x20000000`.
+
+**Part D, the drawing.** The CPU first zeroes the 8 MiB pattern region
+(stage 20's clear). Then frame 3 has the CP fill it: each `DMA_DATA`
+packet has control `0xc0300000` (`CP_SYNC`, `SRC_SEL` 2 for immediate data,
+`DST_SEL` 3 through L2, as Mesa's CP DMA fills on GFX9), the colour, the
+destination, and a byte count of 1,382,400 (180 lines, below the 21-bit
+limit):
+
+| Lines | Colour | Packets |
+| --- | --- | --- |
+| 0–359 | red `0xFFFF0000` | 2 |
+| 360–719 | green `0xFF00FF00` | 2 |
+| 720–1079 | blue `0xFF0000FF` | 2 |
+
+Fence 2's `RELEASE_MEM` writes the L2 back to memory before the fence
+value lands. The CPU then reads the whole region against the image. Stage
+19's flip shows it for 5 s, stage 19's verify checks it, and the flip goes
+back.
+
+**Memory:**
+
+| Buffer | Carveout offset | Size | GPU address |
+| --- | --- | --- | --- |
+| Ring, command, fence (stage 12) | `0x40100000` | 12 KiB | `0xF440100000` |
+| TMR (stage 12) | `0x40400000` | 4 MiB | `0xF440400000` |
+| GFX firmware buffer (new) | `0x40900000` | 496 KiB | `0xF440900000` |
+| GFX work area (new): ring `+0x0000` (8 KiB), write-back `+0x2000` (read pointer `+0x0`, write-pointer poll `+0x8`, fences `+0x100`/`+0x108`), clear-state buffer `+0x3000` | `0x40a00000` | 16 KiB | `0xF440A00000` |
+| Pattern (stages 19–20) | `0x41000000` | 8 MiB | `0xF441000000` |
+
+The new buffers get the stage 9 placement checks and a 1 s stability
+snapshot: 1 MiB around the firmware buffer and 64 KiB around the work area.
+
+**How GC reaches memory.** The CP fetches and writes through the GC's own
+memory hub (GFXHUB), VMID 0. Stage 15 showed MMHUB VMID 0 reaching FB
+aperture addresses with the boot configuration (no page table). The check
+requires the GFXHUB to read the same as MMHUB did at boot 22:
+- `MC_VM_MX_L1_TLB_CNTL` (GC, `0x0a61c`) = `0x00002501`;
+- `VM_CONTEXT0_CNTL` (GC, `0x0a200`) = `0x007ffe80` (context 0 off);
+- `VM_L2_CNTL` (GC, `0x0a100`) = `0x00080602`;
+- its FB location and offset as stage 10 read them.
+
+If they differ, the stage stops before any write. Programming the GFXHUB
+would be a stage of its own.
+
+**The check (no writes)** requires:
+- stage 12's check, GFX on, and the nine images' pinned headers;
+- the three buffers placed and stable;
+- display pipe 0 at boot 22 (stage 19's check);
+- `RLC_CNTL` 0; `CP_ME_CNTL` with the three halt bits set; `CP_MEC_CNTL`
+  with both MEC halts set; `GRBM_GFX_INDEX` `0xe0000000`;
+  `CP_RB_DOORBELL_CONTROL.DOORBELL_EN` 0;
+- the GFXHUB values above.
+
+It **snapshots every register this stage writes** (the 23 of parts B and
+C, and `SCRATCH_REG0`). Where Linux does a read-modify-write (B1, B2, B6,
+B7, C10), the value written is computed from that snapshot. The allowlist
+accepts exactly the computed value, so only the field Linux changes may
+differ. The restore writes the snapshot back. Earlier stages pinned every
+value from a boot reading; here no GC register in parts B and C has been
+read before, so the first boot records them. The tool prints the snapshot.
+
+**New reads (all GFX-gated):**
+- the 23 registers of parts B and C;
+- `RLC_SERDES_CU_MASTER_BUSY` (`0x3b184`) and
+  `RLC_SERDES_NONCU_MASTER_BUSY` (`0x3b188`);
+- `CP_RB0_RPTR` (`0x08700`);
+- the GFXHUB `MC_VM_MX_L1_TLB_CNTL`, `VM_L2_CNTL` and `VM_CONTEXT0_CNTL`;
+- the earlier draft's 9 status registers: `GRBM_STATUS2`, `CP_STAT`,
+  `CP_CPF_STATUS`, `CP_CPC_STATUS`, `RLC_STAT`, and the PFP, ME, CE and
+  MEC1 instruction pointers;
+- for the shader stage, recorded only: Renoir's 12 golden registers
+  (`golden_settings_gc_9_1_rn`).
+
+All offsets come from `gc_9_0_offset.h`, and the inventory test recomputes
+them.
+
+**Steps** (ordered selectors; each printed first):
+
+1. **Check** (above).
+2. **PSP ring, `SETUP_TMR`, firmware copy, nine `LOAD_IP_FW`s** (part A),
+   then the RLC and CP state read again: still off and halted.
+3. **RLC start** (part B). Then `RLC_CNTL` and `RLC_STAT` are read.
+4. **CP start** (part C) and frame 0. `CP_RB0_RPTR` and the write-back
+   must reach 1024.
+5. **Ring test** (frame 1).
+6. **Fence 1** (frame 2).
+7. **Drawing** (part D): the clear, frame 3 and fence 2, the CPU check, the
+   flip, 5 s, the verify, the flip back.
+8. **Restore:**
+   - `CP_ME_CNTL` ← the snapshot (halted);
+   - `rlc_stop` (B1–B3);
+   - every part B and C register ← the snapshot, in reverse order;
+   - `SCRATCH_REG0` ← the snapshot;
+   - then all of them read back against the snapshot (index and value on a
+     mismatch);
+   - then `DESTROY_TMR` and `DESTROY_RINGS`.
+
+   It runs whenever step 3 was started. A closed or abandoned connection
+   runs it, and so does the kext's `stop()`. The flip back runs first if
+   the pattern is up.
 
 **New writes:**
-
-| Target | Values |
-| --- | --- |
-| `C2PMSG_67` | 16 × (k + 1) for frames 0–10 (stage 13 allows up to 48) |
-| Work area | the nine `LOAD_IP_FW` commands' words; `DESTROY_TMR` moves to frame 10 |
-| GFX firmware buffer (new) | physical `0x600900000`–`0x60097BFFF`, only the validated payloads' words, or 0 in each slot's padding |
-
-**No GC register is written.** The engines are only read. `RLC_CNTL`,
-`CP_ME_CNTL` and `CP_MEC_CNTL` keep their boot values.
-
-**Expected:**
-- Fences 1–11, all with status 0.
-- Each `fw_addr` inside the TMR, or a TMR offset (recorded either way).
-- CP halted and RLC off after the loads.
-- The new status registers are recorded. The instruction pointers may
-  change, but no engine runs.
-- Only the expected words change in the work area and the firmware buffer.
+- **Registers:** the 23 of parts B and C, with the values above or the
+  snapshot (restore), and `SCRATCH_REG0` ← `0xcafedead` (stage 6 already
+  allows it). Each goes through a new GC page set. `C2PMSG_67` takes frames
+  0–10 (part A).
+- **Memory:**
+  - the GFX firmware buffer (part A);
+  - the GFX work area: the ring's four frames, the zeroed write-back page,
+    the clear-state buffer;
+  - the pattern region: the CPU's clear;
+  - through the CP: the 6 fills, two fences and the read-pointer
+    write-back.
 
 **Risks:**
-- **The PSP checks each image's signature.** A rejected image gives a
-  non-zero status: a finding, not a fault. The loads stop and the teardown
-  runs.
-- **The firmware stays in the halted engines until power-off,** as
-  SDMA0's has since stage 13. Nothing starts it: the RLC needs
-  `RLC_CNTL.RLC_ENABLE_F32` and the CP needs its halt bits cleared, and
-  this stage writes neither.
-- **GFX power.** The loads need GC powered, so `--gfxoff-disallow` comes
-  first (Linux loads before it allows GFXOFF). If GFX is off, the check
-  stops before any write.
-- **A misdirected write** is checked only across the firmware buffer's
-  1 MiB and the work area. Unexpected words mean: power off at once.
+- **This is the first code running on GC.** A hung RLC or CP shows as a
+  step timeout. The restore still halts the CP and stops the RLC; a GC
+  hang does not stop the display (DCN scans out on its own). If the
+  machine hangs, power off: a cold boot resets GC.
+- **The PSP may reject an image** (non-zero status). The stage stops, and
+  the teardown runs.
+- **The CP writes 8 MiB through the GFXHUB.** The destinations are fixed in
+  the frame and lie inside the checked region, which is not on screen while
+  the CP writes. A wrong translation would show as a fence timeout or
+  unexpected words in the region.
+- **Values computed from the first reading:** an unexpected snapshot (for
+  example the CP or RLC already running) fails the check before any write.
+- **Firmware stays in the halted engines until power-off,** as SDMA0's
+  does.
 - Make a Time Machine backup before this boot.
 
-**What it does not do.** It does not start the RLC or unhalt the CP. It
-sets up no GFX ring, and it changes no GC, IH, GART or display register.
-It loads neither MEC2 nor SDMA.
+**Expected:**
+- all nine loads with status 0;
+- the RLC running (`RLC_STAT` recorded);
+- the read pointer at 1024;
+- `SCRATCH_REG0` `0xdeadbeef`;
+- fences 1 and 2;
+- the region equal to the three bands;
+- **on screen for 5 s: red, green and blue, top to bottom;**
+- then the desktop, and every written register back at its snapshot.
 
 **Stage 21 succeeds when:**
-- `sudo cezanne-diag --gfxoff-disallow --psp-gfx --psp-state` reports `ok`
-  for the check, the ring, `SETUP_TMR`, the copy, all nine loads (each
-  status 0), the observation and the teardown;
-- CP is still halted and RLC still off afterwards;
-- the final register dump matches the boot 22 values apart from the
-  recorded GC status and the PSP counters;
-- the machine stays up and the display is unchanged.
+- `sudo cezanne-diag --gfxoff-disallow --gfx-start --psp-state` reports
+  `ok` for the check, the loads, the RLC start, the CP start, the ring
+  test, fence 1, the drawing (fence 2, the region, the flip, the verify
+  and the flip back), the restore and the teardown;
+- you saw the three bands, and the desktop came back unchanged;
+- the final register dump shows every stage 21 register at its snapshot
+  and pipe 0 at boot 22.
 
 ## Build the test EFIs
 

@@ -153,12 +153,20 @@ binaries are observation references and remain excluded from the finished stack.
 ## Next task: stage 21 proposed, waiting for approval
 
 Stages 0–20 succeeded (boot 31, 2026-10-07). The user chose the main
-graphics engine for stage 21, split into small stages as SDMA was. The
-[stage 21 proposal](test-boot.md#stage-21-gfx-firmware-load-engines-halted-proposal)
-is the first step: the PSP loads the nine GFX images (CE, PFP, ME, MEC1 and
-its jump table, the three RLC save/restore lists, RLC_G), with every engine
-halted. The RLC start, the CP unhalt and a GFX ring test follow in later
-stages. Nothing is built until the user approves it.
+graphics engine for stage 21 and asked for a bold stage. The
+[stage 21 proposal](test-boot.md#stage-21-the-graphics-engine-runs-our-commands-and-draws-proposal)
+covers:
+- the GFX firmware load through the PSP;
+- the RLC start;
+- the CP start with a GFX ring (no doorbell);
+- Linux's ring test;
+- a fence;
+- the CP drawing three colour bands (`DMA_DATA`) shown on pipe 0;
+- a full restore.
+
+Shaders, the KIQ and compute queues, and the EOP interrupt are left for
+later stages. If it proves too tangled, the user agreed to dial it down.
+Nothing is built until the user approves it.
 
 **Builds:** `out/test-efi/usb-stage20` (`usb-stage20-build.json`, on the
 stick, passed boot 31), `out/test-efi/driver`, `out/diag`. Earlier stage 20
