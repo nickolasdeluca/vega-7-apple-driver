@@ -1001,6 +1001,11 @@ const uint32_t kIhClientDce = 4, kIhSrcHubp0Flip = 0x4f;
 // Frame 4, the ring's first quarter again: 9 CONST_FILLs and FENCE 4; the
 // write pointer continues from 4096 to 5120.
 const uint32_t kSdmaOpConstFill = 11;
+// CONST_FILL's FILLSIZE (31:30) 2: dword fills (Mesa 25.2 radv_sdma_fill_memory).
+// Linux leaves it 0, which fills bytes with the data's low byte (boot 30:
+// only the white band came out right); Linux fills with 0, where it does
+// not matter.
+const uint32_t kSdmaFillDword = 2u << 30;
 const uint32_t kSdmaWbFence4 = 0x20c;
 const uint32_t kFillCount = 9; // the 8 bands, then the tail
 const uint32_t kFillBandBytes = kPatternBandLines * kPatternWidth * 4;
@@ -1314,7 +1319,8 @@ enum DiagnosticSelector : uint32_t {
     // Stage 20, after a passing stage 18 acknowledgement (selector 33) on the
     // same connection, in this order; undone before the stage 18 restore.
     kDiagnosticFlipCheck = 39,   // out: Status, index, value, frame count, checksum lo, hi, DEST2, CONTINUE17
-    kDiagnosticFlipFill = 40,    // out: Status, step, fence 4, GFX_RB_RPTR, unexpected words, first offset, MSI change
+    kDiagnosticFlipFill = 40,    // out: Status, step, fence 4, GFX_RB_RPTR, unexpected words, first offset,
+                                 // MSI change, value at the first offset
     kDiagnosticFlipShow = 41,    // out: Status, SURFACE_FLIP_INTERRUPT after the arm; structure: FlipReport
     kDiagnosticFlipAck = 42,     // out: Status, SURFACE_FLIP_INTERRUPT, IH_RB_RPTR written, MSI before, after,
                                  // write-back after
@@ -1883,9 +1889,10 @@ Status clearPattern(const MemoryReader &pattern, const MemoryWriter &writer, uin
 // Writes frame 4 into the SDMA ring and reads it back (kPspReadbackMismatch).
 Status writeSdmaFrame4(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage);
 
-// Reads the whole region against fillWord: kFlipFillMismatch with the count
-// and first offset.
-Status checkFill(const MemoryReader &pattern, uint32_t stage, uint32_t *unexpected, uint32_t *first);
+// Reads the whole region against fillWord: kFlipFillMismatch with the count,
+// the first offset and the value found there.
+Status checkFill(const MemoryReader &pattern, uint32_t stage, uint32_t *unexpected, uint32_t *first,
+                 uint32_t *firstValue);
 
 // dal_irq_service_set(true): SURFACE_FLIP_INTERRUPT <- clear, then <- enable.
 // readback is the register afterwards; kFlipUnexpectedState unless enabled.

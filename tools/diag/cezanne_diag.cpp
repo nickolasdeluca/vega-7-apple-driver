@@ -863,15 +863,16 @@ bool sdmaFlip(io_connect_t connection)
                 static_cast<unsigned long long>(check[7]));
     if (check[0] != kOK) return false;
 
-    uint64_t fill[7] = {};
+    uint64_t fill[8] = {};
     step("flip 2/6 fill: zero the region, frame 4 (9 CONST_FILL, FENCE 4), GFX_RB_WPTR <- 5120, _HI <- 0;\n"
          "  read the region back");
-    if (!call(connection, kDiagnosticFlipFill, fill, 7)) return false;
-    std::printf("%s, step %llu, fence 4 0x%08llx, GFX_RB_RPTR %llu; %llu unexpected words (first +0x%llx), "
-                "%llu MSI\n",
+    if (!call(connection, kDiagnosticFlipFill, fill, 8)) return false;
+    std::printf("%s, step %llu, fence 4 0x%08llx, GFX_RB_RPTR %llu; %llu unexpected words (first +0x%llx\n"
+                "  reads 0x%08llx, expected 0x%08x), %llu MSI\n",
                 statusName(static_cast<Status>(fill[0])), static_cast<unsigned long long>(fill[1]),
                 static_cast<unsigned long long>(fill[2]), static_cast<unsigned long long>(fill[3]),
                 static_cast<unsigned long long>(fill[4]), static_cast<unsigned long long>(fill[5]),
+                static_cast<unsigned long long>(fill[7]), fill[4] != 0 ? fillWord(static_cast<uint32_t>(fill[5])) : 0u,
                 static_cast<unsigned long long>(fill[6]));
     if (fill[0] != kOK) return false;
 

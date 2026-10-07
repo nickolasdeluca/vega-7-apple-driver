@@ -942,10 +942,12 @@ struct FakeWriter {
             } else if (op == kSdmaOpConstFill) {
                 uint64_t a = (uint64_t(ring(d + 2)) << 32) | ring(d + 1);
                 uint64_t bytes = uint64_t(ring(d + 4)) + 1;
+                // FILLSIZE 2 fills dwords; 0 repeats the data's low byte.
+                uint32_t fill = (ring(d) >> 30) == 2 ? ring(d + 3) : (ring(d + 3) & 0xFF) * 0x01010101u;
                 bool inside = a >= kPatternGpuAddress && a + bytes <= kPatternGpuAddress + kPatternSize;
                 if (!inside) r->gart[kRegVmL2ProtectionFaultStatus] = 1;
                 if (inside && r->patternWords != nullptr && r->fillSkip-- != 0)
-                    for (uint64_t i = 0; i < bytes / 4; i++) (*r->patternWords)[(a - kPatternGpuAddress) / 4 + i] = ring(d + 3);
+                    for (uint64_t i = 0; i < bytes / 4; i++) (*r->patternWords)[(a - kPatternGpuAddress) / 4 + i] = fill;
                 d += 5;
             } else if (op == kSdmaOpTrap) {
                 if ((r->sdma[kRegSdma0Cntl] & 1) != 0 && !r->ihDropTrap) postIh(r, 0x0000E008u);
@@ -2696,9 +2698,9 @@ static void testFlip()
           kRegDispInterruptStatusContinue17 == 0x0d7ec);
     CHECK(kFlipWptr == 5120 && kSdmaWbFence4 == 0x20c && kSdmaFrame4Dwords == 49);
     CHECK(kFillBandBytes == 0xfd200 && kFillTailOffset == 0x7e9000);
-    const uint32_t first[] = {11, 0x41000000u, 0xF4, 0xFF000000u, 0x000fd1ffu};
+    const uint32_t first[] = {0x8000000bu, 0x41000000u, 0xF4, 0xFF000000u, 0x000fd1ffu};
     for (uint32_t i = 0; i < 5; i++) CHECK(fillRingWord(i) == first[i]);
-    const uint32_t tail[] = {11, 0x417e9000u, 0xF4, 0, 0x00016fffu};
+    const uint32_t tail[] = {0x8000000bu, 0x417e9000u, 0xF4, 0, 0x00016fffu};
     for (uint32_t i = 0; i < 5; i++) CHECK(fillRingWord(40 + i) == tail[i]);
     CHECK(fillRingWord(38) == 0xFFFFFFFFu); // the 8th band: white
     const uint32_t fence[] = {5, 0x4030120cu, 0xF4, 4};
@@ -2729,7 +2731,8 @@ static void testFlip()
     CHECK(writeAllowed(kRegSdma0GfxRbWptr, 5120, 20) && !writeAllowed(kRegSdma0GfxRbWptr, 5120, 19) &&
           !writeAllowed(kRegSdma0GfxRbWptr, 6144, 20));
     CHECK(kRegHubpreq0DcsurfSurfaceFlipInterrupt / kPageSize * kPageSize == kDisplayPageOffset);
-    CHECK(sdmaWorkWriteAllowed(0, 11, 20) && !sdmaWorkWriteAllowed(0, 11, 19) && !sdmaWorkWriteAllowed(4, 0x41000001u, 20));
+    CHECK(sdmaWorkWriteAllowed(0, 0x8000000bu, 20) && !sdmaWorkWriteAllowed(0, 0x8000000bu, 19) &&
+          !sdmaWorkWriteAllowed(0, 11, 20) && !sdmaWorkWriteAllowed(4, 0x41000001u, 20));
     CHECK(sdmaWorkWriteAllowed(256 * 4, 0, 20) == sdmaWorkWriteAllowed(256 * 4, 0, 19));
     CHECK(patternWriteAllowed(8, 0, 20) && !patternWriteAllowed(8, 0, 19) && !patternWriteAllowed(8, 1, 20));
 
@@ -2743,11 +2746,11 @@ static void testFlip()
         CHECK(checkDisplayBoot22(g.r.reader(), 0x80000, 20, &index, &value, &frames) == kOK);
         uint32_t observed = 0, msi = g.r.msiCount;
         CHECK(clearPattern(g.pattern.reader(), g.pattern.writer(), 20) == kOK && g.pattern.words[5] == 0);
-        CHECK(writeSdmaFrame4(g.work.reader(), g.work.writer(), 20) == kOK && g.work.words[0] == 11);
+        CHECK(writeSdmaFrame4(g.work.reader(), g.work.writer(), 20) == kOK && g.work.words[0] == 0x8000000bu);
         CHECK(submitSdma(g.r.reader(), 0x80000, g.w.writer(), g.work.reader(), 20, 4, &observed) == kOK && observed == 4);
         CHECK(g.r.sdma[kRegSdma0GfxRbWptr] == 5120 && g.r.sdma[kRegSdma0GfxRbRptr] == 5120 && g.r.msiCount == msi);
-        uint32_t unexpected = 9, firstOffset = 9;
-        CHECK(checkFill(g.pattern.reader(), 20, &unexpected, &firstOffset) == kOK && unexpected == 0);
+        uint32_t unexpected = 9, firstOffset = 9, firstValue = 9;
+        CHECK(checkFill(g.pattern.reader(), 20, &unexpected, &firstOffset, &firstValue) == kOK && unexpected == 0);
         CHECK(g.pattern.words[0] == 0xFF000000u && g.r.gart[kRegVmL2ProtectionFaultStatus] == 0);
         int before = g.w.writes;
         uint32_t readback = 0;
@@ -2819,10 +2822,10 @@ static void testFlip()
         // A dropped fill; a flip interrupt that never comes.
         FlipRig g;
         g.r.fillSkip = 2;
-        uint32_t observed = 0, unexpected = 0, firstOffset = 0;
+        uint32_t observed = 0, unexpected = 0, firstOffset = 0, firstValue = 0;
         CHECK(g.fill(&observed) == kOK && observed == 4);
-        CHECK(checkFill(g.pattern.reader(), 20, &unexpected, &firstOffset) == kFlipFillMismatch);
-        CHECK(unexpected == kFillBandBytes / 4 && firstOffset == 2 * kFillBandBytes);
+        CHECK(checkFill(g.pattern.reader(), 20, &unexpected, &firstOffset, &firstValue) == kFlipFillMismatch);
+        CHECK(unexpected == kFillBandBytes / 4 && firstOffset == 2 * kFillBandBytes && firstValue == 0);
         g.r.flipIntDrop = true;
         FlipReport report;
         int pauses = g.r.pauses;

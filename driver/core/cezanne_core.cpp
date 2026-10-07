@@ -2228,11 +2228,11 @@ uint32_t fillRingWord(uint32_t dword)
 {
     if (dword >= kSdmaFrameDwords) return intrRingWord(dword);
     if (dword < kFillCount * 5) {
-        // sdma_v4_0_emit_fill_buffer: the header has no fill size set.
+        // sdma_v4_0_emit_fill_buffer's packet with dword fills, as RADV's.
         const uint32_t fill = dword / 5, offset = fill * kFillBandBytes;
         const uint64_t destination = kPatternGpuAddress + offset;
         const uint32_t bytes = fill < 8 ? kFillBandBytes : kPatternSize - kFillTailOffset;
-        const uint32_t packet[] = {kSdmaOpConstFill, uint32_t(destination), uint32_t(destination >> 32),
+        const uint32_t packet[] = {kSdmaOpConstFill | kSdmaFillDword, uint32_t(destination), uint32_t(destination >> 32),
                                    fillWord(offset), bytes - 1};
         return packet[dword % 5];
     }
@@ -2294,14 +2294,18 @@ Status writeSdmaFrame4(const MemoryReader &work, const MemoryWriter &writer, uin
     return kOK;
 }
 
-Status checkFill(const MemoryReader &pattern, uint32_t stage, uint32_t *unexpected, uint32_t *first)
+Status checkFill(const MemoryReader &pattern, uint32_t stage, uint32_t *unexpected, uint32_t *first,
+                 uint32_t *firstValue)
 {
-    *unexpected = *first = 0;
+    *unexpected = *first = *firstValue = 0;
     if (stage < kFlipStage) return kRegisterNotAllowed;
     for (uint32_t offset = 0; offset < kPatternSize; offset += 4) {
         uint32_t value = 0;
         if (!pattern.read32(pattern.context, offset, &value)) return kRegisterReadFailed;
-        if (value != fillWord(offset) && (*unexpected)++ == 0) *first = offset;
+        if (value != fillWord(offset) && (*unexpected)++ == 0) {
+            *first = offset;
+            *firstValue = value;
+        }
     }
     return *unexpected == 0 ? kOK : kFlipFillMismatch;
 }

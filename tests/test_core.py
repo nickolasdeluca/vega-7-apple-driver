@@ -192,11 +192,13 @@ class CoreTests(unittest.TestCase):
             "!writeAllowed(kRegSdma0GfxRbWptr, 6144, 20)": (
                 "return offset == kRegSdma0GfxRbWptr && value == kFlipWptr;",
                 "return offset == kRegSdma0GfxRbWptr && value >= kFlipWptr;"),
-            "!sdmaWorkWriteAllowed(0, 11, 19)": (
+            "!sdmaWorkWriteAllowed(0, 0x8000000bu, 19)": (
                 "if (stage >= kFlipStage && offset < kSdmaFrameDwords * 4 && value == fillRingWord",
                 "if (offset < kSdmaFrameDwords * 4 && value == fillRingWord"),
             "!patternWriteAllowed(8, 0, 19)": ("(stage >= kFlipStage && value == 0)", "(value == 0)"),
             "fillRingWord(i) == first[i]": ("fillWord(offset), bytes - 1};", "fillWord(offset), bytes};"),
+            # Boot 30: without FILLSIZE 2 only the white band is right.
+            "&firstValue) == kOK && unexpected == 0": ("kSdmaOpConstFill | kSdmaFillDword,", "kSdmaOpConstFill,"),
             "fillRingWord(45 + i) == fence[i]": ("uint32_t(fence >> 32), 4};", "uint32_t(fence >> 32), 3};"),
             # At stage 19 the allowlist still refuses frame 4's write pointer; at
             # stage 18 the gate is what reports the frame as not allowed.
