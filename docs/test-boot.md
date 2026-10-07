@@ -3332,7 +3332,9 @@ connection runs it, and so does the kext's `stop()` if needed.
 
 ### Stage 20: SDMA draws the pattern, and the flip interrupt (proposal)
 
-**Status: proposed 2026-10-07. Not approved.** The user chose to combine
+**Status: proposed 2026-10-07 and approved by the user the same day;
+implemented and built (`out/test-efi/usb-stage20`) the same day. Not yet
+booted.** The user chose to combine
 two steps in this stage: the GPU drawing what is shown, and the display's
 flip interrupt. Starting the main graphics engine is stage 21, proposed
 after this stage boots, and probably split over several stages as SDMA was
@@ -3484,6 +3486,45 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
 - you saw the reversed bands, and the desktop came back unchanged;
 - the final register dump shows the boot 22 values.
 
+**Implementation** (2026-10-07). Diagnostic interface version 16, selectors
+39–44, all on the stage 18 connection:
+
+| Step | Selector | What it does |
+| --- | --- | --- |
+| check | 39 `FlipCheck` | Only after a passing stage 18 acknowledgement, with no stage 19 pattern up. Stage 19's check (pipe 0, `kDisplayExpect`, the region placed, the 1 s checksum, a pipe 0 snapshot), then `SURFACE_FLIP_INTERRUPT` 0 and `DCHUB_INTERRUPT_DEST2` bit 0 = 0. A failing flip register is reported as index 19 or 20, after stage 19's 19 entries. No write. |
+| fill | 40 `FlipFill` | The CPU zeroes the 8 MiB region through the stage 19 mapping and reads it back. Then frame 4 is written to ring dwords 0–255 and read back, and submitted (`submitSdma` frame 4: `GFX_RB_WPTR` must read 4096; ← 5120, `_HI` ← 0; fence 4 polled for 100 ms). Then the whole region is read against the reversed bands. Any MSI during the step fails it. Reports the step reached (1 clear, 2 frame written, 3 submitted, 4 checked). |
+| show | 41 `FlipShow` | The arm (`0x100`, `0x1`, read back: enable set), then `flipWithIntr`: stage 19's two writes and poll, then up to 100 more pauses for the MSI, then the new IH entries from `IH_RB_RPTR` to the write-back. Returns a `FlipReport`, with the latency from just before the flip's operation to the handler's time for that MSI. |
+| acknowledge | 42 `FlipAck` | `SURFACE_FLIP_INTERRUPT` ← `0x101`, then stage 18's `ackIntr` (`IH_RB_RPTR` ← the write-back, 100 ms, no re-fire). |
+| verify | 43 `FlipVerify` | Reads only: stage 19's verify against the reversed bands, and the MSI count unchanged since the acknowledgement. |
+| restore | 44 `FlipRestore` | `restoreFlip`: the flip back with its MSI recorded, `0x101` then 0, pipe 0 at boot 22 and `SURFACE_FLIP_INTERRUPT` 0 (index 11). Then `ackIntr`. Its result is also the property `CezanneGPU flip restore`. |
+
+- **No new writable page set.** The flip-interrupt and surface writes use
+  the stage 19 display page (`0xe000`). `GFX_RB_WPTR` uses the stage 15
+  SDMA page set, and the IH acknowledgements the stage 18 page set.
+- **The restore is owed from the arm on.** The kext marks it owed before
+  the arm's writes. The stage 18 restore runs it first (so the stage 17
+  restore, the stage 15 stop and an abandoned connection do too), and so
+  does `stop()`, before it removes the handler.
+- **Frame 4 is submitted only by the fill.** Selector 23 still accepts
+  frames 0–3 only.
+- **The tool:** `--sdma-flip` runs the `--ih-intr` chain. After the stage 18
+  acknowledgement it runs check, fill, show, acknowledgement, `sleep(5)`,
+  verify and restore. The restore always runs once the show was sent. Then
+  come the stage 18 restore and the rest. The register dump includes the 3
+  new registers from stage 20. Separately, `--inventory16` now prints
+  pipe 0's pitch as the register's value (1920), as boot 28 showed the
+  hardware uses it, not Linux's value + 1.
+
+**Choices not fixed by the proposal:**
+- **The disable writes `0x101`, then 0,** not `0x100` then 0. Linux's
+  acknowledgement is a read-modify-write that keeps the enable bit, so on an
+  enabled interrupt it writes `0x101`. Both values were already in the
+  proposal's list, and the result is the same: cleared, then disabled.
+- **The fill's step fails on any MSI.** Frame 4 has no `TRAP`, so an MSI
+  during the fill would come from something else and is reported.
+- **The verify compares pipe 0 with the stage 20 check's snapshot,** as
+  stage 19 does.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -3495,7 +3536,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate

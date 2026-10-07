@@ -30,7 +30,9 @@ boot 27: the trap reached the kext's handler 31 µs after the write pointer,
 with no re-fire after the acknowledgement. Stage 19 (display test pattern)
 succeeded in boot 28: the flip landed in 13 ms, the pattern showed for 5 s
 with straight grey lines (the hardware reads 1920 pixels per line), and the
-desktop came back unchanged. See "Next task" below. The sections that follow are the earlier discovery record and
+desktop came back unchanged. Stage 20 (SDMA draws the pattern, and the flip
+interrupt) is approved, implemented and built, waiting for boot 29; see
+"Next task" below. The sections that follow are the earlier discovery record and
 still apply.
 
 Completed work:
@@ -144,22 +146,31 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: stage 20 proposed, waiting for approval
+## Next task: boot stage 20 (SDMA fill and the flip interrupt)
 
-Stages 0–19 succeeded (boot 28, 2026-10-07, in the
-[test boot log](test-boot.md#test-boot-log)). On 2026-10-07 the user chose
-to combine SDMA drawing the displayed pattern and HUBP0's flip interrupt
-into stage 20, and to make starting the main graphics engine stage 21. The
-[stage 20 proposal](test-boot.md#stage-20-sdma-draws-the-pattern-and-the-flip-interrupt-proposal)
-is written. Nothing is built until the user approves it.
+Stage 20 was approved on 2026-10-07 (the
+[proposal](test-boot.md#stage-20-sdma-draws-the-pattern-and-the-flip-interrupt-proposal))
+and implemented and built the same day; the implementation notes are in
+that section. Starting the main graphics engine is stage 21, to be proposed
+after this boot. Steps:
 
-**Builds:** `out/test-efi/usb-stage19` (`usb-stage19-build.json`, on the
-stick), `out/test-efi/driver`, `out/diag`. The stage 18 builds are kept as
-`out/test-efi/superseded-driver-stage18` and `superseded-diag-stage18`.
+1. Make a Time Machine backup (the proposal's risks).
+2. The user runs `tools/update_stick.sh 20` (the stick holds stage 19),
+   shuts down fully, cold boots the stick, and runs
+   `tools/capture_boot.sh boot-29-stage20 --gfxoff-disallow --sdma-flip --psp-state`.
+3. The user reports what the screen showed for those 5 seconds: eight
+   bands, black at the top and white at the bottom, with no grey lines. Then
+   whether the desktop came back unchanged.
+4. Read the output against "Stage 20 succeeds when" in
+   [test-boot.md](test-boot.md) and record boot 29 in the log. Follow the
+   [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
+   for defects. A kernel panic is a finding: power off, then read the panic
+   log from the next normal boot.
 
-**Open, small:** `cezanne-diag`'s stage 16 inventory decodes
-`DCSURF_SURFACE_PITCH` the Linux way (value + 1) and prints 1921; boot 28
-showed the hardware reads 1920.
+**Builds:** `out/test-efi/usb-stage20` (`usb-stage20-build.json`),
+`out/test-efi/driver`, `out/diag`. The stage 19 builds that passed boot 28
+are kept as `out/test-efi/superseded-driver-stage19` and
+`superseded-diag-stage19`, with `out/test-efi/usb-stage19`.
 
 ### Earlier: booting stage 19
 
