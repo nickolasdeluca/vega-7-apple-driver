@@ -2986,9 +2986,9 @@ the flush.
 ### Stage 18: interrupt delivery (proposal)
 
 **Status: proposed 2026-10-06 and approved by the user the same day;
-implemented and built (`out/test-efi/usb-stage18`) the same day. Not yet
-booted.** The display test pattern follows as stage 19, proposed after this
-stage boots.
+implemented and built (`out/test-efi/usb-stage18`) the same day.
+Succeeded in boot 27, after the boot 26 fix.** The display test pattern
+follows as stage 19.
 
 **Purpose.** Stage 17 put SDMA0's trap into IH ring 0 but kept CPU delivery
 off. Stage 18 turns it on: the IH raises an MSI, and the kext counts it.
@@ -3178,7 +3178,8 @@ also removes the event source if it is still registered.
 ### Stage 19: display test pattern (proposal)
 
 **Status: proposed 2026-10-06 and approved by the user the same day;
-implementation in progress (see the handoff). Not built.**
+implemented and built (`out/test-efi/usb-stage19`) on 2026-10-07. Not yet
+booted.**
 
 **Purpose.** The first write that changes what is on screen. Pipe 0 keeps
 the firmware's mode and everything else it set up. Only its surface address
@@ -3292,6 +3293,42 @@ connection runs it, and so does the kext's `stop()` if needed.
 - the desktop came back unchanged, and the final register dump shows pipe 0
   at boot 22 again.
 
+**Implementation** (2026-10-07). Diagnostic interface version 15, selectors
+35–38:
+
+| Step | Selector | What it does |
+| --- | --- | --- |
+| check | 35 `DisplayCheck` | Reads pipe 0's 11 stage 16 registers against boot 22 (stage 17's masks), then the 8 `kDisplayExpect` entries (flip control, `EARLIEST_INUSE`, tiling, surface control, metadata, VMID). Places the pattern region with the stage 9 checks, sums it twice 1000 pauses (1 s) apart through a read-only uncached map, and snapshots pipe 0. Returns the first mismatching entry, the frame count and the checksum. No write. |
+| flip | 36 `DisplayFlip` | Writes the 8 MiB pattern word by word, reads it all back, then the two address writes and the poll (`flipDisplay`). Returns `EARLIEST_INUSE`, the pauses taken and the frame count after the flip. |
+| verify | 37 `DisplayVerify` | Reads only: `EARLIEST_INUSE`, flip control, frame count, pipe 0 against the check's snapshot (address expected at the pattern), and the whole pattern. Returns a `DisplayReport`. |
+| restore | 38 `DisplayRestore` | The two writes back to `0xF400000000` and the poll, then pipe 0 against boot 22. Its result is also published as the property `CezanneGPU display restore`. |
+
+- **Register writes** go through a fifth BAR5 page, `kDisplayPageOffset`
+  (`0xe000`), and the allowlist accepts only the high dword `0xf4` and the
+  low dwords `0x41000000` and `0x00000000`.
+- **Pattern writes** go through a separate 8 MiB writable, uncached map of
+  physical `0x601000000` (`withPattern`), opened only for the flip step.
+  Every word must equal `patternWord(offset)`: the core checks it, and the
+  kext's write adapter checks it again.
+- **Order and ownership:** the steps run once per connection, in order.
+  Another connection can start only after a restore. The kext treats the
+  surface as possibly flipped as soon as the flip step starts, so a failed
+  pattern write or flip is still followed by a restore. An abandoned
+  connection runs the restore (property `CezanneGPU display abandoned
+  restore`), and so does `stop()`.
+- **The tool:** `--display-pattern` runs check, flip, `sleep(5)`, verify and
+  restore, and always calls the restore once the flip was sent. The register
+  dump includes the 9 new registers from stage 19.
+
+**Choices not fixed by the proposal:**
+- **The verify compares pipe 0 with the check's snapshot**, not with the
+  boot 22 values, so it measures only what changed during the hold. The
+  restore's check uses the boot 22 values.
+- **The restore runs its register check even if the flip back times out**,
+  and reports the poll's status first.
+- **The kext holds its lock through the check's 1 s checksum.** No other
+  diagnostic runs at the same time.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the
@@ -3303,7 +3340,7 @@ mkdir -p out/test-efi
 cp -Rp /Volumes/EFI/EFI out/test-efi/known-good-EFI
 diskutil unmount /Volumes/EFI
 driver/kext/build.sh out/test-efi/driver
-for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
+for stage in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do
   python3 tools/test_efi.py build --known-good out/test-efi/known-good-EFI \
     --kext out/test-efi/driver/CezanneGPU.kext --stage $stage --output out/test-efi/usb-stage$stage \
     --ocvalidate out/test-efi/opencore/DEBUG/Utilities/ocvalidate/ocvalidate

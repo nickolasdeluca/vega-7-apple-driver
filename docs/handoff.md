@@ -26,7 +26,7 @@ through a driver-built GART page table, its trap arrived in IH ring 0, and
 everything was restored. Stage 18 (MSI interrupt delivery) succeeded in
 boot 27: the trap reached the kext's handler 31 µs after the write pointer,
 with no re-fire after the acknowledgement. Stage 19 (display test pattern)
-is approved and partly implemented, uncommitted; see "Next task" below. The sections that follow are the earlier discovery record and
+is approved, implemented and built, waiting for boot 28; see "Next task" below. The sections that follow are the earlier discovery record and
 still apply.
 
 Completed work:
@@ -140,46 +140,31 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: finish implementing stage 19 (display test pattern)
+## Next task: boot stage 19 (display test pattern)
 
-**Resume here.** Stage 19 was approved on 2026-10-06 (the
-[proposal](test-boot.md#stage-19-display-test-pattern-proposal)). Its
-implementation stopped partway at the user's request. **The work is
-uncommitted in the working tree** (`git status`); nothing of stage 19 is built
-or on the stick.
+Stage 19 was approved on 2026-10-06 (the
+[proposal](test-boot.md#stage-19-display-test-pattern-proposal)) and
+implemented and built on 2026-10-07; the implementation notes are in that
+section. Steps:
 
-Done (in the working tree):
-- **Core:**
-  - stage 19 constants, statuses, selectors 35–38, interface version 15, `kMaxStage` 19;
-  - functions: `displayWriteListed`, `patternWord`, `patternWriteAllowed`, `checkPatternTarget`,
-    `regionChecksum`, `checkDisplayBoot22`, `writePattern`, `flipDisplay`, `verifyDisplay`,
-    `checkDisplayRestored`;
-  - core tests (`testDisplay`) and stage 19 mutants in `tests/test_core.py`.
-- **Kext:**
-  - the 8 MiB pattern mapping (`withPattern`) and the single display page;
-  - the four selectors, and the restore on abandon and in `stop()`;
-  - its tests in `tests/test_kext.py`, which pass.
-- **Tool:** `--display-pattern` (`displayPattern`), with its tests in `tests/test_diag_tool.py`, which pass.
-- **Tests:** `tests/test_inventory16.py` recomputes the 9 new offsets from the headers, and passes.
+1. Make a Time Machine backup (the proposal's risks).
+2. The user runs `tools/update_stick.sh 19` (the stick holds stage 18), cold
+   boots the stick, and runs
+   `tools/capture_boot.sh boot-28-stage19 --display-pattern --psp-state`.
+3. The user reports what the screen showed for those 5 seconds: eight
+   horizontal colour bands, and whether the grey lines were **straight or
+   leaning** (the pitch question from boot 22). Then whether the desktop
+   came back unchanged.
+4. Read the output against "Stage 19 succeeds when" in
+   [test-boot.md](test-boot.md) and record boot 28 in the log. Follow the
+   [fix-within-a-stage rule](test-boot.md#fixing-defects-inside-a-stage)
+   for defects. If the screen stays wrong after the tool ends, the user
+   shuts down fully; a cold boot resets the display.
 
-Left to do:
-1. **Find the one failing test.** The last full run reported 67 tests, 1 failure, which was not yet
-   identified. `tests/test_kext`, `test_diag_tool` and `test_inventory16` pass alone, and the core
-   binary passed before the mutants were added. So check `tests.test_core`'s mutant run and
-   `tests.test_efi_tool`.
-2. Add 19 to `AUTHORIZED_STAGES` in `tools/test_efi.py`, and make the unauthorized stage in
-   `tests/test_efi_tool.py` 20. Then add 19 to the build loop in `test-boot.md`.
-3. Write the stage 19 "Implementation" notes in `test-boot.md`, and update `AGENTS.md` and
-   `README.md`.
-4. Build:
-   - keep `out/test-efi/driver` and `out/diag` as `superseded-*-stage18`;
-   - rebuild both;
-   - build `usb-stage19`.
-
-   Then commit in batches (core, kext, tools, docs).
-5. Boot 28: the user runs `tools/update_stick.sh 19`, cold boots the stick, and runs
-   `tools/capture_boot.sh boot-28-stage19 --display-pattern --psp-state`. Then the user reports
-   whether the grey lines were straight or leaning.
+**Builds:** `out/test-efi/usb-stage19` (`usb-stage19-build.json`),
+`out/test-efi/driver`, `out/diag`. The stage 18 builds that passed boot 27
+are kept as `out/test-efi/superseded-driver-stage18` and
+`superseded-diag-stage18`, with `out/test-efi/usb-stage18`.
 
 ### Earlier: booting stage 18
 
