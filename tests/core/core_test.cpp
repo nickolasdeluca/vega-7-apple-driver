@@ -185,6 +185,7 @@ struct FakeRegisters {
         gc[kRegCbHwControl] = 0x00014107;
         gc[kRegGrbmCntl] = 0x00010000; // another field the RMW must keep
         gc[kRegGrbmGfxCntl] = 0xfedcbaef; // boot 35: never programmed, a pattern
+        gc[kRegGrbmReadError] = 0x80030800; // boot 35/36: never records our read
     }
     void presetFlip()
     {
@@ -3105,13 +3106,23 @@ static void testGfx()
     CHECK(gfxWriteAllowed(kRegCpRb0Base, 0xF440A000u, 21, snap) && !gfxWriteAllowed(kRegCpRb0Base, 0xF440B000u, 21, snap));
     CHECK(gfxWriteAllowed(kRegRlcSpmMcCntl, (snap[8] & ~0xFu) | 0xF, 21, snap));
     CHECK(!gfxWriteAllowed(kRegCpMecCntl, 0, 21, snap) && !gfxWriteAllowed(kRegGcVmL2Cntl, 0, 21, snap));
-    // GRBM_GFX_CNTL is the snapshot's last entry: constants_init's value (the
-    // four fields cleared) and the restore are allowed, any other field is not.
-    const uint32_t gfxCntl = snap[kGfxSnapshotCount - 1];
+    // GRBM_GFX_CNTL and GRBM_READ_ERROR are the snapshot's last two entries:
+    // constants_init's value (the four fields cleared) and the restore are
+    // allowed, any other field is not; the read-error clear is all ones.
+    const uint32_t gfxCntlAt = 37, readErrorAt = 38;
+    CHECK(kGfxSnapshotRegisters[gfxCntlAt] == kRegGrbmGfxCntl &&
+          kGfxSnapshotRegisters[readErrorAt] == kRegGrbmReadError);
+    const uint32_t gfxCntl = snap[gfxCntlAt], readError = snap[readErrorAt];
     CHECK(gfxWriteAllowed(kRegGrbmGfxCntl, gfxCntl & ~kGrbmGfxCntlMask, 21, snap) &&
           gfxWriteAllowed(kRegGrbmGfxCntl, gfxCntl, 21, snap) &&
           !gfxWriteAllowed(kRegGrbmGfxCntl, (gfxCntl & ~kGrbmGfxCntlMask) | 0x10u, 21, snap) &&
           !gfxWriteAllowed(kRegGrbmGfxCntl, gfxCntl & ~kGrbmGfxCntlMask, 20, snap));
+    CHECK(gfxWriteAllowed(kRegGrbmReadError, readError | 0xffffffffu, 21, snap) &&
+          gfxWriteAllowed(kRegGrbmReadError, readError, 21, snap) &&
+          !gfxWriteAllowed(kRegGrbmReadError, readError ^ 0x2u, 21, snap) &&
+          !gfxWriteAllowed(kRegGrbmReadError, readError | 0xffffffffu, 20, snap));
+    CHECK(kGfxExtraWriteCount == 1 && kGfxExtraWrites[0].offset == kRegGrbmReadError &&
+          kGfxExtraWrites[0].mask == 0xffffffffu);
     CHECK(!writeAllowed(kRegCpRb0Wptr, 1024, 21) && !writeAllowed(kRegRlcCntl, 1, 21) && !writeAllowed(kRegCpMeCntl, 0, 21));
     CHECK(writeAllowed(kRegMp0C2PMsg67, 176, 21) && !writeAllowed(kRegMp0C2PMsg67, 192, 21) &&
           !writeAllowed(kRegMp0C2PMsg67, 64, 20) && !writeAllowed(kRegMp0C2PMsg67, 170, 21));
@@ -3178,7 +3189,7 @@ static void testGfx()
         uint32_t writes = 0, cu = 9, noncu = 9;
         int before = g.w.writes;
         CHECK(startRlc(g.r.reader(), 0x80000, g.w.writer(), 21, g.snapshot, &writes, &cu, &noncu) == kOK);
-        CHECK(writes == 25 && g.w.writes == before + 25 && cu == 0 && noncu == 0);
+        CHECK(writes == 26 && g.w.writes == before + 26 && cu == 0 && noncu == 0);
         // The golden settings first, in Linux's order and masks.
         CHECK(g.w.offsets[before] == kRegCbHwControl && g.w.values[before] == 0x00014104u);
         CHECK(g.r.gc[kRegGbAddrConfig] == 0x24000042u && g.r.gc[kRegTcpChanSteerLo] == 0x3120 &&
@@ -3192,6 +3203,10 @@ static void testGfx()
         CHECK(g.w.offsets[before + 14] == kRegRlcCntl && g.w.values[before + 14] == 0);
         CHECK(g.w.values[before + 15] == 0x00000001u && g.w.values[before + 16] == kGrbmSelectSe0Sh0);
         CHECK(g.r.gc[kRegRlcCntl] == 1 && g.r.gc[kRegRlcSrmCntl] == 3 && g.r.gc[kRegRlcSpmMcCntl] == 0x3f);
+        // Last write of the step: GRBM_READ_ERROR as all ones. The fake does
+        // not model write-1-to-clear, so only the write is checked here; the
+        // hardware says whether the clear takes.
+        CHECK(g.w.offsets[before + 25] == kRegGrbmReadError && g.w.values[before + 25] == 0xffffffffu);
         CHECK(g.r.gc[kRegRlcCsibAddrLo] == 0x40A03000u && g.r.gc[kRegRlcCsibLength] == 904 && g.r.gc[kRegRlcCgcgCglsCtrl] == 0);
         uint32_t rptr = 0, cpRptr = 0;
         CHECK(startCp(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.reader(), 21, g.snapshot, &writes, &rptr, &cpRptr) ==
@@ -3226,7 +3241,8 @@ static void testGfx()
         for (uint32_t i = 0; i < kGfxSnapshotCount; i++) CHECK(g.r.gc[kGfxSnapshotRegisters[i]] == g.snapshot[i]);
         CHECK(g.r.gc[kRegCpMeCntl] == (kCpMeHalts | 0x100) && g.r.gc[kRegRlcCntl] == 0);
         CHECK(g.r.gc[kRegGbAddrConfig] == 0x24000011u && g.r.gc[kRegTcpChanSteerLo] == 0x76543210u &&
-              g.r.gc[kRegGrbmCntl] == 0x00010000u && g.r.gc[kRegGrbmGfxCntl] == 0xfedcbaefu);
+              g.r.gc[kRegGrbmCntl] == 0x00010000u && g.r.gc[kRegGrbmGfxCntl] == 0xfedcbaefu &&
+              g.r.gc[kRegGrbmReadError] == 0x80030800u);
         // Then DESTROY_TMR as frame 10.
         CHECK(writePspCommand(g.pspWork.reader(), g.pspWork.writer(), 21, kGfxCmdDestroyTmr, 10) == kOK);
         CHECK(submitPspFrame(g.r.reader(), 0x80000, g.w.writer(), g.pspWork.reader(), 21, 10, &fence) == kOK && fence == 11);

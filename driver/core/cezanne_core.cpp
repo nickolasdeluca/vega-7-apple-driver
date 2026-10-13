@@ -2657,6 +2657,10 @@ bool gfxWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage, const uint
             if (write.offset == offset && value == ((snapshot[i] & ~write.mask) | (write.value & write.mask)))
                 return true;
         }
+        for (const GfxWrite &write : kGfxExtraWrites) {
+            if (write.offset == offset && value == ((snapshot[i] & ~write.mask) | (write.value & write.mask)))
+                return true;
+        }
         return false;
     }
     return false;
@@ -2800,6 +2804,15 @@ Status startRlc(const RegisterReader &registers, uint64_t apertureLength, const 
         (*writes)++;
     }
     writer.pause(writer.context); // udelay(50)
+    // Then clear GRBM_READ_ERROR (after boot 36), as the last write before the
+    // CP start: if the register is write-1-to-clear, whatever the CP's read
+    // records afterwards is its own and nothing older.
+    for (const GfxWrite &clear : kGfxExtraWrites) {
+        const uint32_t value = snapshotOf(snapshot, clear.offset) | clear.value;
+        status = writeGfxRegister(writer, stage, snapshot, clear.offset, value);
+        if (status != kOK) return status;
+        (*writes)++;
+    }
     return kOK;
 }
 

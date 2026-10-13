@@ -1213,7 +1213,7 @@ const uint32_t kGfxSnapshotRegisters[] = {
     kRegCbHwControl,      kRegCbHwControl2,    kRegDbDebug2,           kRegGbAddrConfig,
     kRegGbAddrConfigRead, kRegPaScEnhance,     kRegPaScEnhance1,       kRegPaScLineStippleState,
     kRegTaCntlAux,        kRegTcpChanSteerHi,  kRegTcpChanSteerLo,     kRegGceaProbeMap,
-    kRegGrbmCntl,         kRegGrbmGfxCntl};
+    kRegGrbmCntl,         kRegGrbmGfxCntl,     kRegGrbmReadError};
 const uint32_t kGfxSnapshotCount = sizeof(kGfxSnapshotRegisters) / sizeof(kGfxSnapshotRegisters[0]);
 // The values written besides the snapshot: (snapshot & ~mask) | value; a
 // mask of all ones is a fixed value.
@@ -1282,6 +1282,14 @@ const GfxWrite kGfxWrites[] = {
 const uint32_t kGfxGoldenCount = 12;
 const uint32_t kGfxInitCount = 2;
 const uint32_t kGfxWriteCount = sizeof(kGfxWrites) / sizeof(kGfxWrites[0]);
+// Stage 21's own write, outside Linux's order (after boot 36): clearing
+// GRBM_READ_ERROR as all ones, the write-1-to-clear idiom, so that a value
+// read after the CP start can be attributed to the CP. It is kept out of
+// kGfxWrites on purpose, so the RLC start's golden window cannot shift when
+// it changes. Whether the clear takes is hardware behaviour; the core only
+// writes it.
+const GfxWrite kGfxExtraWrites[] = {{kRegGrbmReadError, 0xffffffff, 0xffffffff}};
+const uint32_t kGfxExtraWriteCount = sizeof(kGfxExtraWrites) / sizeof(kGfxExtraWrites[0]);
 // The precondition list (offset, mask, value), after the image headers and
 // GFX on: RLC off, CP and MEC halted, no doorbell, and the GC hub as MMHUB
 // read at boot 22 with the FB aperture of stage 10.
@@ -1311,7 +1319,8 @@ const uint32_t kGfxStateRegisters[] = {
     kRegCpRbWptrPollAddrHi, kRegCpRb0Base, kRegCpRb0BaseHi, kRegCpMaxContext, kRegCpDeviceId, kRegCpMeCntl,
     kRegScratchReg0, kRegCbHwControl, kRegCbHwControl2, kRegDbDebug2, kRegGbAddrConfig, kRegGbAddrConfigRead,
     kRegPaScEnhance, kRegPaScEnhance1, kRegPaScLineStippleState, kRegTaCntlAux, kRegTcpChanSteerHi,
-    kRegTcpChanSteerLo, kRegGceaProbeMap, kRegGrbmCntl, kRegGrbmGfxCntl, kRegRlcStat, kRegGrbmStatus, kRegGrbmStatus2,
+    kRegTcpChanSteerLo, kRegGceaProbeMap, kRegGrbmCntl, kRegGrbmGfxCntl, kRegGrbmReadError, kRegRlcStat,
+    kRegGrbmStatus, kRegGrbmStatus2,
     kRegCpStat,
     kRegCpCpfStatus, kRegCpCpcStatus, kRegCpBusyStat, kRegCpMecCntl, kRegCpRb0Rptr, kRegCpPfpInstrPntr,
     kRegCpMeInstrPntr, kRegCpCeInstrPntr, kRegCpMec1InstrPntr, kRegRlcSerdesCuMasterBusy,
@@ -1319,7 +1328,7 @@ const uint32_t kGfxStateRegisters[] = {
     kRegGcVmContext0Cntl, kRegCpStalledStat1, kRegCpStalledStat2, kRegCpCpfStalledStat1, kRegCpCpfBusyStat,
     kRegCpGfxError, kRegCpCeHeaderDump, kRegCpPfpHeaderDump, kRegCpMeHeaderDump, kRegRlcGpmGeneral6,
     kRegRlcSafeMode, kRegRlcIntStat, kRegCpfUtcl1Status, kRegCpcUtcl1Status, kRegCpgUtcl1Status,
-    kRegGcVmL2ProtectionFaultStatus, kRegGrbmReadError, kRegGrbmReadError2};
+    kRegGcVmL2ProtectionFaultStatus, kRegGrbmReadError2};
 const uint32_t kGfxStateCount = sizeof(kGfxStateRegisters) / sizeof(kGfxStateRegisters[0]);
 // The BAR5 pages the stage 21 register writes use: CP_ME_CNTL,
 // CP_RB_WPTR_DELAY and PA_SC_ENHANCE(_1); CB, DB, GB_ADDR_CONFIG, TA and

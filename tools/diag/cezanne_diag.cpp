@@ -1374,8 +1374,9 @@ bool gfxEngine(io_connect_t connection)
 
     // From here the restore is owed.
     uint64_t rlc[4] = {};
-    step("gfx 3/8 RLC start: the 12 golden settings, GRBM_CNTL.READ_TIMEOUT 0xff, rlc_stop, serdes, CG off,\n"
-         "  clear-state buffer, save/restore machine, SPM VMID 0xf, RLC_ENABLE_F32");
+    step("gfx 3/8 RLC start: the 12 golden settings, GRBM_CNTL.READ_TIMEOUT 0xff, GRBM_GFX_CNTL 0, rlc_stop,\n"
+         "  serdes, CG off, clear-state buffer, save/restore machine, SPM VMID 0xf, RLC_ENABLE_F32, then\n"
+         "  GRBM_READ_ERROR <- 0xffffffff to clear it (is GRBM_READ_ERROR below the check's reading?)");
     bool ok = callReport(connection, kDiagnosticGfxRlc, rlc, 4, &state);
     if (ok) {
         std::printf("%s, %llu writes, serdes CU 0x%08llx, NONCU 0x%08llx\n", statusName(static_cast<Status>(rlc[0])),
