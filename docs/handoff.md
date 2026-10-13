@@ -38,8 +38,9 @@ check after boot 29, the fill size after boot 30). The flip's MSI arrived
 7.2 ms after the address writes, and none during the hold. Stage 21 (the
 graphics engine: firmware, RLC, CP, ring test, fence, CP drawing) is
 approved and implemented. In boot 32 the CP ran and then stalled in the
-clear-state preamble (boots 32 and 33: the ring fetch waits on memory);
-it is rebuilt with Linux's golden settings for boot 34.
+clear-state preamble. Boot 34 added Linux's golden settings and showed
+the PFP waiting on a register read that never returns; the build for
+boot 35 sets `GRBM_CNTL.READ_TIMEOUT` and reads `GRBM_READ_ERROR`.
 See "Next task" below. The sections that follow are the earlier discovery record and
 still apply.
 
@@ -156,6 +157,21 @@ binaries are observation references and remain excluded from the finished stack.
 
 ## Next task: boot stage 21 again (boot 35, GRBM read timeout)
 
+**Resuming in a new session.** Read [AGENTS.md](../AGENTS.md), then the
+stage 21 proposal, implementation notes and boot 32–34 entries in
+[test-boot.md](test-boot.md). The working rules that matter here:
+- The user runs every disk, EFI and reboot step; the agent only builds,
+  tests and reads `out/test-efi/boot-N-stageM/` afterwards.
+- Defects found while testing an approved stage are fixed within the stage
+  (fix, record in `test-boot.md`, rebuild, retest). A new stage needs a
+  proposal in `test-boot.md` and the user's approval.
+- The user allowed dialling stage 21 down (for example, stopping after the
+  ring test or fence) if the CP bring-up gets too tangled; offer that rather
+  than deciding it.
+- Commits: small verified batches, no agent co-author trailer, firmware and
+  raw captures never tracked. Run the full suite before committing
+  (69 tests; see "Verification record and commands").
+
 Boots 32–34 (2026-10-07; [test boot log](test-boot.md#test-boot-log)) all
 stall at the same point. The CP runs 152 dwords of the clear-state preamble,
 then the PFP waits on a register read that never returns
@@ -164,12 +180,18 @@ continue. The rebuild adds Linux's `constants_init` first write,
 `GRBM_CNTL.READ_TIMEOUT` ← `0xff`, and reads of `GRBM_READ_ERROR`/`2`.
 Steps:
 
-1. The user runs `tools/update_stick.sh 21`, shuts down fully, cold boots
+1. Done on 2026-10-13: the user ran `tools/update_stick.sh 21` (30 files,
+   `match: true`). Still to do: the user shuts down fully, cold boots
    the stick, and runs
    `tools/capture_boot.sh boot-35-stage21 --gfxoff-disallow --gfx-start --psp-state`.
 2. Read `GRBM_READ_ERROR` from the CP step's report. The address names the
    register that does not answer, which tells which block is missing its
    setup. Also note whether the CP got past dword 152.
+   `READ_ADDRESS` is bits 17:2 of `GRBM_READ_ERROR` (a dword offset).
+3. Record boot 35 in the test boot log (same shape as boots 32–34), keep the
+   build as `superseded-*-stage21-timeout` if it is replaced, then either
+   fix within the stage or, if the cause is unclear, ask the user whether
+   to dial stage 21 down.
 
 **Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, rebuilt
 after boot 34), `out/test-efi/driver`, `out/diag`. Earlier stage 21 builds:
