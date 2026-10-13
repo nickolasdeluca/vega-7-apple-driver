@@ -5486,6 +5486,54 @@ boot-35-stage21 --gfxoff-disallow --gfx-start --psp-state`; exit 1).
   already reads 0, this fix changes nothing and the remaining `constants_init`
   work is next. The boot 35 builds are kept as `superseded-*-stage21-timeout`.
 
+**Boot 36, 2026-10-13, stage 21 with `GRBM_GFX_CNTL`** (`out/test-efi/usb-stage21/`,
+rebuilt after boot 35; cold boot; `tools/capture_boot.sh boot-36-stage21
+--gfxoff-disallow --gfx-start --psp-state`; exit 1).
+
+- **The hypothesis is disproved.** `GRBM_GFX_CNTL` reads `0x00000000` in the
+  check's report, before any stage 21 write, so the indexed-access selector
+  was already initialised at cold boot and this stage's write to it is a
+  no-op on value. The "unprogrammed register" pattern seen in `CP_RB0_BASE`
+  and `TCP_CHAN_STEER` is not how this register is left.
+- **The stall is the same one.** `CP_RB0_RPTR` 152, `CP_PFP_INSTR_PNTR`
+  `0x38`, `CP_ME_INSTR_PNTR` `0xa`, `CP_CE_INSTR_PNTR` `0x4c`,
+  `CP_CPF_STALLED_STAT1` `0x1`, `CP_CPF_BUSY_STAT` `0x2`, `CP_STALLED_STAT1`
+  `0x00000c00`, `CP_STALLED_STAT2` `0x0`, `GRBM_STATUS` `0xa0003028`,
+  read-pointer write-back 0. Comparing all 74 registers of the CP report
+  against boot 35's, exactly two differ: the new `GRBM_GFX_CNTL` above, and
+  `CP_STAT`.
+- **`CP_STAT` gained `RCIU_BUSY`** (bit 23, `CP_STAT__RCIU_BUSY__SHIFT`
+  `0x17`): `0x84008200` to `0x84808200`. That is the register command
+  interface unit busy. The only new hardware action in this build is the
+  write to `GRBM_GFX_CNTL`, so the bit is consistent with that write, or
+  with the RCIU still holding the read that timed out; these readings
+  cannot separate the two. It is a status bit, not a new stall reason:
+  `CP_STALLED_STAT2` stayed 0, so the read did complete.
+- **The write-order fix is confirmed on hardware:** the RLC step reports 25
+  writes, and the golden registers took (`GB_ADDR_CONFIG` `0x24000042`,
+  `TCP_CHAN_STEER_LO` `0x3120`, `GCEA_PROBE_MAP` `0xcccc`), so
+  `CB_HW_CONTROL` was programmed this time. The restore put all 38 snapshot
+  registers back at the check's reading and the PSP teardown fenced.
+- **The read error register still does not help.** `GRBM_READ_ERROR` and
+  `GRBM_READ_ERROR2` read `0x80030800` and `0x00020000` again, the same as
+  at the check and the same as boot 35.
+- **Reading.** Five boots, one stall: the CP fetches 152 dwords of the
+  clear-state preamble and stops, and the PFP's register read completes as
+  an error without releasing the pipeline. Of the pre-CP work Linux
+  (`gfx_v9_0_hw_init`) does, this stage now runs the golden settings, the
+  read timeout and the selector; what is left is the rest of
+  `constants_init` (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID,
+  `init_sq_config`, `init_compute_vmid`, `init_gds_vmid`, the tiling mode
+  table) and the cleaner shader. None of them obviously explains a stall in
+  packet fetch and parse, which is where the CP stops; they configure the
+  shader side, which matters for dispatching work, not for the fetcher.
+- **Next (the user's choice, since five boots have not converged):** either
+  clear `GRBM_READ_ERROR` before the CP starts to find out whether it is
+  write-1-to-clear and, if it is, which register the PFP read; or continue
+  with the rest of `constants_init`; or dial stage 21 down. The boot 36
+  builds are kept as `superseded-*-stage21-gfxcntl`.
+- Captures are in ignored `out/test-efi/boot-36-stage21/`.
+
 ## Unknowns and limits
 
 - The firmware lists both partitions `eraseDisk … GPT` creates. Partition 1 is
