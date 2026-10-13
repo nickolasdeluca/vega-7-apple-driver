@@ -37,15 +37,16 @@ interrupt) succeeded in boot 31, after two fixes within the stage (the
 check after boot 29, the fill size after boot 30). The flip's MSI arrived
 7.2 ms after the address writes, and none during the hold. Stage 21 (the
 graphics engine: firmware, RLC, CP, ring test, fence, CP drawing) is
-approved and implemented. Boots 32–36 stall at the same point: the CP runs
-152 dwords of the clear-state preamble and stops, and the PFP waits on a
-register read (`PFP_RCIU_READ_PENDING` until boot 35's read timeout, after
-which the read completes as an error without releasing the pipeline). Boot 35
-added `GRBM_CNTL.READ_TIMEOUT`; boot 36 added the selector `constants_init`
-leaves in `GRBM_GFX_CNTL`, which already reads zero at cold boot, so that
-hypothesis is disproved and the stall is unchanged. `GRBM_READ_ERROR` does not
-record the CP's read in any boot. See "Next task" below. The sections that
-follow are the earlier discovery record and still apply.
+approved and implemented. Boots 32–37 stall at the same point: the CP runs
+152 dwords of the clear-state preamble and stops, and the PFP's register read
+does not release the pipeline (it hung until boot 35's
+`GRBM_CNTL.READ_TIMEOUT`, after which it completed as an error). Boot 36
+added the selector `constants_init` leaves in `GRBM_GFX_CNTL`, which already
+reads zero at cold boot, so that hypothesis is disproved. Boot 37 cleared
+`GRBM_READ_ERROR` and it does not clear, so that register cannot name the
+failing access either. Two candidates are ruled out with evidence. See
+"Next task" below. The sections that follow are the earlier discovery record
+and still apply.
 
 Completed work:
 
@@ -161,7 +162,7 @@ binaries are observation references and remain excluded from the finished stack.
 ## Next task: boot stage 21 again (boot 35, GRBM read timeout)
 
 **Resuming in a new session.** Read [AGENTS.md](../AGENTS.md), then the
-stage 21 proposal, implementation notes and boot 32–36 entries in
+stage 21 proposal, implementation notes and boot 32–37 entries in
 [test-boot.md](test-boot.md). The working rules that matter here:
 - The user runs every disk, EFI and reboot step; the agent only builds,
   tests and reads `out/test-efi/boot-N-stageM/` afterwards.
@@ -187,36 +188,36 @@ that hypothesis is disproved and the stall is unchanged. In every boot
 including at the check before the CP ran, so they do not record the CP's read
 and do not name the register that fails to answer. Steps:
 
-1. **Option A is approved and built (2026-10-13):** clear `GRBM_READ_ERROR`
-   as the last write of the RLC start, all ones, and read the result from
-   the RLC step's report. `out/test-efi/usb-stage21`, `out/test-efi/driver`
-   and `out/diag` are rebuilt (snapshot 39 registers, RLC step 26 writes,
-   `ocvalidate` exit 0, 30 files). Still to do: the user runs
-   `tools/update_stick.sh 21`, shuts down fully, boots the stick and runs
-   `tools/capture_boot.sh boot-37-stage21 --gfxoff-disallow --gfx-start
-   --psp-state`.
-   - **What to read.** The RLC step's report, `GRBM_READ_ERROR`, against the
-     check's `0x80030800`. Lower means write-1-to-clear works and the CP
-     step's value is then the CP's own read (`READ_ADDRESS` bits 17:2 is a
-     dword offset, `GRBM_READ_ERROR2` names the requester). Unchanged means
-     the register is not usable for this. Then `CP_RB0_RPTR`: still 152, or
-     further?
-   - **Why:** boot 35 assumed this register would hold the failing read; in
-     five boots it has never changed, and nothing had tested whether it is
-     writable. `kGfxExtraWrites` holds the one allowed value and is kept out
-     of `kGfxWrites` so the golden window cannot shift again.
-2. If it does not answer the question, the remaining choices are the rest of
-   `constants_init` (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID,
-   `init_sq_config`, `init_compute_vmid`, `init_gds_vmid`) and the cleaner
-   shader (Linux runs them all before the CP start; my read is that they
-   configure the shader side, not the packet fetcher, so the odds are low),
-   or dialling stage 21 down and banking the firmware load, the RLC start
-   and the CP start. Offer that; do not decide it.
-3. **The host runs hot on these boots:** about 85 °C during boot 35 and
-   still near 70 °C idle on the known-good EFI afterwards, and the user has
-   asked for fewer concurrent builds. Keep the boot short, be ready to power
-   off, and run one test suite at a time.
-4. Record boot 37 in the test boot log (same shape as boots 32–36) and keep
+1. **Boot 37 is done (2026-10-13) and it answered the question in the
+   negative.** `GRBM_READ_ERROR ← 0xffffffff` was issued (the RLC step made
+   26 writes), and the register still reads `0x80030800`, so it is **not
+   write-1-to-clear** and never reports the CP's read. It cannot name the
+   register that fails to answer; most likely it is not implemented on this
+   ASIC and reads a constant. Two candidates are now ruled out with
+   evidence: the selector (boot 36) and the read-error register (boot 37).
+2. **Do not repeat the `GRBM_READ_ERROR` clear.** It produced no diagnostic,
+   and it is the one change correlated with the PFP's read going back to
+   pending (`CP_STALLED_STAT2` `0x20` again in boot 37, where it was `0` in
+   boots 35 and 36). One sample per boot cannot separate cause from a racy
+   read; a boot with the clear removed would, but that costs another hot boot
+   for a question whose answer we can live without.
+3. **The user's choice now, six boots in.** The agent's recommendation is to
+   dial stage 21 down and bank what works: the GFX firmware load through the
+   PSP, the RLC start, and the CP start with the CP fetching 152 dwords of the
+   clear-state preamble. The alternative is the rest of `constants_init`
+   (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID, `init_sq_config`,
+   `init_compute_vmid`, `init_gds_vmid`, the tiling mode table) and the
+   cleaner shader; the agent's honest odds on those are low, because they
+   configure the shader side while the CP stops in packet fetch and parse.
+   Offer both; do not decide.
+4. **The host runs hot on these boots:** about 85 °C during boot 35 and still
+   near 70 °C idle on the known-good EFI afterwards, and the user has asked
+   for fewer concurrent builds. Keep boots short, be ready to power off, and
+   run one build or test suite at a time. Use the fast non-sanitized compile
+   (`xcrun clang++ -std=c++17 -Wall -Wextra -Wconversion`, no
+   `-fsanitize`) to check test expectations before spending ~12 minutes on the
+   ASan/UBSan suite; it caught two slips for the price of one minute.
+5. Record boot 38 in the test boot log (same shape as boots 32–37) and keep
    the replaced build as `superseded-*-stage21-<change>`.
 
 **Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, the boot 37

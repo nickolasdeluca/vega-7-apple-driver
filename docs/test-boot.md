@@ -5553,6 +5553,53 @@ rebuilt after boot 35; cold boot; `tools/capture_boot.sh boot-36-stage21
   clear, so this behaviour is hardware-only.
 - Captures are in ignored `out/test-efi/boot-36-stage21/`.
 
+**Boot 37, 2026-10-13, stage 21 clearing `GRBM_READ_ERROR`** (`out/test-efi/usb-stage21/`,
+rebuilt after boot 36; cold boot; `tools/capture_boot.sh boot-37-stage21
+--gfxoff-disallow --gfx-start --psp-state`; exit 1).
+
+- **The clear was issued:** the RLC step reports 26 writes, so
+  `GRBM_READ_ERROR ← 0xffffffff` went out as the last write before the CP
+  start.
+- **The register does not clear.** `GRBM_READ_ERROR` reads `0x80030800` in the
+  RLC step's report after that write, exactly as at the check, and
+  `GRBM_READ_ERROR2` reads `0x00020000`. So it is **not write-1-to-clear**,
+  and it does not report the CP's read. That answers boot 35's question in
+  the negative: this register cannot name the register that fails to answer.
+  The likeliest reading is that it is not implemented on this ASIC and reads
+  a constant, which would also explain why it has never changed in any boot,
+  including before any GC register was touched.
+- **Two behaviour changes against boot 36**, both moving back toward boot 34
+  (the boot before the read timeout): `CP_STALLED_STAT2` `0x0` → `0x20`
+  (`PFP_RCIU_READ_PENDING` set again, so the read no longer completes) and
+  `CP_STAT` `0x84808200` → `0x84008200` (`RCIU_BUSY` clear again). Comparing
+  all 74 registers of the CP report against boot 36's, those two are the only
+  differences; `CP_RB0_RPTR` is 152 again, with the same instruction pointers
+  and the same stall registers.
+- **The clear is not free.** The only new hardware action in this build is
+  the `GRBM_READ_ERROR` write, and the PFP's read went back to pending. With
+  one sample per boot this cannot separate "the write caused it" from "the
+  read's outcome is racy" (it completed in boots 35 and 36, hung in 34 and
+  37). Either way the write bought no diagnostic and is the one change
+  correlated with the read hanging, so **do not repeat it.** Booting again
+  with it removed would show which, at the cost of one more hot boot.
+- **The rest is unchanged:** the nine loads, the golden settings, the
+  restore of all 39 snapshot registers (including `GRBM_READ_ERROR` back at
+  `0x80030800`) and the PSP teardown, which fenced 11.
+- **Reading.** Six boots, one stall: the CP fetches 152 dwords of the
+  clear-state preamble and stops. Two candidate causes are now ruled out
+  with evidence — the indexed-access selector (`GRBM_GFX_CNTL`, already zero
+  at boot 36) and the read-error register (not write-1-to-clear, boot 37).
+  What remains that Linux runs before the CP start and this stage does not is
+  the rest of `constants_init` (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID,
+  `init_sq_config`, `init_compute_vmid`, `init_gds_vmid`, the tiling mode
+  table) and the cleaner shader.
+- **Next (the user's choice).** My reading is that these configure the shader
+  side while the CP stops in packet fetch and parse, so their odds are low,
+  and the agent's recommendation is to dial stage 21 down and bank the
+  firmware load, the RLC start and the CP start. That is the user's call and
+  is offered, not decided.
+- Captures are in ignored `out/test-efi/boot-37-stage21/`.
+
 ## Unknowns and limits
 
 - The firmware lists both partitions `eraseDisk … GPT` creates. Partition 1 is
