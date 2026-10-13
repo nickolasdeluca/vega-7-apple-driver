@@ -3543,6 +3543,50 @@ and the kext's `stop()`, run step 8 before the stage 18 restore.
   (bit 18) has its own clear bit, which this stage does not write, so it
   stays set after the restore.
 
+### Revision: stage 21 dialled down to the CP start (2026-10-13)
+
+**The user dialled stage 21 down** after boots 32–37, six consecutive boots
+at the same stall. The proposal above is kept as approved and unchanged; this
+is what the stage now does.
+
+- **The stage ends at the CP start.** The ring test, fence 1, the CP's DMA
+  fills, the flip and the verify move to **stage 22**, which needs its own
+  proposal and approval before it is built. Their selectors
+  (`kDiagnosticGfxTest`, `GfxDraw`, `GfxVerify`) and their core entry points
+  (`testGfxRing`, `submitGfxDraw`, `checkGfxDraw`, `verifyGfxDraw`) stay in
+  the driver, unused, until then.
+- **The CP step's pass condition changes.** It used to require the read
+  pointer or `CP_RB0_RPTR` to reach 1024, the whole clear-state preamble; it
+  now passes once the CP has fetched the frame at all (`CP_RB0_RPTR > 0`),
+  and the dword count is reported. The read pointer is written per `RB_BLKSZ`
+  block, so it stays 0 until 512 dwords and cannot be the criterion for a
+  partial fetch. **A CP that never fetched still returns `gfx-cp-timeout`**:
+  the fake's `cpHang` case covers exactly that, and a new `cpStopAt = 152`
+  case covers the partial fetch that boots 32–37 show (`CP_RB0_RPTR` 152, no
+  write-back, so `CP_RB0_RPTR` is the only evidence).
+- **What is proven now**, in the order the steps run:
+  - the nine GFX firmware images load through the PSP (`LOAD_IP_FW`, status 0);
+  - the RLC starts with the golden settings, the CSB, the save/restore
+    machine, the SPM VMID and `RLC_ENABLE_F32` (26 writes);
+  - **the CP starts, reads our ring from VRAM through the GFXHUB and executes
+    part of the clear-state preamble** — the first time GC has run anything
+    from this driver. On this host it fetches 152 of 1024 dwords;
+  - every register written goes back to the check's reading and the PSP
+    teardown fences.
+- **What is not proven:** the ring test, any fence written by the CP, any DMA
+  the CP performed, and anything on screen drawn by it. The 152 dwords show
+  the fetcher and the front end working; they do not show a command executed
+  to completion.
+- **The tool's step count drops from eight to five** (`gfx 1/5` … `gfx 5/5`),
+  and its help text says the stage stops at the CP start.
+- **The stage 21 selectors and interface version are unchanged** (version 17,
+  selectors 45–52): 49, 50 and 51 are simply not called by the tool.
+- The stage 21 **success criteria** are now: `ok` for the check, the loads,
+  the RLC start, the CP start, the restore and the teardown; the report shows
+  a non-zero `CP_RB0_RPTR`; the final dump shows every stage 21 register at
+  its snapshot and pipe 0 as at boot 22. No bands on screen are expected
+  (there was never a case for them now).
+
 ### Stage 21: the graphics engine runs our commands and draws (proposal)
 
 **Status: proposed 2026-10-07 (revised the same day at the user's request

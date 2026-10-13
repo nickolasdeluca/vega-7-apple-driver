@@ -37,16 +37,12 @@ interrupt) succeeded in boot 31, after two fixes within the stage (the
 check after boot 29, the fill size after boot 30). The flip's MSI arrived
 7.2 ms after the address writes, and none during the hold. Stage 21 (the
 graphics engine: firmware, RLC, CP, ring test, fence, CP drawing) is
-approved and implemented. Boots 32–37 stall at the same point: the CP runs
-152 dwords of the clear-state preamble and stops, and the PFP's register read
-does not release the pipeline (it hung until boot 35's
-`GRBM_CNTL.READ_TIMEOUT`, after which it completed as an error). Boot 36
-added the selector `constants_init` leaves in `GRBM_GFX_CNTL`, which already
-reads zero at cold boot, so that hypothesis is disproved. Boot 37 cleared
-`GRBM_READ_ERROR` and it does not clear, so that register cannot name the
-failing access either. Two candidates are ruled out with evidence. See
-"Next task" below. The sections that follow are the earlier discovery record
-and still apply.
+approved and implemented, and dialled down on 2026-10-13 to end at the CP
+start: the nine GFX images load through the PSP, the RLC starts, and the CP
+starts and fetches 152 dwords of the clear-state preamble before it stops
+(boots 32–37). The ring test, fence, drawing and verify are deferred to stage
+22. See "Next task" below. The sections that follow are the earlier discovery
+record and still apply.
 
 Completed work:
 
@@ -159,7 +155,62 @@ concurrency, GPU execution and desktop presentation remain unverified. An
 authorized third-party Metal loading route has not been established. Apple AMD
 binaries are observation references and remain excluded from the finished stack.
 
-## Next task: boot stage 21 again (boot 35, GRBM read timeout)
+## Recommended next work (2026-10-13)
+
+The user paused the project here on purpose. The user runs every boot; boots
+are expensive on this host (about 85 °C during a stalled boot, still near
+70 °C idle afterwards). Work that needs no boot should be done first.
+
+1. **Finish boot 38 (the last outstanding hardware step).** It is built and
+   waiting: the user runs `tools/update_stick.sh 21`, shuts down fully, boots
+   the stick, and runs `tools/capture_boot.sh boot-38-stage21 --gfxoff-disallow
+   --gfx-start --psp-state`. This should be the **first exit 0** for stage 21
+   after the dial-down: check, loads, RLC start, CP start, restore and teardown
+   all `ok`. Read `CP_RB0_RPTR` in the CP report (152 so far) and confirm the
+   restore put all 39 snapshot registers back. Record it in the log and commit.
+2. **The Metal shader frontend boundary, offline.** The parked task further
+   down this file has the steps: what Apple's permitted public toolchain emits
+   for one fixed MSL compute kernel, the intermediate form's container and
+   metadata, and what an independent backend would still lack. No hardware, no
+   heat, and it feeds the "known shader with correct results" milestone that
+   the graphics-engine stall blocks. Success is a sourced statement or an
+   explicit list of what blocks the question; readable intermediate output
+   does **not** establish that Metal would accept an independent backend.
+3. **A source review of the boot 32 lead, offline.** Loading `RLC_G` started
+   the RLC (`RLC_CNTL` read 1 before any GC write), which Linux says should
+   not happen without PSP autoload on v12. Our PSP interaction therefore
+   differs from Linux's somewhere. Find where, from the pinned sources in
+   `out/references/`. This is cheap and may matter before any further boot.
+4. **Stage 22, only if the user wants more boots.** Its proposal is the ring
+   test and fence 1 resumed; chasing the stall means the rest of
+   `constants_init` (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID,
+   `init_sq_config`, `init_compute_vmid`, `init_gds_vmid`, the tiling mode
+   table) and the cleaner shader. **The agent's honest odds on that are low**:
+   those configure the shader side, while the CP stops in packet fetch and
+   parse. Two candidates are already ruled out with evidence (the selector in
+   boot 36, the read-error register in boot 37).
+
+**Working notes for whoever resumes:**
+
+- **One build or test suite at a time.** The user asked for this after the host
+  ran hot under overlapping builds.
+- **Use the fast compile to check test expectations first**
+  (`xcrun clang++ -std=c++17 -Wall -Wextra -Wconversion -g -I <core copy>
+  <core>/cezanne_core.cpp tests/core/core_test.cpp -o core_test`, no
+  `-fsanitize`), then the full suite before committing. It takes about a
+  minute against the ~12 minutes of the ASan/UBSan suite, and it caught two
+  expectation slips for the price of one run.
+- **Never let a positional index decide a register set.** `kGfxWrites` is
+  walked from the end to find the golden window; adding an entry at the end
+  silently skipped `CB_HW_CONTROL` (caught by the suite). Stage 21's own
+  `GRBM_READ_ERROR` clear therefore lives in `kGfxExtraWrites`, outside it.
+- **`mv` under `out/test-efi/` has twice landed a directory at the repository
+  root** instead of where it was asked to go. Use explicit paths and verify.
+- The skipped test in one suite run was `test_reports_a_missing_driver`, which
+  skips when `ioreg -r -c CezanneGPU` finds the kext loaded. It is expected on
+  the test EFI and passes on the known-good boot; it is not a defect.
+
+## Next task: boot 38, the first clean pass for the dialled-down stage 21
 
 **Resuming in a new session.** Read [AGENTS.md](../AGENTS.md), then the
 stage 21 proposal, implementation notes and boot 32–37 entries in
@@ -176,51 +227,38 @@ stage 21 proposal, implementation notes and boot 32–37 entries in
   raw captures never tracked. Run the full suite before committing
   (69 tests; see "Verification record and commands").
 
-Boots 32–36 (2026-10-07 and 2026-10-13; [test boot
-log](test-boot.md#test-boot-log)) all stall at the same point: the CP runs 152
-dwords of the clear-state preamble and stops, with no memory fault. Boot 35
-added `constants_init`'s first write, `GRBM_CNTL.READ_TIMEOUT` ← `0xff`, which
-took and cleared `PFP_RCIU_READ_PENDING` (`CP_STALLED_STAT2` `0x20` → `0x00`)
-without releasing the pipeline. Boot 36 added the selector `constants_init`
-leaves in `GRBM_GFX_CNTL`; it **already reads `0x00000000` at cold boot**, so
-that hypothesis is disproved and the stall is unchanged. In every boot
-`GRBM_READ_ERROR` and `GRBM_READ_ERROR2` read `0x80030800` and `0x00020000`,
-including at the check before the CP ran, so they do not record the CP's read
-and do not name the register that fails to answer. Steps:
+Boots 32–37 (2026-10-07 and 2026-10-13; [test boot
+log](test-boot.md#test-boot-log)) all stalled at the same point: the CP ran 152
+dwords of the clear-state preamble and stopped, with no memory fault. What was
+tried and ruled out, each with evidence:
 
-1. **Boot 37 is done (2026-10-13) and it answered the question in the
-   negative.** `GRBM_READ_ERROR ← 0xffffffff` was issued (the RLC step made
-   26 writes), and the register still reads `0x80030800`, so it is **not
-   write-1-to-clear** and never reports the CP's read. It cannot name the
-   register that fails to answer; most likely it is not implemented on this
-   ASIC and reads a constant. Two candidates are now ruled out with
-   evidence: the selector (boot 36) and the read-error register (boot 37).
-2. **Do not repeat the `GRBM_READ_ERROR` clear.** It produced no diagnostic,
-   and it is the one change correlated with the PFP's read going back to
-   pending (`CP_STALLED_STAT2` `0x20` again in boot 37, where it was `0` in
-   boots 35 and 36). One sample per boot cannot separate cause from a racy
-   read; a boot with the clear removed would, but that costs another hot boot
-   for a question whose answer we can live without.
-3. **The user's choice now, six boots in.** The agent's recommendation is to
-   dial stage 21 down and bank what works: the GFX firmware load through the
-   PSP, the RLC start, and the CP start with the CP fetching 152 dwords of the
-   clear-state preamble. The alternative is the rest of `constants_init`
-   (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID, `init_sq_config`,
-   `init_compute_vmid`, `init_gds_vmid`, the tiling mode table) and the
-   cleaner shader; the agent's honest odds on those are low, because they
-   configure the shader side while the CP stops in packet fetch and parse.
-   Offer both; do not decide.
-4. **The host runs hot on these boots:** about 85 °C during boot 35 and still
-   near 70 °C idle on the known-good EFI afterwards, and the user has asked
-   for fewer concurrent builds. Keep boots short, be ready to power off, and
-   run one build or test suite at a time. Use the fast non-sanitized compile
-   (`xcrun clang++ -std=c++17 -Wall -Wextra -Wconversion`, no
-   `-fsanitize`) to check test expectations before spending ~12 minutes on the
-   ASan/UBSan suite; it caught two slips for the price of one minute.
-5. Record boot 38 in the test boot log (same shape as boots 32–37) and keep
-   the replaced build as `superseded-*-stage21-<change>`.
+- **Boot 33:** the stall is the CP's ring fetch waiting on memory, not a bad
+  command stream.
+- **Boot 34:** the golden settings were not the cause, and
+  `CP_STALLED_STAT2.PFP_RCIU_READ_PENDING` showed the PFP waiting on a register
+  read.
+- **Boot 35:** `constants_init`'s first write,
+  `GRBM_CNTL.READ_TIMEOUT` ← `0xff`, took and changed one bit
+  (`CP_STALLED_STAT2` `0x20` → `0x00`): the read now completes as an error but
+  does not release the pipeline.
+- **Boot 36:** the selector `constants_init` leaves in `GRBM_GFX_CNTL` **already
+  reads `0x00000000` at cold boot**, so it is not missing setup.
+- **Boot 37:** clearing `GRBM_READ_ERROR` does not clear it, so that register
+  cannot name the register that fails to answer; it most likely reads a
+  constant on this ASIC.
 
-**Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, the boot 37
+The user then dialled the stage down. Steps:
+
+1. **Boot 38, built and waiting:** `out/test-efi/usb-stage21`,
+   `out/test-efi/driver` and `out/diag` are rebuilt for the dialled-down stage
+   (`ocvalidate` exit 0, 30 files). The user runs `tools/update_stick.sh 21`,
+   shuts down fully, boots the stick and runs `tools/capture_boot.sh
+   boot-38-stage21 --gfxoff-disallow --gfx-start --psp-state`. Expect the first
+   exit 0 for stage 21. Record it (same shape as boots 32–37) and keep the
+   replaced build as `superseded-*-stage21-<change>`.
+2. Everything after that is in **"Recommended next work"** above.
+
+**Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, the boot 38
 build), `out/test-efi/driver`, `out/diag`. Earlier stage 21 builds:
 `superseded-*-stage21-stall` (boot 32), `-fetch` (boot 33), `-golden`
 (boot 34), `-timeout` (boot 35), `-gfxcntl` (boot 36). The stage 20 builds are
@@ -483,6 +521,10 @@ Stages 0–10 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
   user's approval.
 
 ## Offline task while waiting: Metal shader frontend boundary
+
+**This is recommended next work, item 2** (see "Recommended next work" above):
+it needs no boot, and the driver has stalled on the graphics engine until the
+CP runs a full frame.
 
 Continue offline work before driver bring-up:
 
