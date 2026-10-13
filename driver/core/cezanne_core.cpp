@@ -2881,6 +2881,12 @@ Status startCp(const RegisterReader &registers, uint64_t apertureLength, const R
         status = readRegister(registers, apertureLength, stage, kRegCpRb0Rptr, cpRptr);
         if (status != kOK) return status;
         if (*rptr == kGfxFrameStarts[1] || *cpRptr == kGfxFrameStarts[1]) return kOK;
+        // Dialled down on 2026-10-13 (the user): stage 21 now ends here, so the
+        // CP step passes once the CP has fetched the clear-state preamble at
+        // all, and *cpRptr says how far it got. The read pointer is written
+        // per RB_BLKSZ block, so it stays 0 until 512 dwords; the fetch pointer
+        // is what moves. A CP that never fetched still times out.
+        if (*cpRptr > 0) return kOK;
         if (i == kGfxPollPauses) break;
         writer.pause(writer.context);
     }

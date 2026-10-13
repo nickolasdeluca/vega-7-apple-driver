@@ -354,8 +354,8 @@ void usage(FILE *out)
                       "carveout, shows it on pipe 0 for 5 s with HUBP0's flip interrupt on, verifies, flips back,\n"
                       "and finishes as --ih-intr.\n"
                       "--gfx-start creates the PSP ring and TMR, loads the GFX firmware, starts the RLC and the CP,\n"
-                      "runs a ring test and a fence, has the CP draw three bands shown on pipe 0 for 5 s, restores\n"
-                      "every GC register written, and tears down.\n"
+                      "and, dialled down on 2026-10-13, stops there: it restores every GC register written and\n"
+                      "tears down. The ring test, fence, CP drawing and verify are deferred to stage 22.\n"
                       "--display-pattern draws a test pattern in the carveout, shows it on pipe 0 for 5 s by\n"
                       "flipping its surface address, verifies, and flips back to the boot framebuffer.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n"
@@ -1346,7 +1346,7 @@ bool gfxEngine(io_connect_t connection)
                                         "green_sardine_mec.bin", "green_sardine_rlc.bin"};
     uint64_t check[3] = {};
     GfxState checked = {};
-    step("gfx 1/8 check: nine firmware headers; GFX on, RLC off, CP and MEC halted, no doorbell, GC hub as MMHUB at\n"
+    step("gfx 1/5 check: nine firmware headers; GFX on, RLC off, CP and MEC halted, no doorbell, GC hub as MMHUB at\n"
          "  boot 22; pipe 0 at boot 22; firmware buffer, work area and pattern region placed and stable");
     if (!callReport(connection, kDiagnosticGfxCheck, check, 3, &checked)) return false;
     std::printf("%s", statusName(static_cast<Status>(check[0])));
@@ -1361,7 +1361,7 @@ bool gfxEngine(io_connect_t connection)
 
     uint64_t load[6] = {};
     GfxState state = {};
-    step("gfx 2/8 load: copy the nine images (496 KiB) to 0xf440900000, then LOAD_IP_FW as frames 1-9\n"
+    step("gfx 2/5 load: copy the nine images (496 KiB) to 0xf440900000, then LOAD_IP_FW as frames 1-9\n"
          "  (CE, PFP, ME, MEC1, MEC1 jump table, RLC lists CNTL, GPM, SRM, RLC_G)");
     if (!callReport(connection, kDiagnosticGfxLoad, load, 6, &state)) return false;
     std::printf("%s, %llu images loaded, last fence %llu, status 0x%08llx, fw_addr 0x%08llx%08llx\n",
@@ -1374,7 +1374,7 @@ bool gfxEngine(io_connect_t connection)
 
     // From here the restore is owed.
     uint64_t rlc[4] = {};
-    step("gfx 3/8 RLC start: the 12 golden settings, GRBM_CNTL.READ_TIMEOUT 0xff, GRBM_GFX_CNTL 0, rlc_stop,\n"
+    step("gfx 3/5 RLC start: the 12 golden settings, GRBM_CNTL.READ_TIMEOUT 0xff, GRBM_GFX_CNTL 0, rlc_stop,\n"
          "  serdes, CG off, clear-state buffer, save/restore machine, SPM VMID 0xf, RLC_ENABLE_F32, then\n"
          "  GRBM_READ_ERROR <- 0xffffffff to clear it (is GRBM_READ_ERROR below the check's reading?)");
     bool ok = callReport(connection, kDiagnosticGfxRlc, rlc, 4, &state);
@@ -1387,8 +1387,9 @@ bool gfxEngine(io_connect_t connection)
     }
     if (ok) {
         uint64_t cp[4] = {};
-        step("gfx 4/8 CP start: ring 0xf440a00000 (8 KiB), no doorbell, CP_ME_CNTL halts cleared; frame 0 (clear\n"
-             "  state), CP_RB0_WPTR <- 1024, _HI <- 0");
+        step("gfx 4/5 CP start: ring 0xf440a00000 (8 KiB), no doorbell, CP_ME_CNTL halts cleared; frame 0 (clear\n"
+             "  state), CP_RB0_WPTR <- 1024, _HI <- 0. Stage 21 is dialled down here: it passes when the CP has\n"
+             "  fetched the clear-state preamble, and the dword count below is how far it got");
         ok = callReport(connection, kDiagnosticGfxCp, cp, 4, &state);
         if (ok) {
             std::printf("%s, %llu writes, read-pointer write-back %llu, CP_RB0_RPTR %llu\n",
@@ -1398,51 +1399,12 @@ bool gfxEngine(io_connect_t connection)
             ok = cp[0] == kOK;
         }
     }
-    if (ok) {
-        uint64_t test[4] = {};
-        step("gfx 5/8 ring test and fence: SCRATCH_REG0 <- 0xcafedead, SET_UCONFIG_REG SCRATCH_REG0 0xdeadbeef\n"
-             "  (WPTR 1280); RELEASE_MEM fence 1 (WPTR 1536)");
-        ok = callReport(connection, kDiagnosticGfxTest, test, 4, &state);
-        if (ok) {
-            std::printf("%s, SCRATCH_REG0 0x%08llx, fence 1 %llu, read pointer %llu\n",
-                        statusName(static_cast<Status>(test[0])), static_cast<unsigned long long>(test[1]),
-                        static_cast<unsigned long long>(test[2]), static_cast<unsigned long long>(test[3]));
-            ok = test[0] == kOK;
-            if (!ok) printGfxState(state);
-        }
-    }
-    if (ok) {
-        uint64_t draw[6] = {};
-        step("gfx 6/8 draw: zero the region; 6 DMA_DATA fills and fence 2 (WPTR 2048); read the region back; flip\n"
-             "  pipe 0 to it");
-        ok = callReport(connection, kDiagnosticGfxDraw, draw, 6, &state);
-        if (ok) {
-            std::printf("%s, step %llu, fence 2 %llu; %llu unexpected words (first +0x%llx reads 0x%08llx)\n",
-                        statusName(static_cast<Status>(draw[0])), static_cast<unsigned long long>(draw[1]),
-                        static_cast<unsigned long long>(draw[2]), static_cast<unsigned long long>(draw[3]),
-                        static_cast<unsigned long long>(draw[4]), static_cast<unsigned long long>(draw[5]));
-            ok = draw[0] == kOK;
-            if (!ok) printGfxState(state);
-        }
-    }
-    if (ok) {
-        std::printf("  The CP's image is on screen for 5 s: red, green and blue, top to bottom.\n");
-        std::fflush(stdout);
-        sleep(5);
-        uint64_t scalar = 0;
-        DisplayReport report = {};
-        step("gfx 7/8 verify: still the CP's image, frames advanced, pipe 0 otherwise unchanged");
-        ok = callReport(connection, kDiagnosticGfxVerify, &scalar, 1, &report);
-        if (ok) {
-            std::printf("%s\n  in use 0x%02x%08x, %u frames since the flip; display: %u changed; image: %u unexpected "
-                        "words (first +0x%x)\n",
-                        statusName(static_cast<Status>(scalar)), report.inuseHi, report.inuseLo, report.framesAdvanced,
-                        report.displayChanged, report.patternUnexpected, report.patternFirst);
-            ok = scalar == kOK;
-        }
-    }
+    // Dialled down on 2026-10-13 (the user), after boots 32-37: the CP stops
+    // inside the clear-state preamble, so the ring test, fence 1, the CP's
+    // drawing and the verify are deferred to stage 22. Their selectors stay
+    // (kDiagnosticGfxTest, GfxDraw, GfxVerify) and are unused here.
     uint64_t restore[4] = {};
-    step("gfx 8/8 restore: flip back; CP_ME_CNTL halted, rlc_stop, every written GC register back to the check's\n"
+    step("gfx 5/5 restore: flip back; CP_ME_CNTL halted, rlc_stop, every written GC register back to the check's\n"
          "  reading");
     bool restored = callReport(connection, kDiagnosticGfxRestore, restore, 4, &state);
     if (restored) {

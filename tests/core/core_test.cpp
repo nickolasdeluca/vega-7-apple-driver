@@ -160,6 +160,7 @@ struct FakeRegisters {
     FakeMemory *gfxWork = nullptr;
     uint32_t cpPendingWptr = 0;      // the low dword, committed by the _HI write
     bool cpHang = false;             // the CP never fetches
+    uint32_t cpStopAt = 0;            // the CP fetches only this many dwords, no write-back (boots 32-37)
     bool cpDropScratch = false;      // the ring test's write is lost
     uint32_t gcStuck = 0;            // a GC register whose writes are lost
     int fillDropGfx = -1;            // a DMA_DATA fill (by its order) the CP drops
@@ -1028,6 +1029,7 @@ struct FakeWriter {
         auto ring = [m](uint32_t i) { return m[i & (kGfxRingDwords - 1)]; };
         int fills = 0;
         for (uint32_t d = from; d < to;) {
+            if (r->cpStopAt != 0 && d >= from + r->cpStopAt) break;
             uint32_t header = ring(d);
             if ((header >> 30) != 3) {
                 d++;
@@ -1049,8 +1051,12 @@ struct FakeWriter {
             }
             d += length;
         }
-        m[(kGfxWbPage + kGfxWbRptr) / 4] = to;
-        r->gc[kRegCpRb0Rptr] = to;
+        // Dialled down: the CP fetched only part of the frame and stopped, as
+        // in boots 32-37, so the read pointer stops early and nothing is
+        // written back (the write-back is per RB_BLKSZ block).
+        const uint32_t fetched = r->cpStopAt != 0 ? from + r->cpStopAt : to;
+        if (r->cpStopAt == 0) m[(kGfxWbPage + kGfxWbRptr) / 4] = to;
+        r->gc[kRegCpRb0Rptr] = fetched;
     }
     // Processes the frame at frameStart if it names the command and fence
     // buffers: writes the response status and the fence value.
@@ -3270,6 +3276,22 @@ static void testGfx()
         CHECK(checkGfxBoot(g.r.reader(), 0x80000, 20, g.snapshot, &index, &value) == kRegisterNotAllowed);
         uint32_t writes = 0, cu = 0, noncu = 0;
         CHECK(startRlc(g.r.reader(), 0x80000, g.w.writer(), 20, g.snapshot, &writes, &cu, &noncu) == kRegisterNotAllowed);
+    }
+    {
+        // Dialled down on 2026-10-13: a CP that fetches part of frame 0 and
+        // stops, as in boots 32-37, now passes the CP step, and reports how
+        // far it got. A CP that never fetches still times out (above).
+        GfxRig g2;
+        g2.r.cpStopAt = 152;
+        CHECK(g2.load() == kOK);
+        uint32_t w2 = 0, cu2 = 0, nc2 = 0;
+        CHECK(startRlc(g2.r.reader(), 0x80000, g2.w.writer(), 21, g2.snapshot, &w2, &cu2, &nc2) == kOK && w2 == 26);
+        uint32_t rptr2 = 9, cpRptr2 = 9;
+        CHECK(startCp(g2.r.reader(), 0x80000, g2.w.writer(), g2.gfxWork.reader(), 21, g2.snapshot, &w2, &rptr2,
+                      &cpRptr2) == kOK);
+        CHECK(cpRptr2 == 152 && rptr2 == 0 && g2.r.gc[kRegCpRb0Rptr] == 152);
+        uint32_t index2 = 0, value2 = 0;
+        CHECK(restoreGfx(g2.r.reader(), 0x80000, g2.w.writer(), 21, g2.snapshot, &index2, &value2) == kOK);
     }
     {
         // A CP that never fetches; a lost ring-test write; a dropped fill.
