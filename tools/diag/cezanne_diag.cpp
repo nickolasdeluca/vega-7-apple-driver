@@ -306,6 +306,7 @@ const Named kRegisters[] = {
     {"GRBM_CNTL", kRegGrbmCntl},
     {"GRBM_READ_ERROR", kRegGrbmReadError},
     {"GRBM_READ_ERROR2", kRegGrbmReadError2},
+    {"GRBM_GFX_CNTL", kRegGrbmGfxCntl},
 };
 static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage16RegisterCount + kStage17RegisterCount +
                                                                 kStage19RegisterCount + kStage20RegisterCount +

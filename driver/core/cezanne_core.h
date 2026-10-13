@@ -1080,11 +1080,13 @@ const uint32_t kRegGcVmL2ProtectionFaultStatus = 0x0a12c; // VM_L2_PROTECTION_FA
 const uint32_t kRegGrbmCntl = 0x08000; // GRBM_CNTL: gfx_v9_0_constants_init (READ_TIMEOUT), after boot 34
 const uint32_t kRegGrbmReadError = 0x08058; // GRBM_READ_ERROR: the address of a timed-out register read, after boot 34
 const uint32_t kRegGrbmReadError2 = 0x0805c; // GRBM_READ_ERROR2: the same read's requester, after boot 34
+const uint32_t kRegGrbmGfxCntl = 0x08088; // GRBM_GFX_CNTL: soc15_grbm_select's selector (PIPEID, MEID, VMID, QUEUEID), after boot 35
 // Read from stage 21 on (all GFX-gated), in addition to the earlier lists.
 // The last 11 were added after boot 32 (the CP stalled): stall reasons and
 // the last packet headers; then, after boot 33 (the CP waited on its ring
 // fetch), GCEA_PROBE_MAP and the CP's memory-path status; then, after boot
-// 34 (the PFP waited on a register read), GRBM_CNTL and the read-error pair.
+// 34 (the PFP waited on a register read), GRBM_CNTL and the read-error pair;
+// then, after boot 35, GRBM_GFX_CNTL.
 const uint32_t kStage21Registers[] = {
     kRegCpIntCntlRing0,     kRegRlcCsibAddrHi,      kRegRlcCsibAddrLo,      kRegRlcCsibLength,
     kRegRlcSrmCntl,         kRegRlcSpmMcCntl,       kRegRlcSerdesCuMasterBusy, kRegRlcSerdesNoncuMasterBusy,
@@ -1098,7 +1100,7 @@ const uint32_t kStage21Registers[] = {
     kRegTaCntlAux,          kRegTcpChanSteerHi,     kRegTcpChanSteerLo,
     kRegCpStalledStat1, kRegCpStalledStat2, kRegCpCpfStalledStat1, kRegCpCpfBusyStat, kRegCpGfxError, kRegCpCeHeaderDump, kRegCpPfpHeaderDump, kRegCpMeHeaderDump, kRegRlcGpmGeneral6, kRegRlcSafeMode, kRegRlcIntStat,
     kRegGceaProbeMap, kRegCpfUtcl1Status, kRegCpcUtcl1Status, kRegCpgUtcl1Status, kRegGcVmL2ProtectionFaultStatus,
-    kRegGrbmCntl, kRegGrbmReadError, kRegGrbmReadError2};
+    kRegGrbmCntl, kRegGrbmReadError, kRegGrbmReadError2, kRegGrbmGfxCntl};
 const uint32_t kStage21RegisterCount = sizeof(kStage21Registers) / sizeof(kStage21Registers[0]);
 
 // Part A: the GFX firmware. The pinned linux-firmware 20260916 files (their
@@ -1197,6 +1199,7 @@ const uint32_t kGrbmSelectSe0Sh0 = 0x40000000, kGrbmBroadcast = 0xe0000000;
 const uint32_t kRlcSerdesNoncuMask = 0x000dffff;
 const uint32_t kCpDoorbellEnable = 0x40000000;
 const uint32_t kGrbmReadTimeoutMask = 0xff; // GRBM_CNTL.READ_TIMEOUT
+const uint32_t kGrbmGfxCntlMask = 0x7ff; // GRBM_GFX_CNTL: PIPEID [1:0], MEID [3:2], VMID [5:4], QUEUEID [10:8]
 
 // The registers this stage writes, in Linux's order, and SCRATCH_REG0: the
 // check snapshots them, the restore writes the snapshot back in this order.
@@ -1210,7 +1213,7 @@ const uint32_t kGfxSnapshotRegisters[] = {
     kRegCbHwControl,      kRegCbHwControl2,    kRegDbDebug2,           kRegGbAddrConfig,
     kRegGbAddrConfigRead, kRegPaScEnhance,     kRegPaScEnhance1,       kRegPaScLineStippleState,
     kRegTaCntlAux,        kRegTcpChanSteerHi,  kRegTcpChanSteerLo,     kRegGceaProbeMap,
-    kRegGrbmCntl};
+    kRegGrbmCntl,         kRegGrbmGfxCntl};
 const uint32_t kGfxSnapshotCount = sizeof(kGfxSnapshotRegisters) / sizeof(kGfxSnapshotRegisters[0]);
 // The values written besides the snapshot: (snapshot & ~mask) | value; a
 // mask of all ones is a fixed value.
@@ -1266,10 +1269,18 @@ const GfxWrite kGfxWrites[] = {
     // gfx_v9_0_constants_init's first write (after boot 34): register reads
     // that get no answer time out instead of waiting forever.
     {kRegGrbmCntl, kGrbmReadTimeoutMask, kGrbmReadTimeoutMask},
+    // soc15_grbm_select(adev, 0, 0, 0, 0, 0), the value constants_init leaves
+    // it at (after boot 35): the indexed-access selector (PIPEID, MEID, VMID,
+    // QUEUEID) that GRBM_READ_ERROR reports for a read with no answer.
+    {kRegGrbmGfxCntl, kGrbmGfxCntlMask, 0},
 };
-// The golden writes are kGfxWrites' kGfxGoldenCount entries before the last,
-// in Linux's order; the last is the read timeout.
+// The golden writes are kGfxWrites' kGfxGoldenCount entries before the last
+// kGfxInitCount, in Linux's order; the last kGfxInitCount are constants_init's
+// GRBM_CNTL and the GRBM_GFX_CNTL that soc15_grbm_select leaves behind. The
+// RLC start runs all of them, so the window is the tail after the part B/C
+// entries, not everything after the golden ones.
 const uint32_t kGfxGoldenCount = 12;
+const uint32_t kGfxInitCount = 2;
 const uint32_t kGfxWriteCount = sizeof(kGfxWrites) / sizeof(kGfxWrites[0]);
 // The precondition list (offset, mask, value), after the image headers and
 // GFX on: RLC off, CP and MEC halted, no doorbell, and the GC hub as MMHUB
@@ -1300,7 +1311,8 @@ const uint32_t kGfxStateRegisters[] = {
     kRegCpRbWptrPollAddrHi, kRegCpRb0Base, kRegCpRb0BaseHi, kRegCpMaxContext, kRegCpDeviceId, kRegCpMeCntl,
     kRegScratchReg0, kRegCbHwControl, kRegCbHwControl2, kRegDbDebug2, kRegGbAddrConfig, kRegGbAddrConfigRead,
     kRegPaScEnhance, kRegPaScEnhance1, kRegPaScLineStippleState, kRegTaCntlAux, kRegTcpChanSteerHi,
-    kRegTcpChanSteerLo, kRegGceaProbeMap, kRegGrbmCntl, kRegRlcStat, kRegGrbmStatus, kRegGrbmStatus2, kRegCpStat,
+    kRegTcpChanSteerLo, kRegGceaProbeMap, kRegGrbmCntl, kRegGrbmGfxCntl, kRegRlcStat, kRegGrbmStatus, kRegGrbmStatus2,
+    kRegCpStat,
     kRegCpCpfStatus, kRegCpCpcStatus, kRegCpBusyStat, kRegCpMecCntl, kRegCpRb0Rptr, kRegCpPfpInstrPntr,
     kRegCpMeInstrPntr, kRegCpCeInstrPntr, kRegCpMec1InstrPntr, kRegRlcSerdesCuMasterBusy,
     kRegRlcSerdesNoncuMasterBusy, kRegCpRbDoorbellControl, kRegGcMxL1TlbCntl, kRegGcVmL2Cntl,
