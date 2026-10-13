@@ -5532,6 +5532,25 @@ rebuilt after boot 35; cold boot; `tools/capture_boot.sh boot-36-stage21
   write-1-to-clear and, if it is, which register the PFP read; or continue
   with the rest of `constants_init`; or dial stage 21 down. The boot 36
   builds are kept as `superseded-*-stage21-gfxcntl`.
+- **Next (option A, approved by the user):** clear `GRBM_READ_ERROR`
+  before the CP starts. Boot 35 assumed it would hold the failing read's
+  address; in five boots it has never changed, and nothing has tested
+  whether it is writable at all. `GRBM_READ_ERROR` joins the snapshot (39
+  registers) so the restore puts the boot value back, and `kGfxExtraWrites`
+  allows one value there: all ones, the write-1-to-clear idiom, written as
+  the last step of the RLC start so the window before the CP fetches is as
+  short as possible. It is deliberately **not** in `kGfxWrites`, so the
+  golden window's arithmetic cannot shift when it changes (boot 36's
+  `kGfxInitCount` fix was exactly that class of bug). The RLC step makes 26
+  writes. `0x08058` is already in the `0x8000` page, so no new page set.
+  Reading the result needs no new plumbing: the RLC step's report shows
+  `GRBM_READ_ERROR` after the clear, and the CP step's report shows it after
+  the CP ran. **If the RLC step's value drops below the check's `0x80030800`,
+  the register is write-1-to-clear and the CP step's value is the CP's own
+  read; if it is unchanged, the register is not usable for this and that is
+  worth recording.** The core test checks the write, the order and the
+  restore, and says in a comment that the fake does not model write-1-to-
+  clear, so this behaviour is hardware-only.
 - Captures are in ignored `out/test-efi/boot-36-stage21/`.
 
 ## Unknowns and limits

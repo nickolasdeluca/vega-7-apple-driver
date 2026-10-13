@@ -187,34 +187,39 @@ that hypothesis is disproved and the stall is unchanged. In every boot
 including at the check before the CP ran, so they do not record the CP's read
 and do not name the register that fails to answer. Steps:
 
-1. **Decide with the user which way to go.** Five boots have not converged,
-   and the user allowed dialling stage 21 down; offer that, do not decide it.
-   - **A, name the register (cheapest, recommended first).** Boot 35 assumed
-     `GRBM_READ_ERROR` would hold the failing read's address, but it never
-     changes. Clear it before the CP starts to learn whether it is
-     write-1-to-clear: write it in the RLC step through the snapshot-relative
-     allowlist, read it back, and report. If it clears, a later boot can
-     attribute a fresh value to the CP's read; if it does not clear, the
-     register is not usable for this and that is worth knowing too. One
-     register, no new page (`0x08058` is in the `0x8000` page), snapshot and
-     restore already cover the pattern if it joins the snapshot.
-   - **B, the rest of `constants_init`** (`SH_MEM_CONFIG` and `SH_MEM_BASES`
-     per VMID, `init_sq_config`, `init_compute_vmid`, `init_gds_vmid`, the
-     tiling mode table) and the cleaner shader, all of which Linux runs
-     before the CP starts. My honest read: these configure the shader side,
-     and the CP stops in packet fetch and parse, so I would not expect them
-     to fix it — but they are the remaining difference from Linux.
-   - **C, dial stage 21 down**, banking the firmware load, the RLC start and
-     the CP start, and deferring the ring test and drawing.
-2. Whichever is chosen, the user runs `tools/update_stick.sh 21`, shuts down
-   fully, boots the stick and runs `tools/capture_boot.sh boot-37-stage21
-   --gfxoff-disallow --gfx-start --psp-state`. **The host reached about 85 °C
-   during boot 35 and was still near 70 °C idle on the known-good EFI
-   afterwards, so keep the boot short and be ready to power off.**
-3. Record boot 37 in the test boot log (same shape as boots 32–36) and keep
+1. **Option A is approved and built (2026-10-13):** clear `GRBM_READ_ERROR`
+   as the last write of the RLC start, all ones, and read the result from
+   the RLC step's report. `out/test-efi/usb-stage21`, `out/test-efi/driver`
+   and `out/diag` are rebuilt (snapshot 39 registers, RLC step 26 writes,
+   `ocvalidate` exit 0, 30 files). Still to do: the user runs
+   `tools/update_stick.sh 21`, shuts down fully, boots the stick and runs
+   `tools/capture_boot.sh boot-37-stage21 --gfxoff-disallow --gfx-start
+   --psp-state`.
+   - **What to read.** The RLC step's report, `GRBM_READ_ERROR`, against the
+     check's `0x80030800`. Lower means write-1-to-clear works and the CP
+     step's value is then the CP's own read (`READ_ADDRESS` bits 17:2 is a
+     dword offset, `GRBM_READ_ERROR2` names the requester). Unchanged means
+     the register is not usable for this. Then `CP_RB0_RPTR`: still 152, or
+     further?
+   - **Why:** boot 35 assumed this register would hold the failing read; in
+     five boots it has never changed, and nothing had tested whether it is
+     writable. `kGfxExtraWrites` holds the one allowed value and is kept out
+     of `kGfxWrites` so the golden window cannot shift again.
+2. If it does not answer the question, the remaining choices are the rest of
+   `constants_init` (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID,
+   `init_sq_config`, `init_compute_vmid`, `init_gds_vmid`) and the cleaner
+   shader (Linux runs them all before the CP start; my read is that they
+   configure the shader side, not the packet fetcher, so the odds are low),
+   or dialling stage 21 down and banking the firmware load, the RLC start
+   and the CP start. Offer that; do not decide it.
+3. **The host runs hot on these boots:** about 85 °C during boot 35 and
+   still near 70 °C idle on the known-good EFI afterwards, and the user has
+   asked for fewer concurrent builds. Keep the boot short, be ready to power
+   off, and run one test suite at a time.
+4. Record boot 37 in the test boot log (same shape as boots 32–36) and keep
    the replaced build as `superseded-*-stage21-<change>`.
 
-**Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, the boot 36
+**Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, the boot 37
 build), `out/test-efi/driver`, `out/diag`. Earlier stage 21 builds:
 `superseded-*-stage21-stall` (boot 32), `-fetch` (boot 33), `-golden`
 (boot 34), `-timeout` (boot 35), `-gfxcntl` (boot 36). The stage 20 builds are
