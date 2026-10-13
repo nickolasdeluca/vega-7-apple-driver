@@ -37,12 +37,13 @@ interrupt) succeeded in boot 31, after two fixes within the stage (the
 check after boot 29, the fill size after boot 30). The flip's MSI arrived
 7.2 ms after the address writes, and none during the hold. Stage 21 (the
 graphics engine: firmware, RLC, CP, ring test, fence, CP drawing) is
-approved and implemented. In boot 32 the CP ran and then stalled in the
-clear-state preamble. Boot 34 added Linux's golden settings and showed
-the PFP waiting on a register read that never returns; the build for
-boot 35 sets `GRBM_CNTL.READ_TIMEOUT` and reads `GRBM_READ_ERROR`.
-See "Next task" below. The sections that follow are the earlier discovery record and
-still apply.
+approved and implemented. Boots 32–34 stall at the same point: the CP runs
+152 dwords of the clear-state preamble and stops, and the PFP waits on a
+register read that never returns (`PFP_RCIU_READ_PENDING`). Boot 35 added
+Linux's `GRBM_CNTL.READ_TIMEOUT`, which makes that read complete as an
+error and clears the pending bit, but the CP stalls at the same dword and
+`GRBM_READ_ERROR` does not record the read. See "Next task" below. The
+sections that follow are the earlier discovery record and still apply.
 
 Completed work:
 
@@ -158,7 +159,7 @@ binaries are observation references and remain excluded from the finished stack.
 ## Next task: boot stage 21 again (boot 35, GRBM read timeout)
 
 **Resuming in a new session.** Read [AGENTS.md](../AGENTS.md), then the
-stage 21 proposal, implementation notes and boot 32–34 entries in
+stage 21 proposal, implementation notes and boot 32–35 entries in
 [test-boot.md](test-boot.md). The working rules that matter here:
 - The user runs every disk, EFI and reboot step; the agent only builds,
   tests and reads `out/test-efi/boot-N-stageM/` afterwards.
@@ -175,29 +176,50 @@ stage 21 proposal, implementation notes and boot 32–34 entries in
 Boots 32–34 (2026-10-07; [test boot log](test-boot.md#test-boot-log)) all
 stall at the same point. The CP runs 152 dwords of the clear-state preamble,
 then the PFP waits on a register read that never returns
-(`PFP_RCIU_READ_PENDING`); there is no memory fault. The user chose to
-continue. The rebuild adds Linux's `constants_init` first write,
-`GRBM_CNTL.READ_TIMEOUT` ← `0xff`, and reads of `GRBM_READ_ERROR`/`2`.
-Steps:
+(`PFP_RCIU_READ_PENDING`); there is no memory fault. Boot 35 (2026-10-13)
+added `constants_init`'s first write, `GRBM_CNTL.READ_TIMEOUT` ← `0xff`, as
+boot 34 planned. It took, and it changed exactly one bit:
+`CP_STALLED_STAT2` `0x20` → `0x00`. The CP still stalls at dword 152, every
+other register in its report matching boot 34's. `GRBM_READ_ERROR` and
+`GRBM_READ_ERROR2` read `0x80030800` and `0x00020000` at **every** report,
+including the check's, before the CP ran, so they do not record the read and
+do not name the register that fails to answer. That was the point of the
+boot 35 build, and it did not deliver it. Steps:
 
-1. Done on 2026-10-13: the user ran `tools/update_stick.sh 21` (30 files,
-   `match: true`). Still to do: the user shuts down fully, cold boots
-   the stick, and runs
-   `tools/capture_boot.sh boot-35-stage21 --gfxoff-disallow --gfx-start --psp-state`.
-2. Read `GRBM_READ_ERROR` from the CP step's report. The address names the
-   register that does not answer, which tells which block is missing its
-   setup. Also note whether the CP got past dword 152.
-   `READ_ADDRESS` is bits 17:2 of `GRBM_READ_ERROR` (a dword offset).
-3. Record boot 35 in the test boot log (same shape as boots 32–34), keep the
-   build as `superseded-*-stage21-timeout` if it is replaced, then either
-   fix within the stage or, if the cause is unclear, ask the user whether
-   to dial stage 21 down.
+1. Done on 2026-10-13: the user approved the fix, and
+   `out/test-efi/usb-stage21`, `out/test-efi/driver` and `out/diag` are
+   rebuilt with `GRBM_GFX_CNTL` (snapshot 38 registers, RLC step 25 writes;
+   `ocvalidate` exit 0, 30 files). Still to do: the user runs
+   `tools/update_stick.sh 21`, shuts down fully, boots the stick and runs
+   `tools/capture_boot.sh boot-36-stage21 --gfxoff-disallow --gfx-start
+   --psp-state`. **The host reached about 85 °C during boot 35 and was still
+   near 70 °C idle on the known-good EFI afterwards, so keep the boot short
+   and be ready to power off.**
+2. Read `GRBM_GFX_CNTL` in the **check's** report first: that is its
+   cold-boot value, before any stage 21 write. If it holds a pattern rather
+   than zero, the indexed-access selector was never initialized and that is
+   the stall; if it already reads 0, the fix changes nothing.
+   - What it is: `soc15_grbm_select`'s register, `PIPEID` [1:0], `MEID`
+     [3:2], `VMID` [5:4], `QUEUEID` [10:8] (`mmGRBM_GFX_CNTL` `0x0022`, byte
+     `0x08088`). `constants_init`'s SH_MEM loop ends with
+     `soc15_grbm_select(adev, 0, 0, 0, 0, 0)`, which leaves it 0. Stage 21
+     now writes `(snapshot & ~0x7ff)` there through the snapshot-relative
+     allowlist and restores the boot value. `GRBM_READ_ERROR` reports
+     `READ_PIPEID`/`READ_MEID` in that same layout, which is why this
+     register is the candidate for the access that never answers.
+3. If it does not help, the rest of `constants_init` (`SH_MEM_CONFIG` and
+   `SH_MEM_BASES` per VMID, `init_sq_config`, `init_compute_vmid`,
+   `init_gds_vmid`) and the cleaner shader are what Linux still runs before
+   the CP start, and the user may prefer to dial stage 21 down instead
+   (stopping after the ring test, or after the fence). Offer that; do not
+   decide it.
+4. Record boot 36 in the test boot log (same shape as boots 32–35).
 
-**Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, rebuilt
-after boot 34), `out/test-efi/driver`, `out/diag`. Earlier stage 21 builds:
+**Builds:** `out/test-efi/usb-stage21` (`usb-stage21-build.json`, the boot 36
+build), `out/test-efi/driver`, `out/diag`. Earlier stage 21 builds:
 `superseded-*-stage21-stall` (boot 32), `-fetch` (boot 33), `-golden`
-(boot 34). The stage 20 builds are kept as `superseded-driver-stage20` and
-`superseded-diag-stage20`.
+(boot 34), `-timeout` (boot 35). The stage 20 builds are kept as
+`superseded-driver-stage20` and `superseded-diag-stage20`.
 
 ### Earlier: booting stage 19
 

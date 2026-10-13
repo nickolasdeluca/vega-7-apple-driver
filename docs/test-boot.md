@@ -3552,8 +3552,11 @@ the RLC and the CP started, and the CP fetched and ran commands. It then
 stalled in the clear-state preamble, and everything was restored. Boot 33:
 the stall is the CP's ring fetch waiting on memory. Boot 34, with the golden
 settings: the same stall; the PFP waits on a register read that never
-returns. Rebuilt with Linux's GRBM read timeout (`constants_init`'s first
-write) for boot 35.**
+returns. Boot 35, with Linux's GRBM read timeout (`constants_init`'s first
+write): the PFP's read now completes as an error and
+`PFP_RCIU_READ_PENDING` clears, but the CP stalls at the same dword, and
+`GRBM_READ_ERROR` does not record the read (it reads the same before the CP
+runs). See the boot 35 entry and "Next task" in [the handoff](handoff.md).**
 
 **Purpose.** This is the first time the main graphics engine (GC 9.3)
 executes commands from the driver. The user asked for visible progress, so
@@ -5396,6 +5399,92 @@ boot-34-stage21 --gfxoff-disallow --gfx-start --psp-state`; exit 1).
   register gives its address (`READ_ADDRESS`, bits 17:2) and requester
   (`READ_MEID`, `READ_PIPEID`). The boot 34 build is kept as
   `superseded-*-stage21-golden`.
+
+**Boot 35, 2026-10-13, stage 21 with the GRBM read timeout**
+(`out/test-efi/usb-stage21/`, rebuilt after boot 34; cold boot; `tools/capture_boot.sh
+boot-35-stage21 --gfxoff-disallow --gfx-start --psp-state`; exit 1).
+
+- **The write took:** `GRBM_CNTL` read `0x18` at the check, `0xff` after the
+  RLC step and `0x18` again after the restore, so `constants_init`'s first
+  write is in place and a CP register read can now time out.
+- **What changed: one bit.** `CP_STALLED_STAT2` went `0x00000020` to
+  `0x00000000`: `PFP_RCIU_READ_PENDING` is clear. The PFP's stuck register
+  read completes as an error instead of hanging.
+- **The CP is still stalled, identically:** `CP_RB0_RPTR` 152,
+  `CP_PFP_INSTR_PNTR` `0x38`, `CP_ME_INSTR_PNTR` `0xa`, `CP_CE_INSTR_PNTR`
+  `0x4c`, `CP_STAT` `0x84008200`, `GRBM_STATUS` `0xa0003028`,
+  `CP_CPF_STALLED_STAT1` `0x1` (`RING_FETCHING_DATA`), `CP_CPF_BUSY_STAT`
+  `0x2` (`CSF_RING_BUSY`), `CP_STALLED_STAT1` `0x00000c00`. Compared
+  register by register, every other value in the CP report is the same as
+  boot 34's, golden settings included.
+- **The read error register does not record the CP's read.**
+  `GRBM_READ_ERROR` reads `0x80030800` and `GRBM_READ_ERROR2` `0x00020000` at
+  **every** report, including the check's, which is before any stage 21
+  write and before the CP ran. Decoded from `gc_9_0_sh_mask.h`: `READ_ERROR`
+  (bit 31) 1, `READ_ADDRESS` (bits 17:2) `0xc200` dwords, `READ_MEID` 0,
+  `READ_PIPEID` 0, and only `READ_REQUESTER_RSMU` (bit 17) in the second
+  register. `0xc200` dwords is byte `0x30800`, which is `GRBM_GFX_INDEX`
+  (`mmGRBM_GFX_INDEX` `0x2200`, base index 1, in `gc_9_0_offset.h`; byte
+  `0x30800` in this stage's register table), and the requester list has
+  neither `CPF` nor `RLC` set.
+  Because the value never changes across the stage, it cannot be attributed
+  to the PFP's read and does not name the register that fails to answer: it
+  is a leftover or a constant on this ASIC, and this boot cannot say which.
+  The read timeout was necessary but not sufficient; releasing the read did
+  not release the pipeline.
+- **The rest is unchanged:** the nine loads, the golden settings, the RLC
+  start (24 writes), the restore of all 37 snapshot registers and the PSP
+  teardown are as in boots 32–34, and the desktop was unaffected.
+- **The host overheated.** The capture itself completed (exit 1) and wrote
+  the check, load, RLC, CP and restore reports, but the user powered off
+  instead of leaving the stalled CP running, so these readings are all that
+  boot 35 produced. The user measured about 85 °C, which they believe is near
+  the throttling point, and still close to 70 °C idle after returning to the
+  known-good EFI. A cold boot clears the CP's busy bits, as in boot 34.
+  Treat the temperature as a host observation, not a driver measurement:
+  nothing in the driver reports it, and a stalled GC spinning is the obvious
+  suspect, but this stage cannot show that.
+- **Checked against the pinned Linux v6.12** (`gfx_v9_0.c`, `soc15.c`): part C
+  matches `gfx_v9_0_cp_gfx_resume` and frame 0 matches
+  `gfx_v9_0_cp_gfx_start` dword for dword, preamble included;
+  `gfx_v9_0_init_tcp_config` returns early for GC 9.3.0; Renoir's `pg_flags`
+  are `SDMA | VCN | JPEG | VCN_DPG`, so `init_pg` writes nothing and the
+  proposal's claim holds; and `gfx_v9_0_setup_rb` only reads and stores
+  software state.
+- **One selector is still unprogrammed.** `gfx_v9_0_hw_init` runs the cleaner
+  shader, the golden registers, the whole `constants_init` and the RLC and CP
+  resumes, in that order; this stage runs only `constants_init`'s first
+  write. Inside `constants_init`, the SH_MEM loop calls
+  `soc15_grbm_select(adev, 0, 0, 0, i, 0)` for each VMID and ends with
+  `soc15_grbm_select(adev, 0, 0, 0, 0, 0)`, which leaves `GRBM_GFX_CNTL`
+  (`mmGRBM_GFX_CNTL` `0x0022`, byte `0x08088`) at zero: `PIPEID` [1:0],
+  `MEID` [3:2], `VMID` [5:4], `QUEUEID` [10:8]. `GRBM_READ_ERROR` reports
+  `READ_PIPEID` and `READ_MEID` in that same layout, so this register selects
+  the very access that hangs. Stage 21 neither reads nor writes it, and this
+  ASIC leaves unprogrammed registers holding patterns (`CP_RB0_BASE` read
+  `0xfedcbaef` at the boot 32 check).
+- **Fix (within the stage), approved by the user:** `GRBM_GFX_CNTL`
+  (`mmGRBM_GFX_CNTL` `0x0022`, byte `0x08088`) joins the state reads and the
+  snapshot, which grows to 38 registers. The RLC step programs it as
+  `constants_init`'s last `soc15_grbm_select(adev, 0, 0, 0, 0, 0)` does,
+  `(snapshot & ~0x7ff) | 0`, clearing `PIPEID`, `MEID`, `VMID` and `QUEUEID`
+  through the snapshot-relative allowlist, and the restore writes the boot
+  value back. It is the last entry of `kGfxWrites`, so it runs directly after
+  `GRBM_CNTL.READ_TIMEOUT` as in `constants_init`, and the RLC step makes 25
+  writes. No new page set: byte `0x08088` is inside the `0x8000` page, and the
+  test that every snapshot register is paged checks it. The core test presets
+  the register to `0xfedcbaef`, the pattern unprogrammed registers hold, and
+  checks the read-modify-write (`0xfedcb800` written, `0x7ff` cleared), the
+  write order and the restore.
+
+- **Next:** `out/test-efi/usb-stage21`, `out/test-efi/driver` and `out/diag`
+  are rebuilt with that change (`ocvalidate` exit 0, 30 files). The user runs
+  `tools/update_stick.sh 21`, cold boots and runs `tools/capture_boot.sh
+  boot-36-stage21 --gfxoff-disallow --gfx-start --psp-state`. What to read
+  first: `GRBM_GFX_CNTL` in the check's report. If it holds a pattern rather
+  than zero, the selector was never initialized and that is the stall; if it
+  already reads 0, this fix changes nothing and the remaining `constants_init`
+  work is next. The boot 35 builds are kept as `superseded-*-stage21-timeout`.
 
 ## Unknowns and limits
 
