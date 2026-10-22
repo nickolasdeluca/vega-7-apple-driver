@@ -70,6 +70,14 @@ Experimental booting is available only through the USB test EFI in
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS
   volume, or load it with `kmutil`. The user performs disk, EFI and reboot steps.
+- **Exception, Metal track M1 (approved by the user 2026-10-22):** during an M1
+  test boot only (the test EFI with `cezanne-metal=1` and relaxed SIP, see
+  [docs/test-boot.md](docs/test-boot.md)), `tools/capture_m1.sh` may install
+  `CezanneMTLDriver.bundle` into `/Library/GPUBundles` on the data volume and
+  must remove it before the run ends. Relaxed SIP (`csr-active-config`) is set
+  only by the test EFI, which `tools/test_efi.py` builds; the known-good boot
+  keeps `00000000` and resets it each boot. The internal EFI, the sealed
+  system volume and `kmutil` stay off limits.
 - Use read-only OS queries. Tools may write reports and build artifacts inside
   the repository or a requested output directory, but must not mutate graphics
   or system configuration. Do not use privileged probes to bypass restrictions.

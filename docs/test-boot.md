@@ -3983,9 +3983,10 @@ registers. The tool prints them.
   the shader stage as the proposal said. The proposal is kept as approved,
   and the change is recorded in the boot 33 entry.
 
-### Metal track M1: does Metal admit our own device? (proposal, 2026-10-22)
+### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 
-**Not approved yet; nothing below is built.** The user chose, after the
+**Approved by the user on 2026-10-22, together with the AGENTS.md exception,
+and implemented; see "M1 implementation and boot steps" below.** The user chose, after the
 [Metal runtime study](metal-runtime.md), to relax code-signing enforcement in
 an experimental environment, so that our own Metal driver bundle can be
 loaded at all. This proposal defines that environment and its first
@@ -4060,11 +4061,9 @@ test boot offline and run nothing but the M1 steps.
    `newComputePipelineStateWithFunction:` on the `store_index` kernel. It
    reports devices, classes, errors and the bundle's message log as JSON.
 4. **Install and removal**, run by the user in the M1 test boot, because only
-   then is `/Library/GPUBundles` writable:
-   `sudo ditto out/metal-m1/CezanneMTLDriver.bundle
-   /Library/GPUBundles/CezanneMTLDriver.bundle`, and at the end
-   `sudo rm -rf /Library/GPUBundles/CezanneMTLDriver.bundle`, then
-   `ls -la /Library/GPUBundles` to confirm it is empty. If the bundle stayed
+   then is `/Library/GPUBundles` writable. `tools/capture_m1.sh` does both
+   (`sudo ditto` in, `sudo rm -rf` out, then `ls -la /Library/GPUBundles`), and
+   arms the removal before the install so that it runs even if a step fails. If the bundle stayed
    behind, the known-good boot would ignore it: nothing there names
    `CezanneMTLDriver`, and its trust check fails with SIP enabled. It should
    still be removed in the next M1 boot.
@@ -4091,6 +4090,58 @@ off limits.
 - Every M1 boot ends with the removal step, and the next known-good boot is
   checked with `csrutil status` (expect enabled) and `nvram boot-args` (expect
   `-NRedRBPlus`).
+
+#### M1 implementation and boot steps
+
+**Built 2026-10-22:**
+- `CezanneGPU.kext` (`out/test-efi/driver-m1`): `cezanne-metal=1` plus
+  `cezanne-stage=0` publishes `CezanneAccelerator : IOAccelerator` with the two
+  plugin properties. At any other stage the node is refused, and the reason is
+  published as `CezanneGPU M1`. The new dependency is `IOGraphicsFamily`
+  `1.0.0b1`. `kmutil libraries -p` resolves the three `IOAccelerator` imports
+  there (version 600, compatible version `1.0.0b1`).
+- `driver/metal/` builds `CezanneMTLDriver.bundle` (`out/metal-m1/`, signed ad
+  hoc). The class `CezanneMtlDevice` is created at load time on
+  `_MTLDevice`. Every unimplemented message is logged (`CezanneM1:` in the
+  unified log, or `CEZANNE_M1_LOG`) and answered nil/0.
+- `tools/metal_admission_probe.m` (`out/metal-m1/metal-admission-probe`).
+- `tools/test_efi.py build … --stage 0 --m1 RUNG` built
+  `out/test-efi/usb-m1-rung1` (`csr-active-config` `02000000`) and
+  `usb-m1-rung2` (`67000000`). Each changes exactly the four usual values plus
+  `csr-active-config`; `ocvalidate` exit 0; 30 files.
+- `tools/update_stick.sh m1-1` / `m1-2` copy them, and `tools/capture_m1.sh`
+  runs an M1 boot.
+
+**Local pre-check, before any boot (our own process, known-good boot):**
+`metal-admission-probe --load-bundle out/metal-m1/CezanneMTLDriver.bundle`
+loads the bundle directly, bypassing Metal's resolver and its trust check. It
+gave:
+- `principal_class` `CezanneMtlDevice`, a subclass of `_MTLDevice`;
+  `initWithAcceleratorPort:0` constructs it, and `[_MTLDevice init]` returns
+  the object;
+- **`newLibraryWithSource:` succeeds on our device.** `MTLCompilerService`
+  logs `MTLBuildLibraryFromSourceToArchive` for the probe (MSL → AIR), and the
+  only vendor message during that is **`featureProfile`** (sent 5 times,
+  answered 0);
+- **`newComputePipelineStateWithFunction:` returns nil with no error, sends our
+  device no message, and reaches no compiler service.** So `_MTLDevice` does
+  not build pipelines itself: the vendor class does, and that is where an AMD
+  device calls AMD's compiler in the service. A device of ours could compile AIR
+  with its own backend in its own process at that point.
+
+So the post-admission side already works in-process. **What M1 still has to
+show is admission itself:** Metal's resolver finding our bundle in
+`/Library/GPUBundles` and its trust check accepting it under relaxed SIP.
+
+**Boot steps (rung 1 first):**
+1. `tools/update_stick.sh m1-1`, then shut down fully and boot the stick.
+2. In macOS on the stick: `tools/capture_m1.sh boot-39-m1-rung1`. It asks for
+   the sudo password for the install and the removal, prints the probe's JSON
+   and saves everything into `out/test-efi/boot-39-m1-rung1/`.
+3. Shut down fully and boot the normal EFI. Check `csrutil status` (enabled)
+   and `nvram boot-args` (`-NRedRBPlus`).
+4. If rung 1 reports "found but refused" or "not found", repeat with `m1-2`
+   and `boot-40-m1-rung2`.
 
 #### Not in M1
 

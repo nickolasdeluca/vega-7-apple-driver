@@ -214,7 +214,11 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    The user chose to relax code signing in an experimental environment; the
    proposal is **Metal track M1** in [test-boot.md](test-boot.md) (relaxed
    SIP on the test EFI only, our bundle in `/Library/GPUBundles`, an
-   AGENTS.md amendment). **Awaiting approval; nothing built.**
+   AGENTS.md amendment). **Approved and built 2026-10-22**: next is boot 39,
+   `tools/update_stick.sh m1-1` then `tools/capture_m1.sh boot-39-m1-rung1`
+   (steps in test-boot.md, "M1 implementation and boot steps"). A local
+   pre-check already showed MSL → AIR working on our device class in-process,
+   with pipeline creation left to the vendor class.
 4. **Stage 22, only if the user wants more boots.** Its proposal is the ring
    test and fence 1 resumed; chasing the stall means the rest of
    `constants_init` (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID,
@@ -259,7 +263,7 @@ stage 21 proposal, implementation notes and boot 32–37 entries in
   than deciding it.
 - Commits: small verified batches, no agent co-author trailer, firmware and
   raw captures never tracked. Run the full suite before committing
-  (75 tests since the Metal runtime probe; see "Verification record and
+  (81 tests since Metal track M1; see "Verification record and
   commands").
 
 Boots 32–37 (2026-10-07 and 2026-10-13; [test boot
