@@ -5,8 +5,8 @@
 // authorized in docs/test-boot.md.
 //
 //   Stage 0: attach and record the registry's PCI identity. No device access.
-//   Metal track M1 (cezanne-metal=1, only with stage 0): also publish a
-//            CezanneAccelerator node naming our Metal bundle. No device access.
+//   Metal track M1 (cezanne-metal=1, only with stage 0): also publish an
+//            IOAccelerator node naming our Metal bundle. No device access.
 //   Stage 1: also read PCI configuration space, then, only if the device is
 //            already in D0 with memory decoding on, map the register BAR
 //            read-only and read the two boot-state registers the core allows.
@@ -88,9 +88,9 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOWorkLoop.h>
-#include <IOKit/graphics/IOAccelerator.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <kern/clock.h>
+#include <kern/thread.h>
 #include <libkern/OSAtomic.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSNumber.h>
@@ -387,20 +387,23 @@ private:
     cezanne::Status runStage3(Aperture *aperture, const cezanne::Discovery &discovery);
     cezanne::Status copyDiscovery(UInt64 physical);
     IOService *metalNode_ = nullptr; // Metal track M1
+    bool metalStopping_ = false; // re-read each wait: the loop calls IOSleep
     void publishMetalNode();
+    void createMetalNode();
+    static void metalNodeThread(void *argument, wait_result_t);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPU, IOService)
 
 // Metal track M1 (docs/test-boot.md): an IOAccelerator node that only names
 // our Metal bundle, so Metal's resolver can look for it. It touches no
-// register and offers no user client.
-class CezanneAccelerator : public IOAccelerator {
-    OSDeclareDefaultStructors(CezanneAccelerator)
-};
-
-OSDefineMetaClassAndStructors(CezanneAccelerator, IOAccelerator)
-
+// register and offers no user client. IOAccelerator lives in
+// IOGraphicsFamily, which is in the system kernel collection; OpenCore injects
+// this kext into the boot collection, where a link dependency on it cannot
+// resolve and the kext does not load (boot 39). So the node is created by
+// class name, from a thread that waits for IOGraphicsFamily to load.
+static const char *const kMetalNodeClass = "IOAccelerator";
+static const unsigned kMetalWaitSeconds = 120;
 static const char *const kMetalPluginName = "CezanneMTLDriver";
 static const char *const kMetalPluginClassName = "CezanneMtlDevice";
 
@@ -755,10 +758,49 @@ void CezanneGPU::publishMetalNode()
         setProperty("CezanneGPU M1", "refused: stage is not 0");
         return;
     }
-    CezanneAccelerator *node = OSTypeAlloc(CezanneAccelerator);
-    if (node == nullptr || !node->init()) {
-        OSSafeReleaseNULL(node);
-        setProperty("CezanneGPU M1", "node allocation failed");
+    // The thread holds a reference on the driver until it finishes.
+    retain();
+    thread_t thread = nullptr;
+    if (kernel_thread_start(metalNodeThread, this, &thread) != KERN_SUCCESS) {
+        release();
+        setProperty("CezanneGPU M1", "thread start failed");
+        return;
+    }
+    thread_deallocate(thread);
+    setProperty("CezanneGPU M1", "waiting for the IOAccelerator class");
+}
+
+void CezanneGPU::metalNodeThread(void *argument, wait_result_t)
+{
+    CezanneGPU *self = static_cast<CezanneGPU *>(argument);
+    self->createMetalNode();
+    self->release();
+    thread_terminate(current_thread());
+}
+
+void CezanneGPU::createMetalNode()
+{
+    OSObject *object = nullptr;
+    unsigned waited = 0;
+    while (!metalStopping_ && waited < kMetalWaitSeconds) {
+        object = OSMetaClass::allocClassWithName(kMetalNodeClass);
+        if (object != nullptr) {
+            break;
+        }
+        IOSleep(1000);
+        waited++;
+    }
+    publish("M1 wait seconds", waited, 32);
+    IOService *node = OSDynamicCast(IOService, object);
+    if (node == nullptr || metalStopping_) {
+        OSSafeReleaseNULL(object);
+        setProperty("CezanneGPU M1", "the IOAccelerator class did not appear");
+        IOLog(LOG_PREFIX "M1: no IOAccelerator class after %u s\n", waited);
+        return;
+    }
+    if (!node->init()) {
+        node->release();
+        setProperty("CezanneGPU M1", "node init failed");
         return;
     }
     node->setProperty("MetalPluginName", kMetalPluginName);
@@ -778,8 +820,8 @@ void CezanneGPU::publishMetalNode()
     node->registerService();
     metalNode_ = node;
     setProperty("CezanneGPU M1", "node published");
-    IOLog(LOG_PREFIX "M1: published CezanneAccelerator (MetalPluginName %s, class %s)\n", kMetalPluginName,
-          kMetalPluginClassName);
+    IOLog(LOG_PREFIX "M1: published an IOAccelerator after %u s (MetalPluginName %s, class %s)\n", waited,
+          kMetalPluginName, kMetalPluginClassName);
 }
 
 void CezanneGPU::free()
@@ -4494,6 +4536,7 @@ IOReturn CezanneGPU::newUserClient(task_t owningTask, void *securityID, UInt32 t
 void CezanneGPU::stop(IOService *provider)
 {
     IOLog(LOG_PREFIX "stopping\n");
+    metalStopping_ = true;
     if (metalNode_ != nullptr) {
         metalNode_->stop(this);
         metalNode_->detach(this);

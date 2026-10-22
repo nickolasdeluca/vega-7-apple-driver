@@ -48,9 +48,11 @@ DIRECT_CALLS = {"___stack_chk_fail", "__ZN11OSMetaClassC2EPKcPKS_j", "__ZN11OSMe
                 "__ZN28IOFilterInterruptEventSource26filterInterruptEventSourceEP8OSObjectPFvS1_"
                 "P22IOInterruptEventSourceiEPFbS1_PS_EP9IOServicei",
                 "_OSAddAtomic", "_OSIncrementAtomic", "_mach_absolute_time", "_absolutetime_to_nanoseconds",
-                # Metal track M1: the CezanneAccelerator node's construction.
-                "__ZN13IOAcceleratorC2EPK11OSMetaClass", "__ZN13IOAcceleratorD2Ev"}
-OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU", "__ZN20CezanneGPUUserClient", "__ZN18CezanneAccelerator")
+                # Metal track M1: the IOAccelerator node, created by class name
+                # from a thread that waits for IOGraphicsFamily.
+                "__ZN11OSMetaClass18allocClassWithNameEPKc", "_kernel_thread_start", "_thread_deallocate",
+                "_thread_terminate", "_current_thread"}
+OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU", "__ZN20CezanneGPUUserClient")
 
 
 def strip_comments(source):
@@ -438,7 +440,10 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn('PE_parse_boot_argn("cezanne-metal"', source)
         self.assertIn("if (stage_ != 0) {", source[source.index("void CezanneGPU::publishMetalNode()"):])
         self.assertEqual(personality.get("IOClass"), "CezanneGPU")
-        self.assertEqual(info["OSBundleLibraries"].get("com.apple.iokit.IOGraphicsFamily"), "1.0.0b1")
+        # Boot 39: OpenCore injects into the boot kernel collection, so no
+        # library may live only in the system collection (IOGraphicsFamily does).
+        self.assertNotIn("com.apple.iokit.IOGraphicsFamily", info["OSBundleLibraries"])
+        self.assertIn('allocClassWithName(kMetalNodeClass)', source)
         header = (CORE / "cezanne_core.h").read_text()
         self.assertRegex(header, r"const uint32_t kMaxStage = 21;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
@@ -521,6 +526,10 @@ class KextBuildTests(unittest.TestCase):
                                   text=True, timeout=180)
         self.assertEqual(resolved.returncode, 0, resolved.stderr)
         rows = dict(re.findall(r"^\t\t(\S+) in .*: (\S+) \(", resolved.stdout, re.M))
+        # OpenCore injects the kext into the boot kernel collection; a symbol
+        # found only in the system collection does not resolve at boot (boot 39).
+        places = set(re.findall(r"^\t\t\S+ in (\S+?):", resolved.stdout, re.M))
+        self.assertEqual(sorted(p for p in places if "SystemKernelExtensions" in p), [])
         self.assertTrue(undefined)
         self.assertEqual(sorted(set(undefined) - set(rows)), [])
         declared = plistlib.loads((self.kext / "Contents" / "Info.plist").read_bytes())["OSBundleLibraries"]

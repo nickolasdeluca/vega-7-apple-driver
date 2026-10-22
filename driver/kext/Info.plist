@@ -34,8 +34,6 @@
 	</dict>
 	<key>OSBundleLibraries</key>
 	<dict>
-		<key>com.apple.iokit.IOGraphicsFamily</key>
-		<string>1.0.0b1</string>
 		<key>com.apple.iokit.IOPCIFamily</key>
 		<string>2.9</string>
 		<key>com.apple.kpi.iokit</key>
