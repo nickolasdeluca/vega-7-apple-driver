@@ -62,9 +62,10 @@ Experimental booting is available only through the USB test EFI in
   the carveout and back, on request; and stage 20, SDMA0 filling that pattern
   region and HUBP0's flip interrupt delivered through the IH ring as an MSI
   while the pattern is shown, then a restore, on request; and stage 21, the
-  GFX firmware load through the PSP, the RLC and CP start, a ring test, a
-  fence and CP DMA fills shown on pipe 0, then every GC register written back
-  to the value the check read, on request).
+  GFX firmware load through the PSP, the RLC start and the CP start, then
+  every GC register written back to the value the check read, on request;
+  dialled down on 2026-10-13, so its ring test, fence and CP DMA fills move to
+  a stage 22 that needs its own approval).
   Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS

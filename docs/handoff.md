@@ -6,8 +6,8 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current checkpoint, 2026-10-07, branch `cezanne-discovery`: **driver stages
-0–20 succeeded on the USB test EFI** (boots 1–31; see the
+Current checkpoint, 2026-10-22, branch `cezanne-discovery`: **driver stages
+0–21 succeeded on the USB test EFI**, stage 21 as dialled down (boots 1–38; see the
 [test boot log](test-boot.md#test-boot-log)). The driver can do the
 following:
 - read the GPU, the discovery table and the engine state;
@@ -23,7 +23,9 @@ following:
 - show its own test pattern on display pipe 0 by flipping the surface
   address, then flip back (boot 28);
 - have SDMA0 draw that surface, then flip to it with HUBP0's flip interrupt
-  arriving as an MSI, then flip back (boot 31).
+  arriving as an MSI, then flip back (boot 31);
+- load the GFX firmware, start the RLC and start the CP, which fetches 152
+  dwords of the clear-state preamble before it stalls (boot 38).
 
 Stage 17 (GART and the IH ring) succeeded in boot 25: an SDMA copy read
 through a driver-built GART page table, its trap arrived in IH ring 0, and
@@ -40,8 +42,8 @@ graphics engine: firmware, RLC, CP, ring test, fence, CP drawing) is
 approved and implemented, and dialled down on 2026-10-13 to end at the CP
 start: the nine GFX images load through the PSP, the RLC starts, and the CP
 starts and fetches 152 dwords of the clear-state preamble before it stops
-(boots 32–37). The ring test, fence, drawing and verify are deferred to stage
-22. See "Next task" below. The sections that follow are the earlier discovery
+(boots 32–37). Boot 38 (2026-10-22) is its first clean pass, exit 0. The
+ring test, fence, drawing and verify are deferred to stage 22. See "Next task" below. The sections that follow are the earlier discovery
 record and still apply.
 
 Completed work:
@@ -161,7 +163,9 @@ The user paused the project here on purpose. The user runs every boot; boots
 are expensive on this host (about 85 °C during a stalled boot, still near
 70 °C idle afterwards). Work that needs no boot should be done first.
 
-1. **Finish boot 38 (the last outstanding hardware step).** It is built and
+1. **Done: boot 38 succeeded (2026-10-22, exit 0)**; see the test boot log.
+   It showed the PFP read outcome is racy rather than caused by the
+   `GRBM_READ_ERROR` write. Original step, for the record: it was built and
    waiting: the user runs `tools/update_stick.sh 21`, shuts down fully, boots
    the stick, and runs `tools/capture_boot.sh boot-38-stage21 --gfxoff-disallow
    --gfx-start --psp-state`. This should be the **first exit 0** for stage 21
@@ -210,7 +214,7 @@ are expensive on this host (about 85 °C during a stalled boot, still near
   skips when `ioreg -r -c CezanneGPU` finds the kext loaded. It is expected on
   the test EFI and passes on the known-good boot; it is not a defect.
 
-## Next task: boot 38, the first clean pass for the dialled-down stage 21
+## Last task: boot 38, the first clean pass for the dialled-down stage 21 (done)
 
 **Resuming in a new session.** Read [AGENTS.md](../AGENTS.md), then the
 stage 21 proposal, implementation notes and boot 32–37 entries in
@@ -249,7 +253,7 @@ tried and ruled out, each with evidence:
 
 The user then dialled the stage down. Steps:
 
-1. **Boot 38, built and waiting:** `out/test-efi/usb-stage21`,
+1. **Boot 38, done 2026-10-22 (exit 0):** `out/test-efi/usb-stage21`,
    `out/test-efi/driver` and `out/diag` are rebuilt for the dialled-down stage
    (`ocvalidate` exit 0, 30 files). The user runs `tools/update_stick.sh 21`,
    shuts down fully, boots the stick and runs `tools/capture_boot.sh

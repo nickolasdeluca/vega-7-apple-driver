@@ -5644,6 +5644,49 @@ rebuilt after boot 36; cold boot; `tools/capture_boot.sh boot-37-stage21
   is offered, not decided.
 - Captures are in ignored `out/test-efi/boot-37-stage21/`.
 
+**Boot 38, 2026-10-22, stage 21 dialled down to the CP start** (`out/test-efi/usb-stage21/`,
+the dial-down build; cold boot; `tools/capture_boot.sh boot-38-stage21
+--gfxoff-disallow --gfx-start --psp-state`; **exit 0**).
+
+- **Stage 21 succeeded as dialled down: the first exit 0 for this stage.**
+  All five steps report `ok`: the check, the nine loads (`LOAD_IP_FW` frames
+  1–9, last fence 10, status 0), the RLC start (26 writes, serdes CU and NONCU
+  0), the CP start (15 writes) and the restore (flip back ok), then the PSP
+  teardown (`DESTROY_TMR` fence 11, status 0; `DESTROY_RINGS` ok).
+- **The CP stops at the same place as in boots 32–37.** The CP report's dump
+  reads `CP_RB0_RPTR` `0x98` (152), with the same instruction pointers (PFP
+  `0x38`, ME `0x0a`, CE `0x4c`), `CP_STALLED_STAT1` `0xc00`, no
+  `CP_GFX_ERROR`, no UTCL1 or GC protection fault, and the read-pointer
+  write-back still 0.
+- **The summary's `CP_RB0_RPTR 128` is an earlier reading, not the stall
+  point.** `startCp` returns on the first non-zero `CP_RB0_RPTR`, which here
+  caught the CP mid-fetch at 128; the dump, read a moment later, shows where
+  it stopped (152). So the summary number is "the CP was fetching", and the
+  dump's `CP_RB0_RPTR` is "how far it got". Not a hardware finding, and the
+  pass condition is unaffected; it is recorded so the 128 is not read as a
+  change in the stall. Making the summary wait for the pointer to settle would
+  need another boot to check and adds nothing the dump does not already show,
+  so it is left as is.
+- **Boot 37's open question is answered: the PFP's read outcome is racy, not
+  caused by the `GRBM_READ_ERROR` write.** This build still issues that write
+  (the RLC step's 26th), yet `CP_STALLED_STAT2` reads `0x0` and `CP_STAT`
+  `0x84808200` (`RCIU_BUSY` set), as in boots 35 and 36: the read completed,
+  as an error, and the pipeline still did not release. With the write, the
+  read hung in boot 37 and completed here. `GRBM_READ_ERROR` still reads
+  `0x80030800` throughout, consistent with a constant.
+- **The restore is exact.** All 39 snapshot registers read back at the
+  check's values (compared one by one). The status registers outside the
+  snapshot stay busy after the restore (`GRBM_STATUS` `0xa0003028`, `CP_STAT`
+  `0x84008200`, `CP_STALLED_STAT1` `0xc00`), exactly as after the restore in
+  boots 36 and 37: halting the CP and stopping the RLC leaves the stalled
+  front end as it was, and only a GC reset would clear it. The final dump
+  shows the CP ring registers back at 0.
+- **What stage 21 now proves**, per its revision: the nine GFX images load
+  through the PSP, the RLC starts, and the CP starts, reads our ring from VRAM
+  through the GFXHUB and executes 152 of the 1024 dwords of the clear-state
+  preamble. Not proven: any command run to completion, a fence, a CP DMA.
+- Captures are in ignored `out/test-efi/boot-38-stage21/`.
+
 ## Unknowns and limits
 
 - The firmware lists both partitions `eraseDisk … GPT` creates. Partition 1 is
