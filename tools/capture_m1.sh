@@ -8,14 +8,15 @@
 # empty. The removal runs even if an earlier step fails. It writes only inside
 # the new folder and /Library/GPUBundles/CezanneMTLDriver.bundle.
 # Usage: tools/capture_m1.sh NAME   e.g. tools/capture_m1.sh boot-39-m1-rung1
+#        A further run in the same boot adds -runK: boot-40-m1-rung1-run3
 set -u -o pipefail
 [ $# -eq 1 ] || { echo "usage: $0 NAME" >&2; exit 2; }
 case $1 in
-boot-[0-9]*-m1-rung[12]) ;;
-*) echo "name must look like boot-N-m1-rungR: $1" >&2; exit 2 ;;
+boot-[0-9]*-m1-rung[12] | boot-[0-9]*-m1-rung[12]-run[0-9]*) ;;
+*) echo "name must look like boot-N-m1-rungR or boot-N-m1-rungR-runK: $1" >&2; exit 2 ;;
 esac
 case $1 in
-*[!a-z0-9-]*) echo "name must look like boot-N-m1-rungR: $1" >&2; exit 2 ;;
+*[!a-z0-9-]*) echo "name must look like boot-N-m1-rungR or boot-N-m1-rungR-runK: $1" >&2; exit 2 ;;
 esac
 root=$(cd "$(dirname "$0")/.." && pwd)
 bundle="$root/out/metal-m1/CezanneMTLDriver.bundle"

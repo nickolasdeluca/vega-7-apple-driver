@@ -102,6 +102,14 @@ __attribute__((constructor)) static void registerDeviceClass(void)
     class_addMethod(cls, @selector(forwardInvocation:), (IMP)forwardInvocation, "v24@0:8@16");
     class_addMethod(object_getClass((id)cls), @selector(resolveInstanceMethod:), (IMP)resolveInstanceMethod,
                     "c24@0:8:16");
+    // MTLAddDevice asserts conformance to MTLDevice (boot 40) and then to
+    // MTLDeviceSPI (boot 41, which inherits MTLDevice). Neither _MTLDevice nor
+    // MTLIOAccelDevice declares a protocol; vendor classes do. Taken from the
+    // runtime so the bundle need not link Metal.
+    Protocol *device = objc_getProtocol("MTLDeviceSPI");
+    if (device == NULL || !class_addProtocol(cls, device)) {
+        record(@"load: could not add the MTLDeviceSPI protocol");
+    }
     objc_registerClassPair(cls);
     record([NSString stringWithFormat:@"load: CezanneMtlDevice registered on %@ in pid %d", NSStringFromClass(gSuper),
                                       getpid()]);

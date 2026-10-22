@@ -85,6 +85,10 @@ int main(int argc, const char *argv[])
             Class base = objc_getClass("_MTLDevice");
             out[@"principal_class"] = cls ? NSStringFromClass(cls) : [NSNull null];
             out[@"is_mtldevice_subclass"] = @(cls != Nil && base != Nil && [cls isSubclassOfClass:base]);
+            // MTLAddDevice asserts both (boots 40 and 41).
+            out[@"conforms_to_mtldevice"] = @(cls != Nil && [cls conformsToProtocol:@protocol(MTLDevice)]);
+            Protocol *spi = objc_getProtocol("MTLDeviceSPI");
+            out[@"conforms_to_mtldevicespi"] = @(cls != Nil && spi != NULL && [cls conformsToProtocol:spi]);
             if (cls == Nil) {
                 emit(out);
                 return 1;

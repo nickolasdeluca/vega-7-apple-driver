@@ -54,6 +54,8 @@ class BundleAndProbeTests(unittest.TestCase):
             result = json.loads(run.stdout)
             self.assertEqual(result["principal_class"], "CezanneMtlDevice")
             self.assertTrue(result["is_mtldevice_subclass"])
+            self.assertTrue(result["conforms_to_mtldevice"])  # MTLAddDevice asserts it (boot 40)
+            self.assertTrue(result["conforms_to_mtldevicespi"])  # and this (boot 41)
             self.assertTrue(result["constructed"].startswith("CezanneMtlDevice"))
             lines = log.read_text().splitlines()
             self.assertTrue(any(l.startswith("load: CezanneMtlDevice registered on _MTLDevice") for l in lines))
