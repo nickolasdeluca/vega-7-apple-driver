@@ -53,6 +53,17 @@ driver internally. Exit 2 means no device was returned; inspect stderr and
 execution restrictions before interpreting that result. The working stack is
 an observation reference; its AMD binaries are excluded from the finished stack.
 
+## Lower AIR to gfx90c (offline prototype)
+
+```sh
+python3 tools/air_lower.py [--kernel NAME] kernel.air.ll kernel.amdgpu.ll
+```
+
+This rewrites AIR, as LLVM 20's `llvm-dis` prints Apple's `metal -c` output,
+into an `amdgcn-amd-amdhsa` module that public LLVM compiles for gfx90c.
+Compute kernels only; unsupported features are refused by name. It loads and
+dispatches nothing; see the [Metal frontend study](docs/metal-frontend.md).
+
 ## Check firmware headers
 
 ```sh

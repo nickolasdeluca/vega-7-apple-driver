@@ -5,8 +5,9 @@ This study answers the open half of the offline shader boundary study in the
 toolchain emits for one fixed MSL compute kernel, and what an independent
 backend for the Cezanne graphics core (`gfx90c`, see the
 [shader target study](shader-target.md)) would still lack. Nothing was loaded,
-dispatched or run on the GPU, no device library was created, and AIR was not
-translated to any GPU ISA.
+dispatched or run on the GPU, and no device library was created through Apple's
+AMD plugin. AIR was first translated, with public LLVM only, in the later
+[AIR lowering prototype](#air-lowering-prototype).
 
 **Result, in short:**
 - The public toolchain emits **AIR: LLVM bitcode with Apple metadata**, and the
@@ -293,6 +294,88 @@ for `v_main`). Which parameter is what lives only in metadata:
   flags, atomic scopes, the texture access code, the trailing `i1`s). Pinning
   them needs more variants of the same source, not reverse engineering.
 
+## AIR lowering prototype
+
+Added 2026-10-22 at the user's request: the first step that translates AIR.
+Still offline, still our own source, still public tools only: Apple's toolchain
+produces the `.air`, and from there everything is LLVM 20.1.7 and this
+repository. Nothing was loaded, dispatched or run; **compiling is not
+executing**, and none of the kernels below has been checked against a CPU
+reference on hardware.
+
+**The tool** is [`tools/air_lower.py`](../tools/air_lower.py). It reads AIR as
+LLVM 20's `llvm-dis` prints it and writes an `amdgcn-amd-amdhsa` module:
+
+1. Drops AIR's data layout, sets the AMDGPU triple, removes the `air.*` named
+   metadata, renumbers address space 2 to 4, and moves every `alloca` to
+   address space 5 behind an `addrspacecast` to a generic pointer (AIR's
+   address space 0 becomes AMDGPU's flat space).
+2. Renames each kernel to an internal, always-inline `@__air.<name>` and adds an
+   `amdgpu_kernel` wrapper with the original name that computes the built-ins
+   and calls it.
+3. Replaces each called `air.*` declaration with an LLVM IR definition from a
+   small library (barriers, relaxed atomics, math, conversions), and drops
+   declarations nobody calls.
+4. Refuses everything else by name: textures, samplers, argument buffers,
+   SIMD-group operations, non-relaxed atomics, precise `pow`, and vertex and
+   fragment functions. `--kernel NAME` lowers one kernel and drops the others.
+
+**The kernel ABI is the prototype's own choice**, since Apple's is not
+available and does not apply to this driver:
+
+| Item | Choice |
+| --- | --- |
+| Buffer slot *n* | the pointer at kernarg offset 8*n*; unused lower slots keep their place (`k_math`'s slot 1 is `constant`, so its parameter is `ptr addrspace(4)`) |
+| Positions | `llvm.amdgcn.workitem.id` and `workgroup.id`; grid position = workgroup ID × workgroup size + local ID |
+| Sizes | the HSA dispatch packet (`llvm.amdgcn.dispatch.ptr`): workgroup size as `u16` at 4/6/8, grid size as `u32` at 12/16/20. **The driver must therefore supply a dispatch packet** and enable the dispatch pointer in the kernel's user SGPRs |
+| SIMD-group | width 64; lane from `mbcnt.lo`/`mbcnt.hi`; group index = linear local ID / 64 |
+| Threadgroup buffer | at most one, as LLVM's dynamic LDS (`external addrspace(3) global [0 x i8]`). **LLVM places it after the static LDS**: in `k_threadgroup` the 64-float static array takes 256 bytes and the dynamic buffer is addressed from `0x100`. The driver must allocate `.group_segment_fixed_size` plus the dispatch's size |
+| Atomics | relaxed only: `atomicrmw`/`cmpxchg … monotonic` at `agent` scope for device memory and `workgroup` for threadgroup. `cmpxchg.weak` returns the old value and stores it to `*expected`; a probe kernel showed that the caller compares that return with its own expected value to form MSL's `bool` |
+| Barriers | `wg.barrier`: workgroup-scope release fence, `s_barrier`, acquire fence (flags ignored, so always the strongest form); `simdgroup.barrier`: the same at wavefront scope around `wave.barrier` |
+
+**Pipeline** (`out/metal-frontend/lowering/run.sh`, every step captured with
+arguments, output and exit status): `llvm-dis` → `air_lower.py` → `opt -O2
+-mcpu=gfx90c` → `llc -mcpu=gfx90c -filetype=obj` → `ld.lld -shared` →
+`llvm-readelf --notes` and `llvm-objdump -d`.
+
+**Results.** Every compute kernel the prototype claims to support compiles to a
+gfx90c code object; the unsupported ones are refused with the reason:
+
+| Kernel | Result | Instructions | SGPRs / VGPRs | Kernarg | Static LDS | What the ISA shows |
+| --- | --- | --- | --- | --- | --- | --- |
+| `store_index` | code object | 13 | 13 / 4 | 8 | 0 | dispatch packet `u16` load (`s_and_b32 … 0xffff`), `s_mul_i32` workgroup × size, `v_add_u32` local ID, 64-bit address, `global_store_dword` |
+| `k_builtins` | code object | 24 | 14 / 7 | 8 | 0 | `v_mbcnt_lo/hi` lane, `v_mad_*` linear IDs, one `global_store_dwordx4` |
+| `k_threadgroup` | code object | 35 | 13 / 8 | 8 | 256 | `ds_write_b32` ×2, `s_barrier`, `ds_read_b32` ×2, `s_barrier` |
+| `k_atomics` | code object | 63 | 18 / 5 | 24 | 0 | `global_atomic_add`, `global_atomic_smax`, `global_atomic_cmpswap` ×2 (the float add has no native GFX9 instruction and becomes a compare-swap loop; the second is the `cmpxchg`), `ds_wrxchg_rtn_b32`; LLVM's atomic optimizer added wave-level aggregation (`v_mbcnt`) |
+| `k_math` | code object | 203 | 14 / 39 | 16 | 0 | `v_sin_f32`, `v_exp_f32`, `v_log_f32`, `v_rsq_f32`, `v_sqrt_f32`, `v_floor_f32`, `v_fma_f32`, `v_cvt_f16_f32`/`v_cvt_f32_f16`, ×4 lanes each |
+| `k_simd` | refused | | | | | `air.simd_any` (SIMD-group operations need a DPP/permute library) |
+| `k_texture` | refused | | | | | argument kind `air.texture` |
+| `v_main` | refused | | | | | vertex functions |
+
+**Tests:** [`tests/test_air_lower.py`](../tests/test_air_lower.py) runs the
+lowering on fixed AIR text (no Apple toolchain needed) and, when the study's
+LLVM 20.1.7 is present under `out/shader-target/`, assembles the output with
+`llvm-as`, which runs the IR verifier. A mutation check (dropping the
+`addrspace(5)` from the `alloca` rewrite) fails the suite.
+
+**What this establishes, and what it does not.**
+- Established: for compute kernels using buffers, threadgroup memory, the
+  compute built-ins, barriers, relaxed atomics and fast math, AIR from Apple's
+  public frontend can be turned into gfx90c code with public LLVM and about 440
+  lines of Python. No Apple binary was inspected to do it.
+- Not established: that any of this code is correct on the GPU. The ISA was
+  read, not run. Running it needs the driver to dispatch compute, which stage
+  21 has not reached (the CP stalls in the clear-state preamble), and then a CPU
+  reference comparison, which is stage 4 of the [discovery
+  plan](discovery-plan.md).
+- Not established: precise math (`air.sin` rather than `air.fast_sin`), memory
+  orders other than relaxed, SIMD-group operations, textures and samplers
+  (they need the T#/S# handle ABI the inventory flagged), argument buffers, and
+  the whole graphics side (vertex fetch and render-target export are not in
+  AIR).
+- Not established: that Metal would ever hand AIR to this backend. That is the
+  runtime question below and the biggest one left.
+
 ## Remaining questions
 
 - Pinning the inferred operand meanings (barrier flags, atomic scope and the
@@ -300,5 +383,6 @@ for `v_main`). Which parameter is what lives only in metadata:
   variants, and the precise (non-`fast_`) math names with fast math off.
 - The runtime question: whether macOS 26's Metal reaches any replaceable
   compiler path for a non-Apple, non-AMD-kext device.
-- An offline AIR → AMDGPU lowering prototype with the public LLVM target, which
-  this task explicitly deferred ("do not translate AIR yet").
+- Extending the lowering prototype: SIMD-group operations (DPP/permute),
+  textures and samplers once a handle ABI is chosen, precise math, and the
+  memory orders other than relaxed.

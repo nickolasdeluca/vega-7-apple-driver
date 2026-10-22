@@ -179,8 +179,11 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    `gfx90c`. The AIR intrinsic and metadata inventory followed the same day
    (13 functions, 39 intrinsics; texture/sampler handles, argument-buffer
    layout and constexpr samplers are the parts a backend must define with the
-   driver). Open: pinning inferred operand meanings, runtime acceptance, and
-   an AIR lowering prototype. Original item: **The Metal shader frontend boundary,
+   driver). Then the AIR lowering prototype (`tools/air_lower.py`, approved
+   by the user the same day): five compute kernels compile from Apple's AIR
+   to gfx90c code objects with public LLVM 20.1.7; textures, SIMD-group ops
+   and graphics stages are refused. Nothing ran on the GPU. Open: pinning
+   inferred operand meanings, runtime acceptance, extending the lowering. Original item: **The Metal shader frontend boundary,
    offline.** The parked task further
    down this file has the steps: what Apple's permitted public toolchain emits
    for one fixed MSL compute kernel, the intermediate form's container and
@@ -243,7 +246,8 @@ stage 21 proposal, implementation notes and boot 32–37 entries in
   than deciding it.
 - Commits: small verified batches, no agent co-author trailer, firmware and
   raw captures never tracked. Run the full suite before committing
-  (69 tests; see "Verification record and commands").
+  (74 tests since the AIR lowering prototype; see "Verification record and
+  commands").
 
 Boots 32–37 (2026-10-07 and 2026-10-13; [test boot
 log](test-boot.md#test-boot-log)) all stalled at the same point: the CP ran 152
@@ -663,6 +667,17 @@ Preserved failures: `llc` aborts on target-ID `-mcpu` values, clang needs
 `-nogpulib`, a missing descriptor symbol in linked objects, and two corrected
 checker drafts. Nothing was loaded or dispatched; details are in
 [the study](shader-target.md).
+
+The AIR lowering prototype (2026-10-22) added five tests
+(`tests/test_air_lower.py`); the full suite ran 74 tests, all passing, in
+689 s on the normal EFI (so `test_reports_a_missing_driver` ran rather than
+skipping). Dropping the `addrspace(5)` from the `alloca` rewrite in a scratch
+copy failed the new tests. The five supported compute kernels compiled to
+gfx90c code objects through `out/metal-frontend/lowering/run.sh`; three
+preserved failures during development (metadata naming dropped kernels, the
+LDS global in the declaration filter, a suffix on a numbered value) were fixed
+in the tool. Nothing was loaded or dispatched; details are in
+[the study](metal-frontend.md#air-lowering-prototype).
 
 The firmware continuation ran all 26 tests successfully: 13 existing and 13 new
 synthetic-fixture parser tests. All 13 pinned files matched across the kernel.org
