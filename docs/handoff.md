@@ -214,9 +214,13 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    The user chose to relax code signing in an experimental environment; the
    proposal is **Metal track M1** in [test-boot.md](test-boot.md) (relaxed
    SIP on the test EFI only, our bundle in `/Library/GPUBundles`, an
-   AGENTS.md amendment). **Approved and built 2026-10-22**: next is boot 39,
-   `tools/update_stick.sh m1-1` then `tools/capture_m1.sh boot-39-m1-rung1`
-   (steps in test-boot.md, "M1 implementation and boot steps"). A local
+   AGENTS.md amendment). **Approved and built 2026-10-22.** Boot 39 (rung 1)
+   showed the install works under `0x2` but our kext did not load: its new
+   `IOGraphicsFamily` dependency is only in the system kernel collection, and
+   OpenCore injects into the boot one. Fixed within the stage (node created by
+   class name); **next is boot 40**, `tools/update_stick.sh m1-1` then
+   `tools/capture_m1.sh boot-40-m1-rung1` (test-boot.md, "Revision: M1 node by
+   class name"). A local
    pre-check already showed MSL → AIR working on our device class in-process,
    with pipeline creation left to the vendor class.
 4. **Stage 22, only if the user wants more boots.** Its proposal is the ring

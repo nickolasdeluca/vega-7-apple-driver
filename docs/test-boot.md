@@ -4143,6 +4143,28 @@ show is admission itself:** Metal's resolver finding our bundle in
 4. If rung 1 reports "found but refused" or "not found", repeat with `m1-2`
    and `boot-40-m1-rung2`.
 
+#### Revision: M1 node by class name (after boot 39)
+
+Boot 39 showed that the kext must not link against `IOAccelerator`: the class
+is in `IOGraphicsFamily`, which is in the system kernel collection, and
+OpenCore injects our kext into the boot collection. The kext now:
+- drops the `CezanneAccelerator` subclass and the `IOGraphicsFamily`
+  dependency;
+- starts one kernel thread (`kernel_thread_start`) that calls
+  `OSMetaClass::allocClassWithName("IOAccelerator")` once a second for up to
+  120 s. Boot 39 shows `IOGraphicsFamily` does get loaded on the test EFI;
+- once the class exists, it creates a plain `IOAccelerator` node with the same
+  two plugin properties, attaches, starts and registers it, and publishes
+  `CezanneGPU M1 wait seconds`.
+
+Metal matches on the `IOAccelerator` class and reads the properties, so a
+plain instance is enough for M1. Still no register access and no user
+client, still stage 0 only. Rebuilt into `out/test-efi/driver-m1` and
+`usb-m1-rung1` / `usb-m1-rung2` (`ocvalidate` exit 0, 30 files each); `kmutil
+libraries -p` resolves nothing into the system collection. **Next: boot 40,
+rung 1 again** (`tools/update_stick.sh m1-1`, then `tools/capture_m1.sh
+boot-40-m1-rung1`).
+
 #### Not in M1
 
 - No GPU commands, no IOAccel user client, no shared memory, no surfaces. Even
@@ -5873,6 +5895,37 @@ the dial-down build; cold boot; `tools/capture_boot.sh boot-38-stage21
   through the GFXHUB and executes 152 of the 1024 dwords of the clear-state
   preamble. Not proven: any command run to completion, a fence, a CP DMA.
 - Captures are in ignored `out/test-efi/boot-38-stage21/`.
+
+**Boot 39, 2026-10-22, Metal track M1 rung 1** (`out/test-efi/usb-m1-rung1`;
+cold boot; `tools/capture_m1.sh boot-39-m1-rung1`; probe exit 0, **no
+device**).
+
+- **The environment was as planned.** `kern.bootargs` had `cezanne-stage=0
+  cezanne-metal=1`, `nvram csr-active-config` read `%02%00%00%00`, and
+  `csrutil status` reported a custom configuration with only "Filesystem
+  Protections: disabled".
+- **Rung 1 is enough to install.** `sudo ditto` into the `restricted`
+  `/Library/GPUBundles` exited 0. The kernel's sandbox reporting logged every
+  write as `System Policy: ditto(…) allow file-write-…` (a would-be violation
+  allowed by the relaxed flag). The removal ran, and the directory was empty
+  afterwards.
+- **Defect: our kext did not load.** `kmutil showloaded` listed
+  `IOGraphicsFamily` (600) but not `org.cezanne-driver.gpu`, and `ioreg` had
+  no `CezanneGPU` and no accelerator node. So Metal had nothing to resolve,
+  and the probe saw no device at all (NootedRed is absent on the test EFI, so
+  there is no AMD device either).
+- **Cause.** `kmutil inspect` on both kernel collections shows every earlier
+  dependency (`IOPCIFamily`, `kpi.iokit`, `kpi.libkern`, `kpi.mach`) in the
+  **boot** kernel collection, and `IOGraphicsFamily` only in the **system**
+  collection. OpenCore injects our kext into the boot collection, so its new
+  `IOGraphicsFamily` link dependency could not resolve and the kext was not
+  loaded. The kext test's `kmutil libraries` check resolved the symbols
+  against all collections, so it did not catch this; it now also requires
+  that nothing resolve only in the system collection. The boot 39 build fails
+  that check (3 symbols).
+- **Fixed within the stage** (see "Revision: M1 node by class name"); the
+  replaced builds are kept as `superseded-*-m1-*-iographics`.
+- Captures are in ignored `out/test-efi/boot-39-m1-rung1/`.
 
 ## Unknowns and limits
 
