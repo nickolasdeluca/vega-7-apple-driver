@@ -409,8 +409,10 @@ checker exits 0 only if every result above holds.
   [discovery plan](discovery-plan.md).
 - **XNACK policy.** The driver must choose XNACK replay on or off and accept
   matching code objects; "any" code runs under either.
-- **Metal frontend.** LLVM's AMDGPU target compiles LLVM IR. Whether a permitted
-  Metal frontend exposes enough information (for example AIR) for an independent
-  backend is the open half of the offline shader boundary study.
+- **Metal frontend.** LLVM's AMDGPU target compiles LLVM IR. The
+  [Metal frontend study](metal-frontend.md) (2026-10-22) found that Apple's
+  public toolchain emits AIR, LLVM bitcode that LLVM 20.1.7 reads, and that
+  Apple's own AMD translator lists no `gfx90c`; what a backend still lacks is
+  recorded there.
 - **Version spread.** The compiler is 20.1.7; the 23.1.2 tables were compared and
   agree for these targets, but 23.1.2 output was not produced.

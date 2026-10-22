@@ -125,6 +125,7 @@ registers. The native inventory and kext tests compile on macOS with `xcrun`
 - [Target IP and firmware selection manifest](docs/cezanne-target-manifest.md)
 - [Green Sardine firmware provenance and header validation](docs/firmware-provenance.md)
 - [Cezanne shader compiler target](docs/shader-target.md)
+- [Metal shader frontend boundary](docs/metal-frontend.md)
 - [USB test boot](docs/test-boot.md)
 - [Tahoe graphics contracts and experiments](docs/graphics-contract.md)
 - [Metal loader and factory investigation](docs/metal-loader-study.md)

@@ -172,7 +172,13 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    after the dial-down: check, loads, RLC start, CP start, restore and teardown
    all `ok`. Read `CP_RB0_RPTR` in the CP report (152 so far) and confirm the
    restore put all 39 snapshot registers back. Record it in the log and commit.
-2. **The Metal shader frontend boundary, offline.** The parked task further
+2. **Done (2026-10-22): see the [Metal frontend study](metal-frontend.md).**
+   The public toolchain needed the separate Metal Toolchain component
+   (installed with the user's approval); it emits AIR, LLVM bitcode that LLVM
+   20.1.7 reads; Apple's `amdgpu-nt` lists AMD targets up to `gfx1032` but no
+   `gfx90c`. Open: the AIR intrinsic inventory, runtime acceptance, and an AIR
+   lowering prototype. Original item: **The Metal shader frontend boundary,
+   offline.** The parked task further
    down this file has the steps: what Apple's permitted public toolchain emits
    for one fixed MSL compute kernel, the intermediate form's container and
    metadata, and what an independent backend would still lack. No hardware, no
@@ -531,7 +537,8 @@ Stages 0–10 succeeded (see the [test boot log](test-boot.md#test-boot-log)).
 
 ## Offline task while waiting: Metal shader frontend boundary
 
-**This is recommended next work, item 2** (see "Recommended next work" above):
+**Done 2026-10-22** in the [Metal frontend study](metal-frontend.md). Kept for
+the record. **This was recommended next work, item 2** (see "Recommended next work" above):
 it needs no boot, and the driver has stalled on the graphics engine until the
 CP runs a full frame.
 
