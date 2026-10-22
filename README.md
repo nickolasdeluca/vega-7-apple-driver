@@ -111,7 +111,10 @@ that region and the display's flip interrupt as an MSI while it is shown;
 `--gfx-start` (stage 21) loads the GFX firmware, starts the RLC and the
 command processor (which fetches part of the clear-state preamble and
 stalls; the stage is dialled down to end there), then restores every GC
-register. Building the kext needs that firmware in ignored
+register; `--gfx-compute` (stage 22) does the same up to the RLC start, then
+brings up a compute queue on the MEC, runs a ring test and dispatches the
+`store_index` kernel lowered from Apple's AIR, checks its 256 outputs and
+restores. Building the kext needs that firmware in ignored
 `out/firmware-provenance/fw/` (see
 [firmware provenance](docs/firmware-provenance.md)).
 

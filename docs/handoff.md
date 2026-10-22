@@ -230,8 +230,10 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    and the user's choice. A local
    pre-check already showed MSL → AIR working on our device class in-process,
    with pipeline creation left to the vendor class.
-4. **Stage 22, redirected to compute (2026-10-22, the user's choice): proposed,
-   awaiting approval.** A compute queue on the MEC, brought up like Linux's
+4. **Stage 22, redirected to compute (2026-10-22, the user's choice):
+   approved and implemented; next is boot 41** (`tools/update_stick.sh 22`,
+   then `tools/capture_boot.sh boot-41-stage22 --gfxoff-disallow --gfx-compute
+   --psp-state`; test-boot.md, "Stage 22 implementation"). A compute queue on the MEC, brought up like Linux's
    KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
    polling), runs a ring test and dispatches the `store_index` kernel that
    Apple's frontend and our lowering produced; see "Stage 22: a compute queue
@@ -281,7 +283,7 @@ stage 21 proposal, implementation notes and boot 32–37 entries in
   than deciding it.
 - Commits: small verified batches, no agent co-author trailer, firmware and
   raw captures never tracked. Run the full suite before committing
-  (81 tests since Metal track M1; see "Verification record and
+  (83 tests since stage 22; see "Verification record and
   commands").
 
 Boots 32–37 (2026-10-07 and 2026-10-13; [test boot

@@ -3983,9 +3983,10 @@ registers. The tool prints them.
   the shader stage as the proposal said. The proposal is kept as approved,
   and the change is recorded in the boot 33 entry.
 
-### Stage 22: a compute queue on the MEC runs our kernel (proposal, 2026-10-22)
+### Stage 22: a compute queue on the MEC runs our kernel (approved 2026-10-22)
 
-**Not approved yet; nothing below is built.** The user chose, on 2026-10-22,
+**Approved by the user on 2026-10-22 and implemented; see "Stage 22
+implementation" at the end of this section.** The user chose, on 2026-10-22,
 to redirect stage 22 from the stalled graphics ring to compute. Stage 21 left
 the graphics CP (PFP/ME) stalled at dword 152 of the clear-state preamble
 (boots 32–38). A compute kernel does not need that front end: it runs on a
@@ -4169,6 +4170,66 @@ read-pointer write-back and both fences, after each frame.
   through the GFXHUB as in stage 21), no change to the display.
 - No KIQ functions (`MAP_QUEUES`): the queue is the KIQ slot used as a
   plain compute queue.
+
+#### Stage 22 implementation
+
+Built 2026-10-22. Where it differs from the text above, this wins:
+
+- **The queue snapshot is read in the compute step, not at the check.** The
+  per-queue registers can only be read under `GRBM_GFX_CNTL`'s selection,
+  and selecting is a write, while stage 21's check writes nothing. So
+  `startCompute` reads its global snapshot first (`GRBM_GFX_CNTL`,
+  `RLC_CP_SCHEDULERS`, `CP_PQ_WPTR_POLL_CNTL`, `SH_MEM_CONFIG`,
+  `SH_MEM_BASES`, `CP_MEC_CNTL`), then selects the queue, reads the 23
+  per-queue registers, deselects, and checks `CP_HQD_ACTIVE` is 0. This
+  happens after the RLC start, when the restore is already owed.
+  `GRBM_GFX_CNTL` must select nothing at that point, which stage 21's RLC
+  start ensures. Both lists are separate arrays (`kComputeGlobalRegisters`,
+  `kComputeQueueRegisters`), not appended to stage 21's.
+- **Methods A and B run in the same boot.** The ring test commits by
+  polling. If `SCRATCH_REG0` has not changed after the poll window and the
+  queue's `CP_HQD_PQ_RPTR` is still 0, it commits again by `CP_HQD_PQ_WPTR_LO`.
+  The report says which method worked, and the dispatch uses the same one.
+  `kComputeNoProgress` means neither moved the read pointer; a moved read
+  pointer with no scratch change is `kGfxRingTestFailed`.
+- **Progress is judged by `CP_HQD_PQ_RPTR` under the selection**, not by the
+  read-pointer write-back, which moves only per `RPTR_BLOCK_SIZE` block.
+- `COMPUTE_PGM_HI`, `CP_HQD_EOP_BASE_ADDR_HI` and `CP_HQD_PQ_BASE_HI` are 0:
+  `(address >> 8) >> 32` of a 40-bit address.
+- **No new BAR5 pages:** every register written is in stage 21's six pages.
+  The work-area mapping grows from 16 KiB to 40 KiB at stage 22
+  (`gfxWorkSize`). The CPU writes the compute pages once at the load, and
+  then only the poll dword (`computePollWriteAllowed`: 0, 64, 256).
+- **PM4 constants** are from `soc15d.h` at Linux v6.12, pinned into
+  `out/references/` (SHA-256
+  `45426641c204f06f54951174ac02a58c9bd49f7b0a7c822eaf984668ba3b8457`):
+  `DISPATCH_DIRECT` `0x15`, `EVENT_WRITE` `0x46`, `SET_SH_REG` `0x76`,
+  `SET_SH_REG_START` `0x2c00`.
+- **The kernel** is embedded as 18 dwords and `RSRC1`/`RSRC2`.
+  `tests/test_compute_kernel.py` regenerates it from the AIR fixture with
+  `tools/air_lower.py` and LLVM 20.1.7 and requires identical bytes, and a
+  one-bit change fails it.
+- **Interface:** diagnostic version 18, selectors 53 (`ComputeStart`), 54
+  (`ComputeTest`) and 55 (`ComputeDispatch`), each returning a
+  `ComputeState`. `GfxRestore` (52) restores the queue before stage 21's
+  registers and reports a queue failure first. The kext's restore also runs
+  from the PSP teardown and `stop()`.
+- **Tool:** `cezanne-diag --gfx-compute` (stage 22), seven steps (`gfx
+  1/7` … `gfx 7/7`).
+- **Tests:**
+  - the core test's fake gained per-queue registers and a MEC that runs the
+    ring. Its `DISPATCH_DIRECT` executes `store_index` as the code does,
+    reading the workgroup size from the dispatch packet and the output
+    address from kernarg;
+  - the cases are: method A, method B, a MEC that never fetches, a lost
+    scratch write, a wrong kernel, an active queue, a selector already set,
+    stage 21, and a register that does not take the restore.
+
+**Boot steps (boot 41):**
+1. `tools/update_stick.sh 22`, then shut down fully and boot the stick.
+2. In macOS on the stick: `tools/capture_boot.sh boot-41-stage22
+   --gfxoff-disallow --gfx-compute --psp-state`.
+3. Shut down fully and return to the normal EFI.
 
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 
