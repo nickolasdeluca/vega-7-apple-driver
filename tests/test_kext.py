@@ -52,7 +52,8 @@ DIRECT_CALLS = {"___stack_chk_fail", "__ZN11OSMetaClassC2EPKcPKS_j", "__ZN11OSMe
                 # from a thread that waits for IOGraphicsFamily.
                 "__ZN11OSMetaClass18allocClassWithNameEPKc", "_kernel_thread_start", "_thread_deallocate",
                 "_thread_terminate", "_current_thread"}
-OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU", "__ZN20CezanneGPUUserClient")
+# __ZZN7cezanne: entities local to a core function (stage 22's lambdas).
+OWN_PREFIXES = ("__ZN7cezanne", "__ZZN7cezanne", "__ZN10CezanneGPU", "__ZN20CezanneGPUUserClient")
 
 
 def strip_comments(source):
@@ -386,14 +387,26 @@ void f(IOPCIDevice *p, Aperture *a) {
         # The GC page set: only these operations, only these pages; the
         # snapshot-relative allowlist only for it.
         self.assertEqual(sorted(re.findall(r"accessDevice\(cezanne::kGfxPageSet, (\w+)", source)),
-                         ["gfxCpOperation", "gfxDrawOperation", "gfxRestoreOperation", "gfxRlcOperation",
-                          "gfxTestOperation"])
+                         ["computeDispatchOperation", "computeRestoreOperation", "computeStartOperation",
+                          "computeTestOperation", "gfxCpOperation", "gfxDrawOperation", "gfxRestoreOperation",
+                          "gfxRlcOperation", "gfxTestOperation"])
         self.assertIn("const uint32_t kGfxPages[] = {0x8000, 0x9000, 0xa000, 0xc000, 0x30000, 0x3b000};", header)
         self.assertEqual(source.count("page.gfxSnapshot = gfxSnapshot_;"), 1)
+        # Stage 22: the queue snapshot's allowlist, only with the page set and
+        # only from stage 22.
+        self.assertEqual(source.count("page.computeSnapshot = stage_ >= cezanne::kComputeStage ? &computeSnapshot_ : "
+                                      "nullptr;"), 1)
         write = re.search(r"static bool registerWrite\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("(page->gfxSnapshot != nullptr && cezanne::gfxWriteAllowed(offset, value, page->stage, "
                       "page->gfxSnapshot))", write)
         self.assertLess(write.index("gfxWriteAllowed"), write.index(SCRATCH_STORE))
+        self.assertIn("cezanne::computeWriteAllowed(offset, value, page->stage, page->computeSnapshot)", write)
+        self.assertLess(write.index("computeWriteAllowed"), write.index(SCRATCH_STORE))
+        # The compute start comes after a passing RLC start, owes the restore
+        # before it writes, and the queue is restored before stage 21's set.
+        start = re.search(r"cezanne::Status CezanneGPU::computeStart\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("gfxStep_ == kGfxRlcStarted && gfxPassed_", start)
+        self.assertLess(start.index("gfxStep_ = kGfxComputeStarted;"), start.index("computeStartOperation"))
         # The GFX firmware buffer and work area: fixed ranges, written only
         # after the core's allowlists, from stage 21.
         self.assertEqual(source.count(GFX_MAP), 1)
@@ -404,7 +417,9 @@ void f(IOPCIDevice *p, Aperture *a) {
             self.assertLess(source.index(check), source.index(store))
         helper = re.search(r"static cezanne::Status withGfxMemory\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("if (stage < cezanne::kGfxStage) {", helper)
-        self.assertIn("IODeviceMemory::withRange(cezanne::kGfxWorkPhysical, cezanne::kGfxWorkSize)", helper)
+        self.assertIn("IODeviceMemory::withRange(cezanne::kGfxWorkPhysical, stage >= cezanne::kComputeStage", helper)
+        self.assertIn("? cezanne::kComputeWorkSize", helper)
+        self.assertIn(": cezanne::kGfxWorkSize);", helper)
         self.assertIn("IODeviceMemory::withRange(cezanne::kGfxFwPhysical, cezanne::kGfxFwBufferSize)", helper)
         # The restore is owed before the RLC start writes anything, and the
         # GOP surface before the flip; it runs from its selector, before the
@@ -421,6 +436,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn("pspState_ == kPspGfxLoaded", abandon)
         restore = re.search(r"cezanne::Status CezanneGPU::gfxRestoreLocked\(.*?\n}\n", source, re.S).group(0)
         self.assertLess(restore.index("gfxFlipOperation"), restore.index("gfxRestoreOperation"))
+        self.assertLess(restore.index("computeRestoreOperation"), restore.index("gfxRestoreOperation"))
         # The check needs a passing SETUP_TMR by this connection.
         check = re.search(r"cezanne::Status CezanneGPU::gfxCheck\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("pspState_ == kPspTmrSubmitted && pspTmrOk_ && pspOwner_ == owner", check)
@@ -445,7 +461,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertNotIn("com.apple.iokit.IOGraphicsFamily", info["OSBundleLibraries"])
         self.assertIn('allocClassWithName(kMetalNodeClass)', source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 21;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 22;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
