@@ -12,13 +12,13 @@
 // delivery (--ih-intr), and the stage 19 display test pattern
 // (--display-pattern), and the stage 20 SDMA fill and flip interrupt
 // (--sdma-flip), and the stage 21 graphics engine start and drawing
-// (--gfx-start).
+// (--gfx-start), and the stage 22 compute queue and dispatch (--gfx-compute).
 // --psp-state (stage 10) and --inventory16 (stage 16) only read.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
 //                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--sdma-inventory]
 //                          [--sdma-copy] [--gart-ih] [--ih-intr] [--sdma-flip] [--gfx-start]
-//                          [--display-pattern] [--psp-state] [--inventory16]
+//                          [--gfx-compute] [--display-pattern] [--psp-state] [--inventory16]
 #include <IOKit/IOKitLib.h>
 
 #include <cerrno>
@@ -307,10 +307,40 @@ const Named kRegisters[] = {
     {"GRBM_READ_ERROR", kRegGrbmReadError},
     {"GRBM_READ_ERROR2", kRegGrbmReadError2},
     {"GRBM_GFX_CNTL", kRegGrbmGfxCntl},
+    // Stage 22 (the CP_HQD_* and CP_MQD_* read per queue: GRBM_GFX_CNTL's selection).
+    {"CP_MQD_BASE_ADDR", kRegCpMqdBaseAddr},
+    {"CP_MQD_BASE_ADDR_HI", kRegCpMqdBaseAddrHi},
+    {"CP_HQD_ACTIVE", kRegCpHqdActive},
+    {"CP_HQD_VMID", kRegCpHqdVmid},
+    {"CP_HQD_PERSISTENT_STATE", kRegCpHqdPersistentState},
+    {"CP_HQD_PQ_BASE", kRegCpHqdPqBase},
+    {"CP_HQD_PQ_BASE_HI", kRegCpHqdPqBaseHi},
+    {"CP_HQD_PQ_RPTR", kRegCpHqdPqRptr},
+    {"CP_HQD_PQ_RPTR_REPORT_ADDR", kRegCpHqdPqRptrReportAddr},
+    {"CP_HQD_PQ_RPTR_REPORT_ADDR_HI", kRegCpHqdPqRptrReportAddrHi},
+    {"CP_HQD_PQ_WPTR_POLL_ADDR", kRegCpHqdPqWptrPollAddr},
+    {"CP_HQD_PQ_WPTR_POLL_ADDR_HI", kRegCpHqdPqWptrPollAddrHi},
+    {"CP_HQD_PQ_DOORBELL_CONTROL", kRegCpHqdPqDoorbellControl},
+    {"CP_HQD_PQ_CONTROL", kRegCpHqdPqControl},
+    {"CP_HQD_IB_CONTROL", kRegCpHqdIbControl},
+    {"CP_HQD_IQ_TIMER", kRegCpHqdIqTimer},
+    {"CP_HQD_DEQUEUE_REQUEST", kRegCpHqdDequeueRequest},
+    {"CP_MQD_CONTROL", kRegCpMqdControl},
+    {"CP_HQD_EOP_BASE_ADDR", kRegCpHqdEopBaseAddr},
+    {"CP_HQD_EOP_BASE_ADDR_HI", kRegCpHqdEopBaseAddrHi},
+    {"CP_HQD_EOP_CONTROL", kRegCpHqdEopControl},
+    {"CP_HQD_PQ_WPTR_LO", kRegCpHqdPqWptrLo},
+    {"CP_HQD_PQ_WPTR_HI", kRegCpHqdPqWptrHi},
+    {"CP_PQ_WPTR_POLL_CNTL", kRegCpPqWptrPollCntl},
+    {"SH_MEM_BASES", kRegShMemBases},
+    {"SH_MEM_CONFIG", kRegShMemConfig},
+    {"RLC_CP_SCHEDULERS", kRegRlcCpSchedulers},
+    {"CP_CPC_BUSY_STAT", kRegCpCpcBusyStat},
+    {"CP_CPC_STALLED_STAT1", kRegCpCpcStalledStat1},
 };
 static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage16RegisterCount + kStage17RegisterCount +
                                                                 kStage19RegisterCount + kStage20RegisterCount +
-                                                                kStage21RegisterCount,
+                                                                kStage21RegisterCount + kStage22RegisterCount,
               "one name per register");
 
 const char *registerName(uint32_t offset)
@@ -326,8 +356,8 @@ void usage(FILE *out)
     std::fprintf(out, "usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query]\n"
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
                       "                         [--psp-sdma] [--sdma-inventory] [--sdma-copy] [--gart-ih]\n"
-                      "                         [--ih-intr] [--sdma-flip] [--gfx-start] [--display-pattern]\n"
-                      "                         [--psp-state]\n"
+                      "                         [--ih-intr] [--sdma-flip] [--gfx-start] [--gfx-compute]\n"
+                      "                         [--display-pattern] [--psp-state]\n"
                       "                         [--inventory16]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
@@ -356,6 +386,9 @@ void usage(FILE *out)
                       "--gfx-start creates the PSP ring and TMR, loads the GFX firmware, starts the RLC and the CP,\n"
                       "and, dialled down on 2026-10-13, stops there: it restores every GC register written and\n"
                       "tears down. The ring test, fence, CP drawing and verify are deferred to stage 22.\n"
+                      "--gfx-compute does --gfx-start up to the RLC start, then, instead of the CP, brings up a\n"
+                      "compute queue on the MEC (the KIQ slot), runs a ring test and fence, dispatches the\n"
+                      "store_index kernel (256 work-items), checks the output is 0..255, restores and tears down.\n"
                       "--display-pattern draws a test pattern in the carveout, shows it on pipe 0 for 5 s by\n"
                       "flipping its surface address, verifies, and flips back to the boot framebuffer.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n"
@@ -377,6 +410,13 @@ bool parseCount(const char *text, unsigned long max, unsigned long *value)
 void step(const char *text)
 {
     std::printf("%s ... ", text);
+    std::fflush(stdout);
+}
+
+// A stage 21 or 22 step: "gfx n/5" for --gfx-start, "gfx n/7" for --gfx-compute.
+void gfxStep(bool compute, unsigned n, const char *text)
+{
+    std::printf("gfx %u/%u %s ... ", n, compute ? 7u : 5u, text);
     std::fflush(stdout);
 }
 
@@ -1336,17 +1376,94 @@ void printGfxState(const GfxState &state)
                     i % 2 == 1 || i + 1 == kGfxStateCount ? "\n" : "");
 }
 
+// Prints a stage 22 report: the queue's registers, the others, the write-back.
+void printComputeState(const ComputeState &state)
+{
+    for (uint32_t i = 0; i < kComputeQueueStateCount; i++)
+        std::printf("    %-30s 0x%08x%s", registerName(kComputeQueueStateRegisters[i]), state.queue[i],
+                    i % 2 == 1 || i + 1 == kComputeQueueStateCount ? "\n" : "");
+    for (uint32_t i = 0; i < kComputeGlobalStateCount; i++)
+        std::printf("    %-30s 0x%08x%s", registerName(kComputeGlobalStateRegisters[i]), state.global[i],
+                    i % 2 == 1 || i + 1 == kComputeGlobalStateCount ? "\n" : "");
+    std::printf("    write-back: read pointer %u, poll %u, fence 3 %u, fence 4 %u\n", state.rptr, state.poll,
+                state.fence3, state.fence4);
+}
+
+// Stage 22 after the RLC start: the compute queue, its ring test, the
+// dispatch. Returns whether all three passed.
+bool computeQueue(io_connect_t connection)
+{
+    static const char *const commits[] = {"none", "polled write pointer (method A)",
+                                          "CP_HQD_PQ_WPTR_LO (method B)"};
+    uint64_t start[4] = {};
+    ComputeState state = {};
+    step("gfx 4/7 compute start: GRBM_GFX_CNTL selects ME 2 pipe 1 queue 0 (the KIQ slot); its HQD snapshot;\n"
+         "  RLC_CP_SCHEDULERS 0x48 then 0xc8; CP_PQ_WPTR_POLL_CNTL.EN; the HQD as gfx_v9_0_kiq_init_register\n"
+         "  (ring 0xf440a04000, 4 KiB, EOP 0xf440a06000, MQD 0xf440a05000, no doorbell), ACTIVE 1; SH_MEM_CONFIG\n"
+         "  unaligned and SH_MEM_BASES 0 for VMID 0; CP_MEC_CNTL 0");
+    bool ok = callReport(connection, kDiagnosticComputeStart, start, 4, &state);
+    if (ok) {
+        std::printf("%s, %llu writes", statusName(static_cast<Status>(start[0])), static_cast<unsigned long long>(start[1]));
+        if (start[0] == kGfxUnexpectedState) {
+            const uint32_t at = static_cast<uint32_t>(start[2]);
+            const uint32_t offset = at < kComputeQueueCount ? kComputeQueueRegisters[at]
+                                    : at - kComputeQueueCount < kComputeGlobalCount
+                                        ? kComputeGlobalRegisters[at - kComputeQueueCount]
+                                        : 0;
+            std::printf(" (%s reads 0x%08llx)", registerName(offset), static_cast<unsigned long long>(start[3]));
+        }
+        std::printf("\n");
+        printComputeState(state);
+        ok = start[0] == kOK;
+    }
+    if (ok) {
+        uint64_t test[5] = {};
+        step("gfx 5/7 compute ring test: SCRATCH_REG0 <- 0xCAFEDEAD; frame 1 (SET_UCONFIG_REG SCRATCH_REG0\n"
+             "  0xDEADBEEF, fence 3) committed by the polled write pointer (method A), then, if the queue's read\n"
+             "  pointer has not moved, also by CP_HQD_PQ_WPTR_LO (method B)");
+        ok = callReport(connection, kDiagnosticComputeTest, test, 5, &state);
+        if (ok) {
+            const uint64_t commit = test[4] < 3 ? test[4] : 0;
+            std::printf("%s, SCRATCH_REG0 0x%08llx, fence 3 = %llu, CP_HQD_PQ_RPTR %llu, committed by %s\n",
+                        statusName(static_cast<Status>(test[0])), static_cast<unsigned long long>(test[1]),
+                        static_cast<unsigned long long>(test[2]), static_cast<unsigned long long>(test[3]),
+                        commits[commit]);
+            printComputeState(state);
+            ok = test[0] == kOK;
+        }
+    }
+    if (ok) {
+        uint64_t dispatch[5] = {};
+        step("gfx 6/7 dispatch: frame 2 (SET_SH_REG COMPUTE_*: code 0xf440a08000, RSRC1 0x00af0040, RSRC2 0x90,\n"
+             "  64x1x1 threads, user data: dispatch packet and kernarg; DISPATCH_DIRECT 4x1x1; CS partial flush;\n"
+             "  fence 4); then the output at 0xf440a09000 must read 0..255");
+        ok = callReport(connection, kDiagnosticComputeDispatch, dispatch, 5, &state);
+        if (ok) {
+            std::printf("%s, fence 4 = %llu, %llu wrong outputs", statusName(static_cast<Status>(dispatch[0])),
+                        static_cast<unsigned long long>(dispatch[1]), static_cast<unsigned long long>(dispatch[2]));
+            if (dispatch[2] != 0)
+                std::printf(" (first: out[%llu] = 0x%08llx)", static_cast<unsigned long long>(dispatch[3]),
+                            static_cast<unsigned long long>(dispatch[4]));
+            std::printf("\n");
+            printComputeState(state);
+            ok = dispatch[0] == kOK;
+        }
+    }
+    return ok;
+}
+
 // The stage 21 steps after a passing SETUP_TMR: check, load, RLC start, CP
 // start, ring test and fence, draw (and flip), a 5 s hold, verify, restore.
-// The restore runs whenever the RLC start or the flip was sent; the PSP
-// teardown that follows would also run it.
-bool gfxEngine(io_connect_t connection)
+// With compute (stage 22), the compute queue, its ring test and the dispatch
+// replace the CP start. The restore runs whenever the RLC start or the flip
+// was sent; the PSP teardown that follows would also run it.
+bool gfxEngine(io_connect_t connection, bool compute)
 {
     static const char *const files[] = {"green_sardine_ce.bin", "green_sardine_pfp.bin", "green_sardine_me.bin",
                                         "green_sardine_mec.bin", "green_sardine_rlc.bin"};
     uint64_t check[3] = {};
     GfxState checked = {};
-    step("gfx 1/5 check: nine firmware headers; GFX on, RLC off, CP and MEC halted, no doorbell, GC hub as MMHUB at\n"
+    gfxStep(compute, 1, "check: nine firmware headers; GFX on, RLC off, CP and MEC halted, no doorbell, GC hub as MMHUB at\n"
          "  boot 22; pipe 0 at boot 22; firmware buffer, work area and pattern region placed and stable");
     if (!callReport(connection, kDiagnosticGfxCheck, check, 3, &checked)) return false;
     std::printf("%s", statusName(static_cast<Status>(check[0])));
@@ -1361,7 +1478,7 @@ bool gfxEngine(io_connect_t connection)
 
     uint64_t load[6] = {};
     GfxState state = {};
-    step("gfx 2/5 load: copy the nine images (496 KiB) to 0xf440900000, then LOAD_IP_FW as frames 1-9\n"
+    gfxStep(compute, 2, "load: copy the nine images (496 KiB) to 0xf440900000, then LOAD_IP_FW as frames 1-9\n"
          "  (CE, PFP, ME, MEC1, MEC1 jump table, RLC lists CNTL, GPM, SRM, RLC_G)");
     if (!callReport(connection, kDiagnosticGfxLoad, load, 6, &state)) return false;
     std::printf("%s, %llu images loaded, last fence %llu, status 0x%08llx, fw_addr 0x%08llx%08llx\n",
@@ -1374,7 +1491,7 @@ bool gfxEngine(io_connect_t connection)
 
     // From here the restore is owed.
     uint64_t rlc[4] = {};
-    step("gfx 3/5 RLC start: the 12 golden settings, GRBM_CNTL.READ_TIMEOUT 0xff, GRBM_GFX_CNTL 0, rlc_stop,\n"
+    gfxStep(compute, 3, "RLC start: the 12 golden settings, GRBM_CNTL.READ_TIMEOUT 0xff, GRBM_GFX_CNTL 0, rlc_stop,\n"
          "  serdes, CG off, clear-state buffer, save/restore machine, SPM VMID 0xf, RLC_ENABLE_F32, then\n"
          "  GRBM_READ_ERROR <- 0xffffffff to clear it (is GRBM_READ_ERROR below the check's reading?)");
     bool ok = callReport(connection, kDiagnosticGfxRlc, rlc, 4, &state);
@@ -1385,7 +1502,8 @@ bool gfxEngine(io_connect_t connection)
         printGfxState(state);
         ok = rlc[0] == kOK;
     }
-    if (ok) {
+    if (ok && compute) ok = computeQueue(connection);
+    if (ok && !compute) {
         uint64_t cp[4] = {};
         step("gfx 4/5 CP start: ring 0xf440a00000 (8 KiB), no doorbell, CP_ME_CNTL halts cleared; frame 0 (clear\n"
              "  state), CP_RB0_WPTR <- 1024, _HI <- 0. Stage 21 is dialled down here: it passes when the CP has\n"
@@ -1404,13 +1522,23 @@ bool gfxEngine(io_connect_t connection)
     // drawing and the verify are deferred to stage 22. Their selectors stay
     // (kDiagnosticGfxTest, GfxDraw, GfxVerify) and are unused here.
     uint64_t restore[4] = {};
-    step("gfx 5/5 restore: flip back; CP_ME_CNTL halted, rlc_stop, every written GC register back to the check's\n"
-         "  reading");
+    gfxStep(compute, compute ? 7 : 5,
+            compute ? "restore: the queue dequeued and its registers, RLC_CP_SCHEDULERS, the poll control, SH_MEM_*\n"
+                      "  and the MEC halted back; then CP_ME_CNTL halted, rlc_stop, every written GC register back to\n"
+                      "  the check's reading"
+                    : "restore: flip back; CP_ME_CNTL halted, rlc_stop, every written GC register back to the check's\n"
+                      "  reading");
     bool restored = callReport(connection, kDiagnosticGfxRestore, restore, 4, &state);
     if (restored) {
         std::printf("%s, flip back %s", statusName(static_cast<Status>(restore[0])),
                     statusName(static_cast<Status>(restore[3])));
-        if (restore[0] == kGfxNotRestored && restore[1] < kGfxSnapshotCount)
+        if (compute && restore[0] == kGfxNotRestored && restore[1] < kComputeQueueCount + kComputeGlobalCount)
+            std::printf(" (the compute restore: %s reads 0x%08llx)",
+                        registerName(restore[1] < kComputeQueueCount
+                                         ? kComputeQueueRegisters[restore[1]]
+                                         : kComputeGlobalRegisters[restore[1] - kComputeQueueCount]),
+                        static_cast<unsigned long long>(restore[2]));
+        else if (restore[0] == kGfxNotRestored && restore[1] < kGfxSnapshotCount)
             std::printf(" (%s reads 0x%08llx, the check read 0x%08x)", registerName(kGfxSnapshotRegisters[restore[1]]),
                         static_cast<unsigned long long>(restore[2]), checked.values[restore[1]]);
         std::printf("\n");
@@ -1423,7 +1551,8 @@ bool gfxEngine(io_connect_t connection)
 // mode: 0 load only, 1 with the stage 14 inventory, 2 with the stage 15 copy,
 // 3 with the copy and the stage 17 GART and interrupt ring, 4 with those and
 // the stage 18 MSI delivery, 5 with those and the stage 20 SDMA fill and flip;
-// 6 the stage 21 graphics engine after SETUP_TMR, without SDMA.
+// 6 the stage 21 graphics engine after SETUP_TMR, without SDMA; 7 the same
+// with the stage 22 compute queue instead of the CP start.
 bool pspSdma(io_connect_t connection, int mode)
 {
     uint64_t check[7] = {};
@@ -1467,9 +1596,9 @@ bool pspSdma(io_connect_t connection, int mode)
         tmrTeardown(connection, "sdma teardown: DESTROY_TMR if fenced, then DESTROY_RINGS");
         return false;
     }
-    if (mode == 6) {
-        // Stage 21 instead of the SDMA load.
-        bool started = gfxEngine(connection);
+    if (mode == 6 || mode == 7) {
+        // Stage 21 (or, mode 7, stage 22) instead of the SDMA load.
+        bool started = gfxEngine(connection, mode == 7);
         bool torn = tmrTeardown(connection, "gfx teardown: DESTROY_TMR as the next frame if the last fenced, then "
                                             "DESTROY_RINGS");
         return started && torn;
@@ -1603,7 +1732,7 @@ int main(int argc, char **argv)
     unsigned long repeat = 1, interval = 1000;
     bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
          inventory = false, copy = false, psp = false, inventory16Flag = false, gartFlag = false,
-         intrFlag = false, displayFlag = false, flipFlag = false, gfxFlag = false;
+         intrFlag = false, displayFlag = false, flipFlag = false, gfxFlag = false, computeFlag = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -1651,6 +1780,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--gfx-start") == 0) {
             gfxFlag = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--gfx-compute") == 0) {
+            computeFlag = true;
             continue;
         }
         if (std::strcmp(argv[i], "--sdma-flip") == 0) {
@@ -1830,6 +1963,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!pspSdma(connection, 6)) failures++;
+    }
+    if (computeFlag) {
+        if (info[1] < kComputeStage) {
+            std::fprintf(stderr, "cezanne-diag: --gfx-compute needs driver stage %u\n", kComputeStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspSdma(connection, 7)) failures++;
     }
     if (displayFlag) {
         if (info[1] < kDisplayStage) {

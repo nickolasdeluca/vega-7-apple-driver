@@ -39,7 +39,7 @@ class DiagSourceTests(unittest.TestCase):
         self.assertRegex(source, r"if \(ring\) \{[^}]*info\[1\] < kPspRingStage")
         self.assertEqual(len(re.findall(r"\bpspTmr\(connection\)", source)), 1)
         self.assertRegex(source, r"if \(tmr\) \{[^}]*info\[1\] < kPspTmrStage")
-        self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["0", "1", "2", "3", "4", "5", "6"])
+        self.assertEqual(re.findall(r"\bpspSdma\(connection, (\w+)\)", source), ["0", "1", "2", "3", "4", "5", "6", "7"])
         self.assertRegex(source, r"if \(gfxFlag\) \{[^}]*info\[1\] < kGfxStage")
         # The stage 21 restore runs whenever the RLC start was sent; the PSP
         # teardown follows it.
@@ -47,7 +47,12 @@ class DiagSourceTests(unittest.TestCase):
         self.assertLess(gfx.index("kDiagnosticGfxRlc"), gfx.index("kDiagnosticGfxRestore"))
         self.assertNotRegex(gfx[gfx.index("kDiagnosticGfxRlc"):gfx.index("kDiagnosticGfxRestore")], r"\breturn\b")
         psp = re.search(r"bool pspSdma\(.*?\n}\n", source, re.S).group(0)
-        self.assertLess(psp.index("gfxEngine(connection)"), psp.index("gfx teardown"))
+        self.assertLess(psp.index("gfxEngine(connection, mode == 7)"), psp.index("gfx teardown"))
+        # Stage 22 runs only from stage 22, and its compute steps sit between
+        # the RLC start and the restore with no way out in between.
+        self.assertRegex(source, r"if \(computeFlag\) \{[^}]*info\[1\] < kComputeStage")
+        self.assertLess(gfx.index("kDiagnosticGfxRlc"), gfx.index("computeQueue(connection)"))
+        self.assertLess(gfx.index("computeQueue(connection)"), gfx.index("kDiagnosticGfxRestore"))
         self.assertRegex(source, r"if \(flipFlag\) \{[^}]*info\[1\] < kFlipStage")
         self.assertRegex(source, r"if \(gartFlag\) \{[^}]*info\[1\] < kGartStage")
         self.assertRegex(source, r"if \(intrFlag\) \{[^}]*info\[1\] < kIntrStage")
@@ -97,7 +102,7 @@ class DiagSourceTests(unittest.TestCase):
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
         expected = []
         for name in ("kStage16Registers", "kStage17Registers", "kStage19Registers", "kStage20Registers",
-                     "kStage21Registers"):
+                     "kStage21Registers", "kStage22Registers"):
             listed = re.search(r"%s\[\] = \{([^}]*)\}" % name, header).group(1)
             expected += [entry.strip() for entry in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
