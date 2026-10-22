@@ -218,6 +218,14 @@ class CoreTests(unittest.TestCase):
             "== kGfxRingTestFailed": ("if (i == kGfxPollPauses) return kGfxRingTestFailed;",
                                       "if (i == kGfxPollPauses) break;"),
             "== kGfxDrawMismatch": ("return *unexpected == 0 ? kOK : kGfxDrawMismatch;", "return kOK;"),
+            # Stage 22.
+            "== kComputeNoProgress && rptr == 0": ("return *rptr == 0 ? kComputeNoProgress : kGfxRingTestFailed;",
+                                                   "return kGfxRingTestFailed;"),
+            "== kComputeMismatch": ("return *wrong == 0 ? kOK : kComputeMismatch;", "return kOK;"),
+            "!computeWriteAllowed(kRegCpHqdActive, 3, 22, &snap)": (
+                "        if (value == snapshot->queue[i]) return true;", "        return true;"),
+            "kComputeQueueRegisters[index] == kRegCpHqdActive": ("if ((active & kCpHqdActive) != 0) {\n        *index",
+                                                                 "if (false) {\n        *index"),
             "index == 6 && value == 904": ("if (*value != snapshot[i]) return kGfxNotRestored;", ""),
             "g.snapshot, &index, &value) == kOK": (
                 "    for (uint32_t i = 0; i < kGfxSnapshotCount; i++)\n        note(writeGfxRegister",
@@ -314,15 +322,19 @@ class CoreTests(unittest.TestCase):
         # writeFirmwareWord after the firmware-buffer allowlist, and the SDMA
         # and GART work-area words after theirs.
         # Stage 21 adds the GFX firmware buffer, the GFX work area and the
-        # snapshot-relative GC registers.
-        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 9)
+        # snapshot-relative GC registers; stage 22 the queue-snapshot-relative
+        # registers and the write-pointer poll dword.
+        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 11)
         for helper, check in (("writeSdmaWorkWord", "sdmaWorkWriteAllowed(offset, value, stage)"),
                               ("writeGartWorkWord", "gartWorkWriteAllowed(offset, value, stage)"),
                               ("writePatternWord", "patternWriteAllowed(offset, value, stage)"),
                               ("writeGfxFirmwareWord", "gfxFirmwareWriteAllowed(files, offset, value, stage)"),
                               ("writeGfxWorkWord", "gfxWorkWriteAllowed(offset, value, stage)"),
                               ("writeGfxRegister",
-                               "if (!writeAllowed(offset, value, stage) && !gfxWriteAllowed(offset, value, stage, snapshot))")):
+                               "if (!writeAllowed(offset, value, stage) && !gfxWriteAllowed(offset, value, stage, snapshot))"),
+                              ("writeComputeRegister",
+                               "!computeWriteAllowed(offset, value, stage, snapshot))"),
+                              ("writeComputePollWord", "if (!computePollWriteAllowed(offset, value, stage))")):
             body = re.search(r"static Status %s\(.*?\n}\n" % helper, source, re.S).group(0)
             self.assertLess(body.index(check), body.index("write32"), helper)
         firmware = re.search(r"static Status writeFirmwareWord\(.*?\n}\n", source, re.S).group(0)

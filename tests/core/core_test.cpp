@@ -3,6 +3,7 @@
 #include "cezanne_core.h"
 #include "clearstate_gfx9.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -164,6 +165,35 @@ struct FakeRegisters {
     bool cpDropScratch = false;      // the ring test's write is lost
     uint32_t gcStuck = 0;            // a GC register whose writes are lost
     int fillDropGfx = -1;            // a DMA_DATA fill (by its order) the CP drops
+    // Stage 22: per-queue registers, keyed by GRBM_GFX_CNTL's selection, and a
+    // MEC that runs the selected KIQ slot's ring from gfxWork.
+    std::map<uint64_t, uint32_t> hqd;
+    std::map<uint32_t, uint32_t> sh; // SH registers the MEC was given
+    bool mecIgnoresPoll = false;     // the MEC never reads the poll address (method A fails)
+    bool mecHang = false;            // the MEC never fetches
+    bool kernelWrong = false;        // the kernel stores its index plus one
+    uint32_t hqdStuck = 0;           // a per-queue register whose writes are lost
+    static bool perQueue(uint32_t offset)
+    {
+        for (uint32_t q : kComputeQueueRegisters)
+            if (q == offset) return true;
+        return false;
+    }
+    uint64_t hqdKey(uint32_t offset) { return (uint64_t(gc[kRegGrbmGfxCntl] & kGrbmGfxCntlMask) << 32) | offset; }
+    void presetCompute()
+    {
+        gc[kRegRlcCpSchedulers] = 0x12345600; // another field the RMW must keep
+        gc[kRegCpPqWptrPollCntl] = 0x00000001; // PERIOD
+        gc[kRegShMemConfig] = 0x00001001;      // RETRY_DISABLE and ADDRESS_MODE as read
+        gc[kRegShMemBases] = 0x00010002;
+        gc[kRegCpCpcBusyStat] = gc[kRegCpCpcStalledStat1] = 0;
+        // Every queue slot reads its reset values; the KIQ slot's are distinct.
+        for (uint32_t q : kComputeQueueRegisters) hqd[(uint64_t(kComputeSelect) << 32) | q] = 0;
+        hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdPqControl] = 0x00308509;
+        hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdEopControl] = 0x00000040;
+        hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdPersistentState] = 0x00000001;
+        hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdPqDoorbellControl] = 0x40000000;
+    }
     void presetGfx()
     {
         for (uint32_t offset : kGfxStateRegisters) gc[offset] = 0;
@@ -241,6 +271,10 @@ struct FakeRegisters {
         auto vm = self->gart.find(offset);
         if (vm != self->gart.end()) {
             *value = vm->second;
+            return true;
+        }
+        if (perQueue(offset)) {
+            *value = self->hqd[self->hqdKey(offset)];
             return true;
         }
         auto gc = self->gc.find(offset);
@@ -856,7 +890,12 @@ struct FakeWriter {
                 runSdma(r, old, r->sdmaPendingWptr);
             }
         }
-        if (r->gc.count(offset) != 0 && offset != r->gcStuck) gcWrite(r, offset, value);
+        if (FakeRegisters::perQueue(offset)) {
+            if (offset != r->hqdStuck) r->hqd[r->hqdKey(offset)] = value;
+            if (offset == kRegCpHqdPqWptrLo) runMec(r);
+        } else if (r->gc.count(offset) != 0 && offset != r->gcStuck) {
+            gcWrite(r, offset, value);
+        }
         if (offset == kRegMp0C2PMsg67) {
             r->frameStart = r->psp67;
             r->psp67 = value;
@@ -1058,6 +1097,66 @@ struct FakeWriter {
         if (r->cpStopAt == 0) m[(kGfxWbPage + kGfxWbRptr) / 4] = to;
         r->gc[kRegCpRb0Rptr] = fetched;
     }
+    // The MEC on the KIQ slot (ME 2, pipe 1, queue 0): runs the ring from the
+    // queue's read pointer to its write pointer, which it takes from the poll
+    // address (if polling is on) or CP_HQD_PQ_WPTR_LO. SET_UCONFIG_REG
+    // (SCRATCH_REG0), SET_SH_REG, RELEASE_MEM, and DISPATCH_DIRECT, which runs
+    // store_index the way its code does: the workgroup size from the dispatch
+    // packet (USER_DATA 4-5), the output address from kernarg (6-7).
+    static void runMec(FakeRegisters *r)
+    {
+        if (r->gfxWork == nullptr || r->mecHang || (r->gc[kRegCpMecCntl] & kCpMecHalts) != 0 ||
+            (r->gc[kRegRlcCntl] & kRlcEnableF32) == 0)
+            return;
+        auto q = [r](uint32_t offset) { return r->hqd[(uint64_t(kComputeSelect) << 32) | offset]; };
+        if ((q(kRegCpHqdActive) & 1) == 0 || q(kRegCpHqdPqBase) != uint32_t(kComputeRingGpuAddress >> 8) ||
+            (q(kRegCpHqdPqControl) & 0x3f) != 9 || q(kRegCpHqdPqWptrPollAddr) != uint32_t(kComputePollGpuAddress))
+            return;
+        uint32_t *m = r->gfxWork->words;
+        uint32_t to = q(kRegCpHqdPqWptrLo);
+        if ((r->gc[kRegCpPqWptrPollCntl] & kCpPqWptrPollEn) != 0 && !r->mecIgnoresPoll)
+            to = std::max(to, m[(kComputeWbPage + kComputeWbPoll) / 4]);
+        uint32_t from = q(kRegCpHqdPqRptr);
+        if (to <= from) return;
+        auto ring = [m](uint32_t i) { return m[kComputeRingPage / 4 + (i & (kComputeRingDwords - 1))]; };
+        auto at = [m](uint64_t a) -> uint32_t * {
+            return a >= kGfxWorkGpuAddress && a < kGfxWorkGpuAddress + kComputeWorkSize ? &m[(a - kGfxWorkGpuAddress) / 4]
+                                                                                         : nullptr;
+        };
+        for (uint32_t d = from; d < to;) {
+            uint32_t header = ring(d);
+            if ((header >> 30) != 3) {
+                d++;
+                continue;
+            }
+            uint32_t op = (header >> 8) & 0xff, length = ((header >> 16) & 0x3fff) + 2;
+            if (op == kPm4SetUconfigReg && ring(d + 1) == kRegScratchReg0 / 4 - 0xc000 && !r->cpDropScratch) {
+                r->gc[kRegScratchReg0] = ring(d + 2);
+            } else if (op == kPm4SetShReg) {
+                for (uint32_t k = 0; k + 2 < length; k++) r->sh[kSetShRegStart + ring(d + 1) + k] = ring(d + 2 + k);
+            } else if (op == kPm4ReleaseMem) {
+                uint32_t *word = at((uint64_t(ring(d + 4)) << 32) | ring(d + 3));
+                if (word != nullptr) *word = ring(d + 5);
+            } else if (op == kPm4DispatchDirect && r->sh[kShComputePgmLo] == uint32_t(kComputeCodeGpuAddress >> 8) &&
+                       r->sh[kShComputePgmRsrc1 + 1] == kComputePgmRsrc2) {
+                const uint32_t *packet = at((uint64_t(r->sh[kShComputeUserData0 + 5]) << 32) | r->sh[kShComputeUserData0 + 4]);
+                const uint32_t *kernarg = at((uint64_t(r->sh[kShComputeUserData0 + 7]) << 32) | r->sh[kShComputeUserData0 + 6]);
+                if (packet != nullptr && kernarg != nullptr) {
+                    const uint32_t size = packet[1] & 0xffff;
+                    const uint64_t out = (uint64_t(kernarg[1]) << 32) | kernarg[0];
+                    for (uint32_t g = 0; g < ring(d + 1); g++) {
+                        for (uint32_t t = 0; t < r->sh[kShComputeNumThreadX]; t++) {
+                            const uint32_t id = g * size + t;
+                            uint32_t *word = at(out + 4ull * id);
+                            if (word != nullptr) *word = r->kernelWrong ? id + 1 : id;
+                        }
+                    }
+                }
+            }
+            d += length;
+        }
+        r->hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdPqRptr] = to;
+    }
     // Processes the frame at frameStart if it names the command and fence
     // buffers: writes the response status and the fence value.
     static void process(FakeRegisters *r)
@@ -1080,6 +1179,7 @@ struct FakeWriter {
         if (r->gfxOffPending > 0 && --r->gfxOffPending == 0) r->gfxMisc = 0x4;
         if (r->pspPending > 0 && --r->pspPending == 0) r->psp64 = r->pspReply;
         if (r->framePending > 0 && --r->framePending == 0) process(r);
+        runMec(r);
         if (r->mutateOnPause != nullptr) r->mutateOnPause->words[100] ^= 1;
         if (r->ackPending > 0 && --r->ackPending == 0) r->gart[kRegVmInvalidateEng17Ack] = 1;
         if (r->displayFlip != 0) r->gart[kRegHubp0DchubpCntl] ^= r->displayFlip;
@@ -2997,6 +3097,7 @@ struct GfxRig {
     GfxFileSet set;
     uint32_t snapshot[kGfxSnapshotCount] = {};
     uint32_t display[kDisplayInventoryCount] = {};
+    uint32_t stage = 21;
     static bool fwRead(void *c, uint32_t o, uint32_t *v)
     {
         auto *self = static_cast<GfxRig *>(c);
@@ -3030,12 +3131,12 @@ struct GfxRig {
     Status load()
     {
         uint32_t index = 0, value = 0, fence = 0;
-        Status status = checkGfxBoot(r.reader(), 0x80000, 21, snapshot, &index, &value);
-        if (status == kOK) status = writeGfxFirmware(set.files, fwReader(), fwWriter(), 21);
-        if (status == kOK) status = writeGfxWork(gfxWork.reader(), gfxWork.writer(), 21);
+        Status status = checkGfxBoot(r.reader(), 0x80000, stage, snapshot, &index, &value);
+        if (status == kOK) status = writeGfxFirmware(set.files, fwReader(), fwWriter(), stage);
+        if (status == kOK) status = writeGfxWork(gfxWork.reader(), gfxWork.writer(), stage);
         for (uint32_t k = 0; status == kOK && k < kGfxImageCount; k++) {
-            status = writePspCommand(pspWork.reader(), pspWork.writer(), 21, kPspGfxLoad + k, k + 1);
-            if (status == kOK) status = submitPspFrame(r.reader(), 0x80000, w.writer(), pspWork.reader(), 21, k + 1, &fence);
+            status = writePspCommand(pspWork.reader(), pspWork.writer(), stage, kPspGfxLoad + k, k + 1);
+            if (status == kOK) status = submitPspFrame(r.reader(), 0x80000, w.writer(), pspWork.reader(), stage, k + 1, &fence);
         }
         return status;
     }
@@ -3331,6 +3432,217 @@ static void testGfx()
     }
 }
 
+// Stage 22: a rig past the RLC start, with the compute queue's registers.
+struct ComputeRig {
+    GfxRig g;
+    ComputeSnapshot snapshot = {};
+    bool taken = false;
+    ComputeRig()
+    {
+        g.stage = 22;
+        g.r.presetCompute();
+    }
+    Status rlc()
+    {
+        uint32_t writes = 0, cu = 0, noncu = 0;
+        Status status = g.load();
+        return status == kOK ? startRlc(g.r.reader(), 0x80000, g.w.writer(), 22, g.snapshot, &writes, &cu, &noncu)
+                             : status;
+    }
+    Status start(uint32_t *writes, uint32_t *index, uint32_t *value)
+    {
+        return startCompute(g.r.reader(), 0x80000, g.w.writer(), 22, g.snapshot, &snapshot, &taken, writes, index, value);
+    }
+    Status test(uint32_t *scratch, uint32_t *fence, uint32_t *rptr, uint32_t *commit)
+    {
+        return testCompute(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.writer(), g.gfxWork.reader(), 22, g.snapshot,
+                           &snapshot, scratch, fence, rptr, commit);
+    }
+    Status dispatch(uint32_t commit, uint32_t *fence, uint32_t *wrong, uint32_t *first, uint32_t *firstValue)
+    {
+        return dispatchCompute(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.writer(), g.gfxWork.reader(), 22,
+                               g.snapshot, &snapshot, commit, fence, wrong, first, firstValue);
+    }
+    Status restore(uint32_t *index, uint32_t *value)
+    {
+        return restoreCompute(g.r.reader(), 0x80000, g.w.writer(), 22, g.snapshot, &snapshot, index, value);
+    }
+    uint32_t q(uint32_t offset) { return g.r.hqd[(uint64_t(kComputeSelect) << 32) | offset]; }
+};
+
+static void testCompute()
+{
+    // The pinned values (docs/test-boot.md, stage 22).
+    CHECK(kMaxStage == 22 && kComputeStage == 22 && kDiagnosticSelectorCount == 56 && kDiagnosticVersion == 18);
+    CHECK(kRegCpHqdActive == 0xC91Cu && kRegCpPqWptrPollCntl == 0xC20Cu && kRegShMemConfig == 0x8C34u &&
+          kRegRlcCpSchedulers == 0x3B2A8u && kRegCpHqdPqWptrLo == 0xC9ECu && kRegCpHqdEopControl == 0xC9B0u);
+    CHECK(kComputeWorkSize <= kGfxWorkCheckSize && kComputeRingPage == kGfxWorkSize && kComputeCodePage % 256 == 0);
+    CHECK(kComputeRingGpuAddress == 0xF440A04000ull && kComputeOutGpuAddress == 0xF440A09000ull);
+    CHECK(kComputeRingDwords * 4 == kComputeMqdPage - kComputeRingPage && kComputeFrameStarts[2] <= kComputeRingDwords);
+    CHECK(kComputeCodeDwords == 18 && kComputeCode[0] == 0xc0020082u && kComputeCode[17] == 0xbf810000u);
+    CHECK(gfxWorkSize(21) == kGfxWorkSize && gfxWorkSize(22) == kComputeWorkSize);
+    // Every register stage 22 writes sits in a page the adapter already maps.
+    for (uint32_t offset : kStage22Registers) {
+        bool paged = false;
+        for (uint32_t page : kGfxPages) paged = paged || (offset >= page && offset + 4 <= page + kPageSize);
+        CHECK(paged);
+        CHECK(registerAllowed(offset, 22) && !registerAllowed(offset, 21) && gfxGated(offset));
+    }
+    // The ring: the ring test and fence 3, then the dispatch and fence 4.
+    const uint32_t test[] = {0xC0017900u, 0x40, 0xDEADBEEFu, 0xC0064900u, 0x00238514u, 0x20000000u, 0x40A07100u, 0xF4, 3};
+    for (uint32_t i = 0; i < 9; i++) CHECK(computeRingWord(i) == test[i]);
+    CHECK(computeRingWord(11) == pm4(kPm4Nop, 64 - 11 - 2));
+    CHECK(computeRingWord(64) == 0xC0017600u && computeRingWord(65) == 0x216 && computeRingWord(66) == 0xffffffffu);
+    CHECK(computeRingWord(68) == 0x20C && computeRingWord(69) == 0xF440A080u && computeRingWord(70) == 0); // PGM_HI: (address >> 8) >> 32
+    CHECK(computeRingWord(73) == kComputePgmRsrc1 && computeRingWord(74) == kComputePgmRsrc2);
+    uint32_t dispatchAt = 64;
+    while (computeRingWord(dispatchAt) != pm4(kPm4DispatchDirect, 3)) dispatchAt++;
+    CHECK(computeRingWord(dispatchAt + 1) == 4 && computeRingWord(dispatchAt + 4) == kDispatchInitiator);
+    CHECK(computeRingWord(dispatchAt + 5) == 0xC0004600u && computeRingWord(dispatchAt + 6) == 0x407);
+    CHECK(computeRingWord(dispatchAt + 10) == 0x40A07108u && computeRingWord(dispatchAt + 12) == 4);
+    for (uint32_t d = 0, f = 1; d < kComputeFrameStarts[2];) {
+        d += ((computeRingWord(d) >> 16) & 0x3fff) + 2;
+        if (d >= kComputeFrameStarts[f]) CHECK(d == kComputeFrameStarts[f++]);
+    }
+    CHECK(computeWorkWord(kComputeWbPage + kComputeWbPacket + 4) == (64u | (1u << 16)) &&
+          computeWorkWord(kComputeWbPage + kComputeWbKernarg) == 0x40A09000u &&
+          computeWorkWord(kComputeCodePage) == kComputeCode[0] && computeWorkWord(kComputeOutPage) == 0xffffffffu &&
+          computeWorkWord(kComputeOutPage + 1024) == 0 && computeWorkWord(kComputeMqdPage) == 0);
+    CHECK(gfxWorkWord(kComputeRingPage) == computeRingWord(0));
+    // Work-area writes: the compute pages and the poll dword from stage 22 only.
+    CHECK(gfxWorkWriteAllowed(kComputeRingPage, computeRingWord(0), 22) &&
+          !gfxWorkWriteAllowed(kComputeRingPage, computeRingWord(0), 21));
+    CHECK(gfxWorkWriteAllowed(kComputeWbPage + kComputeWbPoll, 64, 22) &&
+          !gfxWorkWriteAllowed(kComputeWbPage + kComputeWbPoll, 65, 22) &&
+          !gfxWorkWriteAllowed(kComputeWbPage + kComputeWbPoll, 64, 21) &&
+          !gfxWorkWriteAllowed(kComputeWorkSize, 0, 22));
+    // Register writes against a snapshot.
+    {
+        ComputeSnapshot snap = {};
+        for (uint32_t i = 0; i < kComputeGlobalCount; i++) snap.global[i] = 0x01000000u * (i + 1);
+        for (uint32_t i = 0; i < kComputeQueueCount; i++) snap.queue[i] = 0x00010000u * (i + 1);
+        CHECK(computeWriteAllowed(kRegRlcCpSchedulers, 0x02000048u, 22, &snap) &&
+              computeWriteAllowed(kRegRlcCpSchedulers, 0x020000c8u, 22, &snap) &&
+              !computeWriteAllowed(kRegRlcCpSchedulers, 0x020000c9u, 22, &snap) &&
+              !computeWriteAllowed(kRegRlcCpSchedulers, 0x02000048u, 21, &snap) &&
+              !computeWriteAllowed(kRegRlcCpSchedulers, 0x02000048u, 22, nullptr));
+        CHECK(computeWriteAllowed(kRegCpMecCntl, 0x06000000u & ~kCpMecHalts, 22, &snap) &&
+              !computeWriteAllowed(kRegCpMecCntl, 0x12345678u, 22, &snap));
+        CHECK(computeWriteAllowed(kRegCpHqdActive, 1, 22, &snap) && computeWriteAllowed(kRegCpHqdActive, 0, 22, &snap) &&
+              !computeWriteAllowed(kRegCpHqdActive, 3, 22, &snap));
+        CHECK(computeWriteAllowed(kRegCpHqdPqWptrLo, 64, 22, &snap) && computeWriteAllowed(kRegCpHqdPqWptrLo, 256, 22, &snap) &&
+              !computeWriteAllowed(kRegCpHqdPqWptrLo, 65, 22, &snap));
+        CHECK(computeWriteAllowed(kRegCpHqdPqBase, 0xF440A040u, 22, &snap) &&
+              !computeWriteAllowed(kRegCpHqdPqBase, 0xF440A050u, 22, &snap));
+        CHECK(!computeWriteAllowed(kRegCpRb0Base, 0xF440A000u, 22, &snap));
+    }
+
+    // The whole stage against the fakes: method A (polling) works.
+    {
+        ComputeRig c;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, index = 9, value = 9;
+        CHECK(c.start(&writes, &index, &value) == kOK && c.taken && writes == 29);
+        CHECK(c.q(kRegCpHqdActive) == 1 && c.q(kRegCpHqdPqBase) == 0xF440A040u && c.q(kRegCpHqdPqControl) == 0xc0308909u &&
+              c.q(kRegCpHqdEopControl) == 0x49 && c.q(kRegCpHqdPersistentState) == 0x5301 &&
+              c.q(kRegCpHqdPqDoorbellControl) == 0 && c.q(kRegCpHqdEopBaseAddr) == 0xF440A060u &&
+              c.q(kRegCpMqdBaseAddr) == 0x40A05000u && c.q(kRegCpHqdPqWptrPollAddr) == 0x40A07008u);
+        CHECK(c.g.r.gc[kRegRlcCpSchedulers] == 0x123456c8u && c.g.r.gc[kRegCpPqWptrPollCntl] == 0x80000001u &&
+              c.g.r.gc[kRegShMemConfig] == 0x00001018u && c.g.r.gc[kRegShMemBases] == 0 &&
+              c.g.r.gc[kRegCpMecCntl] == 0 && (c.g.r.gc[kRegGrbmGfxCntl] & kGrbmGfxCntlMask) == 0);
+        // The selection was set for the queue's writes only.
+        uint32_t scratch = 0, fence = 0, rptr = 0, commit = 0;
+        CHECK(c.test(&scratch, &fence, &rptr, &commit) == kOK);
+        CHECK(scratch == 0xDEADBEEFu && fence == 3 && rptr == 64 && commit == kCommitPoll);
+        uint32_t wrong = 9, first = 9, firstValue = 9;
+        CHECK(c.dispatch(commit, &fence, &wrong, &first, &firstValue) == kOK && fence == 4 && wrong == 0);
+        for (uint32_t i = 0; i < kComputeOutDwords; i++) CHECK(c.g.gfxWork.words[(kComputeOutPage / 4) + i] == i);
+        ComputeState state;
+        CHECK(readComputeState(c.g.r.reader(), 0x80000, c.g.w.writer(), c.g.gfxWork.reader(), 22, c.g.snapshot,
+                               &c.snapshot, &state) == kOK);
+        CHECK(state.queue[0] == 1 && state.queue[1] == 256 && state.fence3 == 3 && state.fence4 == 4 && state.poll == 256);
+        CHECK(c.restore(&index, &value) == kOK && index == 0 && value == 0);
+        for (uint32_t i = 0; i < kComputeQueueCount; i++) CHECK(c.q(kComputeQueueRegisters[i]) == c.snapshot.queue[i]);
+        for (uint32_t i = 0; i < kComputeGlobalCount; i++)
+            CHECK(c.g.r.gc[kComputeGlobalRegisters[i]] == c.snapshot.global[i]);
+        CHECK(c.g.r.gc[kRegCpMecCntl] == kCpMecHalts && c.g.r.gc[kRegRlcCpSchedulers] == 0x12345600u);
+        CHECK(restoreGfx(c.g.r.reader(), 0x80000, c.g.w.writer(), 22, c.g.snapshot, &index, &value) == kOK);
+    }
+    {
+        // Method B, within the stage: a MEC that ignores the poll address.
+        ComputeRig c;
+        c.g.r.mecIgnoresPoll = true;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, index = 0, value = 0, scratch = 0, fence = 0, rptr = 0, commit = 0;
+        CHECK(c.start(&writes, &index, &value) == kOK);
+        CHECK(c.test(&scratch, &fence, &rptr, &commit) == kOK && commit == kCommitRegister && fence == 3);
+        uint32_t wrong = 9, first = 9, firstValue = 9;
+        CHECK(c.dispatch(commit, &fence, &wrong, &first, &firstValue) == kOK && wrong == 0);
+        CHECK(c.restore(&index, &value) == kOK);
+    }
+    {
+        // A MEC that never fetches: neither method moves the read pointer.
+        ComputeRig c;
+        c.g.r.mecHang = true;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, index = 0, value = 0, scratch = 0, fence = 0, rptr = 9, commit = 9;
+        CHECK(c.start(&writes, &index, &value) == kOK);
+        CHECK(c.test(&scratch, &fence, &rptr, &commit) == kComputeNoProgress && rptr == 0 && commit == kCommitNone &&
+              scratch == kScratchBefore);
+        uint32_t wrong = 0, first = 0, firstValue = 0;
+        CHECK(c.dispatch(commit, &fence, &wrong, &first, &firstValue) == kComputeNoProgress);
+        CHECK(c.restore(&index, &value) == kOK && c.q(kRegCpHqdActive) == 0);
+    }
+    {
+        // Fetched but the scratch write is lost: a ring-test failure, not a
+        // fetch problem.
+        ComputeRig c;
+        c.g.r.cpDropScratch = true;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, index = 0, value = 0, scratch = 0, fence = 0, rptr = 0, commit = 0;
+        CHECK(c.start(&writes, &index, &value) == kOK);
+        CHECK(c.test(&scratch, &fence, &rptr, &commit) == kGfxRingTestFailed && rptr == 64);
+    }
+    {
+        // A kernel that writes the wrong values.
+        ComputeRig c;
+        c.g.r.kernelWrong = true;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, index = 0, value = 0, scratch = 0, fence = 0, rptr = 0, commit = 0;
+        CHECK(c.start(&writes, &index, &value) == kOK && c.test(&scratch, &fence, &rptr, &commit) == kOK);
+        uint32_t wrong = 0, first = 9, firstValue = 0;
+        CHECK(c.dispatch(commit, &fence, &wrong, &first, &firstValue) == kComputeMismatch);
+        CHECK(wrong == 256 && first == 0 && firstValue == 1);
+    }
+    {
+        // An active queue at the start, a selector already set, stage 21.
+        ComputeRig c;
+        c.g.r.hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdActive] = 1;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, index = 0, value = 0;
+        CHECK(c.start(&writes, &index, &value) == kGfxUnexpectedState && c.taken && value == 1);
+        CHECK(kComputeQueueRegisters[index] == kRegCpHqdActive && (c.g.r.gc[kRegGrbmGfxCntl] & kGrbmGfxCntlMask) == 0);
+        ComputeRig d;
+        CHECK(d.rlc() == kOK);
+        d.g.r.gc[kRegGrbmGfxCntl] |= 0x5;
+        CHECK(d.start(&writes, &index, &value) == kGfxUnexpectedState && !d.taken && writes == 0);
+        ComputeRig e;
+        CHECK(e.rlc() == kOK);
+        CHECK(startCompute(e.g.r.reader(), 0x80000, e.g.w.writer(), 21, e.g.snapshot, &e.snapshot, &e.taken, &writes,
+                           &index, &value) == kRegisterNotAllowed);
+    }
+    {
+        // A per-queue register that does not take the restore.
+        ComputeRig c;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, index = 0, value = 0, scratch = 0, fence = 0, rptr = 0, commit = 0;
+        CHECK(c.start(&writes, &index, &value) == kOK && c.test(&scratch, &fence, &rptr, &commit) == kOK);
+        c.g.r.hqdStuck = kRegCpHqdEopBaseAddr;
+        CHECK(c.restore(&index, &value) == kGfxNotRestored && index == 0 && value == 0xF440A060u);
+        CHECK(c.g.r.gc[kRegCpMecCntl] == kCpMecHalts && (c.g.r.gc[kRegGrbmGfxCntl] & kGrbmGfxCntlMask) == 0);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -3360,6 +3672,7 @@ int main()
     testDisplay();
     testFlip();
     testGfx();
+    testCompute();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

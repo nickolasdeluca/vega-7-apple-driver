@@ -31,7 +31,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 21;
+const uint32_t kMaxStage = 22;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -1339,6 +1339,191 @@ const uint32_t kGfxPageSet = 0x8000;
 const uint32_t kGfxPages[] = {0x8000, 0x9000, 0xa000, 0xc000, 0x30000, 0x3b000};
 const uint32_t kGfxPageCount = sizeof(kGfxPages) / sizeof(kGfxPages[0]);
 
+// Stage 22 (docs/test-boot.md, "Stage 22: a compute queue on the MEC runs our
+// kernel"): stage 21's check, loads and RLC start (not its graphics CP start),
+// then one compute queue on the MEC brought up as Linux brings up the KIQ
+// (gfx_v9_0_kiq_setting, gfx_v9_0_mqd_init, gfx_v9_0_kiq_init_register), a
+// ring test, and one dispatch of the store_index kernel. Offsets from
+// gc_9_0_offset.h; PM4 from soc15d.h (Linux v6.12).
+const uint32_t kComputeStage = 22;
+// Per queue: read and written only with GRBM_GFX_CNTL selecting the queue.
+const uint32_t kRegCpMqdBaseAddr = (0x2000 + 0x1245) * 4; // CP_MQD_BASE_ADDR
+const uint32_t kRegCpMqdBaseAddrHi = (0x2000 + 0x1246) * 4; // CP_MQD_BASE_ADDR_HI
+const uint32_t kRegCpHqdActive = (0x2000 + 0x1247) * 4; // CP_HQD_ACTIVE
+const uint32_t kRegCpHqdVmid = (0x2000 + 0x1248) * 4; // CP_HQD_VMID
+const uint32_t kRegCpHqdPersistentState = (0x2000 + 0x1249) * 4; // CP_HQD_PERSISTENT_STATE
+const uint32_t kRegCpHqdPqBase = (0x2000 + 0x124d) * 4; // CP_HQD_PQ_BASE
+const uint32_t kRegCpHqdPqBaseHi = (0x2000 + 0x124e) * 4; // CP_HQD_PQ_BASE_HI
+const uint32_t kRegCpHqdPqRptr = (0x2000 + 0x124f) * 4; // CP_HQD_PQ_RPTR
+const uint32_t kRegCpHqdPqRptrReportAddr = (0x2000 + 0x1250) * 4; // CP_HQD_PQ_RPTR_REPORT_ADDR
+const uint32_t kRegCpHqdPqRptrReportAddrHi = (0x2000 + 0x1251) * 4; // CP_HQD_PQ_RPTR_REPORT_ADDR_HI
+const uint32_t kRegCpHqdPqWptrPollAddr = (0x2000 + 0x1252) * 4; // CP_HQD_PQ_WPTR_POLL_ADDR
+const uint32_t kRegCpHqdPqWptrPollAddrHi = (0x2000 + 0x1253) * 4; // CP_HQD_PQ_WPTR_POLL_ADDR_HI
+const uint32_t kRegCpHqdPqDoorbellControl = (0x2000 + 0x1254) * 4; // CP_HQD_PQ_DOORBELL_CONTROL
+const uint32_t kRegCpHqdPqControl = (0x2000 + 0x1256) * 4; // CP_HQD_PQ_CONTROL
+const uint32_t kRegCpHqdIbControl = (0x2000 + 0x125a) * 4; // CP_HQD_IB_CONTROL
+const uint32_t kRegCpHqdIqTimer = (0x2000 + 0x125b) * 4; // CP_HQD_IQ_TIMER
+const uint32_t kRegCpHqdDequeueRequest = (0x2000 + 0x125d) * 4; // CP_HQD_DEQUEUE_REQUEST
+const uint32_t kRegCpMqdControl = (0x2000 + 0x1267) * 4; // CP_MQD_CONTROL
+const uint32_t kRegCpHqdEopBaseAddr = (0x2000 + 0x126a) * 4; // CP_HQD_EOP_BASE_ADDR
+const uint32_t kRegCpHqdEopBaseAddrHi = (0x2000 + 0x126b) * 4; // CP_HQD_EOP_BASE_ADDR_HI
+const uint32_t kRegCpHqdEopControl = (0x2000 + 0x126c) * 4; // CP_HQD_EOP_CONTROL
+const uint32_t kRegCpHqdPqWptrLo = (0x2000 + 0x127b) * 4; // CP_HQD_PQ_WPTR_LO
+const uint32_t kRegCpHqdPqWptrHi = (0x2000 + 0x127c) * 4; // CP_HQD_PQ_WPTR_HI
+// Not per queue (SH_MEM_* are per VMID: VMID 0 with GRBM_GFX_CNTL at 0).
+const uint32_t kRegCpPqWptrPollCntl = (0x2000 + 0x1083) * 4; // CP_PQ_WPTR_POLL_CNTL
+const uint32_t kRegShMemBases = (0x2000 + 0x030a) * 4; // SH_MEM_BASES
+const uint32_t kRegShMemConfig = (0x2000 + 0x030d) * 4; // SH_MEM_CONFIG
+const uint32_t kRegRlcCpSchedulers = (0xA000 + 0x4caa) * 4; // RLC_CP_SCHEDULERS
+const uint32_t kRegCpCpcBusyStat = (0x2000 + 0x0085) * 4; // CP_CPC_BUSY_STAT (read)
+const uint32_t kRegCpCpcStalledStat1 = (0x2000 + 0x0086) * 4; // CP_CPC_STALLED_STAT1 (read)
+const uint32_t kStage22Registers[] = {
+    kRegCpMqdBaseAddr,       kRegCpMqdBaseAddrHi,        kRegCpHqdActive,           kRegCpHqdVmid,
+    kRegCpHqdPersistentState, kRegCpHqdPqBase,           kRegCpHqdPqBaseHi,         kRegCpHqdPqRptr,
+    kRegCpHqdPqRptrReportAddr, kRegCpHqdPqRptrReportAddrHi, kRegCpHqdPqWptrPollAddr, kRegCpHqdPqWptrPollAddrHi,
+    kRegCpHqdPqDoorbellControl, kRegCpHqdPqControl,      kRegCpHqdIbControl,        kRegCpHqdIqTimer,
+    kRegCpHqdDequeueRequest, kRegCpMqdControl,           kRegCpHqdEopBaseAddr,      kRegCpHqdEopBaseAddrHi,
+    kRegCpHqdEopControl,     kRegCpHqdPqWptrLo,          kRegCpHqdPqWptrHi,         kRegCpPqWptrPollCntl,
+    kRegShMemBases,          kRegShMemConfig,            kRegRlcCpSchedulers,       kRegCpCpcBusyStat,
+    kRegCpCpcStalledStat1};
+const uint32_t kStage22RegisterCount = sizeof(kStage22Registers) / sizeof(kStage22Registers[0]);
+
+// The queue: amdgpu_gfx_kiq_acquire's choice with two MECs (ME 2, pipe 1,
+// queue 0), announced to the RLC as gfx_v9_0_kiq_setting does.
+const uint32_t kComputeSelect = 0x00000009; // GRBM_GFX_CNTL: PIPEID 1, MEID 2, QUEUEID 0, VMID 0
+const uint32_t kComputeKiq = 0x48, kRlcKiqMask = 0xff, kRlcKiqEnable = 0x80; // (me << 5) | (pipe << 3) | queue
+
+// The memory, in stage 21's work area after its 16 KiB (its 64 KiB are
+// checked free): ring, MQD, EOP buffer, write-back, code, output.
+const uint32_t kComputeRingPage = 0x4000, kComputeMqdPage = 0x5000, kComputeEopPage = 0x6000,
+               kComputeWbPage = 0x7000, kComputeCodePage = 0x8000, kComputeOutPage = 0x9000;
+const uint32_t kComputeWorkSize = 0xa000;
+const uint32_t kComputeWbRptr = 0x000, kComputeWbPoll = 0x008, kComputeWbFence3 = 0x100, kComputeWbFence4 = 0x108,
+               kComputeWbPacket = 0x200, kComputeWbKernarg = 0x300;
+const uint64_t kComputeRingGpuAddress = kGfxWorkGpuAddress + kComputeRingPage;
+const uint64_t kComputeMqdGpuAddress = kGfxWorkGpuAddress + kComputeMqdPage;
+const uint64_t kComputeEopGpuAddress = kGfxWorkGpuAddress + kComputeEopPage;
+const uint64_t kComputeRptrGpuAddress = kGfxWorkGpuAddress + kComputeWbPage + kComputeWbRptr;
+const uint64_t kComputePollGpuAddress = kGfxWorkGpuAddress + kComputeWbPage + kComputeWbPoll;
+const uint64_t kComputePacketGpuAddress = kGfxWorkGpuAddress + kComputeWbPage + kComputeWbPacket;
+const uint64_t kComputeKernargGpuAddress = kGfxWorkGpuAddress + kComputeWbPage + kComputeWbKernarg;
+const uint64_t kComputeCodeGpuAddress = kGfxWorkGpuAddress + kComputeCodePage;
+const uint64_t kComputeOutGpuAddress = kGfxWorkGpuAddress + kComputeOutPage;
+const uint32_t kComputeRingDwords = 1024; // 4 KiB: QUEUE_SIZE 9
+const uint32_t kComputeFrameStarts[] = {0, 64, 256}; // frame 1: ring test and fence 3; frame 2: the dispatch
+const uint32_t kComputeGroups = 4, kComputeGroupSize = 64, kComputeOutDwords = kComputeGroups * kComputeGroupSize;
+const uint32_t kComputeOutBefore = 0xffffffff;
+
+// PM4 (soc15d.h, v6.12) for the dispatch, as gfx_v9_0_do_edc_gpr_workarounds
+// emits it.
+const uint32_t kPm4DispatchDirect = 0x15, kPm4EventWrite = 0x46, kPm4SetShReg = 0x76;
+const uint32_t kSetShRegStart = 0x2c00;     // PACKET3_SET_SH_REG_START (dwords)
+const uint32_t kCsPartialFlush = 0x00000407; // EVENT_TYPE(7) | EVENT_INDEX(4)
+const uint32_t kDispatchInitiator = 0x1;    // COMPUTE_DISPATCH_INITIATOR.COMPUTE_SHADER_EN
+// SH registers (dword offsets, GC base 0).
+const uint32_t kShComputeNumThreadX = 0x2000 + 0x0e07, kShComputePgmLo = 0x2000 + 0x0e0c,
+               kShComputePgmRsrc1 = 0x2000 + 0x0e12, kShComputeResourceLimits = 0x2000 + 0x0e15,
+               kShComputeStaticThreadMgmtSe0 = 0x2000 + 0x0e16, kShComputeTmpringSize = 0x2000 + 0x0e18,
+               kShComputeUserData0 = 0x2000 + 0x0e40;
+
+// The kernel: Apple's metal 32023.883 compiled store_index (MSL) to AIR,
+// tools/air_lower.py and LLVM 20.1.7 lowered it to gfx90c (code object v5).
+// Its .text, its descriptor's COMPUTE_PGM_RSRC1/2 (8 user SGPRs: private
+// segment buffer, dispatch packet, kernarg; workgroup ID X), as
+// tests/test_compute_kernel.py checks against the study's code object.
+const uint32_t kComputeCode[] = {0xc0020082, 0x00000004, 0xc0060003, 0x00000000, 0x7e020280, 0xbf8cc07f,
+                                 0x8602ff02, 0x0000ffff, 0x92080208, 0x68000008, 0xd28f0001, 0x00020082,
+                                 0x7e060201, 0x32020200, 0x38040503, 0xdc708000, 0x007f0001, 0xbf810000};
+const uint32_t kComputeCodeDwords = sizeof(kComputeCode) / sizeof(kComputeCode[0]);
+const uint32_t kComputePgmRsrc1 = 0x00af0040, kComputePgmRsrc2 = 0x00000090;
+
+// The HQD values (gfx_v9_0_mqd_init): (read & ~mask) | value, the read being
+// the queue snapshot; a mask of all ones is a fixed value.
+const uint32_t kCpPqWptrPollEn = 0x80000000;
+const uint32_t kShMemAlignmentUnaligned = 0x00000018, kShMemRetryDisable = 0x00001000;
+const uint32_t kCpHqdActive = 0x1;
+// The registers stage 22 writes that are not per queue, in this order; the
+// compute start reads them (GRBM_GFX_CNTL first, then with it at 0).
+const uint32_t kComputeGlobalRegisters[] = {kRegGrbmGfxCntl, kRegRlcCpSchedulers, kRegCpPqWptrPollCntl,
+                                            kRegShMemConfig, kRegShMemBases, kRegCpMecCntl};
+const uint32_t kComputeGlobalCount = sizeof(kComputeGlobalRegisters) / sizeof(kComputeGlobalRegisters[0]);
+// The per-queue registers, read under the selection, written in
+// kiq_init_register's order and restored in this order.
+const uint32_t kComputeQueueRegisters[] = {
+    kRegCpHqdEopBaseAddr, kRegCpHqdEopBaseAddrHi, kRegCpHqdEopControl, kRegCpHqdPqDoorbellControl,
+    kRegCpMqdBaseAddr,    kRegCpMqdBaseAddrHi,    kRegCpMqdControl,    kRegCpHqdPqBase,
+    kRegCpHqdPqBaseHi,    kRegCpHqdPqControl,     kRegCpHqdPqRptrReportAddr, kRegCpHqdPqRptrReportAddrHi,
+    kRegCpHqdPqWptrPollAddr, kRegCpHqdPqWptrPollAddrHi, kRegCpHqdPqWptrLo, kRegCpHqdPqWptrHi,
+    kRegCpHqdVmid,        kRegCpHqdPersistentState, kRegCpHqdActive,   kRegCpHqdDequeueRequest,
+    kRegCpHqdPqRptr,      kRegCpHqdIqTimer,       kRegCpHqdIbControl};
+const uint32_t kComputeQueueCount = sizeof(kComputeQueueRegisters) / sizeof(kComputeQueueRegisters[0]);
+struct ComputeSnapshot {
+    uint32_t global[kComputeGlobalCount];
+    uint32_t queue[kComputeQueueCount];
+};
+// The bring-up, in kiq_setting then kiq_init_register order (GfxWrite:
+// offset, mask, value against the snapshot).
+const GfxWrite kComputeGlobalWrites[] = {
+    {kRegRlcCpSchedulers, kRlcKiqMask, kComputeKiq},
+    {kRegRlcCpSchedulers, kRlcKiqMask, kComputeKiq | kRlcKiqEnable},
+    {kRegCpPqWptrPollCntl, kCpPqWptrPollEn, kCpPqWptrPollEn}, // method A: the MEC polls the write pointer
+    {kRegGrbmGfxCntl, kGrbmGfxCntlMask, kComputeSelect},
+    {kRegShMemConfig, ~kShMemRetryDisable, kShMemAlignmentUnaligned}, // constants_init, VMID 0
+    {kRegShMemBases, 0xFFFFFFFF, 0},
+    {kRegCpMecCntl, kCpMecHalts, 0}, // gfx_v9_0_cp_compute_enable(true)
+};
+const GfxWrite kComputeQueueWrites[] = {
+    {kRegCpHqdEopBaseAddr, 0xFFFFFFFF, uint32_t(kComputeEopGpuAddress >> 8)},
+    {kRegCpHqdEopBaseAddrHi, 0xFFFFFFFF, uint32_t(kComputeEopGpuAddress >> 40)},
+    {kRegCpHqdEopControl, 0x3f, 9}, // EOP_SIZE: 2^(9+1) dwords, GFX9_MEC_HPD_SIZE
+    {kRegCpHqdPqDoorbellControl, 0x40000000, 0}, // DOORBELL_EN 0
+    {kRegCpMqdBaseAddr, 0xFFFFFFFF, uint32_t(kComputeMqdGpuAddress) & 0xfffffffc},
+    {kRegCpMqdBaseAddrHi, 0xFFFFFFFF, uint32_t(kComputeMqdGpuAddress >> 32)},
+    {kRegCpMqdControl, 0xf, 0}, // VMID 0
+    {kRegCpHqdPqBase, 0xFFFFFFFF, uint32_t(kComputeRingGpuAddress >> 8)},
+    {kRegCpHqdPqBaseHi, 0xFFFFFFFF, uint32_t(kComputeRingGpuAddress >> 40)},
+    // QUEUE_SIZE 9, RPTR_BLOCK_SIZE 9, UNORD_DISPATCH 0, ROQ_PQ_IB_FLIP 0, PRIV_STATE 1, KMD_QUEUE 1.
+    {kRegCpHqdPqControl, 0xf0003f3f, 0xc0000909},
+    {kRegCpHqdPqRptrReportAddr, 0xFFFFFFFF, uint32_t(kComputeRptrGpuAddress) & 0xfffffffc},
+    {kRegCpHqdPqRptrReportAddrHi, 0xFFFFFFFF, uint32_t(kComputeRptrGpuAddress >> 32) & 0xffff},
+    {kRegCpHqdPqWptrPollAddr, 0xFFFFFFFF, uint32_t(kComputePollGpuAddress) & 0xfffffffc},
+    {kRegCpHqdPqWptrPollAddrHi, 0xFFFFFFFF, uint32_t(kComputePollGpuAddress >> 32) & 0xffff},
+    {kRegCpHqdPqWptrLo, 0xFFFFFFFF, 0},
+    {kRegCpHqdPqWptrHi, 0xFFFFFFFF, 0},
+    {kRegCpHqdVmid, 0xFFFFFFFF, 0},
+    {kRegCpHqdPersistentState, 0x0003ff00, 0x00005300}, // PRELOAD_SIZE 0x53
+    {kRegCpHqdActive, 0xFFFFFFFF, kCpHqdActive},
+};
+// The other per-queue values: method B's write pointers (within the stage,
+// if polling does not move the read pointer) and kiq_fini_register's.
+const GfxWrite kComputeQueueExtraWrites[] = {
+    {kRegCpHqdPqWptrLo, 0xFFFFFFFF, 64},  {kRegCpHqdPqWptrLo, 0xFFFFFFFF, 256},
+    {kRegCpHqdDequeueRequest, 0xFFFFFFFF, 1}, {kRegCpHqdDequeueRequest, 0xFFFFFFFF, 0},
+    {kRegCpHqdActive, 0xFFFFFFFF, 0},     {kRegCpHqdIqTimer, 0xFFFFFFFF, 0},
+    {kRegCpHqdIbControl, 0xFFFFFFFF, 0},  {kRegCpHqdPersistentState, 0xFFFFFFFF, 0},
+    {kRegCpHqdPqDoorbellControl, 0xFFFFFFFF, 0x40000000}, {kRegCpHqdPqDoorbellControl, 0xFFFFFFFF, 0},
+    {kRegCpHqdPqRptr, 0xFFFFFFFF, 0},
+};
+// What a stage 22 report shows (ComputeState): per queue (under the
+// selection), then not per queue, then the write-back.
+const uint32_t kComputeQueueStateRegisters[] = {kRegCpHqdActive, kRegCpHqdPqRptr, kRegCpHqdPqWptrLo,
+                                                kRegCpHqdPqControl, kRegCpHqdDequeueRequest};
+const uint32_t kComputeQueueStateCount =
+    sizeof(kComputeQueueStateRegisters) / sizeof(kComputeQueueStateRegisters[0]);
+const uint32_t kComputeGlobalStateRegisters[] = {kRegCpMecCntl,       kRegCpCpcStatus,     kRegCpCpcBusyStat,
+                                                 kRegCpCpcStalledStat1, kRegCpMec1InstrPntr, kRegCpPqWptrPollCntl,
+                                                 kRegRlcCpSchedulers, kRegShMemConfig,    kRegScratchReg0,
+                                                 kRegGrbmStatus,      kRegCpcUtcl1Status,  kRegGcVmL2ProtectionFaultStatus};
+const uint32_t kComputeGlobalStateCount =
+    sizeof(kComputeGlobalStateRegisters) / sizeof(kComputeGlobalStateRegisters[0]);
+struct ComputeState {
+    uint32_t queue[kComputeQueueStateCount];
+    uint32_t global[kComputeGlobalStateCount];
+    uint32_t rptr, poll, fence3, fence4; // the write-back page
+};
+// How the write pointer reached the MEC (ring test report).
+enum ComputeCommit : uint32_t { kCommitNone = 0, kCommitPoll = 1, kCommitRegister = 2 };
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -1471,6 +1656,9 @@ enum Status : uint32_t {
     kGfxVerifyFailed,
     kGfxNotRestored,
     kGfxOutOfOrder,
+    // Stage 22.
+    kComputeNoProgress, // neither write-pointer method moved the queue's read pointer
+    kComputeMismatch,   // the dispatch finished but the output is not 0..255
 };
 
 const char *statusName(Status status);
@@ -1589,7 +1777,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 17;
+const uint32_t kDiagnosticVersion = 18;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -1669,7 +1857,13 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticGfxDraw = 50,    // out: Status, step, fence 2, unexpected words, first offset, its value
     kDiagnosticGfxVerify = 51,  // out: Status; structure: DisplayReport (not a GfxState)
     kDiagnosticGfxRestore = 52, // out: Status, index into the snapshot list, value, flip-back status
-    kDiagnosticSelectorCount = 53,
+    // Stage 22: after GfxRlc (selector 47), instead of GfxCp, in this order;
+    // each returns a ComputeState as its structure. GfxRestore (52) then
+    // restores the queue before stage 21's registers.
+    kDiagnosticComputeStart = 53,    // out: Status, writes made, index, value
+    kDiagnosticComputeTest = 54,     // out: Status, SCRATCH_REG0, fence 3, read-pointer write-back, ComputeCommit
+    kDiagnosticComputeDispatch = 55, // out: Status, fence 4, wrong outputs, first wrong index, its value
+    kDiagnosticSelectorCount = 56,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -2363,6 +2557,63 @@ Status verifyGfxDraw(const RegisterReader &registers, uint64_t apertureLength, c
 // returned before that.
 Status restoreGfx(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                   uint32_t stage, const uint32_t *snapshot, uint32_t *index, uint32_t *value);
+
+// Stage 22. The work area's size for a stage: stage 21's 16 KiB, or with
+// stage 22 also the compute pages.
+uint32_t gfxWorkSize(uint32_t stage);
+// The compute pages' initial words (0x4000 on): ring (two frames, NOP
+// padded), zeroed MQD and EOP, the write-back page with the dispatch packet
+// and kernarg, the code, the output pre-filled.
+uint32_t computeWorkWord(uint32_t offset);
+uint32_t computeRingWord(uint32_t dword);
+// Whether a register write is a stage 22 value given the compute snapshot:
+// the snapshot value (the restore) or a kComputeGlobalWrites /
+// kComputeQueueWrites value, or a kComputeQueueExtraWrites value.
+bool computeWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage, const ComputeSnapshot *snapshot);
+// The write-pointer poll dword: the frame ends (or 0), written by the CPU to
+// commit (method A).
+bool computePollWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage);
+
+// Reads the compute state: the per-queue registers under the selection (two
+// GRBM_GFX_CNTL writes), then the rest and the write-back page.
+Status readComputeState(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                        const MemoryReader &work, uint32_t stage, const uint32_t *gfxSnapshot,
+                        const ComputeSnapshot *snapshot, ComputeState *state);
+
+// The bring-up after startRlc: reads the global snapshot (GRBM_GFX_CNTL
+// first; it must select nothing), selects the queue and reads its snapshot
+// (kGfxUnexpectedState with the queue index if CP_HQD_ACTIVE is set), then
+// kComputeGlobalWrites and kComputeQueueWrites in Linux's order, and unhalts
+// the MEC. taken says whether the snapshot was read (the restore needs it).
+Status startCompute(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                    uint32_t stage, const uint32_t *gfxSnapshot, ComputeSnapshot *snapshot, bool *taken,
+                    uint32_t *writes, uint32_t *index, uint32_t *value);
+
+// Frame 1: SCRATCH_REG0 <- kScratchBefore, commit by polling (method A); if
+// the read pointer does not move, also by CP_HQD_PQ_WPTR_LO (method B,
+// kComputeNoProgress if neither); then SCRATCH_REG0 must read
+// kScratchRingTest (kGfxRingTestFailed) and fence 3 land (kGfxFenceTimeout).
+Status testCompute(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   const MemoryWriter &workWriter, const MemoryReader &work, uint32_t stage,
+                   const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t *scratch, uint32_t *fence,
+                   uint32_t *rptr, uint32_t *commit);
+
+// Frame 2 by the ring test's method: the dispatch, fence 4
+// (kGfxFenceTimeout), then the output must hold 0..255 (kComputeMismatch
+// with the count, the first wrong index and its value).
+Status dispatchCompute(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                       const MemoryWriter &workWriter, const MemoryReader &work, uint32_t stage,
+                       const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t commit,
+                       uint32_t *fence, uint32_t *wrong, uint32_t *first, uint32_t *firstValue);
+
+// The queue's restore, before restoreGfx: under the selection, dequeue if
+// active (kiq_fini_register), kiq_fini_register's writes, every queue
+// register <- its snapshot; then the MEC halted and every global register <-
+// its snapshot; all read back (kGfxNotRestored; index: queue registers, then
+// kComputeQueueCount + the global index).
+Status restoreCompute(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t *index,
+                      uint32_t *value);
 
 } // namespace cezanne
 

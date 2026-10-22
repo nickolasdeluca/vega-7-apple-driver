@@ -116,6 +116,8 @@ const char *statusName(Status status)
     case kGfxVerifyFailed: return "gfx-verify-failed";
     case kGfxNotRestored: return "gfx-not-restored";
     case kGfxOutOfOrder: return "gfx-out-of-order";
+    case kComputeNoProgress: return "compute-no-progress";
+    case kComputeMismatch: return "compute-mismatch";
     }
     return "unknown";
 }
@@ -218,6 +220,9 @@ bool registerAllowed(uint32_t offset, uint32_t stage)
     for (uint32_t i = 0; stage >= kGfxStage && i < kStage21RegisterCount; i++) {
         if (kStage21Registers[i] == offset) return true;
     }
+    for (uint32_t i = 0; stage >= kComputeStage && i < kStage22RegisterCount; i++) {
+        if (kStage22Registers[i] == offset) return true;
+    }
     return false;
 }
 
@@ -245,6 +250,9 @@ bool gfxGated(uint32_t offset)
     }
     for (uint32_t i = 0; i < kStage21RegisterCount; i++) {
         if (kStage21Registers[i] == offset) return true;
+    }
+    for (uint32_t i = 0; i < kStage22RegisterCount; i++) {
+        if (kStage22Registers[i] == offset) return true;
     }
     return false;
 }
@@ -2611,13 +2619,19 @@ uint32_t gfxWorkWord(uint32_t offset)
 {
     if (offset < kGfxWbPage) return gfxRingWord(offset / 4);
     if (offset < kGfxCsbPage) return 0;
-    return offset < kGfxWorkSize ? gfxCsbWord((offset - kGfxCsbPage) / 4) : 0;
+    if (offset < kGfxWorkSize) return gfxCsbWord((offset - kGfxCsbPage) / 4);
+    return computeWorkWord(offset);
+}
+
+uint32_t gfxWorkSize(uint32_t stage)
+{
+    return stage >= kComputeStage ? kComputeWorkSize : kGfxWorkSize;
 }
 
 bool gfxWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
 {
-    if (stage < kGfxStage || (offset & 3) != 0 || offset >= kGfxWorkSize) return false;
-    return value == gfxWorkWord(offset);
+    if (stage < kGfxStage || (offset & 3) != 0 || offset >= gfxWorkSize(stage)) return false;
+    return value == gfxWorkWord(offset) || computePollWriteAllowed(offset, value, stage);
 }
 
 static Status writeGfxWorkWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
@@ -2629,11 +2643,11 @@ static Status writeGfxWorkWord(const MemoryWriter &writer, uint32_t stage, uint3
 Status writeGfxWork(const MemoryReader &work, const MemoryWriter &writer, uint32_t stage)
 {
     if (stage < kGfxStage) return kRegisterNotAllowed;
-    for (uint32_t offset = 0; offset < kGfxWorkSize; offset += 4) {
+    for (uint32_t offset = 0; offset < gfxWorkSize(stage); offset += 4) {
         Status status = writeGfxWorkWord(writer, stage, offset, gfxWorkWord(offset));
         if (status != kOK) return status;
     }
-    for (uint32_t offset = 0; offset < kGfxWorkSize; offset += 4) {
+    for (uint32_t offset = 0; offset < gfxWorkSize(stage); offset += 4) {
         uint32_t value = 0;
         if (!work.read32(work.context, offset, &value)) return kRegisterReadFailed;
         if (value != gfxWorkWord(offset)) return kPspReadbackMismatch;
@@ -2976,6 +2990,466 @@ Status restoreGfx(const RegisterReader &registers, uint64_t apertureLength, cons
         Status status = readRegister(registers, apertureLength, stage, kGfxSnapshotRegisters[i], value);
         if (status != kOK) return status;
         if (*value != snapshot[i]) return kGfxNotRestored;
+    }
+    *index = *value = 0;
+    return kOK;
+}
+
+// Stage 22.
+
+// gfx_v9_0_ring_emit_fence on the compute ring: RELEASE_MEM writing seq at a
+// compute write-back offset.
+static uint32_t computeFenceWord(uint32_t i, uint32_t at, uint32_t seq)
+{
+    const uint64_t address = kGfxWorkGpuAddress + kComputeWbPage + at;
+    const uint32_t words[] = {pm4(kPm4ReleaseMem, 6), kReleaseMemEvent, kReleaseMemData, uint32_t(address),
+                              uint32_t(address >> 32), seq, 0, 0};
+    return words[i];
+}
+
+// Frame 2 before its NOP padding, as gfx_v9_0_do_edc_gpr_workarounds emits a
+// dispatch: the SH registers, DISPATCH_DIRECT, a CS partial flush, then fence
+// 4. Returns the dword count (at most kComputeFrameStarts[2] - [1]).
+static uint32_t computeDispatchWords(uint32_t *w)
+{
+    uint32_t n = 0;
+    w[n++] = pm4(kPm4SetShReg, 1);
+    w[n++] = kShComputeStaticThreadMgmtSe0 - kSetShRegStart;
+    w[n++] = 0xffffffff; // every CU of the one SE
+    w[n++] = pm4(kPm4SetShReg, 2);
+    w[n++] = kShComputePgmLo - kSetShRegStart;
+    w[n++] = uint32_t(kComputeCodeGpuAddress >> 8);
+    w[n++] = uint32_t(kComputeCodeGpuAddress >> 40);
+    w[n++] = pm4(kPm4SetShReg, 2);
+    w[n++] = kShComputePgmRsrc1 - kSetShRegStart;
+    w[n++] = kComputePgmRsrc1;
+    w[n++] = kComputePgmRsrc2;
+    w[n++] = pm4(kPm4SetShReg, 1);
+    w[n++] = kShComputeTmpringSize - kSetShRegStart;
+    w[n++] = 0; // no scratch
+    w[n++] = pm4(kPm4SetShReg, 1);
+    w[n++] = kShComputeResourceLimits - kSetShRegStart;
+    w[n++] = 0;
+    w[n++] = pm4(kPm4SetShReg, 3);
+    w[n++] = kShComputeNumThreadX - kSetShRegStart;
+    w[n++] = kComputeGroupSize;
+    w[n++] = 1;
+    w[n++] = 1;
+    // The kernel's user SGPRs (code properties 0xb): s[0:3] the private
+    // segment buffer (no scratch), s[4:5] the dispatch packet, s[6:7] kernarg.
+    w[n++] = pm4(kPm4SetShReg, 8);
+    w[n++] = kShComputeUserData0 - kSetShRegStart;
+    w[n++] = 0;
+    w[n++] = 0;
+    w[n++] = 0;
+    w[n++] = 0;
+    w[n++] = uint32_t(kComputePacketGpuAddress);
+    w[n++] = uint32_t(kComputePacketGpuAddress >> 32);
+    w[n++] = uint32_t(kComputeKernargGpuAddress);
+    w[n++] = uint32_t(kComputeKernargGpuAddress >> 32);
+    w[n++] = pm4(kPm4DispatchDirect, 3);
+    w[n++] = kComputeGroups;
+    w[n++] = 1;
+    w[n++] = 1;
+    w[n++] = kDispatchInitiator;
+    w[n++] = pm4(kPm4EventWrite, 0);
+    w[n++] = kCsPartialFlush;
+    for (uint32_t i = 0; i < 8; i++) w[n++] = computeFenceWord(i, kComputeWbFence4, 4);
+    return n;
+}
+
+uint32_t computeRingWord(uint32_t dword)
+{
+    if (dword < kComputeFrameStarts[1]) {
+        // Frame 1: gfx_v9_0_ring_test_ring, then fence 3.
+        const uint32_t test[] = {pm4(kPm4SetUconfigReg, 1), kRegScratchReg0 / 4 - 0xc000, kScratchRingTest};
+        if (dword < 3) return test[dword];
+        if (dword < 11) return computeFenceWord(dword - 3, kComputeWbFence3, 3);
+        return nopWord(dword, 11, kComputeFrameStarts[1]);
+    }
+    if (dword < kComputeFrameStarts[2]) {
+        uint32_t words[192]; // kComputeFrameStarts[2] - [1]
+        const uint32_t count = computeDispatchWords(words);
+        const uint32_t i = dword - kComputeFrameStarts[1];
+        return i < count ? words[i] : nopWord(dword, kComputeFrameStarts[1] + count, kComputeFrameStarts[2]);
+    }
+    return 0;
+}
+
+// hsa_kernel_dispatch_packet_t, as far as the kernel reads it (the workgroup
+// size at +4; the grid size for completeness): one dimension, 64 x 1 x 1
+// work-items per group, 256 x 1 x 1 in all.
+static uint32_t computePacketWord(uint32_t i)
+{
+    const uint32_t words[] = {1u << 16, kComputeGroupSize | (1u << 16), 1, kComputeOutDwords, 1, 1};
+    return i < sizeof(words) / sizeof(words[0]) ? words[i] : 0;
+}
+
+uint32_t computeWorkWord(uint32_t offset)
+{
+    if (offset < kComputeRingPage || offset >= kComputeWorkSize) return 0;
+    if (offset < kComputeMqdPage) return computeRingWord((offset - kComputeRingPage) / 4);
+    if (offset < kComputeWbPage) return 0; // the MQD and EOP buffer
+    if (offset < kComputeCodePage) {
+        const uint32_t at = offset - kComputeWbPage;
+        if (at >= kComputeWbPacket && at < kComputeWbPacket + 64) return computePacketWord((at - kComputeWbPacket) / 4);
+        if (at == kComputeWbKernarg) return uint32_t(kComputeOutGpuAddress);
+        if (at == kComputeWbKernarg + 4) return uint32_t(kComputeOutGpuAddress >> 32);
+        return 0;
+    }
+    if (offset < kComputeOutPage) {
+        const uint32_t i = (offset - kComputeCodePage) / 4;
+        return i < kComputeCodeDwords ? kComputeCode[i] : 0;
+    }
+    return (offset - kComputeOutPage) / 4 < kComputeOutDwords ? kComputeOutBefore : 0;
+}
+
+bool computePollWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
+{
+    if (stage < kComputeStage) return false;
+    if (offset == kComputeWbPage + kComputeWbPoll + 4) return value == 0;
+    if (offset != kComputeWbPage + kComputeWbPoll) return false;
+    return value == kComputeFrameStarts[0] || value == kComputeFrameStarts[1] || value == kComputeFrameStarts[2];
+}
+
+static Status writeComputePollWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
+{
+    if (!computePollWriteAllowed(offset, value, stage)) return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+static uint32_t masked(uint32_t read, const GfxWrite &write)
+{
+    return (read & ~write.mask) | (write.value & write.mask);
+}
+
+bool computeWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage, const ComputeSnapshot *snapshot)
+{
+    if (stage < kComputeStage || snapshot == nullptr) return false;
+    for (uint32_t i = 0; i < kComputeGlobalCount; i++) {
+        if (kComputeGlobalRegisters[i] != offset) continue;
+        if (value == snapshot->global[i]) return true;
+        for (const GfxWrite &write : kComputeGlobalWrites) {
+            if (write.offset == offset && value == masked(snapshot->global[i], write)) return true;
+        }
+        return false;
+    }
+    for (uint32_t i = 0; i < kComputeQueueCount; i++) {
+        if (kComputeQueueRegisters[i] != offset) continue;
+        if (value == snapshot->queue[i]) return true;
+        for (const GfxWrite &write : kComputeQueueWrites) {
+            if (write.offset == offset && value == masked(snapshot->queue[i], write)) return true;
+        }
+        for (const GfxWrite &write : kComputeQueueExtraWrites) {
+            if (write.offset == offset && value == masked(snapshot->queue[i], write)) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+static Status writeComputeRegister(const RegisterWriter &writer, uint32_t stage, const uint32_t *gfxSnapshot,
+                                   const ComputeSnapshot *snapshot, uint32_t offset, uint32_t value)
+{
+    if (!writeAllowed(offset, value, stage) && !gfxWriteAllowed(offset, value, stage, gfxSnapshot) &&
+        !computeWriteAllowed(offset, value, stage, snapshot))
+        return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+static uint32_t globalIndex(uint32_t offset)
+{
+    for (uint32_t i = 0; i < kComputeGlobalCount; i++) {
+        if (kComputeGlobalRegisters[i] == offset) return i;
+    }
+    return kComputeGlobalCount;
+}
+
+static uint32_t queueIndex(uint32_t offset)
+{
+    for (uint32_t i = 0; i < kComputeQueueCount; i++) {
+        if (kComputeQueueRegisters[i] == offset) return i;
+    }
+    return kComputeQueueCount;
+}
+
+// soc15_grbm_select(adev, 2, 1, 0, 0, 0), and back to what it read.
+static Status selectQueue(const RegisterWriter &writer, uint32_t stage, const uint32_t *gfxSnapshot,
+                          const ComputeSnapshot *snapshot, bool on)
+{
+    const uint32_t read = snapshot->global[globalIndex(kRegGrbmGfxCntl)];
+    const uint32_t value = on ? (read & ~kGrbmGfxCntlMask) | kComputeSelect : read;
+    return writeComputeRegister(writer, stage, gfxSnapshot, snapshot, kRegGrbmGfxCntl, value);
+}
+
+static Status pollWork(const MemoryReader &work, const RegisterWriter &writer, uint32_t offset, uint32_t expected,
+                       uint32_t pauses, uint32_t *value)
+{
+    for (uint32_t i = 0; i <= pauses; i++) {
+        if (!work.read32(work.context, offset, value)) return kRegisterReadFailed;
+        if (*value == expected) return kOK;
+        if (i == pauses) break;
+        writer.pause(writer.context);
+    }
+    return kGfxFenceTimeout;
+}
+
+Status readComputeState(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                        const MemoryReader &work, uint32_t stage, const uint32_t *gfxSnapshot,
+                        const ComputeSnapshot *snapshot, ComputeState *state)
+{
+    *state = ComputeState();
+    if (stage < kComputeStage) return kRegisterNotAllowed;
+    Status first = kOK;
+    if (snapshot != nullptr) {
+        Status status = selectQueue(writer, stage, gfxSnapshot, snapshot, true);
+        for (uint32_t i = 0; status == kOK && i < kComputeQueueStateCount; i++)
+            status = readRegister(registers, apertureLength, stage, kComputeQueueStateRegisters[i], &state->queue[i]);
+        Status back = selectQueue(writer, stage, gfxSnapshot, snapshot, false);
+        first = status != kOK ? status : back;
+    }
+    for (uint32_t i = 0; i < kComputeGlobalStateCount; i++) {
+        Status status = readRegister(registers, apertureLength, stage, kComputeGlobalStateRegisters[i], &state->global[i]);
+        if (status != kOK) return status;
+    }
+    const struct {
+        uint32_t at;
+        uint32_t *value;
+    } words[] = {{kComputeWbRptr, &state->rptr}, {kComputeWbPoll, &state->poll}, {kComputeWbFence3, &state->fence3},
+                 {kComputeWbFence4, &state->fence4}};
+    for (const auto &word : words) {
+        if (!work.read32(work.context, kComputeWbPage + word.at, word.value)) return kRegisterReadFailed;
+    }
+    return first;
+}
+
+Status startCompute(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                    uint32_t stage, const uint32_t *gfxSnapshot, ComputeSnapshot *snapshot, bool *taken,
+                    uint32_t *writes, uint32_t *index, uint32_t *value)
+{
+    *taken = false;
+    *writes = *index = *value = 0;
+    if (stage < kComputeStage) return kRegisterNotAllowed;
+    // The global snapshot, GRBM_GFX_CNTL first: it must select nothing, so
+    // SH_MEM_* read (and are later written) for VMID 0.
+    for (uint32_t i = 0; i < kComputeGlobalCount; i++) {
+        Status status = readRegister(registers, apertureLength, stage, kComputeGlobalRegisters[i], &snapshot->global[i]);
+        if (status != kOK) return status;
+    }
+    const uint32_t select = snapshot->global[globalIndex(kRegGrbmGfxCntl)];
+    if ((select & kGrbmGfxCntlMask) != 0) {
+        *index = kComputeQueueCount + globalIndex(kRegGrbmGfxCntl);
+        *value = select;
+        return kGfxUnexpectedState;
+    }
+    // The queue snapshot under the selection. Selecting is already a write,
+    // so the selection is undone on every path out.
+    Status status = selectQueue(writer, stage, gfxSnapshot, snapshot, true);
+    if (status != kOK) return status;
+    (*writes)++;
+    for (uint32_t i = 0; status == kOK && i < kComputeQueueCount; i++)
+        status = readRegister(registers, apertureLength, stage, kComputeQueueRegisters[i], &snapshot->queue[i]);
+    Status back = selectQueue(writer, stage, gfxSnapshot, snapshot, false);
+    if (back == kOK) (*writes)++;
+    if (status != kOK) return status;
+    if (back != kOK) return back;
+    *taken = true;
+    // The queue must be idle: Linux's "dequeue if active" branch is not run.
+    const uint32_t active = snapshot->queue[queueIndex(kRegCpHqdActive)];
+    if ((active & kCpHqdActive) != 0) {
+        *index = queueIndex(kRegCpHqdActive);
+        *value = active;
+        return kGfxUnexpectedState;
+    }
+    auto global = [&](const GfxWrite &write) {
+        Status result = writeComputeRegister(writer, stage, gfxSnapshot, snapshot, write.offset,
+                                             masked(snapshot->global[globalIndex(write.offset)], write));
+        if (result == kOK) (*writes)++;
+        return result;
+    };
+    // gfx_v9_0_kiq_setting.
+    status = global(kComputeGlobalWrites[0]);
+    if (status == kOK) status = global(kComputeGlobalWrites[1]);
+    if (status != kOK) return status;
+    // gfx_v9_0_kiq_init_register under the selection: the poll control
+    // (here enabled: method A), then the HQD, ACTIVE last.
+    status = selectQueue(writer, stage, gfxSnapshot, snapshot, true);
+    if (status != kOK) return status;
+    (*writes)++;
+    status = global(kComputeGlobalWrites[2]);
+    for (uint32_t i = 0; status == kOK && i < sizeof(kComputeQueueWrites) / sizeof(kComputeQueueWrites[0]); i++) {
+        const GfxWrite &write = kComputeQueueWrites[i];
+        status = writeComputeRegister(writer, stage, gfxSnapshot, snapshot, write.offset,
+                                      masked(snapshot->queue[queueIndex(write.offset)], write));
+        if (status == kOK) (*writes)++;
+    }
+    back = selectQueue(writer, stage, gfxSnapshot, snapshot, false);
+    if (back == kOK) (*writes)++;
+    if (status != kOK) return status;
+    if (back != kOK) return back;
+    // constants_init's SH_MEM_* for VMID 0, then gfx_v9_0_cp_compute_enable.
+    for (uint32_t i = 4; status == kOK && i < sizeof(kComputeGlobalWrites) / sizeof(kComputeGlobalWrites[0]); i++)
+        status = global(kComputeGlobalWrites[i]);
+    if (status != kOK) return status;
+    writer.pause(writer.context); // udelay(50)
+    return kOK;
+}
+
+// Commits a write pointer: method A writes the poll dword, method B also the
+// queue's CP_HQD_PQ_WPTR_LO under the selection.
+static Status commitCompute(const RegisterWriter &writer, const MemoryWriter &workWriter, uint32_t stage,
+                            const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t method, uint32_t wptr)
+{
+    const uint32_t poll = kComputeWbPage + kComputeWbPoll;
+    Status status = writeComputePollWord(workWriter, stage, poll + 4, 0);
+    if (status == kOK) status = writeComputePollWord(workWriter, stage, poll, wptr);
+    if (status != kOK || method != kCommitRegister) return status;
+    status = selectQueue(writer, stage, gfxSnapshot, snapshot, true);
+    if (status != kOK) return status;
+    status = writeComputeRegister(writer, stage, gfxSnapshot, snapshot, kRegCpHqdPqWptrLo, wptr);
+    Status back = selectQueue(writer, stage, gfxSnapshot, snapshot, false);
+    return status != kOK ? status : back;
+}
+
+// CP_HQD_PQ_RPTR under the selection (the write-back moves only per block).
+static Status queueRptr(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                        uint32_t stage, const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t *rptr)
+{
+    Status status = selectQueue(writer, stage, gfxSnapshot, snapshot, true);
+    if (status != kOK) return status;
+    status = readRegister(registers, apertureLength, stage, kRegCpHqdPqRptr, rptr);
+    Status back = selectQueue(writer, stage, gfxSnapshot, snapshot, false);
+    return status != kOK ? status : back;
+}
+
+static Status waitScratch(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                          uint32_t stage, uint32_t *scratch)
+{
+    for (uint32_t i = 0;; i++) {
+        Status status = readRegister(registers, apertureLength, stage, kRegScratchReg0, scratch);
+        if (status != kOK) return status;
+        if (*scratch == kScratchRingTest) return kOK;
+        if (i >= kGfxPollPauses) return kGfxRingTestFailed; // the compute ring test's window
+        writer.pause(writer.context);
+    }
+}
+
+Status testCompute(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                   const MemoryWriter &workWriter, const MemoryReader &work, uint32_t stage,
+                   const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t *scratch, uint32_t *fence,
+                   uint32_t *rptr, uint32_t *commit)
+{
+    *scratch = *fence = *rptr = *commit = 0;
+    if (stage < kComputeStage || snapshot == nullptr) return kRegisterNotAllowed;
+    Status status = writeComputeRegister(writer, stage, gfxSnapshot, snapshot, kRegScratchReg0, kScratchBefore);
+    // Method A: the MEC polls the write pointer.
+    if (status == kOK)
+        status = commitCompute(writer, workWriter, stage, gfxSnapshot, snapshot, kCommitPoll, kComputeFrameStarts[1]);
+    if (status != kOK) return status;
+    status = waitScratch(registers, apertureLength, writer, stage, scratch);
+    if (status == kOK) *commit = kCommitPoll;
+    if (status == kGfxRingTestFailed) {
+        status = queueRptr(registers, apertureLength, writer, stage, gfxSnapshot, snapshot, rptr);
+        if (status != kOK) return status;
+        if (*rptr != 0) return kGfxRingTestFailed; // fetched, not executed
+        // Method B, within the stage: the write pointer by register too.
+        status = commitCompute(writer, workWriter, stage, gfxSnapshot, snapshot, kCommitRegister,
+                               kComputeFrameStarts[1]);
+        if (status != kOK) return status;
+        status = waitScratch(registers, apertureLength, writer, stage, scratch);
+        if (status == kOK) *commit = kCommitRegister;
+        if (status == kGfxRingTestFailed) {
+            Status read = queueRptr(registers, apertureLength, writer, stage, gfxSnapshot, snapshot, rptr);
+            if (read != kOK) return read;
+            return *rptr == 0 ? kComputeNoProgress : kGfxRingTestFailed;
+        }
+    }
+    if (status != kOK) return status;
+    status = pollWork(work, writer, kComputeWbPage + kComputeWbFence3, 3, kGfxPollPauses, fence);
+    Status read = queueRptr(registers, apertureLength, writer, stage, gfxSnapshot, snapshot, rptr);
+    return status != kOK ? status : read;
+}
+
+Status dispatchCompute(const RegisterReader &, uint64_t, const RegisterWriter &writer,
+                       const MemoryWriter &workWriter, const MemoryReader &work, uint32_t stage,
+                       const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t commit,
+                       uint32_t *fence, uint32_t *wrong, uint32_t *first, uint32_t *firstValue)
+{
+    *fence = *wrong = *first = *firstValue = 0;
+    if (stage < kComputeStage || snapshot == nullptr) return kRegisterNotAllowed;
+    if (commit != kCommitPoll && commit != kCommitRegister) return kComputeNoProgress;
+    Status status =
+        commitCompute(writer, workWriter, stage, gfxSnapshot, snapshot, commit, kComputeFrameStarts[2]);
+    if (status != kOK) return status;
+    status = pollWork(work, writer, kComputeWbPage + kComputeWbFence4, 4, kGfxDrawPauses, fence);
+    if (status != kOK) return status;
+    for (uint32_t i = 0; i < kComputeOutDwords; i++) {
+        uint32_t value = 0;
+        if (!work.read32(work.context, kComputeOutPage + 4 * i, &value)) return kRegisterReadFailed;
+        if (value != i && (*wrong)++ == 0) {
+            *first = i;
+            *firstValue = value;
+        }
+    }
+    return *wrong == 0 ? kOK : kComputeMismatch;
+}
+
+Status restoreCompute(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t *index,
+                      uint32_t *value)
+{
+    *index = *value = 0;
+    if (stage < kComputeStage || snapshot == nullptr) return kRegisterNotAllowed;
+    Status first = kOK;
+    auto note = [&first](Status status) {
+        if (first == kOK) first = status;
+    };
+    auto put = [&](uint32_t offset, uint32_t to) {
+        note(writeComputeRegister(writer, stage, gfxSnapshot, snapshot, offset, to));
+    };
+    Status status = selectQueue(writer, stage, gfxSnapshot, snapshot, true);
+    if (status != kOK) return status;
+    // gfx_v9_0_kiq_fini_register: dequeue if active.
+    uint32_t active = 0;
+    note(readRegister(registers, apertureLength, stage, kRegCpHqdActive, &active));
+    if ((active & kCpHqdActive) != 0) {
+        put(kRegCpHqdDequeueRequest, 1);
+        for (uint32_t i = 0; i <= kGfxPollPauses; i++) {
+            if (readRegister(registers, apertureLength, stage, kRegCpHqdActive, &active) != kOK ||
+                (active & kCpHqdActive) == 0 || i == kGfxPollPauses)
+                break;
+            writer.pause(writer.context);
+        }
+        if ((active & kCpHqdActive) != 0) put(kRegCpHqdActive, 0); // the dequeue timed out
+        put(kRegCpHqdDequeueRequest, 0);
+    }
+    const SdmaWrite fini[] = {{kRegCpHqdIqTimer, 0},          {kRegCpHqdIbControl, 0},
+                              {kRegCpHqdPersistentState, 0},  {kRegCpHqdPqDoorbellControl, 0x40000000},
+                              {kRegCpHqdPqDoorbellControl, 0}, {kRegCpHqdPqRptr, 0},
+                              {kRegCpHqdPqWptrHi, 0},         {kRegCpHqdPqWptrLo, 0}};
+    for (const SdmaWrite &write : fini) put(write.offset, write.value);
+    // Every queue register back, then read back, still selected.
+    for (uint32_t i = 0; i < kComputeQueueCount; i++) put(kComputeQueueRegisters[i], snapshot->queue[i]);
+    Status verified = kOK;
+    for (uint32_t i = 0; first == kOK && verified == kOK && i < kComputeQueueCount; i++) {
+        verified = readRegister(registers, apertureLength, stage, kComputeQueueRegisters[i], value);
+        if (verified == kOK && *value != snapshot->queue[i]) {
+            *index = i;
+            verified = kGfxNotRestored;
+        }
+    }
+    note(selectQueue(writer, stage, gfxSnapshot, snapshot, false));
+    // gfx_v9_0_cp_compute_enable(false) (the snapshot is halted), then the
+    // rest, GRBM_GFX_CNTL included.
+    put(kRegCpMecCntl, snapshot->global[globalIndex(kRegCpMecCntl)]);
+    for (uint32_t i = 0; i < kComputeGlobalCount; i++) put(kComputeGlobalRegisters[i], snapshot->global[i]);
+    if (first != kOK) return first;
+    if (verified != kOK) return verified;
+    for (uint32_t i = 0; i < kComputeGlobalCount; i++) {
+        *index = kComputeQueueCount + i;
+        status = readRegister(registers, apertureLength, stage, kComputeGlobalRegisters[i], value);
+        if (status != kOK) return status;
+        if (*value != snapshot->global[i]) return kGfxNotRestored;
     }
     *index = *value = 0;
     return kOK;
