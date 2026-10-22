@@ -3983,6 +3983,122 @@ registers. The tool prints them.
   the shader stage as the proposal said. The proposal is kept as approved,
   and the change is recorded in the boot 33 entry.
 
+### Metal track M1: does Metal admit our own device? (proposal, 2026-10-22)
+
+**Not approved yet; nothing below is built.** The user chose, after the
+[Metal runtime study](metal-runtime.md), to relax code-signing enforcement in
+an experimental environment, so that our own Metal driver bundle can be
+loaded at all. This proposal defines that environment and its first
+experiment. It is a separate track from stage 22: it touches no GC, CP or
+display register, and it is numbered `M1` so the hardware stages keep their
+order.
+
+**The question M1 answers:** with SIP relaxed on the test EFI only, does
+Metal find a bundle of ours in `/Library/GPUBundles`, accept its class, and
+construct it as a device? If it does, which messages does Metal send our
+device during enumeration and during `newLibraryWithSource:` /
+`newComputePipelineStateWithFunction:`? We observe those on our own object,
+which shows the compiler interface without disassembling Apple code.
+
+#### What is already known
+
+- Metal's resolver searches `/Library/GPUBundles` before
+  `/System/Library/Extensions`, takes the bundle named by the accelerator's
+  `MetalPluginName`, tries `MetalPluginClassName` then `NSPrincipalClass`, and
+  requires a subclass of `_MTLDevice` ([admission study](metal-admission.md)).
+  Each candidate must pass `rootless_check_trusted_class(path,
+  "KernelExtensionManagement")`, a SIP-dependent trust check.
+- `/Library/GPUBundles` exists on the data volume. It is empty and carries the
+  `restricted` flag (`ls -ldO`), so **even root cannot write it while SIP is
+  enabled**. Nothing on the sealed system volume needs to change.
+- `IOAccelerator` is a public class in the SDK's `Kernel.framework`
+  (`IOKit/graphics/IOAccelerator.h`), so our kext can publish a node that
+  Metal's `IOAccelerator` matching notification sees.
+- Both EFIs already delete `csr-active-config` and `boot-args` from NVRAM and
+  add their own on every boot, and `tools/test_efi.py` rejects a test config
+  that sets a value the known-good one would not reset. **Booting the internal
+  EFI therefore puts SIP back to `00000000`.**
+- Our test app is built with plain `clang`, without the hardened runtime, so
+  library validation does not apply to it. M1 needs **no AMFI change**.
+
+#### The environment change (test EFI only)
+
+| Setting | Known-good | Test (M1) | Why |
+| --- | --- | --- | --- |
+| `NVRAM → Add → 7C436110-…:csr-active-config` | `00000000` | rung 1: `02000000` (`CSR_ALLOW_UNRESTRICTED_FS`, `0x2`); rung 2, only if rung 1 is not enough: `67000000` (`0x67`) | Lets root write the `restricted` `/Library/GPUBundles`, and is the likeliest bit for the rootless trust check. Bit values are from XNU's public `bsd/sys/csr.h` |
+| `NVRAM → Add → …:boot-args` | `-NRedRBPlus` | the stage args plus `cezanne-metal=1` | Selects M1 in the kext |
+
+Rung 2 is `0x67`: `UNTRUSTED_KEXTS | UNRESTRICTED_FS | TASK_FOR_PID |
+UNRESTRICTED_DTRACE | UNRESTRICTED_NVRAM`, short of `csrutil disable`'s `0x7f`
+(no `APPLE_INTERNAL`, no `KERNEL_DEBUGGER`). Neither rung sets
+`CSR_ALLOW_UNAUTHENTICATED_ROOT` (`0x800`): **the sealed system volume stays
+sealed**. `tools/test_efi.py` would add `csr-active-config` to its expected
+differences and keep its check that both configs delete it.
+
+**What relaxed SIP exposes, for that boot only:** with `0x2`, root processes
+can write SIP-protected paths on the data volume (`/Library/GPUBundles`,
+`/System/Library` is still sealed). With `0x67`, also unsigned kexts, task
+ports of other processes and unrestricted NVRAM. Recommendation: keep the
+test boot offline and run nothing but the M1 steps.
+
+#### The pieces
+
+1. **Kernel (`CezanneGPU.kext`, behind `cezanne-metal=1`):** publish one child
+   service, class `CezanneAccelerator : IOAccelerator`, with `MetalPluginName`
+   `CezanneMTLDriver` and `MetalPluginClassName` `CezanneMtlDevice`. It does
+   **no register access** (not even reads), creates no user client, and runs
+   none of the hardware stages. If Metal later tries `IOServiceOpen` on it,
+   that fails, and we record the failure.
+2. **Bundle (`CezanneMTLDriver.bundle`, new, user space):** principal class
+   `CezanneMtlDevice`, a subclass of `_MTLDevice` resolved at load time.
+   `initWithAcceleratorPort:` records its argument and returns `self`. Every
+   message Metal sends is recorded (method resolution and forwarding on our
+   own class) to a log file, and answered with nil, 0 or `NO` unless a minimal
+   answer is needed to get further (for example `name`). No GPU work.
+3. **Test app (`tools/metal_admission_probe.m`, new):** `MTLCopyAllDevices`;
+   for our device, `newLibraryWithSource:` and
+   `newComputePipelineStateWithFunction:` on the `store_index` kernel. It
+   reports devices, classes, errors and the bundle's message log as JSON.
+4. **Install and removal**, run by the user in the M1 test boot, because only
+   then is `/Library/GPUBundles` writable:
+   `sudo ditto out/metal-m1/CezanneMTLDriver.bundle
+   /Library/GPUBundles/CezanneMTLDriver.bundle`, and at the end
+   `sudo rm -rf /Library/GPUBundles/CezanneMTLDriver.bundle`, then
+   `ls -la /Library/GPUBundles` to confirm it is empty. If the bundle stayed
+   behind, the known-good boot would ignore it: nothing there names
+   `CezanneMTLDriver`, and its trust check fails with SIP enabled. It should
+   still be removed in the next M1 boot.
+
+#### A rule change this needs
+
+AGENTS.md says "never … install driver code on the macOS volume". Placing the
+bundle in `/Library/GPUBundles` during M1 boots is exactly that (on the data
+volume, removable, protected by SIP outside M1). **Approving M1 means amending
+that rule** to allow this one directory during M1 test boots only, with the
+removal step above. The internal EFI, the system volume and `kmutil` stay
+off limits.
+
+#### Success criteria and outcomes
+
+- **Admitted:** `MTLCopyAllDevices` returns a `CezanneMtlDevice`, and the
+  message log shows `initWithAcceleratorPort:`. Then record every message sent
+  during enumeration and compilation, and what `MTLCompilerService` logs for a
+  device whose vendor is us. That last part is the compiler interface.
+- **Found but refused:** the log or the probe shows our bundle resolved but
+  the trust check or the class check failing. Record which, then rung 2.
+- **Not found:** no message reaches our class. Check that the
+  `CezanneAccelerator` node and its properties are in `ioreg`, then rung 2.
+- Every M1 boot ends with the removal step, and the next known-good boot is
+  checked with `csrutil status` (expect enabled) and `nvram boot-args` (expect
+  `-NRedRBPlus`).
+
+#### Not in M1
+
+- No GPU commands, no IOAccel user client, no shared memory, no surfaces. Even
+  a fully admitted device can do nothing yet; M1 only shows whether the door
+  opens and what Metal asks for on the way in.
+- No change to WindowServer, other apps or the system volume.
+
 ## Build the test EFIs
 
 On this Mac, with the internal EFI mounted read-only only for the copy (the

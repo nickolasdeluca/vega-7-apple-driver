@@ -211,6 +211,10 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    an Apple platform binary loading Apple-signed code only, so the
    **next Metal step needs a user decision on code-signing policy** for an
    experimental environment (see that study's "What this means").
+   The user chose to relax code signing in an experimental environment; the
+   proposal is **Metal track M1** in [test-boot.md](test-boot.md) (relaxed
+   SIP on the test EFI only, our bundle in `/Library/GPUBundles`, an
+   AGENTS.md amendment). **Awaiting approval; nothing built.**
 4. **Stage 22, only if the user wants more boots.** Its proposal is the ring
    test and fence 1 resumed; chasing the stall means the rest of
    `constants_init` (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID,
