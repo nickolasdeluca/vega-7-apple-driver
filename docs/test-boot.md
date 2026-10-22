@@ -3983,6 +3983,193 @@ registers. The tool prints them.
   the shader stage as the proposal said. The proposal is kept as approved,
   and the change is recorded in the boot 33 entry.
 
+### Stage 22: a compute queue on the MEC runs our kernel (proposal, 2026-10-22)
+
+**Not approved yet; nothing below is built.** The user chose, on 2026-10-22,
+to redirect stage 22 from the stalled graphics ring to compute. Stage 21 left
+the graphics CP (PFP/ME) stalled at dword 152 of the clear-state preamble
+(boots 32–38). A compute kernel does not need that front end: it runs on a
+compute queue of the **MEC**, a separate processor whose firmware (MEC1 and
+its jump table) stage 21 already loads. Linux brings up its kernel interface
+queue (KIQ) on that MEC by writing the queue's HQD registers directly, with
+no clear-state preamble. That is the path this stage follows.
+
+**The question stage 22 answers:** does a compute queue brought up the way
+Linux brings up the KIQ fetch and execute our PM4 packets on this host, and
+does our kernel, compiled from Apple's AIR by the
+[lowering prototype](metal-frontend.md#air-lowering-prototype), produce the
+right result on the GPU?
+
+#### Sources (pinned, `out/references/`)
+
+- `gfx_v9_0.c`: `gfx_v9_0_mqd_init`, `gfx_v9_0_kiq_init_register`,
+  `gfx_v9_0_kiq_setting`, `gfx_v9_0_kiq_fini_register`,
+  `gfx_v9_0_cp_compute_enable`, `gfx_v9_0_cp_resume` (order),
+  `gfx_v9_0_ring_test_ring`, `gfx_v9_0_ring_emit_fence`,
+  `gfx_v9_0_do_edc_gpr_workarounds` (the in-kernel dispatch sequence),
+  `gfx_v9_0_constants_init` (`SH_MEM_*` for VMID 0); `GFX9_MEC_HPD_SIZE`
+  4096; for GC 9.3.0, `num_mec` 2, 4 pipes, 8 queues.
+- `amdgpu_gfx.c`: `amdgpu_gfx_kiq_acquire`. With two MECs it takes the
+  highest free queue with queue 0 and, on MEC 2, pipe ≤ 1: **ME 2, pipe 1,
+  queue 0**.
+- `gc_9_0_offset.h` / `gc_9_0_sh_mask.h`: offsets and fields below.
+
+#### What runs, in order
+
+Steps 1–3 are stage 21's, unchanged: the check, the nine firmware loads, and
+the RLC start with its golden settings. **Stage 21's graphics CP start (`CP_ME_CNTL` unhalt and frame 0) is skipped**, so the stalled front end
+plays no part.
+
+4. **Select the queue.** `GRBM_GFX_CNTL` (`0x0022`) ← `0x00000009` (PIPEID 1,
+   MEID 2, QUEUEID 0, VMID 0). Every HQD register below is read at the check
+   and written under this selection, and the selection goes back to 0 after
+   each block.
+5. **Tell the RLC which queue is the KIQ** (`gfx_v9_0_kiq_setting`):
+   `RLC_CP_SCHEDULERS` (`0x4caa`, GC base 1) ← (check value & `0xffffff00`) |
+   `0x48`, then | `0x80`.
+6. **Program the HQD** (`gfx_v9_0_kiq_init_register`, values as
+   `gfx_v9_0_mqd_init` computes them), with the MEC still halted:
+
+   | Register (dword offset) | Value |
+   | --- | --- |
+   | `CP_PQ_WPTR_POLL_CNTL` (`0x1083`) | check value with `EN` (bit 31) = **1** (method A, below) |
+   | `CP_HQD_EOP_BASE_ADDR` / `_HI` (`0x126a`/`0x126b`) | EOP buffer >> 8, low / high |
+   | `CP_HQD_EOP_CONTROL` (`0x126c`) | check value with `EOP_SIZE` = 9 (2^10 dwords = 4096 bytes) |
+   | `CP_HQD_PQ_DOORBELL_CONTROL` (`0x1254`) | check value with `DOORBELL_EN` = 0 |
+   | `CP_MQD_BASE_ADDR` / `_HI` (`0x1245`/`0x1246`) | MQD page & `~3`, high |
+   | `CP_MQD_CONTROL` (`0x1267`) | check value with `VMID` = 0 |
+   | `CP_HQD_PQ_BASE` / `_HI` (`0x124d`/`0x124e`) | ring >> 8, low / high |
+   | `CP_HQD_PQ_CONTROL` (`0x1256`) | check value with `QUEUE_SIZE` 9 (4 KiB), `RPTR_BLOCK_SIZE` 9, `UNORD_DISPATCH` 0, `ROQ_PQ_IB_FLIP` 0, `PRIV_STATE` 1, `KMD_QUEUE` 1 |
+   | `CP_HQD_PQ_RPTR_REPORT_ADDR` / `_HI` (`0x1250`/`0x1251`) | read-pointer write-back, high & `0xffff` |
+   | `CP_HQD_PQ_WPTR_POLL_ADDR` / `_HI` (`0x1252`/`0x1253`) | write-pointer poll location, high & `0xffff` |
+   | `CP_HQD_PQ_WPTR_LO` / `_HI` (`0x127b`/`0x127c`) | 0 / 0 |
+   | `CP_HQD_VMID` (`0x1248`) | 0 |
+   | `CP_HQD_PERSISTENT_STATE` (`0x1249`) | check value with `PRELOAD_SIZE` = `0x53` |
+   | `CP_HQD_ACTIVE` (`0x1247`) | 1 |
+
+   Precondition (part of the check): `CP_HQD_ACTIVE` reads 0 for this queue,
+   so Linux's "dequeue if active" branch is not needed; if it reads 1, stage
+   22 stops at the check.
+7. **`SH_MEM_CONFIG` for VMID 0** (`constants_init`; selection
+   `GRBM_GFX_CNTL` 0): `SH_MEM_CONFIG` (`0x030d`) ← `ALIGNMENT_MODE` 3
+   (unaligned) with `RETRY_DISABLE` kept as the check read it (Linux takes it
+   from `amdgpu_noretry`, whose default is not in the pinned sources);
+   `SH_MEM_BASES` (`0x030a`) ← 0.
+8. **Unhalt the MEC** (`gfx_v9_0_cp_compute_enable`): `CP_MEC_CNTL`
+   (`0x008d`) ← 0, then 50 µs. It reads `0x50000000` (both MEs halted) at
+   every stage 21 check.
+
+**Memory**, all in stage 21's work area at carveout `0x40a00000` (GPU
+`0xf440a00000`). Its 64 KiB are already checked free; stage 21 uses
+`0x0000`–`0x3fff`. The CPU writes every page before the MEC is unhalted:
+
+| Offset | Size | Content |
+| --- | --- | --- |
+| `0x4000` | 4 KiB | compute ring (PM4) |
+| `0x5000` | 4 KiB | MQD, zeroed (the MEC uses it only to save state on preemption; this stage never preempts) |
+| `0x6000` | 4 KiB | EOP buffer, zeroed |
+| `0x7000` | 4 KiB | write-back: `+0x000` read pointer, `+0x008` write-pointer poll (64-bit), `+0x100` fence 3, `+0x108` fence 4, `+0x200` an HSA dispatch packet (64 bytes: setup 1 dimension, workgroup 64×1×1, grid 256×1×1), `+0x300` kernarg (8 bytes: the output address) |
+| `0x8000` | 256 B | the kernel's 72 code bytes (256-aligned for `COMPUTE_PGM_LO`) |
+| `0x9000` | 1 KiB | output: 256 dwords, pre-filled with `0xffffffff` |
+
+**The write pointer.** Linux on gfx9 commits compute write pointers only by
+doorbell (`gfx_v9_0_ring_set_wptr_compute`: "only DOORBELL method supported
+on gfx9 now"). This stage does not set up doorbells: that is a BIF/NBIO
+aperture and the BAR2 mapping, a separate proposal. Instead:
+- **method A (first):** `CP_PQ_WPTR_POLL_CNTL.EN` = 1, so the MEC polls the
+  queue's `WPTR_POLL_ADDR`. The CPU commits by writing the new write pointer
+  (in dwords) to `+0x008`. `gfx_v9_0_mqd_init` itself notes the poll address
+  "is only used if CP_PQ_WPTR_POLL_CNTL.EN=1";
+- **method B (within the stage, if A shows the read pointer not moving):** write
+  `CP_HQD_PQ_WPTR_LO` directly, with polling left on. Same registers, so it is
+  a fix within the stage.
+
+If neither moves the read pointer, the next step is a doorbell proposal.
+
+**Frames on the compute ring:**
+
+1. **Ring test** (`gfx_v9_0_ring_test_ring`): `SCRATCH_REG0` ← `0xCAFEDEAD`
+   by MMIO (stage 6's register), then `SET_UCONFIG_REG SCRATCH_REG0
+   0xDEADBEEF`, then `RELEASE_MEM` writing fence 3 = 3 to `+0x100`, with
+   stage 21's `kReleaseMemEvent`/`kReleaseMemData`. Pass: `SCRATCH_REG0`
+   reads `0xDEADBEEF` and fence 3 lands.
+2. **Dispatch** (as `do_edc_gpr_workarounds`), all `SET_SH_REG`:
+   - `COMPUTE_STATIC_THREAD_MGMT_SE0` = `0xffffffff` (one SE on this ASIC);
+   - `COMPUTE_PGM_LO`/`HI` = code >> 8, >> 40;
+   - `COMPUTE_PGM_RSRC1` = `0x00af0040`, `RSRC2` = `0x00000090` (8 user
+     SGPRs, workgroup ID X), from the kernel descriptor;
+   - `COMPUTE_TMPRING_SIZE` = 0 (no scratch), `COMPUTE_RESOURCE_LIMITS` = 0;
+   - `COMPUTE_NUM_THREAD_X/Y/Z` = 64, 1, 1;
+   - `COMPUTE_USER_DATA_0..7` = 0, 0, 0, 0 (private segment buffer: no
+     scratch), dispatch packet low/high, kernarg low/high. This is the
+     kernel's code properties `0xb`: s[0:3], s[4:5], s[6:7].
+
+   Then `DISPATCH_DIRECT` 4, 1, 1 with `COMPUTE_DISPATCH_INITIATOR` =
+   `COMPUTE_SHADER_EN`, `EVENT_WRITE` CS partial flush (type 7, index 4), and
+   `RELEASE_MEM` fence 4 = 4 at `+0x108`. **Pass: fence 4 lands and `out[i]
+   == i` for all 256 dwords.**
+
+**The kernel** is the `store_index` that Apple's `metal` compiled from MSL to
+AIR and that `tools/air_lower.py` and LLVM 20.1.7 lowered to gfx90c. Its 72
+code bytes and descriptor fields are copied into the core as constants. A
+test recompiles them when the study toolchain is present and requires
+identical bytes. PM4 opcodes and `SET_SH_REG_START` come from Linux's
+`soc15d.h`, pinned with the other references at implementation time.
+
+#### Restore and teardown
+
+As `gfx_v9_0_kiq_fini_register`, then stage 21's restore:
+- under the selection: `CP_HQD_DEQUEUE_REQUEST` ← 1, wait for
+  `CP_HQD_ACTIVE` bit 0 to clear (and write `CP_HQD_ACTIVE` ← 0 if it times
+  out), `DEQUEUE_REQUEST` ← 0; then `CP_HQD_IQ_TIMER`, `IB_CONTROL`,
+  `PERSISTENT_STATE` ← 0, `PQ_DOORBELL_CONTROL` ← `0x40000000` then 0,
+  `PQ_RPTR`, `WPTR_HI`, `WPTR_LO` ← 0;
+- `CP_MEC_CNTL` back to `0x50000000` (halted);
+- **every register this stage wrote back to the check's reading** (the HQD
+  set under its selection, `RLC_CP_SCHEDULERS`, `CP_PQ_WPTR_POLL_CNTL`,
+  `SH_MEM_*`, `GRBM_GFX_CNTL`, `SCRATCH_REG0`), then stage 21's `rlc_stop`,
+  its restore and the PSP teardown.
+
+The new snapshot entries are a separate list, not appended to stage 21's
+golden window (the `CB_HW_CONTROL` lesson: never let a position decide a
+register set).
+
+#### Reported, read-only
+
+Besides stage 21's 74 registers: `CP_HQD_ACTIVE`, `CP_HQD_PQ_RPTR`,
+`CP_HQD_PQ_WPTR_LO`, `CP_CPC_STATUS`, `CP_CPC_BUSY_STAT`,
+`CP_CPC_STALLED_STAT1` and `CP_MEC1_INSTR_PNTR` (already reported), plus the
+read-pointer write-back and both fences, after each frame.
+
+#### Success criteria and outcomes
+
+- **Stage 22 succeeds** if:
+  - every step reports `ok`;
+  - the ring test turns `SCRATCH_REG0` into `0xDEADBEEF` and fence 3 lands;
+  - fence 4 lands and the output holds 0..255;
+  - the restore puts every written register back;
+  - the PSP teardown fences.
+
+  That is the first **"known shader with correct results"** on this GPU, and
+  the first time code from Apple's frontend and our backend runs on it.
+- **Read pointer does not move** (method A): switch to method B within the
+  stage. Neither works: a doorbell proposal.
+- **Read pointer moves, `SCRATCH_REG0` does not change:** packets are fetched
+  but not executed. Compare `CP_CPC_STALLED_STAT1` with the graphics stall.
+- **Ring test passes, dispatch does not finish:** record the CPC and GRBM
+  status and the output. Candidates are `SH_MEM_*`, the rest of
+  `constants_init`, and the user-SGPR layout.
+- **Dispatch finishes with wrong output:** the backend's ABI is wrong (user
+  SGPRs, dispatch packet, kernarg). This is diagnosable offline from the
+  output pattern.
+
+#### Not in stage 22
+
+- No doorbells, no interrupts from the MEC, no graphics ring, no GART (VMID 0
+  through the GFXHUB as in stage 21), no change to the display.
+- No KIQ functions (`MAP_QUEUES`): the queue is the KIQ slot used as a
+  plain compute queue.
+
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 
 **Approved by the user on 2026-10-22, together with the AGENTS.md exception,

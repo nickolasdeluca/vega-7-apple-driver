@@ -230,7 +230,14 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    and the user's choice. A local
    pre-check already showed MSL → AIR working on our device class in-process,
    with pipeline creation left to the vendor class.
-4. **Stage 22, only if the user wants more boots.** Its proposal is the ring
+4. **Stage 22, redirected to compute (2026-10-22, the user's choice): proposed,
+   awaiting approval.** A compute queue on the MEC, brought up like Linux's
+   KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
+   polling), runs a ring test and dispatches the `store_index` kernel that
+   Apple's frontend and our lowering produced; see "Stage 22: a compute queue
+   on the MEC runs our kernel" in test-boot.md. The older plan below
+   (graphics ring, rest of `constants_init`) is superseded. Earlier text:
+   **Stage 22, only if the user wants more boots.** Its proposal is the ring
    test and fence 1 resumed; chasing the stall means the rest of
    `constants_init` (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID,
    `init_sq_config`, `init_compute_vmid`, `init_gds_vmid`, the tiling mode
