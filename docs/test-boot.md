@@ -5927,6 +5927,90 @@ device**).
   replaced builds are kept as `superseded-*-m1-*-iographics`.
 - Captures are in ignored `out/test-efi/boot-39-m1-rung1/`.
 
+**Boot 40, 2026-10-22, Metal track M1 rung 1 after the class-name fix**
+(`out/test-efi/usb-m1-rung1`; cold boot; `tools/capture_m1.sh
+boot-40-m1-rung1`; probe exit 134, an assertion).
+
+- **The kext loaded and published the node.** `kmutil` lists
+  `org.cezanne-driver.gpu` (0.1.0) and `IOGraphicsFamily`. `CezanneGPU M1`
+  reads "node published" after **17 s** of waiting for the class.
+  `ioreg -c IOAccelerator` shows a plain `IOAccelerator` (registered,
+  matched, active) with `MetalPluginName` `CezanneMTLDriver` and
+  `MetalPluginClassName` `CezanneMtlDevice`.
+- **Metal admitted our bundle with SIP at `0x2`.** In the probe process, AMFI
+  logged the bundle's executable as ad hoc signed, and `amfid` reported it
+  "not valid" (code -423). The load still went ahead, because the probe is
+  not a hardened process. Then our class was created, and **Metal constructed
+  it: `initWithAcceleratorPort: 16131`** (a real port, unlike the local
+  pre-check's 0). `[_MTLDevice init]` returned the object, and Metal sent
+  **`_setAcceleratorService:`** (answered nil). This is the path the
+  [admission study](metal-admission.md) recorded: initializer, then
+  `_setAcceleratorService:`, then `MTLAddDevice`.
+- **Defect: `MTLAddDevice` asserted** `[newDevice
+  conformsToProtocol:@protocol(MTLDevice)]` ("failed assertion … at line 1054
+  in MTLAddDevice") and the probe aborted (exit 134, no JSON). Our class,
+  created at load time, did not declare the protocol. `_MTLDevice` does not
+  declare it itself; vendor classes do.
+- **So M1's question is answered for rung 1:** with
+  `CSR_ALLOW_UNRESTRICTED_FS` alone, Metal resolves, trusts, loads and
+  constructs a third-party device bundle from `/Library/GPUBundles` in a
+  non-hardened app. Rung 2 is not needed for admission.
+- **Fixed within the stage:** the bundle adds the runtime's `MTLDevice`
+  protocol to `CezanneMtlDevice` before registering it. The probe's
+  `--load-bundle` mode now reports `conforms_to_mtldevice`, and the test
+  requires it (it fails on the boot 40 bundle). Only the bundle and the probe
+  changed (`out/metal-m1/`; the old ones are kept as
+  `out/superseded-metal-m1-protocol`); the kext and the test EFI are
+  unchanged, so the stick needs no update.
+- The removal ran; `/Library/GPUBundles` is empty afterwards. Captures are
+  in ignored `out/test-efi/boot-40-m1-rung1/`.
+
+**Boot 40, run 2** (the same boot, no reboot; captured as
+`out/test-efi/boot-41-m1-rung1/`, a name chosen before the run turned out to
+share the boot; probe exit 134). With `MTLDevice` declared, `MTLAddDevice`
+passed line 1054 and asserted the next line: `[newDevice
+conformsToProtocol:@protocol(MTLDeviceSPI)]` at line 1055. Public runtime
+introspection (`class_copyProtocolList`, `protocol_copyProtocolList`) in our
+own process shows that neither `_MTLDevice` nor `MTLIOAccelDevice` adopts a
+protocol, and that `MTLDeviceSPI` inherits `MTLDevice`. **Fixed within the
+stage:** the bundle adopts `MTLDeviceSPI`, and the probe and test check it.
+The previous bundle is kept as `out/superseded-metal-m1-spi`.
+`tools/capture_m1.sh` now accepts `-runK` for further runs in one boot.
+
+**Boot 40, run 3** (same boot; `out/test-efi/boot-40-m1-rung1-run3/`;
+**probe exit 0**).
+
+- **`MTLCopyAllDevices` returned our device**, class `CezanneMtlDevice`,
+  through Metal's own path: resolver, trust check, bundle load, construction
+  (`initWithAcceleratorPort: 11011`), `_setAcceleratorService:`, and
+  `MTLAddDevice`.
+- **What Metal asked of the vendor, in order:** `_setAcceleratorService:`,
+  then `featureProfile`, `maxBufferLength` and `registryID` (all answered
+  0/nil, so the probe reports `registry_id` 0). Then, during compilation,
+  `featureProfile` only.
+- **`newLibraryWithSource:` succeeded on the admitted device**
+  (`MTLCompilerService`: `MTLBuildLibraryFromSourceToArchive`, 10.5 ms), and
+  `newFunctionWithName:` returned an `_MTLFunctionInternal`.
+  `newComputePipelineStateWithFunction:` returned nil with no error and no
+  service request, as in the local pre-check: pipelines are the vendor
+  class's job.
+- AMFI again logged the bundle as ad hoc signed and "not valid" (code -423),
+  without stopping the load into the non-hardened probe.
+- Removal ran; `/Library/GPUBundles` is empty afterwards.
+
+**M1 result.** With SIP relaxed only by `CSR_ALLOW_UNRESTRICTED_FS` (`0x2`),
+on this host, Metal resolves, trusts, loads, constructs and registers a
+third-party device bundle from `/Library/GPUBundles` for a non-hardened app.
+It compiles MSL to AIR for that device with Apple's own service, and leaves
+pipeline creation (the backend) to the device class. Rung 2 was not needed.
+Not shown: hardened apps or WindowServer loading the bundle (library
+validation is expected to refuse ad hoc code there; not tested), any GPU
+work, and real answers to the vendor messages above.
+
+**Back on the known-good EFI** (2026-10-22, after boot 40): `csrutil status`
+reports enabled, `nvram boot-args` is `-NRedRBPlus`, and `/Library/GPUBundles`
+is empty.
+
 ## Unknowns and limits
 
 - The firmware lists both partitions `eraseDisk … GPT` creates. Partition 1 is

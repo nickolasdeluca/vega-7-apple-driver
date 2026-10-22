@@ -218,9 +218,16 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    showed the install works under `0x2` but our kext did not load: its new
    `IOGraphicsFamily` dependency is only in the system kernel collection, and
    OpenCore injects into the boot one. Fixed within the stage (node created by
-   class name); **next is boot 40**, `tools/update_stick.sh m1-1` then
-   `tools/capture_m1.sh boot-40-m1-rung1` (test-boot.md, "Revision: M1 node by
-   class name"). A local
+   class name). **Boot 40: Metal admitted our bundle** from
+   `/Library/GPUBundles` with SIP `0x2` and constructed `CezanneMtlDevice`
+   (`initWithAcceleratorPort:`, `_setAcceleratorService:`), then
+   `MTLAddDevice` asserted conformance to `MTLDevice`, then `MTLDeviceSPI`;
+   both fixed in the bundle within the same boot. **Run 3 succeeded:
+   `MTLCopyAllDevices` returns `CezanneMtlDevice`**, Metal asks it only
+   `_setAcceleratorService:`, `featureProfile`, `maxBufferLength` and
+   `registryID`, compiles MSL to AIR for it, and leaves pipelines to it.
+   **M1 is answered at rung 1.** What follows (a stage M2) needs a proposal
+   and the user's choice. A local
    pre-check already showed MSL → AIR working on our device class in-process,
    with pipeline creation left to the vendor class.
 4. **Stage 22, only if the user wants more boots.** Its proposal is the ring
