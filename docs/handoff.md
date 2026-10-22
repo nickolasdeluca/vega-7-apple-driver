@@ -180,7 +180,12 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    the graphics-engine stall blocks. Success is a sourced statement or an
    explicit list of what blocks the question; readable intermediate output
    does **not** establish that Metal would accept an independent backend.
-3. **A source review of the boot 32 lead, offline.** Loading `RLC_G` started
+3. **Done (2026-10-22): the boot 32 lead is not a divergence.** Linux's
+   `autoload_supported` only gates the `GFX_CMD_ID_AUTOLOAD_RLC` command, and
+   `gfx_v9_0_rlc_resume` always starts with `rlc_stop`, so a running RLC after
+   the PSP load is tolerated, never ruled out; stage 21 does the same. See the
+   correction under the stage 21 proposal's "No autoload". Original item:
+   **A source review of the boot 32 lead, offline.** Loading `RLC_G` started
    the RLC (`RLC_CNTL` read 1 before any GC write), which Linux says should
    not happen without PSP autoload on v12. Our PSP interaction therefore
    differs from Linux's somewhere. Find where, from the pinned sources in

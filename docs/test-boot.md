@@ -3646,6 +3646,26 @@ first: GC must stay powered, and its registers are GFX-gated reads.
 - **No autoload.** PSP v12 sets `autoload_supported = false`
   (`psp_early_init`). So no `psp_rlc_autoload_start`, and loading `RLC_G`
   does not start the RLC: `gfx_v9_0_rlc_start` does that later.
+
+  **Correction (2026-10-22, source review, no boot):** the last clause was an
+  inference, not something Linux states, and boot 32 contradicted it
+  (`RLC_CNTL` 1 after the loads). `autoload_supported` controls one PSP
+  command, `GFX_CMD_ID_AUTOLOAD_RLC` (`0x21`, `psp_rlc_autoload_start`),
+  sent after the last GFX image on ASICs whose RLC loads the other images
+  itself from the TOC (`psp_load_toc`). It says nothing about whether the PSP
+  sets `RLC_ENABLE_F32` when it writes `RLC_G` directly, as on v12. Linux
+  never reads `RLC_CNTL` between the PSP load and `gfx_v9_0_rlc_resume`, and
+  that function begins with an unconditional `rlc_stop` (`RLC_ENABLE_F32` ←
+  0, the GUI idle interrupt off, the serdes wait) before any RLC setup, with
+  no RLC soft reset anywhere on that path (`gfx_v9_0_rlc_reset` has no
+  caller in the pinned sources). So a running RLC after the load is
+  something Linux tolerates by construction, and stage 21's RLC step does the
+  same `rlc_stop` first. **Boot 32's finding is PSP firmware behaviour, not
+  evidence that our PSP interaction differs from Linux's.** The rest of the
+  PSP sequence also matches for this purpose: Linux loads ASD and the TAs only
+  after the non-PSP firmware, and Renoir's `pg_flags` (SDMA, VCN, JPEG,
+  VCN_DPG) have no GFX power gating, so `gfx_v9_0_init_pg` writes no
+  `RLC_JUMP_TABLE_RESTORE` here.
 - **The bytes** (`amdgpu_ucode_init_single_fw`):
   - CE, PFP, ME and `RLC_G`: `ucode_size_bytes` from
     `ucode_array_offset_bytes`;
