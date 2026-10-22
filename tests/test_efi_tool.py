@@ -4,6 +4,7 @@ import io
 import json
 import plistlib
 import re
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -104,6 +105,50 @@ class TestEfiTests(unittest.TestCase):
         manifest = json.loads((self.output / "manifest.json").read_text())
         self.assertFalse(manifest["sysreport"])
         self.assertNotIn("Misc.Debug.SysReport", manifest["config_changes"])
+
+    def test_m1_relaxes_sip_only_at_stage_0(self):
+        for rung, csr in (("1", b"\x02\0\0\0"), ("2", b"\x67\0\0\0")):
+            with self.subTest(rung=rung):
+                if self.output.exists():
+                    shutil.rmtree(self.output)
+                code, out = self.build("0", "--m1", rung)
+                self.assertEqual(code, 0, out)
+                with (self.output / "EFI" / "OC" / "Config.plist").open("rb") as handle:
+                    test = plistlib.load(handle)
+                self.assertEqual(test["NVRAM"]["Add"][GUID]["csr-active-config"], csr)
+                self.assertEqual(test["NVRAM"]["Add"][GUID]["boot-args"],
+                                 "-v keepsyms=1 debug=0x100 msgbuf=1048576 cezanne-stage=0 cezanne-metal=1")
+                manifest = json.loads((self.output / "manifest.json").read_text())
+                self.assertEqual(manifest["m1_rung"], int(rung))
+                self.assertEqual(manifest["csr_active_config"], csr.hex())
+                self.assertIn("NVRAM.Add.%s.csr-active-config" % GUID, manifest["config_changes"])
+
+    def test_m1_refusals(self):
+        # A hardware stage never shares a boot with M1.
+        code, out = self.build("1", "--m1", "1")
+        self.assertEqual(code, 2)
+        self.assertIn("M1 runs only at stage 0", out)
+        # The known-good boot must restore SIP fully...
+        value = config()
+        value["NVRAM"]["Add"][GUID]["csr-active-config"] = b"\x02\0\0\0"
+        self.write_config(value)
+        code, out = self.build("0", "--m1", "1")
+        self.assertEqual(code, 2)
+        self.assertIn("must restore SIP fully", out)
+        # ...and delete the value each boot, so the relaxed one never persists.
+        value = config()
+        value["NVRAM"]["Delete"][GUID] = ["boot-args"]
+        self.write_config(value)
+        code, out = self.build("0", "--m1", "1")
+        self.assertEqual(code, 2)
+        self.assertIn("lacks csr-active-config", out)
+
+    def test_sip_is_untouched_without_m1(self):
+        self.assertEqual(self.build("0")[0], 0)
+        with (self.output / "EFI" / "OC" / "Config.plist").open("rb") as handle:
+            self.assertEqual(plistlib.load(handle)["NVRAM"]["Add"][GUID]["csr-active-config"], b"\0\0\0\0")
+        manifest = json.loads((self.output / "manifest.json").read_text())
+        self.assertIsNone(manifest["m1_rung"])
 
     def test_build_changes_only_the_intended_values_and_files(self):
         code, out = self.build()

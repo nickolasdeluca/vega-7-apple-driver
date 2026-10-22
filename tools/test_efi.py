@@ -6,8 +6,10 @@ output directory; it never mounts, writes or erases disks, NVRAM or EFI
 partitions. See docs/test-boot.md for the procedure and the boot rules.
 
 build:  test_efi.py build --known-good EFI --kext CezanneGPU.kext --stage N --output DIR
-        [--ocvalidate PATH]. Writes DIR/EFI and DIR/manifest.json. The tree is
-        assembled in DIR.partial and renamed only after every check passes.
+        [--ocvalidate PATH] [--m1 RUNG]. Writes DIR/EFI and DIR/manifest.json. The
+        tree is assembled in DIR.partial and renamed only after every check passes.
+        --m1 builds a Metal track M1 EFI: stage 0, cezanne-metal=1 and relaxed
+        SIP (csr-active-config) at the given rung.
 verify: test_efi.py verify --manifest DIR/manifest.json --side test|known_good EFI
         Compares an EFI folder (the USB copy, or the internal EFI after testing)
         with the hashes recorded at build time.
@@ -60,6 +62,17 @@ DRIVER_ENTRY = {
 EXPECTED_CHANGES = {"Kernel.Add", "NVRAM.Add.%s.boot-args" % APPLE_BOOT_GUID,
                     "Misc.Security.AllowSetDefault", "Misc.Debug.Target"}
 IGNORED_NAMES = (".DS_Store",)
+# Metal track M1 (docs/test-boot.md): relaxed SIP on the test EFI only, so
+# root can write the restricted /Library/GPUBundles and Metal's rootless trust
+# check may accept our bundle. Values are little-endian csr-active-config
+# data; bits from XNU's bsd/sys/csr.h. Neither sets CSR_ALLOW_UNAUTHENTICATED_ROOT
+# (0x800): the sealed system volume stays sealed.
+M1_CSR = {1: b"\x02\x00\x00\x00",   # CSR_ALLOW_UNRESTRICTED_FS
+          2: b"\x67\x00\x00\x00"}   # UNTRUSTED_KEXTS | UNRESTRICTED_FS | TASK_FOR_PID |
+                                     # UNRESTRICTED_DTRACE | UNRESTRICTED_NVRAM
+M1_STAGE = 0
+SIP_ENABLED = b"\x00\x00\x00\x00"
+CSR_CHANGE = "NVRAM.Add.%s.csr-active-config" % APPLE_BOOT_GUID
 
 
 class Rejected(ValueError):
@@ -114,21 +127,28 @@ def dependents(kexts_dir, removed_ids, kept):
     return found
 
 
-def boot_args(stage):
+def boot_args(stage, m1=None):
     if stage not in AUTHORIZED_STAGES:
         raise Rejected("stage %r is not authorized; docs/test-boot.md authorizes %s"
                        % (stage, list(AUTHORIZED_STAGES)))
+    if m1 is not None:
+        if m1 not in M1_CSR:
+            raise Rejected("M1 rung %r is not one of %s" % (m1, sorted(M1_CSR)))
+        if stage != M1_STAGE:
+            raise Rejected("M1 runs only at stage %d, not %d: no Metal experiment shares a boot "
+                           "with register access" % (M1_STAGE, stage))
+        return "%s cezanne-stage=%d cezanne-metal=1" % (BASE_BOOT_ARGS, stage)
     return "%s cezanne-stage=%d" % (BASE_BOOT_ARGS, stage)
 
 
-def expected_changes(sysreport=False):
-    return EXPECTED_CHANGES | ({SYSREPORT_CHANGE} if sysreport else set())
+def expected_changes(sysreport=False, m1=None):
+    return EXPECTED_CHANGES | ({SYSREPORT_CHANGE} if sysreport else set()) | ({CSR_CHANGE} if m1 else set())
 
 
-def derive(config, kexts_dir, stage, sysreport=False):
+def derive(config, kexts_dir, stage, sysreport=False, m1=None):
     """Return (test config, {removed bundle: bundle id}). Reads only kext Info.plists."""
     test = copy.deepcopy(config)
-    args = boot_args(stage)
+    args = boot_args(stage, m1)
     if config["Misc"]["Boot"].get("LauncherOption") != "Disabled":
         raise Rejected("Misc.Boot.LauncherOption must be Disabled: the test EFI must not "
                        "register itself as a firmware boot option")
@@ -157,6 +177,12 @@ def derive(config, kexts_dir, stage, sysreport=False):
             raise Rejected("known-good Misc.Debug.SysReport is %r, expected false"
                            % (config["Misc"]["Debug"].get("SysReport"),))
         test["Misc"]["Debug"]["SysReport"] = True
+    if m1 is not None:
+        known_csr = config["NVRAM"]["Add"].get(APPLE_BOOT_GUID, {}).get("csr-active-config")
+        if known_csr != SIP_ENABLED:
+            raise Rejected("known-good csr-active-config is %r, expected %r: the known-good boot must "
+                           "restore SIP fully" % (known_csr, SIP_ENABLED))
+        test["NVRAM"]["Add"][APPLE_BOOT_GUID]["csr-active-config"] = M1_CSR[m1]
     return test, removed_ids
 
 
@@ -171,10 +197,10 @@ def differences(a, b, prefix=""):
     return [] if type(a) is type(b) and a == b else [prefix]
 
 
-def check_configs(known, test, sysreport=False):
+def check_configs(known, test, sysreport=False, m1=None):
     """Raise Rejected unless the test config differs from known-good only as intended."""
     changed = set(differences(known, test))
-    expected = expected_changes(sysreport)
+    expected = expected_changes(sysreport, m1)
     if changed != expected:
         raise Rejected("unexpected config differences: extra %s, missing %s"
                        % (sorted(changed - expected), sorted(expected - changed)))
@@ -231,7 +257,7 @@ def run_ocvalidate(tool, config):
     return result
 
 
-def build(known_efi, kext, output, stage, ocvalidate=None, sysreport=False):
+def build(known_efi, kext, output, stage, ocvalidate=None, sysreport=False, m1=None):
     known_efi, kext, output = Path(known_efi), Path(kext), Path(output)
     partial = output.with_name(output.name + ".partial")
     for path in (output, partial):
@@ -242,7 +268,7 @@ def build(known_efi, kext, output, stage, ocvalidate=None, sysreport=False):
     config_path = find_config(known_efi)
     with config_path.open("rb") as handle:
         known = plistlib.load(handle)
-    test, removed_ids = derive(known, known_efi / "OC" / "Kexts", stage, sysreport)
+    test, removed_ids = derive(known, known_efi / "OC" / "Kexts", stage, sysreport, m1)
     config_rel = config_path.relative_to(known_efi).as_posix()
     skipped = sorted(p.relative_to(known_efi).as_posix() for p in config_path.parent.iterdir()
                      if p.is_file() and is_config_backup(p, config_path))
@@ -262,7 +288,7 @@ def build(known_efi, kext, output, stage, ocvalidate=None, sysreport=False):
         with (efi / config_rel).open("rb") as handle:
             written = plistlib.load(handle)
         known_hashes, test_hashes = tree(known_efi), tree(efi)
-        check_configs(known, written, sysreport)
+        check_configs(known, written, sysreport, m1)
         check_tree(known_hashes, test_hashes, config_rel, skipped)
         check_bundles(efi, written)
         validation = run_ocvalidate(ocvalidate, efi / config_rel) if ocvalidate else None
@@ -275,10 +301,11 @@ def build(known_efi, kext, output, stage, ocvalidate=None, sysreport=False):
     manifest = {
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "known_good": str(known_efi.resolve()), "driver_kext": str(kext.resolve()),
-        "stage": stage, "config": config_rel, "boot_args": boot_args(stage),
+        "stage": stage, "config": config_rel, "boot_args": boot_args(stage, m1),
+        "m1_rung": m1, "csr_active_config": M1_CSR[m1].hex() if m1 else None,
         "removed_kexts": {name: {"bundle_id": removed_ids[name], "reason": REMOVED_KEXTS[name]}
                           for name in REMOVED_KEXTS},
-        "skipped_config_backups": skipped, "config_changes": sorted(expected_changes(sysreport)),
+        "skipped_config_backups": skipped, "config_changes": sorted(expected_changes(sysreport, m1)),
         "sysreport": sysreport,
         "ocvalidate": validation, "known_good_sha256": known_hashes, "test_sha256": test_hashes,
     }
@@ -313,6 +340,8 @@ def main(argv=None):
     make.add_argument("--ocvalidate", help="ocvalidate matching the OpenCore version")
     make.add_argument("--sysreport", action="store_true",
                       help="also enable OpenCore's one-time SysReport dump (ACPI tables, SMBIOS)")
+    make.add_argument("--m1", type=int, choices=sorted(M1_CSR),
+                      help="Metal track M1 at this relaxed-SIP rung (stage 0 only)")
     check = commands.add_parser("verify")
     check.add_argument("--manifest", required=True)
     check.add_argument("--side", required=True, choices=("test", "known_good"))
@@ -320,8 +349,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "build":
-            manifest = build(args.known_good, args.kext, args.output, args.stage, args.ocvalidate, args.sysreport)
-            print(json.dumps({"output": args.output, "stage": manifest["stage"], "config_changes": manifest["config_changes"],
+            manifest = build(args.known_good, args.kext, args.output, args.stage, args.ocvalidate, args.sysreport,
+                             args.m1)
+            print(json.dumps({"output": args.output, "stage": manifest["stage"], "m1_rung": manifest["m1_rung"],
+                              "config_changes": manifest["config_changes"],
                               "removed_kexts": sorted(manifest["removed_kexts"]),
                               "ocvalidate_exit": (manifest["ocvalidate"] or {}).get("exit_code"),
                               "test_files": len(manifest["test_sha256"])}, indent=1))

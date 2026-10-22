@@ -4,14 +4,17 @@
 # drive"). The user runs it; it touches only /Volumes/CZTEST on an external
 # disk and never the internal EFI.
 # Usage: tools/update_stick.sh STAGE   (copies out/test-efi/usb-stageSTAGE)
+#        tools/update_stick.sh m1-RUNG (Metal track M1: out/test-efi/usb-m1-rungRUNG)
 set -eu
 volume=/Volumes/CZTEST
 [ $# -eq 1 ] || { echo "usage: $0 STAGE" >&2; exit 2; }
 case $1 in
-'' | *[!0-9]*) echo "stage must be a number: $1" >&2; exit 2 ;;
+m1-1 | m1-2) name="usb-m1-rung${1#m1-}" ;;
+'' | *[!0-9]*) echo "stage must be a number or m1-1/m1-2: $1" >&2; exit 2 ;;
+*) name="usb-stage$1" ;;
 esac
 root=$(cd "$(dirname "$0")/.." && pwd)
-build="$root/out/test-efi/usb-stage$1"
+build="$root/out/test-efi/$name"
 [ -d "$build/EFI" ] && [ -f "$build/manifest.json" ] ||
   { echo "no built test EFI at $build (see docs/test-boot.md)" >&2; exit 1; }
 

@@ -13,7 +13,8 @@ class UpdateStickTests(unittest.TestCase):
         return subprocess.run([str(SCRIPT), *args], capture_output=True, text=True, timeout=30)
 
     def test_refuses_bad_arguments_and_missing_builds(self):
-        for args, code in (([], 2), (["1x"], 2), (["-1"], 2), (["1", "2"], 2), (["999"], 1)):
+        for args, code in (([], 2), (["1x"], 2), (["-1"], 2), (["1", "2"], 2), (["999"], 1),
+                           (["m1"], 2), (["m1-3"], 2), (["m1-1x"], 2)):
             with self.subTest(args):
                 run = self.run_script(*args)
                 self.assertEqual(run.returncode, code, run.stderr)
