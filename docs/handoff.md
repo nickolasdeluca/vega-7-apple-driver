@@ -176,8 +176,11 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    The public toolchain needed the separate Metal Toolchain component
    (installed with the user's approval); it emits AIR, LLVM bitcode that LLVM
    20.1.7 reads; Apple's `amdgpu-nt` lists AMD targets up to `gfx1032` but no
-   `gfx90c`. Open: the AIR intrinsic inventory, runtime acceptance, and an AIR
-   lowering prototype. Original item: **The Metal shader frontend boundary,
+   `gfx90c`. The AIR intrinsic and metadata inventory followed the same day
+   (13 functions, 39 intrinsics; texture/sampler handles, argument-buffer
+   layout and constexpr samplers are the parts a backend must define with the
+   driver). Open: pinning inferred operand meanings, runtime acceptance, and
+   an AIR lowering prototype. Original item: **The Metal shader frontend boundary,
    offline.** The parked task further
    down this file has the steps: what Apple's permitted public toolchain emits
    for one fixed MSL compute kernel, the intermediate form's container and

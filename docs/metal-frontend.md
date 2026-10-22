@@ -150,10 +150,10 @@ From AIR, for `gfx90c`, using the public LLVM AMDGPU target:
 
 1. **Lowering.** AIR is not AMDGPU IR. Built-ins arrive as metadata-tagged
    arguments (`air.thread_position_in_grid`) and, in larger kernels, as
-   `air.*` intrinsic calls (none in this kernel; an inventory needs more
-   kernels). Each needs a mapping to AMDGPU work-item/workgroup IDs, LDS,
-   barriers, atomics and image instructions. Address space 1 happens to match
-   AMDGPU's global space; the others are not yet checked.
+   `air.*` intrinsic calls (none in this kernel; see the inventory below).
+   Each needs a mapping to AMDGPU work-item/workgroup IDs, LDS, barriers,
+   atomics and image instructions. Address spaces 1 and 3 match AMDGPU's
+   global and local; 2 (constant) does not (see the inventory).
 2. **The kernel ABI.** Metal buffer slots, textures and samplers must be
    assigned to user SGPRs, descriptor tables or argument buffers in a layout
    the runtime driver fills. Neither side of that contract exists yet.
@@ -180,11 +180,124 @@ The Metal toolchain is installed under the Xcode license (`License.rtf`,
   existing Xcode install as much as to this component, and is recorded for the
   user's own judgment, not decided here.
 
+## AIR intrinsic and metadata inventory
+
+Added 2026-10-22, same toolchain, same rules: our own MSL source only, compiled
+with `metal -S -emit-llvm` and `metal -c` (default options, so fast math on),
+read as text. Three files in ignored `out/metal-frontend/inventory/` cover 13
+functions:
+
+| File | Functions | Covers |
+| --- | --- | --- |
+| `compute.metal` | `k_builtins`, `k_threadgroup`, `k_atomics`, `k_simd`, `k_math` | 8 compute built-ins, static and dynamic threadgroup memory, both barriers, five atomic forms, SIMD-group reductions and shuffles, common math |
+| `textures.metal` | `k_texture`, `k_const_sampler`, `k_argbuf` | read, write and sample access, a bound and a constexpr sampler, gather, an argument buffer holding a pointer, a texture and a constant |
+| `graphics.metal` | `v_main`, `v_pull`, `f_main`, `f_simple` | stage-in and vertex pulling, `position` and `point_size`, two render targets, framebuffer fetch, depth output, discard, derivatives, `front_facing`, `sample_id` |
+
+All six compiles exit 0. LLVM 20.1.7's `llvm-dis` reads all three `.air` files
+and its `llvm-as` re-assembles the output, which runs the IR verifier, with
+exit 0. LLVM 20's `opt` refuses them ("unrecognized architecture 'air64_v28'"):
+public LLVM parses AIR but has no AIR target, so any pass pipeline must first
+retarget the module.
+
+### Address spaces
+
+| AIR | Used for | AMDGPU equivalent |
+| --- | --- | --- |
+| 0 | private (the `cmpxchg` expected value) | 5 (private/scratch) after `alloca` lowering |
+| 1 | `device` buffers, and texture handles (`%struct._texture_2d_t addrspace(1)*`) | 1 (global) for buffers; textures need a descriptor, not a pointer |
+| 2 | `constant` buffers, argument buffers, sampler handles, constexpr sampler state | 4 (constant) |
+| 3 | `threadgroup`: a static array (an `addrspace(3)` global) and a `[[threadgroup(0)]]` argument | 3 (local/LDS) |
+
+Only 1 and 3 line up numerically. A backend must renumber 2, and must decide
+what an `addrspace(1)` texture pointer and an `addrspace(2)` sampler pointer
+are at run time: on GFX9 they become a 256-bit image descriptor (T#) and a
+128-bit sampler descriptor (S#) loaded into SGPRs, which the runtime driver
+writes.
+
+### Intrinsics
+
+Thirty-nine distinct `air.*` declarations (counting type variants separately). Floating-point names have a
+`fast_` form when fast math is on (`air.fast_sin`, not `air.sin`); with fast
+math off the precise forms should appear instead, which this run did not
+produce.
+
+| Group | Declarations seen | Shape |
+| --- | --- | --- |
+| Barriers | `air.wg.barrier(i32, i32)`, `air.simdgroup.barrier(i32, i32)` | (memory flags, scope). Observed: `mem_threadgroup` → `(2, 1)`, `mem_device` → `(1, 1)`, a SIMD-group `mem_none` → `(0, 4)`. So flags 1 device, 2 threadgroup; scope 1 threadgroup, 4 SIMD-group (inferred from three calls) |
+| Atomics | `air.atomic.{global,local}.*`: `add.u.i32`, `max.s.i32`, `add.f32`, `xchg.i32`, `cmpxchg.weak.i32` | (pointer, value(s), memory order, scope, `i1`). The relaxed calls pass order 0; scope 2 for device memory, 1 for threadgroup; the trailing `i1` was always `true` (meaning not established). `cmpxchg` takes the expected value through an `addrspace(0)` pointer, plus two orders |
+| SIMD-group | `air.simd_sum`, `simd_broadcast` (lane as `i16`), `simd_shuffle_down` (`i16` delta), `simd_any` (`i1`), `simd_prefix_exclusive_sum` | Map to wave64 DPP/permute and reductions; the SIMD width is a built-in (`air.threads_per_simdgroup`), so 64 is the backend's answer |
+| Textures | `air.read_texture_2d`, `write_texture_2d`, `sample_texture_2d`, `gather_texture_2d`, `get_width_texture_2d`, `get_height_texture_2d`, `air.get_read_sampler` | Results are `{ <4 x T>, i8 }` (the value plus an `i8`, plausibly a residency status). `sample` takes coordinates, an `i1`, an offset, an `i1` (explicit LOD or not), the LOD, a float and an `i32`. The last `i32` of read/write calls tracks the access qualifier (read 1, write 2, sample 0; inferred). `read` obtains its sampler from `air.get_read_sampler()` |
+| Fragment | `air.discard_fragment`, `air.dfdx`, `air.dfdy`, `air.fwidth` | GFX9: exec-mask kill and quad-lane differences |
+| Math | `air.fma`, `air.dot`, `air.fast_{sin, exp, sqrt, rsqrt, pow, fabs, floor, fract, clamp}` | Most map to single GFX9 instructions or short LLVM AMDGPU expansions |
+| Conversion | `air.convert.f.v4f16.f.v4f32`, `air.convert.f.v4f32.f.v4f16`, `air.convert.f.f32.u.i32`, `air.convert.f.v2f32.u.v2i32` | The name encodes destination and source kind and type |
+
+Plain LLVM intrinsics appear too: only `llvm.lifetime.start`/`end` here.
+
+### Function signatures and metadata
+
+The **entry point's IR signature is the stage's whole interface**: every
+built-in, buffer, texture and sampler is a parameter, and vertex and fragment
+outputs are a returned packed struct (`<{ <4 x float>, <2 x float>, float }>`
+for `v_main`). Which parameter is what lives only in metadata:
+
+- **Stage lists:** `!air.kernel`, `!air.vertex`, `!air.fragment`; each entry is
+  (function, outputs, inputs).
+- **Bindings:** `air.buffer`, `air.texture`, `air.sampler`, each with
+  `air.location_index` (slot, count), an access kind (`air.read`,
+  `air.read_write`, `air.write`, `air.sample`) and, for buffers,
+  `air.address_space`, `air.arg_type_size`, `air.arg_type_align_size`, and
+  `air.struct_type_info` for structured types such as `metal::_atomic`.
+- **Dynamic threadgroup memory** is an `air.buffer` with `air.address_space` 3;
+  its size is supplied at dispatch, so the backend needs a run-time LDS-size
+  input.
+- **Argument buffers:** `air.indirect_buffer` with `air.buffer_size` 24 and an
+  `air.struct_type_info` list of (offset, size, …, type, name,
+  `air.indirect_argument`) per member: the pointer at 0 (8 bytes), the texture
+  at 8, the `uint` at 16. The IR loads the texture handle out of that struct,
+  so **the argument buffer's in-memory layout is part of the ABI**. Apple's AMD
+  stack defines what 8 bytes of a texture handle mean; an independent driver
+  must define its own and match it in the backend.
+- **Compute built-ins:** `air.thread_position_in_grid`,
+  `thread_position_in_threadgroup`, `threadgroup_position_in_grid`,
+  `threads_per_threadgroup`, `threads_per_grid`, `thread_index_in_simdgroup`,
+  `simdgroup_index_in_threadgroup`, `threads_per_simdgroup`. On GFX9 the
+  positions come from VGPR/SGPR system values; the sizes need kernel arguments
+  or constants the driver provides.
+- **Vertex:** `air.vertex_input` with `air.location_index` per `[[attribute]]`.
+  Stage-in arrives as **already-fetched values** (`<3 x float>`), so the
+  backend or the driver must generate the vertex fetch from the pipeline's
+  vertex descriptor. Also `air.vertex_id`, `air.instance_id`; outputs
+  `air.position`, `air.point_size`, and `air.vertex_output` with a generated
+  linkage name (`generated(2uvDv2_f)`).
+- **Fragment:** `air.fragment_input` with the same generated name and its
+  interpolation (`air.center`, `air.perspective` / `air.no_perspective`),
+  `air.position`, `air.front_facing`, `air.sample_id`; outputs
+  `air.render_target` (index, …) and `air.depth` with `air.depth_qualifier`.
+  **Framebuffer fetch** is an input tagged `air.render_target` 0.
+- **Constexpr samplers** become an `addrspace(2)` constant of two `i64` (here
+  `0x007bff0000080a49` and 0), listed in `!air.sampler_states`. The encoding is
+  Apple's and is not decoded here; a backend must translate it into an S#.
+
+### What this adds to the backend list
+
+- Every intrinsic seen has a plausible GFX9 lowering, and nothing in the IR is
+  opaque **except** three things a backend must define together with the
+  runtime driver: the texture and sampler handle representation (pointers to
+  opaque structs in address spaces 1 and 2), the argument-buffer layout of
+  those handles, and the constexpr sampler encoding.
+- Vertex fetch and render-target export are not in AIR. Stage-in values and
+  returned structs must be lowered against pipeline state (vertex descriptor,
+  attachment formats), so a graphics backend compiles per pipeline, not per
+  function.
+- Some operand meanings above are inferred from a handful of calls (barrier
+  flags, atomic scopes, the texture access code, the trailing `i1`s). Pinning
+  them needs more variants of the same source, not reverse engineering.
+
 ## Remaining questions
 
-- An inventory of `air.*` intrinsics and metadata across a representative set
-  of kernels (threadgroup memory, barriers, atomics, textures, a vertex and a
-  fragment function), still only by compiling our own source.
+- Pinning the inferred operand meanings (barrier flags, atomic scope and the
+  trailing `i1`, the texture access code, the `sample` flags) with more source
+  variants, and the precise (non-`fast_`) math names with fast math off.
 - The runtime question: whether macOS 26's Metal reaches any replaceable
   compiler path for a non-Apple, non-AMD-kext device.
 - An offline AIR → AMDGPU lowering prototype with the public LLVM target, which
