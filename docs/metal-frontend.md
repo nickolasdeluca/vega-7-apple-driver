@@ -382,7 +382,10 @@ LLVM 20.1.7 is present under `out/shader-target/`, assembles the output with
   trailing `i1`, the texture access code, the `sample` flags) with more source
   variants, and the precise (non-`fast_`) math names with fast math off.
 - The runtime question: whether macOS 26's Metal reaches any replaceable
-  compiler path for a non-Apple, non-AMD-kext device.
+  compiler path for a non-Apple, non-AMD-kext device. The [runtime
+  study](metal-runtime.md) (2026-10-22) found the AMD backend running inside
+  Apple's per-app `MTLCompilerService`, a platform binary that loads
+  Apple-signed code only; no replaceable slot was observed.
 - Extending the lowering prototype: SIMD-group operations (DPP/permute),
   textures and samplers once a handle ABI is chosen, precise math, and the
   memory orders other than relaxed.

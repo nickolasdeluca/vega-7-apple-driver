@@ -202,6 +202,15 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    not happen without PSP autoload on v12. Our PSP interaction therefore
    differs from Linux's somewhere. Find where, from the pinned sources in
    `out/references/`. This is cheap and may matter before any further boot.
+3b. **Done (2026-10-22): the Metal runtime compilation path**, by
+   observation only (user's choice), in [metal-runtime.md](metal-runtime.md).
+   Each app gets its own `MTLCompilerService`; MSL → AIR is Apple's, and for
+   the pipeline the service loads AMD's AMDIL/SC compiler
+   (`AMDRadeonX5000Shared`, `libAMDIL902`, `libSC`, `libGCNASM`) and emits
+   an `amdgpu_gfx900` GPU Mach-O (NootedRed presents Vega 10). The service is
+   an Apple platform binary loading Apple-signed code only, so the
+   **next Metal step needs a user decision on code-signing policy** for an
+   experimental environment (see that study's "What this means").
 4. **Stage 22, only if the user wants more boots.** Its proposal is the ring
    test and fence 1 resumed; chasing the stall means the rest of
    `constants_init` (`SH_MEM_CONFIG` and `SH_MEM_BASES` per VMID,
@@ -246,7 +255,7 @@ stage 21 proposal, implementation notes and boot 32–37 entries in
   than deciding it.
 - Commits: small verified batches, no agent co-author trailer, firmware and
   raw captures never tracked. Run the full suite before committing
-  (74 tests since the AIR lowering prototype; see "Verification record and
+  (75 tests since the Metal runtime probe; see "Verification record and
   commands").
 
 Boots 32–37 (2026-10-07 and 2026-10-13; [test boot
