@@ -47,8 +47,10 @@ DIRECT_CALLS = {"___stack_chk_fail", "__ZN11OSMetaClassC2EPKcPKS_j", "__ZN11OSMe
                 "__ZN10IOWorkLoop8workLoopEv",
                 "__ZN28IOFilterInterruptEventSource26filterInterruptEventSourceEP8OSObjectPFvS1_"
                 "P22IOInterruptEventSourceiEPFbS1_PS_EP9IOServicei",
-                "_OSAddAtomic", "_OSIncrementAtomic", "_mach_absolute_time", "_absolutetime_to_nanoseconds"}
-OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU", "__ZN20CezanneGPUUserClient")
+                "_OSAddAtomic", "_OSIncrementAtomic", "_mach_absolute_time", "_absolutetime_to_nanoseconds",
+                # Metal track M1: the CezanneAccelerator node's construction.
+                "__ZN13IOAcceleratorC2EPK11OSMetaClass", "__ZN13IOAcceleratorD2Ev"}
+OWN_PREFIXES = ("__ZN7cezanne", "__ZN10CezanneGPU", "__ZN20CezanneGPUUserClient", "__ZN18CezanneAccelerator")
 
 
 def strip_comments(source):
@@ -432,6 +434,11 @@ void f(IOPCIDevice *p, Aperture *a) {
         source = (KEXT / "CezanneGPU.cpp").read_text()
         self.assertIn('PE_parse_boot_argn("cezanne-stage"', source)
         self.assertIn("stage > cezanne::kMaxStage", source)
+        # Metal track M1: its node needs cezanne-metal=1 and is refused at any stage but 0.
+        self.assertIn('PE_parse_boot_argn("cezanne-metal"', source)
+        self.assertIn("if (stage_ != 0) {", source[source.index("void CezanneGPU::publishMetalNode()"):])
+        self.assertEqual(personality.get("IOClass"), "CezanneGPU")
+        self.assertEqual(info["OSBundleLibraries"].get("com.apple.iokit.IOGraphicsFamily"), "1.0.0b1")
         header = (CORE / "cezanne_core.h").read_text()
         self.assertRegex(header, r"const uint32_t kMaxStage = 21;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")

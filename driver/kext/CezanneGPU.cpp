@@ -5,6 +5,8 @@
 // authorized in docs/test-boot.md.
 //
 //   Stage 0: attach and record the registry's PCI identity. No device access.
+//   Metal track M1 (cezanne-metal=1, only with stage 0): also publish a
+//            CezanneAccelerator node naming our Metal bundle. No device access.
 //   Stage 1: also read PCI configuration space, then, only if the device is
 //            already in D0 with memory decoding on, map the register BAR
 //            read-only and read the two boot-state registers the core allows.
@@ -86,6 +88,7 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/graphics/IOAccelerator.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <kern/clock.h>
 #include <libkern/OSAtomic.h>
@@ -383,9 +386,23 @@ private:
                               cezanne::Discovery *discovery);
     cezanne::Status runStage3(Aperture *aperture, const cezanne::Discovery &discovery);
     cezanne::Status copyDiscovery(UInt64 physical);
+    IOService *metalNode_ = nullptr; // Metal track M1
+    void publishMetalNode();
 };
 
 OSDefineMetaClassAndStructors(CezanneGPU, IOService)
+
+// Metal track M1 (docs/test-boot.md): an IOAccelerator node that only names
+// our Metal bundle, so Metal's resolver can look for it. It touches no
+// register and offers no user client.
+class CezanneAccelerator : public IOAccelerator {
+    OSDeclareDefaultStructors(CezanneAccelerator)
+};
+
+OSDefineMetaClassAndStructors(CezanneAccelerator, IOAccelerator)
+
+static const char *const kMetalPluginName = "CezanneMTLDriver";
+static const char *const kMetalPluginClassName = "CezanneMtlDevice";
 
 // Reads a little-endian 4-byte PCI registry property set by IOPCIFamily.
 static bool registryU32(IOService *provider, const char *key, UInt32 *value)
@@ -408,6 +425,13 @@ static bool requestedStage(UInt32 *stage)
     }
     *stage = value;
     return true;
+}
+
+// cezanne-metal=1 selects Metal track M1; any other value or none, no node.
+static bool requestedMetal()
+{
+    UInt32 value = 0;
+    return PE_parse_boot_argn("cezanne-metal", &value, sizeof(value)) && value == 1;
 }
 
 static bool configRead(void *context, uint8_t offset, uint8_t width, uint32_t *value)
@@ -716,7 +740,46 @@ bool CezanneGPU::start(IOService *provider)
     IOLog(LOG_PREFIX "attached at stage %u to %s; no register or configuration writes performed\n", stage_,
           provider->getName());
     registerService();
+    if (requestedMetal()) {
+        publishMetalNode();
+    }
     return true;
+}
+
+void CezanneGPU::publishMetalNode()
+{
+    // M1 runs on its own: with any hardware stage the node is refused, so a
+    // Metal experiment never shares a boot with register access.
+    if (stage_ != 0) {
+        IOLog(LOG_PREFIX "M1: refusing the Metal node at stage %u (M1 needs cezanne-stage=0)\n", stage_);
+        setProperty("CezanneGPU M1", "refused: stage is not 0");
+        return;
+    }
+    CezanneAccelerator *node = OSTypeAlloc(CezanneAccelerator);
+    if (node == nullptr || !node->init()) {
+        OSSafeReleaseNULL(node);
+        setProperty("CezanneGPU M1", "node allocation failed");
+        return;
+    }
+    node->setProperty("MetalPluginName", kMetalPluginName);
+    node->setProperty("MetalPluginClassName", kMetalPluginClassName);
+    node->setProperty("CezanneGPU M1", true);
+    if (!node->attach(this)) {
+        node->release();
+        setProperty("CezanneGPU M1", "attach failed");
+        return;
+    }
+    if (!node->start(this)) {
+        node->detach(this);
+        node->release();
+        setProperty("CezanneGPU M1", "start failed");
+        return;
+    }
+    node->registerService();
+    metalNode_ = node;
+    setProperty("CezanneGPU M1", "node published");
+    IOLog(LOG_PREFIX "M1: published CezanneAccelerator (MetalPluginName %s, class %s)\n", kMetalPluginName,
+          kMetalPluginClassName);
 }
 
 void CezanneGPU::free()
@@ -4431,6 +4494,11 @@ IOReturn CezanneGPU::newUserClient(task_t owningTask, void *securityID, UInt32 t
 void CezanneGPU::stop(IOService *provider)
 {
     IOLog(LOG_PREFIX "stopping\n");
+    if (metalNode_ != nullptr) {
+        metalNode_->stop(this);
+        metalNode_->detach(this);
+        OSSafeReleaseNULL(metalNode_);
+    }
     // Every connection's close already restored; the handler must not
     // outlive the driver in any case.
     if (lock_ != nullptr) {
