@@ -33,7 +33,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 23;
+const uint32_t kMaxStage = 24;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -1608,8 +1608,179 @@ enum ComputeRefusal : uint32_t {
     kRefusedBuffer = 5,  // misaligned, empty or outside the data area
     kRefusedLength = 6,  // shorter than what the grid touches
     kRefusedOverlap = 7, // two buffers overlap
-    kRefusedCount = 8,   // a sixth submission
+    kRefusedCount = 8,   // a sixth submission (stage 24: a ninth)
+    kRefusedDescriptor = 9, // stage 24: a privileged, debug, scratch or trap descriptor, or a wrong user SGPR count
 };
+
+// Stage 24 (docs/test-boot.md, "Stage 24: a user VMID with its own page
+// table, and uploaded code"): the GC hub's VM enabled as
+// gfxhub_v1_0_gart_enable does with stage 17's values (context 0 and the
+// GART aperture left out), VMID 1 translating a 1 MiB window onto the
+// submission region through a flat page table, and up to kVmSubmitMax
+// submissions run as INDIRECT_BUFFERs at VMID 1 from the VMID 0 ring
+// (gfx_v9_0_ring_emit_ib_compute).
+const uint32_t kVmStage = 24;
+const uint32_t kVmid = 1; // amdgpu's VMIDs 1-7; KFD takes 8-15
+// The GC hub's VM block (gc_9_0_offset.h, GC base 0x2000); all in BAR5 page
+// 0xA000, which stage 21 maps.
+const uint32_t kRegGcVmL2Cntl2 = (0x2000 + 0x0841) * 4;                  // VM_L2_CNTL2
+const uint32_t kRegGcVmL2Cntl3 = (0x2000 + 0x0842) * 4;                  // VM_L2_CNTL3
+const uint32_t kRegGcVmL2ProtectionFaultCntl = (0x2000 + 0x0847) * 4;    // VM_L2_PROTECTION_FAULT_CNTL
+const uint32_t kRegGcVmL2ProtectionFaultCntl2 = (0x2000 + 0x0848) * 4;   // VM_L2_PROTECTION_FAULT_CNTL2
+const uint32_t kRegGcVmL2ProtectionFaultAddrLo32 = (0x2000 + 0x084c) * 4; // VM_L2_PROTECTION_FAULT_ADDR_LO32 (read)
+const uint32_t kRegGcVmL2ProtectionFaultAddrHi32 = (0x2000 + 0x084d) * 4; // VM_L2_PROTECTION_FAULT_ADDR_HI32 (read)
+const uint32_t kRegGcVmL2ProtectionFaultDefaultAddrLo32 = (0x2000 + 0x084e) * 4;
+const uint32_t kRegGcVmL2ProtectionFaultDefaultAddrHi32 = (0x2000 + 0x084f) * 4;
+const uint32_t kRegGcVmL2Context1IdentityApertureLowAddrLo32 = (0x2000 + 0x0851) * 4;
+const uint32_t kRegGcVmL2Context1IdentityApertureLowAddrHi32 = (0x2000 + 0x0852) * 4;
+const uint32_t kRegGcVmL2Context1IdentityApertureHighAddrLo32 = (0x2000 + 0x0853) * 4; // (read)
+const uint32_t kRegGcVmL2Context1IdentityApertureHighAddrHi32 = (0x2000 + 0x0854) * 4; // (read)
+const uint32_t kRegGcVmL2ContextIdentityPhysicalOffsetLo32 = (0x2000 + 0x0855) * 4;    // (read)
+const uint32_t kRegGcVmL2ContextIdentityPhysicalOffsetHi32 = (0x2000 + 0x0856) * 4;    // (read)
+const uint32_t kRegGcVmL2Cntl4 = (0x2000 + 0x0857) * 4;                  // VM_L2_CNTL4
+const uint32_t kRegGcVmContext1Cntl = (0x2000 + 0x0881) * 4;             // VM_CONTEXT1_CNTL
+const uint32_t kRegGcVmInvalidateEng17Req = (0x2000 + 0x08b4) * 4;       // VM_INVALIDATE_ENG17_REQ
+const uint32_t kRegGcVmInvalidateEng17Ack = (0x2000 + 0x08c6) * 4;       // VM_INVALIDATE_ENG17_ACK (read)
+const uint32_t kRegGcVmInvalidateEng17AddrRangeLo32 = (0x2000 + 0x08e9) * 4;
+const uint32_t kRegGcVmInvalidateEng17AddrRangeHi32 = (0x2000 + 0x08ea) * 4;
+const uint32_t kRegGcVmContext1PageTableBaseAddrLo32 = (0x2000 + 0x08ed) * 4; // context 0's + 2 x VMID 1
+const uint32_t kRegGcVmContext1PageTableBaseAddrHi32 = (0x2000 + 0x08ee) * 4;
+const uint32_t kRegGcVmContext1PageTableStartAddrLo32 = (0x2000 + 0x090d) * 4;
+const uint32_t kRegGcVmContext1PageTableStartAddrHi32 = (0x2000 + 0x090e) * 4;
+const uint32_t kRegGcVmContext1PageTableEndAddrLo32 = (0x2000 + 0x092d) * 4;
+const uint32_t kRegGcVmContext1PageTableEndAddrHi32 = (0x2000 + 0x092e) * 4;
+// VMID 1's GDS, GWS and OA (gfx_v9_0_init_compute_vmid), required 0 (read).
+const uint32_t kRegGdsVmid1Base = (0x2000 + 0x1302) * 4, kRegGdsVmid1Size = (0x2000 + 0x1303) * 4,
+               kRegGdsGwsVmid1 = (0x2000 + 0x1321) * 4, kRegGdsOaVmid1 = (0x2000 + 0x1331) * 4;
+const uint32_t kStage24Registers[] = {
+    kRegGcVmL2Cntl2, kRegGcVmL2Cntl3, kRegGcVmL2Cntl4, kRegGcVmL2ProtectionFaultCntl, kRegGcVmL2ProtectionFaultCntl2,
+    kRegGcVmL2ProtectionFaultAddrLo32, kRegGcVmL2ProtectionFaultAddrHi32, kRegGcVmL2ProtectionFaultDefaultAddrLo32,
+    kRegGcVmL2ProtectionFaultDefaultAddrHi32, kRegGcVmL2Context1IdentityApertureLowAddrLo32,
+    kRegGcVmL2Context1IdentityApertureLowAddrHi32, kRegGcVmL2Context1IdentityApertureHighAddrLo32,
+    kRegGcVmL2Context1IdentityApertureHighAddrHi32, kRegGcVmL2ContextIdentityPhysicalOffsetLo32,
+    kRegGcVmL2ContextIdentityPhysicalOffsetHi32, kRegGcVmContext1Cntl, kRegGcVmInvalidateEng17Req,
+    kRegGcVmInvalidateEng17Ack, kRegGcVmInvalidateEng17AddrRangeLo32, kRegGcVmInvalidateEng17AddrRangeHi32,
+    kRegGcVmContext1PageTableBaseAddrLo32, kRegGcVmContext1PageTableBaseAddrHi32,
+    kRegGcVmContext1PageTableStartAddrLo32, kRegGcVmContext1PageTableStartAddrHi32,
+    kRegGcVmContext1PageTableEndAddrLo32, kRegGcVmContext1PageTableEndAddrHi32, kRegGdsVmid1Base, kRegGdsVmid1Size,
+    kRegGdsGwsVmid1, kRegGdsOaVmid1};
+const uint32_t kStage24RegisterCount = sizeof(kStage24Registers) / sizeof(kStage24Registers[0]);
+
+// The window: VA kVmVaBase + x is the submission region's offset x, one PTE
+// per 4 KiB page, valid only where a submission maps it.
+const uint64_t kVmVaBase = 0x100000000ull;
+const uint32_t kVmPageBytes = 0x1000, kVmPages = kSubmitSize / kVmPageBytes;
+// The page table and the default page, in stage 21's work area after the
+// compute pages (it grows to 48 KiB): outside the window, never mappable.
+const uint32_t kVmTablePage = 0xa000, kVmDefaultPage = 0xb000, kVmWorkSize = 0xc000;
+const uint64_t kVmTablePhysical = kGfxWorkPhysical + kVmTablePage;
+const uint64_t kVmDefaultPhysical = kGfxWorkPhysical + kVmDefaultPage;
+// PTEs as stage 17's (kGartPte0): VALID, SYSTEM, MTYPE_UC, and the access bits
+// per area: code R+X, a submission's page R, data R+W (amdgpu_vm.h).
+const uint64_t kPteValid = 0x1, kPteSystem = 0x2, kPteExecutable = 0x10, kPteReadable = 0x20, kPteWriteable = 0x40,
+               kPteMtypeUc = 3ull << 57;
+// Code slots 5-15 take uploaded code (slots 0-4 stay stage 23's corpus);
+// submission n's page holds its IB (+0), dispatch packet and kernarg.
+const uint32_t kVmCodeSlotFirst = 5, kVmCodeSlots = kSubmitSlotArea / kSubmitCodeSlot;
+const uint32_t kVmSubmitPageFirst = 0x11000, kVmPacket = 0x100, kVmKernarg = 0x180;
+// Eight 32-dword frames from dword 256 (ACQUIRE_MEM, INDIRECT_BUFFER, fence n
+// by RELEASE_MEM, NOPs): the write pointer ends at 512.
+const uint32_t kVmSubmitMax = 8, kVmFrameDwords = 32;
+// soc15d.h: INDIRECT_BUFFER, its VALID bit and the VMID at bit 24.
+const uint32_t kPm4IndirectBuffer = 0x3f, kIndirectBufferValid = 1u << 23, kIndirectBufferVmidShift = 24;
+// gmc_v9_0_get_invalidate_req(1, 0): VMID 1, L2 PTEs, PDE0-2, L1 PTEs.
+const uint32_t kVmInvalidateReq = 0x007c0002;
+// gfx_v9_0_constants_init for VMIDs 1-15: the private aperture at 0x1000...,
+// the shared at 0x2000... (gmc_v9_0's aperture starts >> 48).
+const uint32_t kVmShMemBases = 0x20001000;
+// What the check requires (the MMHUB's boot 22 state, which stage 17 found):
+// offset, mask, value. A fault must redirect to the default page and never
+// halt (VM_L2_PROTECTION_FAULT_CNTL: the *_ENABLE_DEFAULT bits set, both
+// CRASH_ON_* clear); VMID 1's context off and empty; no GDS for VMID 1.
+const GfxExpect kVmExpect[] = {
+    {kRegGcVmL2Cntl, 0xffffffff, 0x00080602},
+    {kRegGcVmL2Cntl2, 0xffffffff, 0},
+    {kRegGcVmL2Cntl3, 0xffffffff, 0x80100007},
+    {kRegGcVmL2Cntl4, 0xffffffff, 0x000000c1},
+    {kRegGcMxL1TlbCntl, 0xffffffff, 0x00002501},
+    {kRegGcVmL2ProtectionFaultCntl, 0xc0001ffc, 0x00001ffc},
+    {kRegGcVmL2ProtectionFaultCntl2, 0xffffffff, 0x000a0000},
+    {kRegGcVmL2ProtectionFaultDefaultAddrLo32, 0xffffffff, 0},
+    {kRegGcVmL2ProtectionFaultDefaultAddrHi32, 0xffffffff, 0},
+    {kRegGcVmL2Context1IdentityApertureLowAddrLo32, 0xffffffff, 0},
+    {kRegGcVmL2Context1IdentityApertureLowAddrHi32, 0xffffffff, 0},
+    {kRegGcVmL2Context1IdentityApertureHighAddrLo32, 0xffffffff, 0},
+    {kRegGcVmL2Context1IdentityApertureHighAddrHi32, 0xffffffff, 0},
+    {kRegGcVmL2ContextIdentityPhysicalOffsetLo32, 0xffffffff, 0},
+    {kRegGcVmL2ContextIdentityPhysicalOffsetHi32, 0xffffffff, 0},
+    {kRegGcVmInvalidateEng17AddrRangeLo32, 0xffffffff, 0},
+    {kRegGcVmInvalidateEng17AddrRangeHi32, 0xffffffff, 0},
+    {kRegGcVmContext1Cntl, 0x00000001, 0},
+    {kRegGcVmContext1PageTableBaseAddrLo32, 0xffffffff, 0},
+    {kRegGcVmContext1PageTableBaseAddrHi32, 0xffffffff, 0},
+    {kRegGcVmContext1PageTableStartAddrLo32, 0xffffffff, 0},
+    {kRegGcVmContext1PageTableStartAddrHi32, 0xffffffff, 0},
+    {kRegGcVmContext1PageTableEndAddrLo32, 0xffffffff, 0},
+    {kRegGcVmContext1PageTableEndAddrHi32, 0xffffffff, 0},
+    {kRegGdsVmid1Base, 0xffffffff, 0},
+    {kRegGdsVmid1Size, 0xffffffff, 0},
+    {kRegGdsGwsVmid1, 0xffffffff, 0},
+    {kRegGdsOaVmid1, 0xffffffff, 0},
+};
+const uint32_t kVmExpectCount = sizeof(kVmExpect) / sizeof(kVmExpect[0]);
+// The enable (offset, mask, value against the check's reading), in
+// gfxhub_v1_0_gart_enable's order: init_system_aperture_regs' default page,
+// init_tlb_regs, init_cache_regs, disable_identity_aperture,
+// program_invalidation (engine 17), setup_vmid_config and setup_vm_pt_regs for
+// VMID 1. The restore writes the reading back in reverse.
+const GfxWrite kVmWrites[] = {
+    {kRegGcVmL2ProtectionFaultDefaultAddrLo32, 0xffffffff, uint32_t(kVmDefaultPhysical >> 12)},
+    {kRegGcVmL2ProtectionFaultDefaultAddrHi32, 0xffffffff, uint32_t(kVmDefaultPhysical >> 44)},
+    {kRegGcVmL2ProtectionFaultCntl2, 0xffffffff, 0x000e0000},
+    {kRegGcMxL1TlbCntl, 0xffffffff, 0x00003d59},
+    {kRegGcVmL2Cntl, 0xffffffff, 0x00080603},
+    {kRegGcVmL2Cntl2, 0xffffffff, 0x00000003},
+    {kRegGcVmL2Cntl3, 0xffffffff, 0x8014800c},
+    {kRegGcVmL2Cntl4, 0xffffffff, 0x00000001},
+    {kRegGcVmL2Context1IdentityApertureLowAddrLo32, 0xffffffff, 0xffffffff},
+    {kRegGcVmL2Context1IdentityApertureLowAddrHi32, 0xffffffff, 0x0000000f},
+    {kRegGcVmInvalidateEng17AddrRangeLo32, 0xffffffff, 0xffffffff},
+    {kRegGcVmInvalidateEng17AddrRangeHi32, 0xffffffff, 0x0000001f},
+    // ENABLE_CONTEXT, depth 0 (flat), block size 0, no retry: 0x007ffe01 from
+    // the 0x007ffe80 MMHUB context 0 read at boot 22.
+    {kRegGcVmContext1Cntl, 0x000000ff, 0x00000001},
+    {kRegGcVmContext1PageTableStartAddrLo32, 0xffffffff, uint32_t(kVmVaBase >> 12)},
+    {kRegGcVmContext1PageTableStartAddrHi32, 0xffffffff, uint32_t(kVmVaBase >> 44)},
+    {kRegGcVmContext1PageTableEndAddrLo32, 0xffffffff, uint32_t((kVmVaBase >> 12) + kVmPages - 1)},
+    {kRegGcVmContext1PageTableEndAddrHi32, 0xffffffff, 0},
+    {kRegGcVmContext1PageTableBaseAddrLo32, 0xffffffff, uint32_t(kVmTablePhysical | 1)},
+    {kRegGcVmContext1PageTableBaseAddrHi32, 0xffffffff, uint32_t(kVmTablePhysical >> 32)},
+};
+const uint32_t kVmCount = sizeof(kVmWrites) / sizeof(kVmWrites[0]);
+struct VmSnapshot {
+    uint32_t hub[kVmCount]; // the check's reading of kVmWrites' registers
+    uint32_t faultCntl;     // VM_L2_PROTECTION_FAULT_CNTL, written only to clear the status
+    uint32_t shMem[2];      // VMID 1's SH_MEM_CONFIG and SH_MEM_BASES, read at the start
+    bool checked, shMemTaken;
+};
+// A VMID 1 submission: the code slot (5-15) and its descriptor fields, the
+// threads per group and groups per grid, the LDS bytes, and each buffer's
+// data-area offset (page aligned) and length.
+struct VmRequest {
+    uint32_t slot;
+    uint32_t rsrc1, rsrc2, properties;
+    uint32_t group[3];
+    uint32_t groups[3];
+    uint32_t ldsBytes;
+    uint32_t buffers;
+    uint32_t offset[kComputeMaxBuffers];
+    uint32_t length[kComputeMaxBuffers];
+};
+// COMPUTE_PGM_RSRC1 PRIV, DEBUG_MODE, CDBG_USER; RSRC2 SCRATCH_EN,
+// TRAP_PRESENT, EXCP_EN_MSB, EXCP_EN (gc_9_0_sh_mask.h): refused.
+const uint32_t kRsrc1Refused = (1u << 20) | (1u << 22) | (1u << 25);
+const uint32_t kRsrc2Refused = 0x1u | (1u << 6) | (3u << 13) | (0x7fu << 24);
+const uint32_t kRsrc2UserSgprShift = 1, kRsrc2UserSgprMask = 0x3e;
 
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
@@ -1747,6 +1918,8 @@ enum Status : uint32_t {
     kComputeNoProgress, // neither write-pointer method moved the queue's read pointer
     kComputeMismatch,   // the dispatch finished but the output is not 0..255
     kComputeRefused,    // stage 23: a submission outside its kernel's bounds (ComputeRefusal)
+    // Stage 24.
+    kVmFlushTimeout, // VM_INVALIDATE_ENG17_ACK never showed VMID 1
 };
 
 const char *statusName(Status status);
@@ -1865,7 +2038,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 20;
+const uint32_t kDiagnosticVersion = 21;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -1955,7 +2128,12 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticComputeWrite = 56,  // in: data-area offset, then ComputeChunk; out: Status
     kDiagnosticComputeSubmit = 57, // in: ComputeRequest; out: Status, fence, read pointer, refusal, index
     kDiagnosticComputeRead = 58,   // in: data-area offset, bytes; out: Status, ComputeChunk
-    kDiagnosticSelectorCount = 59,
+    // Stage 24, after a passing compute ring test and instead of stage 23's
+    // submissions. GfxRestore (52) restores the VM before the queue.
+    kDiagnosticComputeVmStart = 59,  // out: Status, writes made, index, value; structure: ComputeState
+    kDiagnosticComputeCode = 60,     // in: code slot, byte offset, then ComputeChunk; out: Status
+    kDiagnosticComputeVmSubmit = 61, // in: VmRequest; out: Status, VmReport
+    kDiagnosticSelectorCount = 62,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -2735,6 +2913,59 @@ Status submitCompute(const RegisterReader &registers, uint64_t apertureLength, c
                      uint32_t stage, const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t commit,
                      const ComputeRequest &request, uint32_t n, uint32_t *fence, uint32_t *rptr, uint32_t *reason,
                      uint32_t *index);
+
+// Stage 24.
+// What a VMID 1 submission reports: its fence, the queue's read pointer, a
+// refusal (ComputeRefusal) and its buffer, the GC hub's latched fault (status,
+// address), the non-zero words in the default page, and the queue's state.
+struct VmReport {
+    uint32_t fence, rptr, reason, index;
+    uint32_t faultStatus, faultAddrLo, faultAddrHi, defaultWords;
+    ComputeState state;
+};
+// A register write the VM enable, a submission's flush or the restore makes:
+// kVmWrites' values or the check's reading, the fault-status clear, the
+// VMID 1 flush request, GRBM_GFX_CNTL selecting VMID 1, and VMID 1's SH_MEM_*.
+bool vmWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage, const VmSnapshot *vm,
+                    const ComputeSnapshot *compute);
+// PTE for window page `page` (its area's access bits), and whether a
+// work-area word is a page-table half that may be written (0 or that PTE).
+uint64_t vmPte(uint32_t page);
+bool vmTableWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage);
+// The check, at the gfx check and before any write: kVmExpect
+// (kGfxUnexpectedState; index into it, value), then the reading of kVmWrites'
+// registers and the fault control.
+Status checkVmBoot(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, VmSnapshot *vm,
+                   uint32_t *index, uint32_t *value);
+// After a passing compute ring test: VMID 1's SH_MEM_* (read, then written
+// under GRBM_GFX_CNTL VMID 1), then kVmWrites in order.
+Status startVm(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer, uint32_t stage,
+               const uint32_t *gfxSnapshot, const ComputeSnapshot *compute, VmSnapshot *vm, uint32_t *writes,
+               uint32_t *index, uint32_t *value);
+// Uploaded code: words into code slot 5-15 at a byte offset.
+Status writeVmCode(const MemoryWriter &region, uint32_t stage, uint32_t slot, uint32_t offset, const uint32_t *words,
+                   uint32_t count);
+// Checks a VMID 1 request (kComputeRefused with the ComputeRefusal and buffer).
+Status checkVmRequest(const VmRequest &request, uint32_t submitted, uint32_t *reason, uint32_t *index);
+// Submission n's ring frame (dword) and page (byte offset: the IB, the
+// dispatch packet, kernarg), and whether it maps window page `page`.
+uint32_t vmFrameWord(const VmRequest &request, uint32_t n, uint32_t dword);
+uint32_t vmPageWord(const VmRequest &request, uint32_t n, uint32_t offset);
+bool vmMapped(const VmRequest &request, uint32_t n, uint32_t page);
+// Submission n at VMID 1: checks the request, writes its page and the page
+// table (only its pages valid), flushes VMID 1's TLB (kVmFlushTimeout),
+// commits its frame, waits for fence n and reports.
+Status submitVm(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                const MemoryWriter &workWriter, const MemoryReader &work, const MemoryWriter &region, uint32_t stage,
+                const uint32_t *gfxSnapshot, const ComputeSnapshot *compute, const VmSnapshot *vm, uint32_t commit,
+                const VmRequest &request, uint32_t n, VmReport *report);
+// The VM's restore, before restoreCompute: context 1 off and emptied, a VMID 1
+// flush, VMID 1's SH_MEM_* back, the rest in reverse, the fault status
+// cleared, then everything read back (kGfxNotRestored; index into kVmWrites,
+// kVmCount for the fault control, kVmCount + 1 and + 2 for SH_MEM_*).
+Status restoreVm(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                 uint32_t stage, const uint32_t *gfxSnapshot, const ComputeSnapshot *compute, const VmSnapshot *vm,
+                 uint32_t *index, uint32_t *value);
 
 } // namespace cezanne
 

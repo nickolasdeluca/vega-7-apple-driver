@@ -180,6 +180,28 @@ struct FakeRegisters {
     std::vector<uint32_t> *submit = nullptr;
     uint32_t acquires = 0;
     std::vector<uint32_t> corpusRuns;
+    // Stage 24: SH_MEM_* for VMID 1 (selected by GRBM_GFX_CNTL), the
+    // GC hub's TLB (window page -> PTE, filled on use, emptied by a VMID 1
+    // flush), the faults it took, and the code slot of each VMID 1 dispatch.
+    std::map<uint64_t, uint32_t> vmShMem;
+    std::map<uint64_t, uint64_t> vmTlb;
+    bool vmFlushHang = false; // the invalidation engine never ACKs
+    uint32_t vmFlushes = 0, vmFaults = 0;
+    std::vector<uint32_t> vmRuns;
+    uint32_t vmidSelected() { return (gc[kRegGrbmGfxCntl] >> 4) & 0x3; }
+    static bool shMemRegister(uint32_t offset) { return offset == kRegShMemConfig || offset == kRegShMemBases; }
+    // The GC hub's VM block as the check expects it (the MMHUB's boot 22
+    // values), VMID 1's context off, and VMID 1's SH_MEM_* as reset.
+    void presetVm()
+    {
+        for (uint32_t offset : kStage24Registers) gc[offset] = 0;
+        for (const GfxExpect &expect : kVmExpect) gc[expect.offset] = expect.value;
+        gc[kRegGcVmL2ProtectionFaultCntl] = 0x3ffffffc;
+        gc[kRegGcVmContext1Cntl] = 0x007ffe80;
+        gc[kRegGcVmL2ProtectionFaultStatus] = 0;
+        vmShMem[(uint64_t(kVmid) << 32) | kRegShMemConfig] = 0x00001001;
+        vmShMem[(uint64_t(kVmid) << 32) | kRegShMemBases] = 0;
+    }
     static bool perQueue(uint32_t offset)
     {
         for (uint32_t q : kComputeQueueRegisters)
@@ -282,6 +304,10 @@ struct FakeRegisters {
         }
         if (perQueue(offset)) {
             *value = self->hqd[self->hqdKey(offset)];
+            return true;
+        }
+        if (shMemRegister(offset) && self->vmidSelected() == kVmid) {
+            *value = self->vmShMem[(uint64_t(self->vmidSelected()) << 32) | offset];
             return true;
         }
         auto gc = self->gc.find(offset);
@@ -897,7 +923,9 @@ struct FakeWriter {
                 runSdma(r, old, r->sdmaPendingWptr);
             }
         }
-        if (FakeRegisters::perQueue(offset)) {
+        if (FakeRegisters::shMemRegister(offset) && r->vmidSelected() == kVmid) {
+            r->vmShMem[(uint64_t(r->vmidSelected()) << 32) | offset] = value;
+        } else if (FakeRegisters::perQueue(offset)) {
             if (offset != r->hqdStuck) r->hqd[r->hqdKey(offset)] = value;
             if (offset == kRegCpHqdPqWptrLo) runMec(r);
         } else if (r->gc.count(offset) != 0 && offset != r->gcStuck) {
@@ -1056,6 +1084,16 @@ struct FakeWriter {
             return;
         }
         r->gc[offset] = value;
+        if (offset == kRegGcVmInvalidateEng17Req) {
+            r->vmFlushes++;
+            if (r->vmFlushHang) return;
+            r->gc[kRegGcVmInvalidateEng17Ack] = value & 0xffff;
+            if ((value & (1u << kVmid)) != 0) r->vmTlb.clear();
+        }
+        if (offset == kRegGcVmL2ProtectionFaultCntl && (value & 1) != 0) {
+            r->gc[kRegGcVmL2ProtectionFaultStatus] = 0; // CLEAR_PROTECTION_FAULT_STATUS_ADDR
+            r->gc[kRegGcVmL2ProtectionFaultAddrLo32] = r->gc[kRegGcVmL2ProtectionFaultAddrHi32] = 0;
+        }
         if (offset == kRegCpRb0WptrHi) {
             uint32_t from = r->gc[kRegCpRb0Wptr];
             r->gc[kRegCpRb0Wptr] = r->cpPendingWptr;
@@ -1123,6 +1161,85 @@ struct FakeWriter {
             if (std::memcmp(code, kCorpusCode[k].code, kCorpusCode[k].dwords * 4) == 0) return k;
         }
         return kCorpusCount;
+    }
+    // The GC hub for VMID 1: context 1 on, the L2 on and the table where the
+    // core puts it; VA pages within the range, through the TLB, to the
+    // region. Anything else is a fault: latched once (VMID 1, as a write) and
+    // redirected to the default page, as RANGE/VALID_PROTECTION_FAULT_ENABLE_DEFAULT do.
+    static uint32_t *vmAt(FakeRegisters *r, uint64_t va)
+    {
+        uint32_t *m = r->gfxWork->words;
+        auto pair = [r](uint32_t lo, uint32_t hi) { return (uint64_t(r->gc[hi]) << 32) | r->gc[lo]; };
+        const uint64_t page = va >> 12;
+        const uint64_t start = pair(kRegGcVmContext1PageTableStartAddrLo32, kRegGcVmContext1PageTableStartAddrHi32);
+        const uint64_t end = pair(kRegGcVmContext1PageTableEndAddrLo32, kRegGcVmContext1PageTableEndAddrHi32);
+        const uint64_t table = pair(kRegGcVmContext1PageTableBaseAddrLo32, kRegGcVmContext1PageTableBaseAddrHi32);
+        bool ok = (r->gc[kRegGcVmContext1Cntl] & 1) != 0 && (r->gc[kRegGcVmL2Cntl] & 1) != 0 &&
+                  table == (kVmTablePhysical | 1) && page >= start && page <= end && page - start < kVmPages;
+        uint64_t pte = 0;
+        if (ok) {
+            auto hit = r->vmTlb.find(page);
+            if (hit == r->vmTlb.end()) {
+                const uint32_t at = uint32_t(kVmTablePage + 8 * (page - start)) / 4;
+                pte = (uint64_t(m[at + 1]) << 32) | m[at];
+                r->vmTlb[page] = pte;
+            } else {
+                pte = hit->second;
+            }
+            ok = (pte & kPteValid) != 0;
+        }
+        const uint64_t physical = pte & 0x0000fffffffff000ull;
+        if (ok && r->submit != nullptr && physical >= kSubmitPhysical && physical < kSubmitPhysical + kSubmitSize)
+            return &(*r->submit)[(physical - kSubmitPhysical + (va & 0xfff)) / 4];
+        r->vmFaults++;
+        if (r->gc[kRegGcVmL2ProtectionFaultStatus] == 0) {
+            r->gc[kRegGcVmL2ProtectionFaultStatus] = (kVmid << 20) | (1u << 18) | (1u << 4);
+            r->gc[kRegGcVmL2ProtectionFaultAddrLo32] = uint32_t(page);
+            r->gc[kRegGcVmL2ProtectionFaultAddrHi32] = uint32_t(page >> 32);
+        }
+        const uint64_t fallback = (uint64_t(r->gc[kRegGcVmL2ProtectionFaultDefaultAddrHi32]) << 44) |
+                                  (uint64_t(r->gc[kRegGcVmL2ProtectionFaultDefaultAddrLo32]) << 12);
+        return fallback == kVmDefaultPhysical ? &m[(kVmDefaultPage + (va & 0xfff)) / 4] : nullptr;
+    }
+    // The corpus kernel whose code COMPUTE_PGM_LO points at through VMID 1.
+    static uint32_t vmCorpusIndex(FakeRegisters *r)
+    {
+        const uint64_t pgm = (uint64_t(r->sh[kShComputePgmLo + 1]) << 40) | (uint64_t(r->sh[kShComputePgmLo]) << 8);
+        for (uint32_t k = 0; k < kCorpusCount; k++) {
+            if (r->sh[kShComputePgmRsrc1] != kCorpusCode[k].rsrc1) continue;
+            bool same = true;
+            for (uint32_t i = 0; same && i < kCorpusCode[k].dwords; i++) {
+                const uint32_t *word = vmAt(r, pgm + 4 * i);
+                same = word != nullptr && *word == kCorpusCode[k].code[i];
+            }
+            if (same) return k;
+        }
+        return kCorpusCount;
+    }
+    // An IB at VMID 1: SET_SH_REG and DISPATCH_DIRECT, the dispatch running
+    // the corpus kernel at its code through the GC hub. False if it hangs.
+    static bool runIb(FakeRegisters *r, const std::vector<uint32_t> &ib)
+    {
+        auto at = [r](uint64_t a) { return vmAt(r, a); };
+        for (uint32_t d = 0; d < ib.size();) {
+            const uint32_t header = ib[d];
+            if ((header >> 30) != 3) {
+                d++;
+                continue;
+            }
+            const uint32_t op = (header >> 8) & 0xff, length = ((header >> 16) & 0x3fff) + 2;
+            if (d + length > ib.size()) break;
+            if (op == kPm4SetShReg) {
+                for (uint32_t k = 0; k + 2 < length; k++) r->sh[kSetShRegStart + ib[d + 1] + k] = ib[d + 2 + k];
+            } else if (op == kPm4DispatchDirect) {
+                r->vmRuns.push_back(uint32_t((((uint64_t(r->sh[kShComputePgmLo]) << 8) - kVmVaBase)) / kSubmitCodeSlot));
+                const uint32_t k = vmCorpusIndex(r);
+                if (k < kCorpusCount) runCorpus(r, k, ib[d + 1], ib[d + 2], ib[d + 3], at);
+                if (r->dispatchHang) return false;
+            }
+            d += length;
+        }
+        return true;
     }
     // Runs corpus kernel k as its MSL does, over groups gx x gy x gz of the
     // NUM_THREAD size, buffers from kernarg (the last user-data pair). A buffer
@@ -1217,6 +1334,19 @@ struct FakeWriter {
                 if (word != nullptr) *word = ring(d + 5);
             } else if (op == kPm4AcquireMem && ring(d + 1) == kAcquireMemCoher) {
                 r->acquires++;
+            } else if (op == kPm4IndirectBuffer && (ring(d + 3) >> kIndirectBufferVmidShift) == kVmid &&
+                       (ring(d + 3) & kIndirectBufferValid) != 0) {
+                const uint64_t va = (uint64_t(ring(d + 2) & 0xffff) << 32) | ring(d + 1);
+                std::vector<uint32_t> ib(ring(d + 3) & 0xfffff);
+                for (uint32_t i = 0; i < ib.size(); i++) {
+                    const uint32_t *word = vmAt(r, va + 4 * i);
+                    ib[i] = word != nullptr ? *word : 0;
+                }
+                if (!runIb(r, ib)) {
+                    r->hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdPqRptr] = d + length;
+                    r->mecHang = true;
+                    return;
+                }
             } else if (op == kPm4DispatchDirect && corpusIndex(r) < kCorpusCount) {
                 runCorpus(r, corpusIndex(r), ring(d + 1), ring(d + 2), ring(d + 3), at);
                 if (r->dispatchHang) {
@@ -3592,7 +3722,7 @@ struct ComputeRig {
 static void testCompute()
 {
     // The pinned values (docs/test-boot.md, stage 22).
-    CHECK(kComputeStage == 22 && kDiagnosticVersion == 20);
+    CHECK(kComputeStage == 22 && kDiagnosticVersion == 21);
     CHECK(kComputeSelect == 0x4); // MEC1, pipe 0, queue 0 (after boot 42)
     CHECK(kRegCpHqdActive == 0xC91Cu && kRegCpPqWptrPollCntl == 0xC20Cu && kRegShMemConfig == 0x8C34u &&
           kRegRlcCpSchedulers == 0x3B2A8u && kRegCpHqdPqWptrLo == 0xC9ECu && kRegCpHqdEopControl == 0xC9B0u);
@@ -3826,7 +3956,7 @@ static ComputeRequest corpusRequest(uint32_t k, uint32_t sx, uint32_t sy, uint32
 static void testCorpus()
 {
     // The pinned values (docs/test-boot.md, stage 23).
-    CHECK(kMaxStage == 23 && kCorpusStage == 23 && kDiagnosticSelectorCount == 59);
+    CHECK(kCorpusStage == 23);
     CHECK(kSubmitGpuAddress == 0xF440B00000ull && kSubmitPhysical == 0x600B00000ull && kSubmitSize == 0x100000);
     CHECK(kCorpusCount == 5 && kCorpusCode[0].dwords == kComputeCodeDwords &&
           std::memcmp(kCorpusCode[0].code, kComputeCode, sizeof(kComputeCode)) == 0); // stage 22's kernel
@@ -3997,6 +4127,359 @@ static void testCorpus()
     }
 }
 
+
+// A stage 24 session: the compute rig with the GC hub at its boot values.
+struct VmRig {
+    ComputeRig c;
+    VmSnapshot vm = {};
+    uint32_t commit = 0;
+    explicit VmRig(uint32_t at = 24) : c(at) { c.g.r.presetVm(); }
+    // The check (at the gfx check), the RLC, the compute start and ring test,
+    // the VM start, and the corpus uploaded to slots 5-9.
+    Status open()
+    {
+        uint32_t index = 0, value = 0, writes = 0, scratch = 0, fence = 0, rptr = 0;
+        Status status = checkVmBoot(c.g.r.reader(), 0x80000, c.stage, &vm, &index, &value);
+        if (status == kOK) status = c.rlc();
+        if (status == kOK) status = c.start(&writes, &index, &value);
+        if (status == kOK) status = c.test(&scratch, &fence, &rptr, &commit);
+        if (status == kOK) status = start(&writes);
+        for (uint32_t k = 0; status == kOK && k < kCorpusCount; k++)
+            status = writeVmCode(c.regionWriter(), c.stage, kVmCodeSlotFirst + k, 0, kCorpusCode[k].code,
+                                 kCorpusCode[k].dwords);
+        return status;
+    }
+    Status start(uint32_t *writes)
+    {
+        uint32_t index = 0, value = 0;
+        return startVm(c.g.r.reader(), 0x80000, c.g.w.writer(), c.stage, c.g.snapshot, &c.snapshot, &vm, writes, &index,
+                       &value);
+    }
+    Status submit(const VmRequest &request, uint32_t n, VmReport *report)
+    {
+        return submitVm(c.g.r.reader(), 0x80000, c.g.w.writer(), c.g.gfxWork.writer(), c.g.gfxWork.reader(),
+                        c.regionWriter(), c.stage, c.g.snapshot, &c.snapshot, &vm, commit, request, n, report);
+    }
+    Status restore(uint32_t *index, uint32_t *value)
+    {
+        return restoreVm(c.g.r.reader(), 0x80000, c.g.w.writer(), c.stage, c.g.snapshot, &c.snapshot, &vm, index, value);
+    }
+    uint32_t pte(uint32_t page, uint32_t half) { return c.g.gfxWork.words[(kVmTablePage + 8 * page + 4 * half) / 4]; }
+};
+
+// A VMID 1 request for corpus kernel k uploaded to `slot` (its descriptor),
+// with group (x, y), groups (x, y) and buffers at data-area offsets.
+static VmRequest vmRequest(uint32_t k, uint32_t slot, uint32_t sx, uint32_t sy, uint32_t gx, uint32_t gy,
+                           std::vector<std::pair<uint32_t, uint32_t>> buffers, uint32_t lds = 0)
+{
+    VmRequest request = {};
+    request.slot = slot;
+    request.rsrc1 = kCorpusCode[k].rsrc1;
+    request.rsrc2 = kCorpusCode[k].rsrc2;
+    request.properties = kCorpusCode[k].properties;
+    request.group[0] = sx;
+    request.group[1] = sy;
+    request.group[2] = 1;
+    request.groups[0] = gx;
+    request.groups[1] = gy;
+    request.groups[2] = 1;
+    request.ldsBytes = lds;
+    request.buffers = uint32_t(buffers.size());
+    for (uint32_t i = 0; i < buffers.size(); i++) {
+        request.offset[i] = buffers[i].first;
+        request.length[i] = buffers[i].second;
+    }
+    return request;
+}
+
+static void testVm()
+{
+    // The pinned values (docs/test-boot.md, stage 24).
+    CHECK(kMaxStage == 24 && kVmStage == 24 && kVmid == 1 && kDiagnosticSelectorCount == 62);
+    CHECK(kRegGcVmL2Cntl2 == 0xa104 && kRegGcVmL2ProtectionFaultCntl == 0xa11c && kRegGcVmL2Cntl4 == 0xa15c &&
+          kRegGcVmContext1Cntl == 0xa204 && kRegGcVmInvalidateEng17Req == 0xa2d0 &&
+          kRegGcVmInvalidateEng17Ack == 0xa318 && kRegGcVmContext1PageTableBaseAddrLo32 == 0xa3b4 &&
+          kRegGcVmContext1PageTableStartAddrLo32 == 0xa434 && kRegGcVmContext1PageTableEndAddrLo32 == 0xa4b4 &&
+          kRegGdsVmid1Base == 0xcc08 && kRegGdsOaVmid1 == 0xccc4);
+    CHECK(kVmPages == 256 && kVmTablePhysical == 0x600A0A000ull && kVmDefaultPhysical == 0x600A0B000ull &&
+          kVmWorkSize <= kGfxWorkCheckSize && kVmTablePage >= kComputeWorkSize && kVmTablePage + 8 * kVmPages <= kVmDefaultPage);
+    CHECK(kVmCodeSlots == 16 && kVmSubmitPageFirst + kVmSubmitMax * kVmPageBytes <= kSubmitDataArea &&
+          kVmSubmitPageFirst >= kSubmitSlotArea + kComputeSubmitMax * kSubmitSlotSize);
+    CHECK(kComputeSubmitFirst + kVmSubmitMax * kVmFrameDwords == 512 && kVmInvalidateReq == 0x007c0002);
+    CHECK(((0x007ffe80u & ~kVmWrites[12].mask) | kVmWrites[12].value) == 0x007ffe01 && kVmWrites[12].offset == kRegGcVmContext1Cntl);
+    CHECK(kVmWrites[0].value == 0x600A0B && kVmWrites[1].value == 0 && kVmWrites[17].value == 0x0A0A001 &&
+          kVmWrites[18].value == 6 && kVmWrites[13].value == 0x100000 && kVmWrites[15].value == 0x1000ff);
+    for (uint32_t offset : kStage24Registers)
+        CHECK(registerAllowed(offset, 24) && !registerAllowed(offset, 23) &&
+              ((offset >> 12) == 0xA || (offset >> 12) == 0xC));
+
+    // PTEs: code R+X, the slots' pages R, data R+W; all uncached system pages.
+    CHECK(vmPte(0) == (0x600B00000ull | 0x33 | kPteMtypeUc) && vmPte(0x10) == (0x600B10000ull | 0x23 | kPteMtypeUc) &&
+          vmPte(0x11) == (0x600B11000ull | 0x23 | kPteMtypeUc) && vmPte(0x20) == (0x600B20000ull | 0x63 | kPteMtypeUc) &&
+          vmPte(0xff) == (0x600BFF000ull | 0x63 | kPteMtypeUc));
+    CHECK(vmTableWriteAllowed(kVmTablePage, uint32_t(vmPte(0)), 24) && vmTableWriteAllowed(kVmTablePage + 4, 0x06000006, 24) &&
+          vmTableWriteAllowed(kVmTablePage + 8 * 255, 0, 24) && !vmTableWriteAllowed(kVmTablePage, uint32_t(vmPte(1)), 24) &&
+          !vmTableWriteAllowed(kVmTablePage + 8 * 256, 0, 24) && !vmTableWriteAllowed(kVmTablePage, 0, 23) &&
+          !vmTableWriteAllowed(kVmTablePage + 2, 0, 24) && !vmTableWriteAllowed(kVmDefaultPage, 0, 24));
+    CHECK(gfxWorkWriteAllowed(kVmTablePage + 8, uint32_t(vmPte(1)), 24) && !gfxWorkWriteAllowed(kVmTablePage + 8, 0, 23));
+    CHECK(computePollWriteAllowed(kComputeWbPage + kComputeWbPoll, 288, 24) &&
+          computePollWriteAllowed(kComputeWbPage + kComputeWbPoll, 512, 24) &&
+          !computePollWriteAllowed(kComputeWbPage + kComputeWbPoll, 288, 23));
+    // Region: uploaded code from slot 5, any words, stage 24 only.
+    CHECK(submitWriteAllowed(5 * kSubmitCodeSlot, 0x12345678, 24) && !submitWriteAllowed(5 * kSubmitCodeSlot, 0x12345678, 23) &&
+          !submitWriteAllowed(0, kCorpusCode[0].code[0] ^ 1, 24));
+    const uint32_t words[2] = {1, 2};
+    FakeMemory scratchRegion;
+    CHECK(writeVmCode(scratchRegion.writer(), 23, 5, 0, words, 2) == kRegisterNotAllowed &&
+          writeVmCode(scratchRegion.writer(), 24, 4, 0, words, 2) == kRegisterNotAllowed &&
+          writeVmCode(scratchRegion.writer(), 24, 16, 0, words, 2) == kRegisterNotAllowed &&
+          writeVmCode(scratchRegion.writer(), 24, 5, kSubmitCodeSlot - 4, words, 2) == kRegisterNotAllowed &&
+          writeVmCode(scratchRegion.writer(), 24, 5, 2, words, 1) == kRegisterNotAllowed);
+
+    // Requests: what each refusal catches.
+    uint32_t reason = 99, index = 99;
+    const VmRequest good = vmRequest(1, 6, 256, 1, 4, 1, {{0, 4096}, {4096, 4096}, {8192, 4096}});
+    CHECK(checkVmRequest(good, 0, &reason, &index) == kOK && reason == kRefusedNone);
+    auto refused = [&](VmRequest request, uint32_t why, uint32_t at = 0, uint32_t submitted = 0) {
+        return checkVmRequest(request, submitted, &reason, &index) == kComputeRefused && reason == why && index == at;
+    };
+    auto with = [&](uint32_t rsrc1, uint32_t rsrc2, uint32_t properties = 0xb) {
+        VmRequest request = good;
+        request.rsrc1 ^= rsrc1;
+        request.rsrc2 ^= rsrc2;
+        request.properties = properties;
+        return request;
+    };
+    CHECK(refused(good, kRefusedCount, 0, kVmSubmitMax));
+    VmRequest slot = good;
+    slot.slot = 4;
+    CHECK(refused(slot, kRefusedKernel));
+    slot.slot = 16;
+    CHECK(refused(slot, kRefusedKernel));
+    CHECK(kCorpusCode[1].properties == 0xb && ((kCorpusCode[1].rsrc2 & kRsrc2UserSgprMask) >> 1) == 8 &&
+          (kCorpusCode[1].rsrc1 & kRsrc1Refused) == 0 && (kCorpusCode[1].rsrc2 & kRsrc2Refused) == 0);
+    CHECK(refused(with(1u << 20, 0), kRefusedDescriptor) && refused(with(1u << 22, 0), kRefusedDescriptor) &&
+          refused(with(1u << 25, 0), kRefusedDescriptor)); // PRIV, DEBUG_MODE, CDBG_USER
+    CHECK(refused(with(0, 1), kRefusedDescriptor) && refused(with(0, 1u << 6), kRefusedDescriptor) &&
+          refused(with(0, 1u << 13), kRefusedDescriptor) && refused(with(0, 1u << 24), kRefusedDescriptor) &&
+          refused(with(0, 1u << 30), kRefusedDescriptor)); // SCRATCH_EN, TRAP_PRESENT, EXCP_EN_MSB, EXCP_EN
+    CHECK(refused(with(0, 0, 0x9), kRefusedDescriptor) && refused(with(0, 2), kRefusedDescriptor)); // SGPRs: 8 for 0xb
+    CHECK(checkVmRequest(with(0, 0x1c, 0x9), 0, &reason, &index) == kOK); // 6 for 0x9
+    CHECK(checkVmRequest(with(1u << 21, 0), 0, &reason, &index) == kOK); // DX10_CLAMP is no privilege
+    CHECK(refused(vmRequest(1, 6, 0, 1, 4, 1, {{0, 4096}}), kRefusedGroup) &&
+          refused(vmRequest(1, 6, 64, 32, 1, 1, {{0, 8192}}), kRefusedGroup) &&
+          refused(vmRequest(1, 6, 64, 1, 0, 1, {{0, 4096}}), kRefusedGrid) &&
+          refused(vmRequest(1, 6, 1024, 1, 1025, 1, {{0, 4096}}), kRefusedGrid) &&
+          refused(vmRequest(1, 6, 64, 1, 1, 1, {{0, 4096}}, 65536 + 512), kRefusedLds));
+    VmRequest five = good;
+    five.buffers = kComputeMaxBuffers + 1;
+    CHECK(refused(vmRequest(1, 6, 64, 1, 1, 1, {}), kRefusedBuffer) && refused(five, kRefusedBuffer));
+    CHECK(refused(vmRequest(1, 6, 64, 1, 1, 1, {{0, 4096}, {4100, 4096}}), kRefusedBuffer, 1) && // not page-aligned
+          refused(vmRequest(1, 6, 64, 1, 1, 1, {{0, 0}}), kRefusedBuffer) &&
+          refused(vmRequest(1, 6, 64, 1, 1, 1, {{kSubmitDataSize - 4096, 4100}}), kRefusedBuffer));
+    CHECK(refused(vmRequest(1, 6, 64, 1, 1, 1, {{0, 4097}, {4096, 4}}), kRefusedOverlap, 1) && // shares a page
+          refused(vmRequest(1, 6, 64, 1, 1, 1, {{8192, 4}, {0, 4096}, {0, 4}}), kRefusedOverlap, 2));
+    CHECK(checkVmRequest(vmRequest(1, 6, 64, 1, 1, 1, {{0, 4096}, {4096, 4}, {kSubmitDataSize - 4096, 4096}}), 0, &reason,
+                         &index) == kOK); // no length bound: the mapping is
+
+    // The frame: ACQUIRE_MEM, the IB at VMID 1, fence n; the page: IB, packet, kernarg.
+    const VmRequest sum = vmRequest(2, 7, 256, 1, 64, 1, {{0x70000, 0x10000}, {0x80000, 256}}, 1024);
+    CHECK(vmFrameWord(sum, 2, 0) == 0xC0055800u && vmFrameWord(sum, 2, 1) == 0x28C40000u);
+    CHECK(vmFrameWord(sum, 2, 7) == pm4(kPm4IndirectBuffer, 2) && vmFrameWord(sum, 2, 8) == 0x00013000u &&
+          vmFrameWord(sum, 2, 9) == 1 && (vmFrameWord(sum, 2, 10) >> 20) == 0x18);
+    CHECK(vmFrameWord(sum, 2, 11) == 0xC0064900u && vmFrameWord(sum, 2, 14) == 0x40A07130u && vmFrameWord(sum, 2, 16) == 3);
+    CHECK(vmFrameWord(sum, 2, 19) == pm4(kPm4Nop, kVmFrameDwords - 19 - 2) && vmFrameWord(sum, 2, 32) == 0);
+    const uint32_t ibDwords = vmFrameWord(sum, 2, 10) & 0xfffff;
+    CHECK(ibDwords * 4 <= kVmPacket && vmPageWord(sum, 2, 4 * (ibDwords - 5)) == pm4(kPm4DispatchDirect, 3) &&
+          vmPageWord(sum, 2, 4 * ibDwords) == 0);
+    bool pgm = false;
+    for (uint32_t i = 0; i + 1 < ibDwords; i++)
+        pgm = pgm || (vmPageWord(sum, 2, 4 * i) == 0x01000070u && vmPageWord(sum, 2, 4 * i + 4) == 0); // slot 7 >> 8
+    CHECK(pgm);
+    CHECK(vmPageWord(sum, 2, kVmPacket) == (3u << 16) && vmPageWord(sum, 2, kVmPacket + 12) == 256 * 64 &&
+          vmPageWord(sum, 2, kVmPacket + 28) == 1024);
+    CHECK(vmPageWord(sum, 2, kVmKernarg) == 0x00090000u && vmPageWord(sum, 2, kVmKernarg + 4) == 1 &&
+          vmPageWord(sum, 2, kVmKernarg + 8) == 0x000A0000u && vmPageWord(sum, 2, kVmKernarg + 16) == 0);
+    // Mapped: its code slot, its page, its buffers' pages; nothing else.
+    uint32_t mapped = 0;
+    for (uint32_t p = 0; p < kVmPages; p++) mapped += vmMapped(sum, 2, p) ? 1 : 0;
+    CHECK(mapped == 1 + 1 + 16 + 1 && vmMapped(sum, 2, 7) && vmMapped(sum, 2, 0x13) && vmMapped(sum, 2, 0x90) &&
+          vmMapped(sum, 2, 0x9f) && vmMapped(sum, 2, 0xa0) && !vmMapped(sum, 2, 0xa1) && !vmMapped(sum, 2, 0x12) &&
+          !vmMapped(sum, 2, 2));
+
+    // Register writes: the enable's values or the reading, from stage 24 after the check.
+    {
+        VmSnapshot vm = {};
+        vm.hub[12] = 0x007ffe80;
+        vm.faultCntl = 0x3ffffffc;
+        CHECK(!vmWriteAllowed(kRegGcVmContext1Cntl, 0x007ffe01, 24, &vm, nullptr)); // unchecked
+        vm.checked = true;
+        CHECK(vmWriteAllowed(kRegGcVmContext1Cntl, 0x007ffe01, 24, &vm, nullptr) &&
+              vmWriteAllowed(kRegGcVmContext1Cntl, 0x007ffe80, 24, &vm, nullptr) &&
+              !vmWriteAllowed(kRegGcVmContext1Cntl, 0x007ffe81, 24, &vm, nullptr) &&
+              !vmWriteAllowed(kRegGcVmContext1Cntl, 0x007ffe01, 23, &vm, nullptr));
+        CHECK(vmWriteAllowed(kRegGcVmL2ProtectionFaultCntl, 0x3ffffffd, 24, &vm, nullptr) &&
+              !vmWriteAllowed(kRegGcVmL2ProtectionFaultCntl, 0x3ffffffe, 24, &vm, nullptr));
+        CHECK(vmWriteAllowed(kRegGcVmInvalidateEng17Req, kVmInvalidateReq, 24, &vm, nullptr) &&
+              !vmWriteAllowed(kRegGcVmInvalidateEng17Req, 0x007c0001, 24, &vm, nullptr) && // VMID 0
+              !vmWriteAllowed(kRegGcVmInvalidateEng17Ack, 2, 24, &vm, nullptr) &&
+              !vmWriteAllowed(kRegGcVmL2ProtectionFaultStatus, 0, 24, &vm, nullptr));
+        CHECK(!vmWriteAllowed(kRegShMemBases, kVmShMemBases, 24, &vm, nullptr)); // not read yet
+        vm.shMemTaken = true;
+        vm.shMem[0] = 0x00001001;
+        CHECK(vmWriteAllowed(kRegShMemBases, kVmShMemBases, 24, &vm, nullptr) &&
+              vmWriteAllowed(kRegShMemConfig, 0x00001018 & (kShMemRetryDisable | kShMemAlignmentUnaligned), 24, &vm,
+                             nullptr) &&
+              !vmWriteAllowed(kRegShMemBases, 0x20002000, 24, &vm, nullptr));
+    }
+
+    // The check: everything as at boot 22's MMHUB, then the reading.
+    {
+        VmRig v;
+        VmSnapshot vm = {};
+        uint32_t value = 0;
+        CHECK(checkVmBoot(v.c.g.r.reader(), 0x80000, 24, &vm, &index, &value) == kOK && vm.checked &&
+              vm.hub[12] == 0x007ffe80 && vm.hub[4] == 0x00080602 && vm.faultCntl == 0x3ffffffc);
+        CHECK(checkVmBoot(v.c.g.r.reader(), 0x80000, 23, &vm, &index, &value) == kRegisterNotAllowed && !vm.checked);
+        v.c.g.r.gc[kRegGcVmContext1Cntl] = 0x007ffe81;
+        CHECK(checkVmBoot(v.c.g.r.reader(), 0x80000, 24, &vm, &index, &value) == kGfxUnexpectedState && index == 17 &&
+              value == 0x007ffe81 && !vm.checked);
+        v.c.g.r.gc[kRegGcVmContext1Cntl] = 0x007ffe80;
+        v.c.g.r.gc[kRegGcVmL2ProtectionFaultCntl] = 0x7ffffffc; // CRASH_ON_NO_RETRY_FAULT
+        CHECK(checkVmBoot(v.c.g.r.reader(), 0x80000, 24, &vm, &index, &value) == kGfxUnexpectedState && index == 5);
+        v.c.g.r.gc[kRegGcVmL2ProtectionFaultCntl] = 0x3ffffffc;
+        v.c.g.r.gc[kRegGdsGwsVmid1] = 1;
+        CHECK(checkVmBoot(v.c.g.r.reader(), 0x80000, 24, &vm, &index, &value) == kGfxUnexpectedState && index == 26);
+    }
+
+    // A whole session against the fakes: the corpus uploaded and run at VMID 1,
+    // a kernel the fake does not know, the fault probe, then store_index again.
+    {
+        VmRig v;
+        CHECK(v.open() == kOK);
+        FakeRegisters &r = v.c.g.r;
+        CHECK(r.gc[kRegGcVmContext1Cntl] == 0x007ffe01 && r.gc[kRegGcVmL2Cntl] == 0x00080603 &&
+              r.gc[kRegGcVmContext1PageTableBaseAddrLo32] == 0x0A0A001 && r.gc[kRegGcMxL1TlbCntl] == 0x00003d59);
+        CHECK(r.vmShMem[(uint64_t(kVmid) << 32) | kRegShMemBases] == kVmShMemBases &&
+              r.vmShMem[(uint64_t(kVmid) << 32) | kRegShMemConfig] ==
+                  ((0x00001001 & kShMemRetryDisable) | kShMemAlignmentUnaligned) &&
+              r.gc[kRegShMemBases] == 0 && r.vmidSelected() != kVmid); // VMID 0 as stage 22 left it, deselected
+        CHECK(v.c.submit[5 * kSubmitCodeSlot / 4] == kCorpusCode[0].code[0]);
+        std::vector<uint32_t> in(0x8000);
+        for (uint32_t i = 0; i < 0x8000; i++) {
+            const float a = float(i), b = float(2 * i);
+            std::memcpy(&in[i], &a, 4);
+            CHECK(writeComputeData(v.c.regionWriter(), 24, 0x10000 + 4 * i, &in[i], 1) == kOK);
+            std::memcpy(&in[i], &b, 4);
+            CHECK(writeComputeData(v.c.regionWriter(), 24, 0x30000 + 4 * i, &in[i], 1) == kOK);
+        }
+        for (uint32_t i = 0; i < 0x4000; i++) CHECK(writeComputeData(v.c.regionWriter(), 24, 0x70000 + 4 * i, &i, 1) == kOK);
+        const uint32_t zero = 0;
+        CHECK(writeComputeData(v.c.regionWriter(), 24, 0x81000, &zero, 1) == kOK);
+        const VmRequest requests[] = {
+            vmRequest(0, 5, 256, 1, 64, 1, {{0x00000, 0x10000}}),
+            vmRequest(1, 6, 256, 1, 128, 1, {{0x10000, 0x20000}, {0x30000, 0x20000}, {0x50000, 0x20000}}),
+            vmRequest(2, 7, 256, 1, 64, 1, {{0x70000, 0x10000}, {0x80000, 256}}, 1024),
+            vmRequest(3, 8, 256, 1, 64, 1, {{0x81000, 4}}),
+            vmRequest(4, 9, 16, 16, 8, 4, {{0x82000, 0x8000}}),
+        };
+        VmReport report = {};
+        for (uint32_t n = 0; n < kCorpusCount; n++) {
+            CHECK(v.submit(requests[n], n, &report) == kOK && report.fence == n + 1 &&
+                  report.rptr == kComputeSubmitFirst + (n + 1) * kVmFrameDwords && report.faultStatus == 0 &&
+                  report.defaultWords == 0);
+        }
+        CHECK(r.vmRuns == std::vector<uint32_t>({5, 6, 7, 8, 9}) &&
+              r.corpusRuns == std::vector<uint32_t>({0, 1, 2, 3, 4}) && r.vmFlushes == 5 && r.vmFaults == 0);
+        bool exact = true;
+        for (uint32_t i = 0; i < 0x4000; i++) exact = exact && v.c.data(4 * i) == i;
+        for (uint32_t i = 0; i < 0x8000; i++) {
+            float got;
+            const uint32_t word = v.c.data(0x50000 + 4 * i);
+            std::memcpy(&got, &word, 4);
+            exact = exact && got == float(3 * i);
+        }
+        for (uint32_t g = 0; g < 64; g++) exact = exact && v.c.data(0x80000 + 4 * g) == 256 * 256 * g + 255 * 128;
+        exact = exact && v.c.data(0x81000) == 0x4000;
+        for (uint32_t y = 0; y < 64; y++)
+            for (uint32_t x = 0; x < 128; x++) exact = exact && v.c.data(0x82000 + 4 * (y * 128 + x)) == ((y << 16) | x);
+        CHECK(exact);
+        // The table holds only the last submission's pages.
+        CHECK(v.pte(9, 0) == uint32_t(vmPte(9)) && v.pte(9, 1) == uint32_t(vmPte(9) >> 32) && v.pte(8, 0) == 0 &&
+              v.pte(0x15, 0) == uint32_t(vmPte(0x15)) && v.pte(0x14, 0) == 0 && v.pte(0xa2, 0) == uint32_t(vmPte(0xa2)) &&
+              v.pte(0xa9, 0) == uint32_t(vmPte(0xa9)) && v.pte(0xaa, 0) == 0 && v.pte(0x20, 0) == 0);
+        // Code the fake does not know: the IB runs, the fence lands, nothing is computed.
+        std::vector<uint32_t> other(kCorpusCode[0].code, kCorpusCode[0].code + kCorpusCode[0].dwords);
+        other[0] ^= 0x10;
+        CHECK(writeVmCode(v.c.regionWriter(), 24, 10, 0, other.data(), uint32_t(other.size())) == kOK);
+        CHECK(v.submit(vmRequest(0, 10, 64, 1, 1, 1, {{0x90000, 0x1000}}), 5, &report) == kOK && report.fence == 6 &&
+              r.vmRuns.size() == 6 && r.vmRuns[5] == 10 && r.corpusRuns.size() == 5);
+        // The fault probe: 2048 threads into one page; the next page, mapped by
+        // submission 1 and still in its TLB had nobody flushed, keeps its canary.
+        const uint32_t canary = 0xC0FFEE00u;
+        for (uint32_t i = 0; i < 1024; i++) CHECK(writeComputeData(v.c.regionWriter(), 24, 0x1000 + 4 * i, &canary, 1) == kOK);
+        CHECK(v.submit(vmRequest(0, 5, 256, 1, 8, 1, {{0x0000, 0x1000}}), 6, &report) == kOK && report.fence == 7 &&
+              report.faultStatus == ((kVmid << 20) | (1u << 18) | (1u << 4)) && report.faultAddrLo == 0x100021 &&
+              report.faultAddrHi == 0 && report.defaultWords == 1024 && r.vmFaults == 1024);
+        bool kept = true;
+        for (uint32_t i = 0; i < 1024; i++) kept = kept && v.c.data(4 * i) == i && v.c.data(0x1000 + 4 * i) == canary;
+        CHECK(kept && v.c.g.gfxWork.words[kVmDefaultPage / 4] == 1024 && report.state.poll == report.rptr);
+        // And store_index again: the queue goes on after a fault.
+        CHECK(v.submit(vmRequest(0, 5, 64, 1, 4, 1, {{0x91000, 0x1000}}), 7, &report) == kOK && report.fence == 8 &&
+              report.rptr == 512 && v.c.data(0x91000 + 4 * 255) == 255 && report.faultAddrLo == 0x100021);
+        // A ninth: refused before anything is written.
+        const uint32_t flushes = r.vmFlushes;
+        CHECK(v.submit(requests[0], kVmSubmitMax, &report) == kComputeRefused && report.reason == kRefusedCount &&
+              r.vmFlushes == flushes);
+        // The restore: everything as read, the fault cleared, VMID 1's SH_MEM_* back.
+        uint32_t value = 0;
+        CHECK(v.restore(&index, &value) == kOK && r.vmFlushes == flushes + 1);
+        for (const GfxExpect &expect : kVmExpect) CHECK((r.gc[expect.offset] & expect.mask) == expect.value);
+        CHECK(r.gc[kRegGcVmContext1Cntl] == 0x007ffe80 && r.gc[kRegGcVmL2ProtectionFaultCntl] == 0x3ffffffc &&
+              r.gc[kRegGcVmL2ProtectionFaultStatus] == 0 && r.gc[kRegGcVmL2ProtectionFaultAddrLo32] == 0 &&
+              r.vmShMem[(uint64_t(kVmid) << 32) | kRegShMemConfig] == 0x00001001 &&
+              r.vmShMem[(uint64_t(kVmid) << 32) | kRegShMemBases] == 0 &&
+              r.vmidSelected() != kVmid);
+        CHECK(v.c.restore(&index, &value) == kOK && v.c.q(kRegCpHqdActive) == 0);
+    }
+    {
+        // A flush that never completes: no frame is committed, and the restore
+        // still restores everything, reporting it last.
+        VmRig v;
+        CHECK(v.open() == kOK);
+        v.c.g.r.vmFlushHang = true;
+        VmReport report = {};
+        const uint32_t wptr = v.c.q(kRegCpHqdPqWptrLo);
+        CHECK(v.submit(vmRequest(0, 5, 64, 1, 1, 1, {{0, 0x1000}}), 0, &report) == kVmFlushTimeout && report.fence == 0 &&
+              v.c.q(kRegCpHqdPqWptrLo) == wptr && v.c.g.r.corpusRuns.empty());
+        uint32_t value = 0;
+        CHECK(v.restore(&index, &value) == kVmFlushTimeout && v.c.g.r.gc[kRegGcVmContext1Cntl] == 0x007ffe80 &&
+              v.c.g.r.gc[kRegGcVmL2Cntl] == 0x00080602);
+        CHECK(std::strcmp(statusName(kVmFlushTimeout), "vm-flush-timeout") == 0);
+    }
+    {
+        // A register that does not read back is reported by its index.
+        VmRig v;
+        CHECK(v.open() == kOK);
+        v.c.g.r.gcStuck = kRegGcVmContext1Cntl; // the disable does not take
+        uint32_t value = 0;
+        CHECK(v.restore(&index, &value) == kGfxNotRestored && index == 12 && value == 0x007ffe01);
+    }
+    {
+        // Stage 23 sessions can do none of it; without the check, nothing starts.
+        VmRig v(23);
+        CHECK(v.open() == kRegisterNotAllowed && v.c.g.r.gc[kRegGcVmContext1Cntl] == 0x007ffe80);
+        VmRig w;
+        uint32_t writes = 0, value = 0, scratch = 0, fence = 0, rptr = 0;
+        CHECK(w.c.rlc() == kOK && w.c.start(&writes, &index, &value) == kOK &&
+              w.c.test(&scratch, &fence, &rptr, &w.commit) == kOK);
+        CHECK(w.start(&writes) == kRegisterNotAllowed && writes == 0);
+        VmReport report = {};
+        CHECK(w.submit(vmRequest(0, 5, 64, 1, 1, 1, {{0, 0x1000}}), 0, &report) == kRegisterNotAllowed &&
+              w.restore(&index, &value) == kRegisterNotAllowed && w.c.g.r.vmFlushes == 0);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -4028,6 +4511,7 @@ int main()
     testGfx();
     testCompute();
     testCorpus();
+    testVm();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

@@ -218,6 +218,39 @@ class CoreTests(unittest.TestCase):
             "== kGfxRingTestFailed": ("if (i == kGfxPollPauses) return kGfxRingTestFailed;",
                                       "if (i == kGfxPollPauses) break;"),
             "== kGfxDrawMismatch": ("return *unexpected == 0 ? kOK : kGfxDrawMismatch;", "return kOK;"),
+            # Stage 24.
+            "report.faultAddrLo == 0x100021": ("    if (status == kOK) status = flushVm(registers, apertureLength, writer, stage, gfxSnapshot, compute, vm);\n    const uint32_t start",
+                "    const uint32_t start"),
+            "== kVmFlushTimeout && report.fence == 0": ("if (i >= kGartPollPauses) return kVmFlushTimeout;",
+                "if (i >= kGartPollPauses) return kOK;"),
+            "!vmTableWriteAllowed(kVmTablePage, uint32_t(vmPte(1)), 24)": ("    return value == 0 || value == ((offset & 4) == 0 ? uint32_t(pte) : uint32_t(pte >> 32));",
+                "    return (void)pte, (void)value, true;"),
+            "refused(with(1u << 20, 0), kRefusedDescriptor)": ("(request.rsrc1 & kRsrc1Refused) != 0 || ",
+                ""),
+            "refused(with(0, 1u << 6), kRefusedDescriptor)": ("(request.rsrc2 & kRsrc2Refused) != 0 ||",
+                "false ||"),
+            "refused(with(0, 0, 0x9), kRefusedDescriptor)": ("!((request.properties == 0xb && sgprs == 8) || (request.properties == 0x9 && sgprs == 6))",
+                "((void)sgprs, false)"),
+            "{{0, 4097}, {4096, 4}}), kRefusedOverlap, 1)": ("if (offset / kVmPageBytes <= otherLast",
+                "if (offset <= otherLast"),
+            "{{0, 4096}, {4100, 4096}}), kRefusedBuffer, 1)": ("if (offset % kVmPageBytes != 0 || length == 0",
+                "if (length == 0"),
+            "!vmWriteAllowed(kRegGcVmInvalidateEng17Req, 0x007c0001": ("if (offset == kRegGcVmInvalidateEng17Req) return value == kVmInvalidateReq;",
+                "if (offset == kRegGcVmInvalidateEng17Req) return true;"),
+            "!vmWriteAllowed(kRegGcVmContext1Cntl, 0x007ffe01, 23": ("    if (stage < kVmStage || vm == nullptr || !vm->checked) return false;\n    const uint32_t i = vmIndex",
+                "    if ((void)stage, vm == nullptr || !vm->checked) return false;\n    const uint32_t i = vmIndex"),
+            "kGfxNotRestored && index == 12": ("if (*value != (i < kVmCount ? vm->hub[i] : vm->faultCntl)) return kGfxNotRestored;",
+                ""),
+            "r.gc[kRegGcVmL2ProtectionFaultStatus] == 0": ("    put(kRegGcVmL2ProtectionFaultCntl, vm->faultCntl | 1);\n",
+                ""),
+            "v.restore(&index, &value) == kOK && r.vmFlushes == flushes + 1": ("        put(kRegShMemConfig, vm->shMem[0]);\n",
+                ""),
+            "== kGfxUnexpectedState && index == 17": ("if ((*value & kVmExpect[i].mask) != kVmExpect[i].value) return kGfxUnexpectedState;",
+                ""),
+            "v.pte(8, 0) == 0": ("const uint64_t pte = vmMapped(request, n, p) ? vmPte(p) : 0;",
+                "const uint64_t pte = vmPte(p);"),
+            "report.defaultWords == 1024": ("        if (value != 0) report->defaultWords++;\n",
+                ""),
             # Stage 23.
             "refused(corpusRequest(0, 64, 1, 2, 1, {{0, 256}}), kRefusedLength)": (
                 "if (length < touched(args.buffer[i], threads, groups)) return refuse(kRefusedLength);",
@@ -337,8 +370,8 @@ class CoreTests(unittest.TestCase):
         # Stage 21 adds the GFX firmware buffer, the GFX work area and the
         # snapshot-relative GC registers; stage 22 the queue-snapshot-relative
         # registers and the write-pointer poll dword; stage 23 the submission
-        # region.
-        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 12)
+        # region; stage 24 the VM registers.
+        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 13)
         for helper, check in (("writeSdmaWorkWord", "sdmaWorkWriteAllowed(offset, value, stage)"),
                               ("writeGartWorkWord", "gartWorkWriteAllowed(offset, value, stage)"),
                               ("writePatternWord", "patternWriteAllowed(offset, value, stage)"),
@@ -349,7 +382,8 @@ class CoreTests(unittest.TestCase):
                               ("writeComputeRegister",
                                "!computeWriteAllowed(offset, value, stage, snapshot))"),
                               ("writeComputePollWord", "if (!computePollWriteAllowed(offset, value, stage))"),
-                              ("writeSubmitWord", "if (!submitWriteAllowed(offset, value, stage))")):
+                              ("writeSubmitWord", "if (!submitWriteAllowed(offset, value, stage))"),
+                              ("writeVmRegister", "!vmWriteAllowed(offset, value, stage, vm, compute))")):
             body = re.search(r"static Status %s\(.*?\n}\n" % helper, source, re.S).group(0)
             self.assertLess(body.index(check), body.index("write32"), helper)
         firmware = re.search(r"static Status writeFirmwareWord\(.*?\n}\n", source, re.S).group(0)

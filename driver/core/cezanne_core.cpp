@@ -119,6 +119,7 @@ const char *statusName(Status status)
     case kComputeNoProgress: return "compute-no-progress";
     case kComputeMismatch: return "compute-mismatch";
     case kComputeRefused: return "compute-refused";
+    case kVmFlushTimeout: return "vm-flush-timeout";
     }
     return "unknown";
 }
@@ -224,6 +225,9 @@ bool registerAllowed(uint32_t offset, uint32_t stage)
     for (uint32_t i = 0; stage >= kComputeStage && i < kStage22RegisterCount; i++) {
         if (kStage22Registers[i] == offset) return true;
     }
+    for (uint32_t i = 0; stage >= kVmStage && i < kStage24RegisterCount; i++) {
+        if (kStage24Registers[i] == offset) return true;
+    }
     return false;
 }
 
@@ -251,6 +255,9 @@ bool gfxGated(uint32_t offset)
     }
     for (uint32_t i = 0; i < kStage21RegisterCount; i++) {
         if (kStage21Registers[i] == offset) return true;
+    }
+    for (uint32_t i = 0; i < kStage24RegisterCount; i++) {
+        if (kStage24Registers[i] == offset) return true;
     }
     for (uint32_t i = 0; i < kStage22RegisterCount; i++) {
         if (kStage22Registers[i] == offset) return true;
@@ -2626,13 +2633,14 @@ uint32_t gfxWorkWord(uint32_t offset)
 
 uint32_t gfxWorkSize(uint32_t stage)
 {
-    return stage >= kComputeStage ? kComputeWorkSize : kGfxWorkSize;
+    return stage >= kVmStage ? kVmWorkSize : stage >= kComputeStage ? kComputeWorkSize : kGfxWorkSize;
 }
 
 bool gfxWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
 {
     if (stage < kGfxStage || (offset & 3) != 0 || offset >= gfxWorkSize(stage)) return false;
     if (value == gfxWorkWord(offset) || computePollWriteAllowed(offset, value, stage)) return true;
+    if (vmTableWriteAllowed(offset, value, stage)) return true; // stage 24: the page table
     // Stage 23: the submission frames, which the core builds per request.
     const uint32_t frames = kComputeRingPage + kComputeSubmitFirst * 4;
     return stage >= kCorpusStage && offset >= frames &&
@@ -3134,6 +3142,10 @@ bool computePollWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     for (uint32_t n = 0; stage >= kCorpusStage && n < kComputeSubmitMax; n++) {
         if (value == kComputeSubmitFirst + (n + 1) * kComputeSubmitFrameDwords) return true;
     }
+    // Stage 24: the end of VMID 1 submission n's frame.
+    for (uint32_t n = 0; stage >= kVmStage && n < kVmSubmitMax; n++) {
+        if (value == kComputeSubmitFirst + (n + 1) * kVmFrameDwords) return true;
+    }
     return false;
 }
 
@@ -3488,6 +3500,7 @@ bool submitWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (stage < kCorpusStage || (offset & 3) != 0 || offset >= kSubmitSize) return false;
     if (offset >= kSubmitSlotArea) return true; // the slots (built by the core) and the data
     const uint32_t kernel = offset / kSubmitCodeSlot, i = (offset % kSubmitCodeSlot) / 4;
+    if (kernel >= kVmCodeSlotFirst) return stage >= kVmStage; // stage 24: uploaded code, run only at VMID 1
     if (kernel >= kCorpusCount) return false;
     return value == (i < kCorpusCode[kernel].dwords ? kCorpusCode[kernel].code[i] : 0);
 }
@@ -3542,17 +3555,9 @@ static uint64_t slotGpuAddress(uint32_t n)
     return kSubmitGpuAddress + kSubmitSlotArea + uint64_t(n) * kSubmitSlotSize;
 }
 
-// The frame before its NOP padding: gfx_v9_0_emit_mem_sync, stage 22's
-// SET_SH_REG writes for this kernel and grid, DISPATCH_DIRECT, then fence n
-// by RELEASE_MEM (gfx_v9_0_ring_emit_fence). Returns the dword count.
-static uint32_t computeSubmitWords(const ComputeRequest &request, uint32_t n, uint32_t *w)
+// gfx_v9_0_emit_mem_sync: ACQUIRE_MEM over the full range.
+static uint32_t acquireWords(uint32_t *w)
 {
-    const CorpusCode &code = kCorpusCode[request.kernel];
-    const uint64_t pgm = kSubmitGpuAddress + uint64_t(request.kernel) * kSubmitCodeSlot;
-    const uint32_t lds = code.staticLds + request.ldsBytes;
-    const uint32_t rsrc2 = (code.rsrc2 & ~kRsrc2LdsMask) |
-                           ((((lds + kLdsGranule - 1) / kLdsGranule) << kRsrc2LdsShift) & kRsrc2LdsMask);
-    const uint64_t packet = slotGpuAddress(n), kernarg = packet + kSubmitKernarg;
     uint32_t c = 0;
     w[c++] = pm4(kPm4AcquireMem, 5);
     w[c++] = kAcquireMemCoher;
@@ -3561,6 +3566,18 @@ static uint32_t computeSubmitWords(const ComputeRequest &request, uint32_t n, ui
     w[c++] = 0;          // CP_COHER_BASE
     w[c++] = 0;          // CP_COHER_BASE_HI
     w[c++] = 0x0000000a; // POLL_INTERVAL
+    return c;
+}
+
+// Stage 22's SET_SH_REG writes for a kernel (its code address, RSRC1/2 with
+// LDS_SIZE for lds bytes, the group size, user data), then DISPATCH_DIRECT.
+static uint32_t dispatchWords(uint32_t *w, uint64_t pgm, uint32_t rsrc1, uint32_t rsrc2, uint32_t lds,
+                              uint32_t properties, const uint32_t *group, const uint32_t *groups, uint64_t packet,
+                              uint64_t kernarg)
+{
+    const uint32_t ldsRsrc2 = (rsrc2 & ~kRsrc2LdsMask) |
+                              ((((lds + kLdsGranule - 1) / kLdsGranule) << kRsrc2LdsShift) & kRsrc2LdsMask);
+    uint32_t c = 0;
     w[c++] = pm4(kPm4SetShReg, 1);
     w[c++] = kShComputeStaticThreadMgmtSe0 - kSetShRegStart;
     w[c++] = 0xffffffff;
@@ -3570,8 +3587,8 @@ static uint32_t computeSubmitWords(const ComputeRequest &request, uint32_t n, ui
     w[c++] = uint32_t(pgm >> 40);
     w[c++] = pm4(kPm4SetShReg, 2);
     w[c++] = kShComputePgmRsrc1 - kSetShRegStart;
-    w[c++] = code.rsrc1;
-    w[c++] = rsrc2;
+    w[c++] = rsrc1;
+    w[c++] = ldsRsrc2;
     w[c++] = pm4(kPm4SetShReg, 1);
     w[c++] = kShComputeTmpringSize - kSetShRegStart;
     w[c++] = 0;
@@ -3580,12 +3597,12 @@ static uint32_t computeSubmitWords(const ComputeRequest &request, uint32_t n, ui
     w[c++] = 0;
     w[c++] = pm4(kPm4SetShReg, 3);
     w[c++] = kShComputeNumThreadX - kSetShRegStart;
-    w[c++] = request.group[0];
-    w[c++] = request.group[1];
-    w[c++] = request.group[2];
+    w[c++] = group[0];
+    w[c++] = group[1];
+    w[c++] = group[2];
     // The private segment buffer (no scratch), the dispatch packet if the
     // kernel reads it, then kernarg.
-    const bool dispatchPtr = (code.properties & kCodeDispatchPtr) != 0;
+    const bool dispatchPtr = (properties & kCodeDispatchPtr) != 0;
     w[c++] = pm4(kPm4SetShReg, dispatchPtr ? 8 : 6);
     w[c++] = kShComputeUserData0 - kSetShRegStart;
     for (uint32_t i = 0; i < 4; i++) w[c++] = 0;
@@ -3596,10 +3613,24 @@ static uint32_t computeSubmitWords(const ComputeRequest &request, uint32_t n, ui
     w[c++] = uint32_t(kernarg);
     w[c++] = uint32_t(kernarg >> 32);
     w[c++] = pm4(kPm4DispatchDirect, 3);
-    w[c++] = request.groups[0];
-    w[c++] = request.groups[1];
-    w[c++] = request.groups[2];
+    w[c++] = groups[0];
+    w[c++] = groups[1];
+    w[c++] = groups[2];
     w[c++] = kDispatchInitiator;
+    return c;
+}
+
+// The frame before its NOP padding: gfx_v9_0_emit_mem_sync, stage 22's
+// SET_SH_REG writes for this kernel and grid, DISPATCH_DIRECT, then fence n
+// by RELEASE_MEM (gfx_v9_0_ring_emit_fence). Returns the dword count.
+static uint32_t computeSubmitWords(const ComputeRequest &request, uint32_t n, uint32_t *w)
+{
+    const CorpusCode &code = kCorpusCode[request.kernel];
+    const uint64_t pgm = kSubmitGpuAddress + uint64_t(request.kernel) * kSubmitCodeSlot;
+    const uint64_t packet = slotGpuAddress(n), kernarg = packet + kSubmitKernarg;
+    uint32_t c = acquireWords(w);
+    c += dispatchWords(w + c, pgm, code.rsrc1, code.rsrc2, code.staticLds + request.ldsBytes, code.properties,
+                       request.group, request.groups, packet, kernarg);
     for (uint32_t i = 0; i < 8; i++) w[c++] = computeEopFenceWord(i, kComputeWbSubmitFence + 8 * n, n + 1);
     return c;
 }
@@ -3692,6 +3723,380 @@ Status submitCompute(const RegisterReader &registers, uint64_t apertureLength, c
     status = pollWork(work, writer, kComputeWbPage + kComputeWbSubmitFence + 8 * n, n + 1, kGfxDrawPauses, fence);
     Status read = queueRptr(registers, apertureLength, writer, stage, gfxSnapshot, snapshot, rptr);
     return status != kOK ? status : read;
+}
+
+
+// Stage 24.
+
+static uint32_t vmIndex(uint32_t offset)
+{
+    for (uint32_t i = 0; i < kVmCount; i++) {
+        if (kVmWrites[i].offset == offset) return i;
+    }
+    return kVmCount;
+}
+
+bool vmWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage, const VmSnapshot *vm,
+                    const ComputeSnapshot *compute)
+{
+    if (stage < kVmStage || vm == nullptr || !vm->checked) return false;
+    const uint32_t i = vmIndex(offset);
+    if (i < kVmCount) return value == vm->hub[i] || value == masked(vm->hub[i], kVmWrites[i]);
+    if (offset == kRegGcVmL2ProtectionFaultCntl) return value == vm->faultCntl || value == (vm->faultCntl | 1);
+    if (offset == kRegGcVmInvalidateEng17Req) return value == kVmInvalidateReq;
+    if (offset == kRegGrbmGfxCntl)
+        return compute != nullptr &&
+               value == ((compute->global[globalIndex(kRegGrbmGfxCntl)] & ~kGrbmGfxCntlMask) | (kVmid << 4));
+    if (!vm->shMemTaken) return false;
+    if (offset == kRegShMemConfig)
+        return value == vm->shMem[0] || value == ((vm->shMem[0] & kShMemRetryDisable) | kShMemAlignmentUnaligned);
+    if (offset == kRegShMemBases) return value == vm->shMem[1] || value == kVmShMemBases;
+    return false;
+}
+
+static Status writeVmRegister(const RegisterWriter &writer, uint32_t stage, const uint32_t *gfxSnapshot,
+                              const ComputeSnapshot *compute, const VmSnapshot *vm, uint32_t offset, uint32_t value)
+{
+    if (!writeAllowed(offset, value, stage) && !gfxWriteAllowed(offset, value, stage, gfxSnapshot) &&
+        !computeWriteAllowed(offset, value, stage, compute) && !vmWriteAllowed(offset, value, stage, vm, compute))
+        return kRegisterNotAllowed;
+    return writer.write32(writer.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+uint64_t vmPte(uint32_t page)
+{
+    const uint32_t offset = page * kVmPageBytes;
+    const uint64_t access = offset < kSubmitSlotArea   ? kPteReadable | kPteExecutable
+                            : offset < kSubmitDataArea ? kPteReadable
+                                                       : kPteReadable | kPteWriteable;
+    return (kSubmitPhysical + offset) | kPteValid | kPteSystem | access | kPteMtypeUc;
+}
+
+bool vmTableWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
+{
+    if (stage < kVmStage || (offset & 3) != 0 || offset < kVmTablePage || offset >= kVmTablePage + kVmPages * 8)
+        return false;
+    const uint64_t pte = vmPte((offset - kVmTablePage) / 8);
+    return value == 0 || value == ((offset & 4) == 0 ? uint32_t(pte) : uint32_t(pte >> 32));
+}
+
+Status checkVmBoot(const RegisterReader &registers, uint64_t apertureLength, uint32_t stage, VmSnapshot *vm,
+                   uint32_t *index, uint32_t *value)
+{
+    *vm = VmSnapshot();
+    *index = *value = 0;
+    if (stage < kVmStage) return kRegisterNotAllowed;
+    for (uint32_t i = 0; i < kVmExpectCount; i++) {
+        *index = i;
+        Status status = readRegister(registers, apertureLength, stage, kVmExpect[i].offset, value);
+        if (status != kOK) return status;
+        if ((*value & kVmExpect[i].mask) != kVmExpect[i].value) return kGfxUnexpectedState;
+    }
+    *index = *value = 0;
+    for (uint32_t i = 0; i < kVmCount; i++) {
+        Status status = readRegister(registers, apertureLength, stage, kVmWrites[i].offset, &vm->hub[i]);
+        if (status != kOK) return status;
+    }
+    Status status = readRegister(registers, apertureLength, stage, kRegGcVmL2ProtectionFaultCntl, &vm->faultCntl);
+    if (status != kOK) return status;
+    vm->checked = true;
+    return kOK;
+}
+
+// soc15_grbm_select(adev, 0, 0, 0, 1, 0), and back to what the compute start read.
+static uint32_t vmidSelect(const ComputeSnapshot *compute, bool on)
+{
+    const uint32_t read = compute->global[globalIndex(kRegGrbmGfxCntl)];
+    return on ? (read & ~kGrbmGfxCntlMask) | (kVmid << 4) : read;
+}
+
+Status startVm(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer, uint32_t stage,
+               const uint32_t *gfxSnapshot, const ComputeSnapshot *compute, VmSnapshot *vm, uint32_t *writes,
+               uint32_t *index, uint32_t *value)
+{
+    *writes = *index = *value = 0;
+    if (stage < kVmStage || compute == nullptr || vm == nullptr || !vm->checked) return kRegisterNotAllowed;
+    auto put = [&](uint32_t offset, uint32_t to) {
+        Status status = writeVmRegister(writer, stage, gfxSnapshot, compute, vm, offset, to);
+        if (status == kOK) (*writes)++;
+        return status;
+    };
+    // constants_init's SH_MEM_* for VMID 1, read and written under its
+    // selection, which is undone on every path out.
+    Status status = put(kRegGrbmGfxCntl, vmidSelect(compute, true));
+    if (status != kOK) return status;
+    status = readRegister(registers, apertureLength, stage, kRegShMemConfig, &vm->shMem[0]);
+    if (status == kOK) status = readRegister(registers, apertureLength, stage, kRegShMemBases, &vm->shMem[1]);
+    if (status == kOK) {
+        vm->shMemTaken = true;
+        status = put(kRegShMemConfig, (vm->shMem[0] & kShMemRetryDisable) | kShMemAlignmentUnaligned);
+    }
+    if (status == kOK) status = put(kRegShMemBases, kVmShMemBases);
+    Status back = put(kRegGrbmGfxCntl, vmidSelect(compute, false));
+    if (status != kOK) return status;
+    if (back != kOK) return back;
+    // gfxhub_v1_0_gart_enable's writes for VMID 1, in order.
+    for (uint32_t i = 0; i < kVmCount; i++) {
+        *index = i;
+        *value = masked(vm->hub[i], kVmWrites[i]);
+        status = put(kVmWrites[i].offset, *value);
+        if (status != kOK) return status;
+    }
+    *index = *value = 0;
+    return kOK;
+}
+
+Status writeVmCode(const MemoryWriter &region, uint32_t stage, uint32_t slot, uint32_t offset, const uint32_t *words,
+                   uint32_t count)
+{
+    if (stage < kVmStage || slot < kVmCodeSlotFirst || slot >= kVmCodeSlots || (offset & 3) != 0 ||
+        uint64_t(offset) + 4ull * count > kSubmitCodeSlot)
+        return kRegisterNotAllowed;
+    for (uint32_t i = 0; i < count; i++) {
+        Status status = writeSubmitWord(region, stage, slot * kSubmitCodeSlot + offset + 4 * i, words[i]);
+        if (status != kOK) return status;
+    }
+    return kOK;
+}
+
+Status checkVmRequest(const VmRequest &request, uint32_t submitted, uint32_t *reason, uint32_t *index)
+{
+    *reason = *index = 0;
+    auto refuse = [reason](uint32_t why) {
+        *reason = why;
+        return kComputeRefused;
+    };
+    if (submitted >= kVmSubmitMax) return refuse(kRefusedCount);
+    if (request.slot < kVmCodeSlotFirst || request.slot >= kVmCodeSlots) return refuse(kRefusedKernel);
+    // No privileged, debug, scratch or trap code; the user SGPRs the core sets up.
+    const uint32_t sgprs = (request.rsrc2 & kRsrc2UserSgprMask) >> kRsrc2UserSgprShift;
+    if ((request.rsrc1 & kRsrc1Refused) != 0 || (request.rsrc2 & kRsrc2Refused) != 0 ||
+        !((request.properties == 0xb && sgprs == 8) || (request.properties == 0x9 && sgprs == 6)))
+        return refuse(kRefusedDescriptor);
+    uint64_t perGroup = 1, groups = 1;
+    for (uint32_t d = 0; d < 3; d++) {
+        if (request.group[d] == 0 || request.group[d] > kComputeMaxGroupThreads) return refuse(kRefusedGroup);
+        perGroup *= request.group[d];
+        if (request.groups[d] == 0 || request.groups[d] > kComputeMaxGroups) return refuse(kRefusedGrid);
+        groups *= request.groups[d];
+    }
+    if (perGroup > kComputeMaxGroupThreads) return refuse(kRefusedGroup);
+    if (perGroup * groups > kComputeMaxThreads) return refuse(kRefusedGrid);
+    if (request.ldsBytes > kComputeMaxLds) return refuse(kRefusedLds);
+    if (request.buffers == 0 || request.buffers > kComputeMaxBuffers) return refuse(kRefusedBuffer);
+    // Whole pages per buffer: the mapping is the bound, so no page is shared.
+    for (uint32_t i = 0; i < request.buffers; i++) {
+        *index = i;
+        const uint64_t offset = request.offset[i], length = request.length[i];
+        if (offset % kVmPageBytes != 0 || length == 0 || offset + length > kSubmitDataSize) return refuse(kRefusedBuffer);
+        const uint64_t last = (offset + length - 1) / kVmPageBytes;
+        for (uint32_t j = 0; j < i; j++) {
+            const uint64_t otherFirst = request.offset[j] / kVmPageBytes,
+                           otherLast = (uint64_t(request.offset[j]) + request.length[j] - 1) / kVmPageBytes;
+            if (offset / kVmPageBytes <= otherLast && otherFirst <= last) return refuse(kRefusedOverlap);
+        }
+    }
+    *index = 0;
+    return kOK;
+}
+
+static uint64_t vmPageVa(uint32_t n)
+{
+    return kVmVaBase + kVmSubmitPageFirst + uint64_t(n) * kVmPageBytes;
+}
+
+// Submission n's IB: the SET_SH_REG writes and DISPATCH_DIRECT, at VAs.
+static uint32_t vmIbWords(const VmRequest &request, uint32_t n, uint32_t *w)
+{
+    const uint64_t pgm = kVmVaBase + uint64_t(request.slot) * kSubmitCodeSlot;
+    return dispatchWords(w, pgm, request.rsrc1, request.rsrc2, request.ldsBytes, request.properties, request.group,
+                         request.groups, vmPageVa(n) + kVmPacket, vmPageVa(n) + kVmKernarg);
+}
+
+// gfx_v9_0_emit_mem_sync, the IB at VMID 1 (gfx_v9_0_ring_emit_ib_compute),
+// then fence n by RELEASE_MEM.
+static uint32_t vmFrameWords(const VmRequest &request, uint32_t n, uint32_t *w)
+{
+    uint32_t ib[kVmPacket / 4];
+    const uint32_t ibDwords = vmIbWords(request, n, ib);
+    const uint64_t va = vmPageVa(n);
+    uint32_t c = acquireWords(w);
+    w[c++] = pm4(kPm4IndirectBuffer, 2);
+    w[c++] = uint32_t(va);
+    w[c++] = uint32_t(va >> 32) & 0xffff;
+    w[c++] = kIndirectBufferValid | ibDwords | (kVmid << kIndirectBufferVmidShift);
+    for (uint32_t i = 0; i < 8; i++) w[c++] = computeEopFenceWord(i, kComputeWbSubmitFence + 8 * n, n + 1);
+    return c;
+}
+
+uint32_t vmFrameWord(const VmRequest &request, uint32_t n, uint32_t dword)
+{
+    if (dword >= kVmFrameDwords) return 0;
+    uint32_t words[kVmFrameDwords];
+    const uint32_t count = vmFrameWords(request, n, words);
+    return dword < count ? words[dword] : nopWord(dword, count, kVmFrameDwords);
+}
+
+uint32_t vmPageWord(const VmRequest &request, uint32_t n, uint32_t offset)
+{
+    if (offset >= kVmPageBytes) return 0;
+    if (offset < kVmPacket) {
+        uint32_t ib[kVmPacket / 4];
+        const uint32_t count = vmIbWords(request, n, ib);
+        return offset / 4 < count ? ib[offset / 4] : 0;
+    }
+    if (offset < kVmKernarg) {
+        // hsa_kernel_dispatch_packet_t as far as kernels read it (stage 23's).
+        const uint32_t words[] = {3u << 16,
+                                  request.group[0] | (request.group[1] << 16),
+                                  request.group[2],
+                                  request.group[0] * request.groups[0],
+                                  request.group[1] * request.groups[1],
+                                  request.group[2] * request.groups[2],
+                                  0,
+                                  request.ldsBytes};
+        const uint32_t i = (offset - kVmPacket) / 4;
+        return i < sizeof(words) / sizeof(words[0]) ? words[i] : 0;
+    }
+    // kernarg: each buffer's VA.
+    const uint32_t i = (offset - kVmKernarg) / 8;
+    if (i >= request.buffers || i >= kComputeMaxBuffers) return 0;
+    const uint64_t va = kVmVaBase + kSubmitDataArea + request.offset[i];
+    return (offset & 4) == 0 ? uint32_t(va) : uint32_t(va >> 32);
+}
+
+bool vmMapped(const VmRequest &request, uint32_t n, uint32_t page)
+{
+    const uint64_t at = uint64_t(page) * kVmPageBytes;
+    if (at == uint64_t(request.slot) * kSubmitCodeSlot || at == kVmSubmitPageFirst + uint64_t(n) * kVmPageBytes)
+        return true;
+    for (uint32_t i = 0; i < request.buffers && i < kComputeMaxBuffers; i++) {
+        const uint64_t start = kSubmitDataArea + uint64_t(request.offset[i]);
+        if (at + kVmPageBytes > start && at < start + request.length[i]) return true;
+    }
+    return false;
+}
+
+// gmc_v9_0_flush_gpu_tlb on the GC hub by MMIO (no semaphore on GFXHUB): the
+// request, a dummy read of it (GC below 9.4.2), then the ACK for VMID 1.
+static Status flushVm(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                      uint32_t stage, const uint32_t *gfxSnapshot, const ComputeSnapshot *compute, const VmSnapshot *vm)
+{
+    Status status =
+        writeVmRegister(writer, stage, gfxSnapshot, compute, vm, kRegGcVmInvalidateEng17Req, kVmInvalidateReq);
+    uint32_t value = 0;
+    if (status == kOK) status = readRegister(registers, apertureLength, stage, kRegGcVmInvalidateEng17Req, &value);
+    for (uint32_t i = 0; status == kOK; i++) {
+        status = readRegister(registers, apertureLength, stage, kRegGcVmInvalidateEng17Ack, &value);
+        if (status != kOK) break;
+        if ((value & (1u << kVmid)) != 0) return kOK;
+        if (i >= kGartPollPauses) return kVmFlushTimeout;
+        writer.pause(writer.context);
+    }
+    return status;
+}
+
+Status submitVm(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                const MemoryWriter &workWriter, const MemoryReader &work, const MemoryWriter &region, uint32_t stage,
+                const uint32_t *gfxSnapshot, const ComputeSnapshot *compute, const VmSnapshot *vm, uint32_t commit,
+                const VmRequest &request, uint32_t n, VmReport *report)
+{
+    *report = VmReport();
+    if (stage < kVmStage || compute == nullptr || vm == nullptr || !vm->checked) return kRegisterNotAllowed;
+    if (commit != kCommitPoll && commit != kCommitRegister) return kComputeNoProgress;
+    Status status = checkVmRequest(request, n, &report->reason, &report->index);
+    if (status != kOK) return status;
+    // Its page (IB, dispatch packet, kernarg), then the page table with only
+    // its pages valid, then VMID 1's TLB, then its frame.
+    const uint32_t page = kVmSubmitPageFirst + n * kVmPageBytes;
+    for (uint32_t at = 0; status == kOK && at < kVmPageBytes; at += 4)
+        status = writeSubmitWord(region, stage, page + at, vmPageWord(request, n, at));
+    for (uint32_t p = 0; status == kOK && p < kVmPages; p++) {
+        const uint64_t pte = vmMapped(request, n, p) ? vmPte(p) : 0;
+        status = writeGfxWorkWord(workWriter, stage, kVmTablePage + 8 * p, uint32_t(pte));
+        if (status == kOK) status = writeGfxWorkWord(workWriter, stage, kVmTablePage + 8 * p + 4, uint32_t(pte >> 32));
+    }
+    if (status == kOK) status = flushVm(registers, apertureLength, writer, stage, gfxSnapshot, compute, vm);
+    const uint32_t start = kComputeSubmitFirst + n * kVmFrameDwords;
+    for (uint32_t d = 0; status == kOK && d < kVmFrameDwords; d++)
+        status = writeGfxWorkWord(workWriter, stage, kComputeRingPage + 4 * (start + d), vmFrameWord(request, n, d));
+    if (status == kOK)
+        status = commitCompute(writer, workWriter, stage, gfxSnapshot, compute, commit, start + kVmFrameDwords);
+    if (status != kOK) return status;
+    const Status fenced =
+        pollWork(work, writer, kComputeWbPage + kComputeWbSubmitFence + 8 * n, n + 1, kGfxDrawPauses, &report->fence);
+    if (fenced == kRegisterReadFailed) return fenced;
+    // What the GC hub latched, what reached the default page, and the queue.
+    const struct {
+        uint32_t offset;
+        uint32_t *value;
+    } faults[] = {{kRegGcVmL2ProtectionFaultStatus, &report->faultStatus},
+                  {kRegGcVmL2ProtectionFaultAddrLo32, &report->faultAddrLo},
+                  {kRegGcVmL2ProtectionFaultAddrHi32, &report->faultAddrHi}};
+    for (const auto &fault : faults) {
+        status = readRegister(registers, apertureLength, stage, fault.offset, fault.value);
+        if (status != kOK) return status;
+    }
+    for (uint32_t at = kVmDefaultPage; at < kVmDefaultPage + kVmPageBytes; at += 4) {
+        uint32_t value = 0;
+        if (!work.read32(work.context, at, &value)) return kRegisterReadFailed;
+        if (value != 0) report->defaultWords++;
+    }
+    status = queueRptr(registers, apertureLength, writer, stage, gfxSnapshot, compute, &report->rptr);
+    Status state = readComputeState(registers, apertureLength, writer, work, stage, gfxSnapshot, compute, &report->state);
+    if (fenced != kOK) return fenced;
+    return status != kOK ? status : state;
+}
+
+Status restoreVm(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                 uint32_t stage, const uint32_t *gfxSnapshot, const ComputeSnapshot *compute, const VmSnapshot *vm,
+                 uint32_t *index, uint32_t *value)
+{
+    *index = *value = 0;
+    if (stage < kVmStage || compute == nullptr || vm == nullptr || !vm->checked) return kRegisterNotAllowed;
+    Status first = kOK;
+    auto put = [&](uint32_t offset, uint32_t to) {
+        Status status = writeVmRegister(writer, stage, gfxSnapshot, compute, vm, offset, to);
+        if (first == kOK) first = status;
+    };
+    // VMID 1 first: its context off, then its TLB (while the L2 is still on).
+    put(kRegGcVmContext1Cntl, vm->hub[vmIndex(kRegGcVmContext1Cntl)]);
+    const Status flushed = flushVm(registers, apertureLength, writer, stage, gfxSnapshot, compute, vm);
+    if (vm->shMemTaken) {
+        put(kRegGrbmGfxCntl, vmidSelect(compute, true));
+        put(kRegShMemConfig, vm->shMem[0]);
+        put(kRegShMemBases, vm->shMem[1]);
+        put(kRegGrbmGfxCntl, vmidSelect(compute, false));
+    }
+    // The rest in reverse, then gmc_v9_0_process_interrupt's clear of the
+    // latched fault and the control as read.
+    for (uint32_t i = kVmCount; i-- > 0;) put(kVmWrites[i].offset, vm->hub[i]);
+    put(kRegGcVmL2ProtectionFaultCntl, vm->faultCntl | 1);
+    put(kRegGcVmL2ProtectionFaultCntl, vm->faultCntl);
+    if (first != kOK) return first;
+    for (uint32_t i = 0; i <= kVmCount; i++) {
+        *index = i;
+        const uint32_t offset = i < kVmCount ? kVmWrites[i].offset : kRegGcVmL2ProtectionFaultCntl;
+        Status status = readRegister(registers, apertureLength, stage, offset, value);
+        if (status != kOK) return status;
+        if (*value != (i < kVmCount ? vm->hub[i] : vm->faultCntl)) return kGfxNotRestored;
+    }
+    if (vm->shMemTaken) {
+        Status status = writeVmRegister(writer, stage, gfxSnapshot, compute, vm, kRegGrbmGfxCntl, vmidSelect(compute, true));
+        Status verified = kOK;
+        for (uint32_t i = 0; status == kOK && verified == kOK && i < 2; i++) {
+            *index = kVmCount + 1 + i;
+            verified = readRegister(registers, apertureLength, stage, i == 0 ? kRegShMemConfig : kRegShMemBases, value);
+            if (verified == kOK && *value != vm->shMem[i]) verified = kGfxNotRestored;
+        }
+        Status back =
+            writeVmRegister(writer, stage, gfxSnapshot, compute, vm, kRegGrbmGfxCntl, vmidSelect(compute, false));
+        if (status != kOK) return status;
+        if (verified != kOK) return verified;
+        if (back != kOK) return back;
+    }
+    *index = *value = 0;
+    return flushed;
 }
 
 } // namespace cezanne
