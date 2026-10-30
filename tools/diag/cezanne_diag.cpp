@@ -350,10 +350,47 @@ static_assert(sizeof(kRegisters) / sizeof(kRegisters[0]) == kStage16RegisterCoun
                                                                 kStage19RegisterCount + kStage20RegisterCount +
                                                                 kStage21RegisterCount + kStage22RegisterCount,
               "one name per register");
+// Stage 24: the GC hub's VM block and VMID 1's GDS, read after the others.
+const Named kVmRegisters[] = {
+    {"VM_L2_CNTL2_GC", kRegGcVmL2Cntl2},
+    {"VM_L2_CNTL3_GC", kRegGcVmL2Cntl3},
+    {"VM_L2_CNTL4_GC", kRegGcVmL2Cntl4},
+    {"VM_L2_PROTECTION_FAULT_CNTL_GC", kRegGcVmL2ProtectionFaultCntl},
+    {"VM_L2_PROTECTION_FAULT_CNTL2_GC", kRegGcVmL2ProtectionFaultCntl2},
+    {"VM_L2_PROTECTION_FAULT_ADDR_LO32_GC", kRegGcVmL2ProtectionFaultAddrLo32},
+    {"VM_L2_PROTECTION_FAULT_ADDR_HI32_GC", kRegGcVmL2ProtectionFaultAddrHi32},
+    {"VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32_GC", kRegGcVmL2ProtectionFaultDefaultAddrLo32},
+    {"VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32_GC", kRegGcVmL2ProtectionFaultDefaultAddrHi32},
+    {"VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32_GC", kRegGcVmL2Context1IdentityApertureLowAddrLo32},
+    {"VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_HI32_GC", kRegGcVmL2Context1IdentityApertureLowAddrHi32},
+    {"VM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32_GC", kRegGcVmL2Context1IdentityApertureHighAddrLo32},
+    {"VM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_HI32_GC", kRegGcVmL2Context1IdentityApertureHighAddrHi32},
+    {"VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_LO32_GC", kRegGcVmL2ContextIdentityPhysicalOffsetLo32},
+    {"VM_L2_CONTEXT_IDENTITY_PHYSICAL_OFFSET_HI32_GC", kRegGcVmL2ContextIdentityPhysicalOffsetHi32},
+    {"VM_CONTEXT1_CNTL_GC", kRegGcVmContext1Cntl},
+    {"VM_INVALIDATE_ENG17_REQ_GC", kRegGcVmInvalidateEng17Req},
+    {"VM_INVALIDATE_ENG17_ACK_GC", kRegGcVmInvalidateEng17Ack},
+    {"VM_INVALIDATE_ENG17_ADDR_RANGE_LO32_GC", kRegGcVmInvalidateEng17AddrRangeLo32},
+    {"VM_INVALIDATE_ENG17_ADDR_RANGE_HI32_GC", kRegGcVmInvalidateEng17AddrRangeHi32},
+    {"VM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32_GC", kRegGcVmContext1PageTableBaseAddrLo32},
+    {"VM_CONTEXT1_PAGE_TABLE_BASE_ADDR_HI32_GC", kRegGcVmContext1PageTableBaseAddrHi32},
+    {"VM_CONTEXT1_PAGE_TABLE_START_ADDR_LO32_GC", kRegGcVmContext1PageTableStartAddrLo32},
+    {"VM_CONTEXT1_PAGE_TABLE_START_ADDR_HI32_GC", kRegGcVmContext1PageTableStartAddrHi32},
+    {"VM_CONTEXT1_PAGE_TABLE_END_ADDR_LO32_GC", kRegGcVmContext1PageTableEndAddrLo32},
+    {"VM_CONTEXT1_PAGE_TABLE_END_ADDR_HI32_GC", kRegGcVmContext1PageTableEndAddrHi32},
+    {"GDS_VMID1_BASE", kRegGdsVmid1Base},
+    {"GDS_VMID1_SIZE", kRegGdsVmid1Size},
+    {"GDS_GWS_VMID1", kRegGdsGwsVmid1},
+    {"GDS_OA_VMID1", kRegGdsOaVmid1},
+};
+static_assert(sizeof(kVmRegisters) / sizeof(kVmRegisters[0]) == kStage24RegisterCount, "one name per register");
 
 const char *registerName(uint32_t offset)
 {
     for (const Named &reg : kRegisters) {
+        if (reg.offset == offset) return reg.name;
+    }
+    for (const Named &reg : kVmRegisters) {
         if (reg.offset == offset) return reg.name;
     }
     return "?";
@@ -1837,7 +1874,7 @@ bool gfxEngine(io_connect_t connection, bool compute, bool corpus, bool vm)
     if (check[0] == kGfxUnexpectedState && check[1] >= kGfxExpectCount && check[1] - kGfxExpectCount < kVmExpectCount) {
         // Stage 24's GC hub check, after stage 21's list.
         const GfxExpect &expect = kVmExpect[check[1] - kGfxExpectCount];
-        std::printf(" (GC hub 0x%05x reads 0x%08llx; expected 0x%08x under mask 0x%08x)", expect.offset,
+        std::printf(" (%s reads 0x%08llx; expected 0x%08x under mask 0x%08x)", registerName(expect.offset),
                     static_cast<unsigned long long>(check[2]), expect.value, expect.mask);
     }
     if (check[0] == kDisplayUnexpectedState) printDisplayCheckEntry(check[1], check[2]);
@@ -2394,8 +2431,9 @@ int main(int argc, char **argv)
     for (unsigned long pass = 0; pass < repeat; pass++) {
         if (pass > 0) usleep(static_cast<useconds_t>(interval * 1000));
         if (repeat > 1) std::printf("-- pass %lu\n", pass + 1);
-        for (uint32_t i = 0; i < count; i++) {
-            const Named &reg = kRegisters[i];
+        const uint32_t vm = info[1] >= kVmStage ? kStage24RegisterCount : 0;
+        for (uint32_t i = 0; i < count + vm; i++) {
+            const Named &reg = i < count ? kRegisters[i] : kVmRegisters[i - count];
             // Name first and flushed: if a read hangs the machine, the last
             // line on screen identifies the register.
             std::printf("%-30s 0x%05x  ", reg.name, reg.offset);

@@ -112,7 +112,7 @@ class DiagSourceTests(unittest.TestCase):
         header = (ROOT / "driver" / "core" / "cezanne_core.h").read_text()
         expected = []
         for name in ("kStage16Registers", "kStage17Registers", "kStage19Registers", "kStage20Registers",
-                     "kStage21Registers", "kStage22Registers"):
+                     "kStage21Registers", "kStage22Registers", "kStage24Registers"):
             listed = re.search(r"%s\[\] = \{([^}]*)\}" % name, header).group(1)
             expected += [entry.strip() for entry in listed.split(",")]
         self.assertEqual(re.findall(r'\{"\w+", (kReg\w+)\}', source), expected)
