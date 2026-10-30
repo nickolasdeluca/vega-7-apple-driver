@@ -387,7 +387,7 @@ void usage(FILE *out)
                       "and, dialled down on 2026-10-13, stops there: it restores every GC register written and\n"
                       "tears down. The ring test, fence, CP drawing and verify are deferred to stage 22.\n"
                       "--gfx-compute does --gfx-start up to the RLC start, then, instead of the CP, brings up a\n"
-                      "compute queue on the MEC (the KIQ slot), runs a ring test and fence, dispatches the\n"
+                      "compute queue on MEC1 (pipe 0, queue 0), runs a ring test and fence, dispatches the\n"
                       "store_index kernel (256 work-items), checks the output is 0..255, restores and tears down.\n"
                       "--display-pattern draws a test pattern in the carveout, shows it on pipe 0 for 5 s by\n"
                       "flipping its surface address, verifies, and flips back to the boot framebuffer.\n"
@@ -1397,8 +1397,8 @@ bool computeQueue(io_connect_t connection)
                                           "CP_HQD_PQ_WPTR_LO (method B)"};
     uint64_t start[4] = {};
     ComputeState state = {};
-    step("gfx 4/7 compute start: GRBM_GFX_CNTL selects ME 2 pipe 1 queue 0 (the KIQ slot); its HQD snapshot;\n"
-         "  RLC_CP_SCHEDULERS 0x48 then 0xc8; CP_PQ_WPTR_POLL_CNTL.EN; the HQD as gfx_v9_0_kiq_init_register\n"
+    step("gfx 4/7 compute start: GRBM_GFX_CNTL selects ME 1 pipe 0 queue 0 (compute ring 0's slot, not a\n"
+         "  KIQ); its HQD snapshot; CP_PQ_WPTR_POLL_CNTL.EN; the HQD as gfx_v9_0_kiq_init_register writes it\n"
          "  (ring 0xf440a04000, 4 KiB, EOP 0xf440a06000, MQD 0xf440a05000, no doorbell), ACTIVE 1; SH_MEM_CONFIG\n"
          "  unaligned and SH_MEM_BASES 0 for VMID 0; CP_MEC_CNTL 0");
     bool ok = callReport(connection, kDiagnosticComputeStart, start, 4, &state);
@@ -1524,7 +1524,7 @@ bool gfxEngine(io_connect_t connection, bool compute)
     // (kDiagnosticGfxTest, GfxDraw, GfxVerify) and are unused here.
     uint64_t restore[4] = {};
     gfxStep(compute, compute ? 7 : 5,
-            compute ? "restore: the queue dequeued and its registers, RLC_CP_SCHEDULERS, the poll control, SH_MEM_*\n"
+            compute ? "restore: the queue dequeued and its registers (the poll control among them), SH_MEM_*\n"
                       "  and the MEC halted back; then CP_ME_CNTL halted, rlc_stop, every written GC register back to\n"
                       "  the check's reading"
                     : "restore: flip back; CP_ME_CNTL halted, rlc_stop, every written GC register back to the check's\n"
