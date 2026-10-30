@@ -218,6 +218,19 @@ class CoreTests(unittest.TestCase):
             "== kGfxRingTestFailed": ("if (i == kGfxPollPauses) return kGfxRingTestFailed;",
                                       "if (i == kGfxPollPauses) break;"),
             "== kGfxDrawMismatch": ("return *unexpected == 0 ? kOK : kGfxDrawMismatch;", "return kOK;"),
+            # Stage 23.
+            "refused(corpusRequest(0, 64, 1, 2, 1, {{0, 256}}), kRefusedLength)": (
+                "if (length < touched(args.buffer[i], threads, groups)) return refuse(kRefusedLength);",
+                "(void)touched(args.buffer[i], threads, groups);"),
+            "kRefusedOverlap, 2)": ("return refuse(kRefusedOverlap);", "(void)0;"),
+            "!submitWriteAllowed(0, kCorpusCode[0].code[0] ^ 1, 23)": (
+                "    return value == (i < kCorpusCode[kernel].dwords ? kCorpusCode[kernel].code[i] : 0);",
+                "    return (void)value, (void)i, true;"),
+            "!gfxWorkWriteAllowed(frame, 0x1234, 22)": ("return stage >= kCorpusStage && offset >= frames &&",
+                                                       "return offset >= frames &&"),
+            "computeSubmitWord(sum, 2, 1) == 0x28C40000u": ("    w[c++] = kAcquireMemCoher;",
+                                                            "    w[c++] = kAcquireMemCoher & ~(1u << 29);"),
+            "65536 + 512": ("    if (lds > kComputeMaxLds) return refuse(kRefusedLds);", "    (void)lds;"),
             # Stage 22.
             "== kComputeNoProgress && rptr == 0": ("return *rptr == 0 ? kComputeNoProgress : kGfxRingTestFailed;",
                                                    "return kGfxRingTestFailed;"),
@@ -323,8 +336,9 @@ class CoreTests(unittest.TestCase):
         # and GART work-area words after theirs.
         # Stage 21 adds the GFX firmware buffer, the GFX work area and the
         # snapshot-relative GC registers; stage 22 the queue-snapshot-relative
-        # registers and the write-pointer poll dword.
-        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 11)
+        # registers and the write-pointer poll dword; stage 23 the submission
+        # region.
+        self.assertEqual(len(re.findall(r"\.write32\s*\(", source)), 12)
         for helper, check in (("writeSdmaWorkWord", "sdmaWorkWriteAllowed(offset, value, stage)"),
                               ("writeGartWorkWord", "gartWorkWriteAllowed(offset, value, stage)"),
                               ("writePatternWord", "patternWriteAllowed(offset, value, stage)"),
@@ -334,7 +348,8 @@ class CoreTests(unittest.TestCase):
                                "if (!writeAllowed(offset, value, stage) && !gfxWriteAllowed(offset, value, stage, snapshot))"),
                               ("writeComputeRegister",
                                "!computeWriteAllowed(offset, value, stage, snapshot))"),
-                              ("writeComputePollWord", "if (!computePollWriteAllowed(offset, value, stage))")):
+                              ("writeComputePollWord", "if (!computePollWriteAllowed(offset, value, stage))"),
+                              ("writeSubmitWord", "if (!submitWriteAllowed(offset, value, stage))")):
             body = re.search(r"static Status %s\(.*?\n}\n" % helper, source, re.S).group(0)
             self.assertLess(body.index(check), body.index("write32"), helper)
         firmware = re.search(r"static Status writeFirmwareWord\(.*?\n}\n", source, re.S).group(0)

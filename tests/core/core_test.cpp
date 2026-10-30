@@ -175,6 +175,11 @@ struct FakeRegisters {
     bool eopHang = false;            // RELEASE_MEM's end-of-pipe event never retires (boot 41)
     bool dispatchHang = false;       // DISPATCH_DIRECT never completes: nothing after it runs
     uint32_t hqdStuck = 0;           // a per-queue register whose writes are lost
+    // Stage 23: the submission region, the ACQUIRE_MEMs seen, and the corpus
+    // dispatches run (by kernel index).
+    std::vector<uint32_t> *submit = nullptr;
+    uint32_t acquires = 0;
+    std::vector<uint32_t> corpusRuns;
     static bool perQueue(uint32_t offset)
     {
         for (uint32_t q : kComputeQueueRegisters)
@@ -1106,6 +1111,71 @@ struct FakeWriter {
     // its event hangs, as on boot 41), and DISPATCH_DIRECT, which runs
     // store_index the way its code does: the workgroup size from the dispatch
     // packet (USER_DATA 4-5), the output address from kernarg (6-7).
+    // The corpus kernel whose code slot COMPUTE_PGM_LO points at (and whose
+    // code is there), or kCorpusCount.
+    static uint32_t corpusIndex(FakeRegisters *r)
+    {
+        if (r->submit == nullptr) return kCorpusCount;
+        for (uint32_t k = 0; k < kCorpusCount; k++) {
+            const uint64_t pgm = kSubmitGpuAddress + uint64_t(k) * kSubmitCodeSlot;
+            if (r->sh[kShComputePgmLo] != uint32_t(pgm >> 8) || r->sh[kShComputePgmRsrc1] != kCorpusCode[k].rsrc1) continue;
+            const uint32_t *code = &(*r->submit)[(pgm - kSubmitGpuAddress) / 4];
+            if (std::memcmp(code, kCorpusCode[k].code, kCorpusCode[k].dwords * 4) == 0) return k;
+        }
+        return kCorpusCount;
+    }
+    // Runs corpus kernel k as its MSL does, over groups gx x gy x gz of the
+    // NUM_THREAD size, buffers from kernarg (the last user-data pair). A buffer
+    // access outside the region is dropped.
+    template <typename At>
+    static void runCorpus(FakeRegisters *r, uint32_t k, uint32_t gx, uint32_t gy, uint32_t gz, At at)
+    {
+        r->corpusRuns.push_back(k);
+        const bool packet = (kCorpusCode[k].properties & kCodeDispatchPtr) != 0;
+        const uint32_t karg = kShComputeUserData0 + (packet ? 6 : 4);
+        const uint32_t *kernarg = at((uint64_t(r->sh[karg + 1]) << 32) | r->sh[karg]);
+        if (kernarg == nullptr) return;
+        auto buffer = [&](uint32_t i, uint64_t element) -> uint32_t * {
+            return at(((uint64_t(kernarg[2 * i + 1]) << 32) | kernarg[2 * i]) + 4 * element);
+        };
+        const uint32_t sx = r->sh[kShComputeNumThreadX], sy = r->sh[kShComputeNumThreadX + 1],
+                       sz = r->sh[kShComputeNumThreadX + 2];
+        const uint32_t wx = gx * sx, wy = gy * sy, add = r->kernelWrong ? 1 : 0;
+        if (k == 3) { // atomic_count
+            if (uint32_t *counter = buffer(0, 0)) *counter += gx * gy * gz * sx * sy * sz + add;
+            return;
+        }
+        if (k == 2) { // group_sum, along x
+            for (uint32_t g = 0; g < gx; g++) {
+                uint32_t sum = add;
+                for (uint32_t t = 0; t < sx; t++) {
+                    if (const uint32_t *in = buffer(0, uint64_t(g) * sx + t)) sum += *in;
+                }
+                if (uint32_t *out = buffer(1, g)) *out = sum;
+            }
+            return;
+        }
+        for (uint32_t y = 0; y < wy; y++) {
+            for (uint32_t x = 0; x < wx; x++) {
+                const uint64_t i = uint64_t(y) * wx + x;
+                if (k == 0 && y == 0) {
+                    if (uint32_t *out = buffer(0, x)) *out = x + add;
+                } else if (k == 1 && y == 0) {
+                    const uint32_t *a = buffer(0, x), *b = buffer(1, x);
+                    uint32_t *c = buffer(2, x);
+                    if (a != nullptr && b != nullptr && c != nullptr) {
+                        float fa, fb;
+                        std::memcpy(&fa, a, 4);
+                        std::memcpy(&fb, b, 4);
+                        const float fc = fa + fb + float(add);
+                        std::memcpy(c, &fc, 4);
+                    }
+                } else if (k == 4) {
+                    if (uint32_t *out = buffer(0, i)) *out = ((y << 16) | x) + add;
+                }
+            }
+        }
+    }
     static void runMec(FakeRegisters *r)
     {
         if (r->gfxWork == nullptr || r->mecHang || (r->gc[kRegCpMecCntl] & kCpMecHalts) != 0 ||
@@ -1122,9 +1192,11 @@ struct FakeWriter {
         uint32_t from = q(kRegCpHqdPqRptr);
         if (to <= from) return;
         auto ring = [m](uint32_t i) { return m[kComputeRingPage / 4 + (i & (kComputeRingDwords - 1))]; };
-        auto at = [m](uint64_t a) -> uint32_t * {
-            return a >= kGfxWorkGpuAddress && a < kGfxWorkGpuAddress + kComputeWorkSize ? &m[(a - kGfxWorkGpuAddress) / 4]
-                                                                                         : nullptr;
+        auto at = [m, r](uint64_t a) -> uint32_t * {
+            if (a >= kGfxWorkGpuAddress && a < kGfxWorkGpuAddress + kComputeWorkSize) return &m[(a - kGfxWorkGpuAddress) / 4];
+            if (r->submit != nullptr && a >= kSubmitGpuAddress && a < kSubmitGpuAddress + kSubmitSize)
+                return &(*r->submit)[(a - kSubmitGpuAddress) / 4];
+            return nullptr;
         };
         for (uint32_t d = from; d < to;) {
             uint32_t header = ring(d);
@@ -1143,6 +1215,15 @@ struct FakeWriter {
             } else if (op == kPm4ReleaseMem && !r->eopHang) {
                 uint32_t *word = at((uint64_t(ring(d + 4)) << 32) | ring(d + 3));
                 if (word != nullptr) *word = ring(d + 5);
+            } else if (op == kPm4AcquireMem && ring(d + 1) == kAcquireMemCoher) {
+                r->acquires++;
+            } else if (op == kPm4DispatchDirect && corpusIndex(r) < kCorpusCount) {
+                runCorpus(r, corpusIndex(r), ring(d + 1), ring(d + 2), ring(d + 3), at);
+                if (r->dispatchHang) {
+                    r->hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdPqRptr] = d + length;
+                    r->mecHang = true;
+                    return;
+                }
             } else if (op == kPm4DispatchDirect && r->sh[kShComputePgmLo] == uint32_t(kComputeCodeGpuAddress >> 8) &&
                        r->sh[kShComputePgmRsrc1 + 1] == kComputePgmRsrc2) {
                 const uint32_t *packet = at((uint64_t(r->sh[kShComputeUserData0 + 5]) << 32) | r->sh[kShComputeUserData0 + 4]);
@@ -3448,43 +3529,70 @@ struct ComputeRig {
     GfxRig g;
     ComputeSnapshot snapshot = {};
     bool taken = false;
-    ComputeRig()
+    uint32_t stage;
+    std::vector<uint32_t> submit = std::vector<uint32_t>(kSubmitSize / 4, 0x5A5A5A5Au);
+    explicit ComputeRig(uint32_t at = 22) : stage(at)
     {
-        g.stage = 22;
+        g.stage = at;
         g.r.presetCompute();
+        g.r.submit = &submit;
     }
+    static bool submitRead(void *c, uint32_t o, uint32_t *v)
+    {
+        auto *self = static_cast<ComputeRig *>(c);
+        if (o % 4 != 0 || o / 4 >= self->submit.size()) return false;
+        *v = self->submit[o / 4];
+        return true;
+    }
+    static bool submitWrite(void *c, uint32_t o, uint32_t v)
+    {
+        auto *self = static_cast<ComputeRig *>(c);
+        if (o % 4 != 0 || o / 4 >= self->submit.size()) return false;
+        self->submit[o / 4] = v;
+        return true;
+    }
+    MemoryReader region() { return MemoryReader{submitRead, this}; }
+    MemoryWriter regionWriter() { return MemoryWriter{submitWrite, this}; }
     Status rlc()
     {
         uint32_t writes = 0, cu = 0, noncu = 0;
         Status status = g.load();
-        return status == kOK ? startRlc(g.r.reader(), 0x80000, g.w.writer(), 22, g.snapshot, &writes, &cu, &noncu)
+        return status == kOK ? startRlc(g.r.reader(), 0x80000, g.w.writer(), stage, g.snapshot, &writes, &cu, &noncu)
                              : status;
     }
     Status start(uint32_t *writes, uint32_t *index, uint32_t *value)
     {
-        return startCompute(g.r.reader(), 0x80000, g.w.writer(), 22, g.snapshot, &snapshot, &taken, writes, index, value);
+        return startCompute(g.r.reader(), 0x80000, g.w.writer(), stage, g.snapshot, &snapshot, &taken, writes, index,
+                            value);
     }
     Status test(uint32_t *scratch, uint32_t *fence, uint32_t *rptr, uint32_t *commit)
     {
-        return testCompute(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.writer(), g.gfxWork.reader(), 22, g.snapshot,
-                           &snapshot, scratch, fence, rptr, commit);
+        return testCompute(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.writer(), g.gfxWork.reader(), stage,
+                           g.snapshot, &snapshot, scratch, fence, rptr, commit);
     }
     Status dispatch(uint32_t commit, uint32_t *fence, uint32_t *wrong, uint32_t *first, uint32_t *firstValue)
     {
-        return dispatchCompute(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.writer(), g.gfxWork.reader(), 22,
+        return dispatchCompute(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.writer(), g.gfxWork.reader(), stage,
                                g.snapshot, &snapshot, commit, fence, wrong, first, firstValue);
     }
     Status restore(uint32_t *index, uint32_t *value)
     {
-        return restoreCompute(g.r.reader(), 0x80000, g.w.writer(), 22, g.snapshot, &snapshot, index, value);
+        return restoreCompute(g.r.reader(), 0x80000, g.w.writer(), stage, g.snapshot, &snapshot, index, value);
+    }
+    Status submit_(const ComputeRequest &request, uint32_t n, uint32_t commit, uint32_t *fence, uint32_t *rptr,
+                   uint32_t *reason, uint32_t *index)
+    {
+        return submitCompute(g.r.reader(), 0x80000, g.w.writer(), g.gfxWork.writer(), g.gfxWork.reader(), regionWriter(),
+                             stage, g.snapshot, &snapshot, commit, request, n, fence, rptr, reason, index);
     }
     uint32_t q(uint32_t offset) { return g.r.hqd[(uint64_t(kComputeSelect) << 32) | offset]; }
+    uint32_t data(uint32_t offset) { return submit[(kSubmitDataArea + offset) / 4]; }
 };
 
 static void testCompute()
 {
     // The pinned values (docs/test-boot.md, stage 22).
-    CHECK(kMaxStage == 22 && kComputeStage == 22 && kDiagnosticSelectorCount == 56 && kDiagnosticVersion == 19);
+    CHECK(kComputeStage == 22 && kDiagnosticVersion == 20);
     CHECK(kComputeSelect == 0x4); // MEC1, pipe 0, queue 0 (after boot 42)
     CHECK(kRegCpHqdActive == 0xC91Cu && kRegCpPqWptrPollCntl == 0xC20Cu && kRegShMemConfig == 0x8C34u &&
           kRegRlcCpSchedulers == 0x3B2A8u && kRegCpHqdPqWptrLo == 0xC9ECu && kRegCpHqdEopControl == 0xC9B0u);
@@ -3693,6 +3801,202 @@ static void testCompute()
     }
 }
 
+
+// A request for corpus kernel k with group (x, y) and groups (x, y), its
+// buffers at the given data-area offsets and lengths.
+static ComputeRequest corpusRequest(uint32_t k, uint32_t sx, uint32_t sy, uint32_t gx, uint32_t gy,
+                                    std::vector<std::pair<uint32_t, uint32_t>> buffers, uint32_t lds = 0)
+{
+    ComputeRequest request = {};
+    request.kernel = k;
+    request.group[0] = sx;
+    request.group[1] = sy;
+    request.group[2] = 1;
+    request.groups[0] = gx;
+    request.groups[1] = gy;
+    request.groups[2] = 1;
+    request.ldsBytes = lds;
+    for (uint32_t i = 0; i < buffers.size(); i++) {
+        request.offset[i] = buffers[i].first;
+        request.length[i] = buffers[i].second;
+    }
+    return request;
+}
+
+static void testCorpus()
+{
+    // The pinned values (docs/test-boot.md, stage 23).
+    CHECK(kMaxStage == 23 && kCorpusStage == 23 && kDiagnosticSelectorCount == 59);
+    CHECK(kSubmitGpuAddress == 0xF440B00000ull && kSubmitPhysical == 0x600B00000ull && kSubmitSize == 0x100000);
+    CHECK(kCorpusCount == 5 && kCorpusCode[0].dwords == kComputeCodeDwords &&
+          std::memcmp(kCorpusCode[0].code, kComputeCode, sizeof(kComputeCode)) == 0); // stage 22's kernel
+    for (uint32_t k = 0; k < kCorpusCount; k++)
+        CHECK(kCorpusCode[k].dwords * 4 <= kSubmitCodeSlot && kCorpusCode[k].staticLds == 0 &&
+              (kCorpusCode[k].properties == 0xb || kCorpusCode[k].properties == 0x9));
+    CHECK(kComputeSubmitFirst == kComputeFrameStarts[2] &&
+          kComputeSubmitFirst + kComputeSubmitMax * kComputeSubmitFrameDwords < kComputeRingDwords);
+    CHECK(kComputeWbSubmitFence + 8 * kComputeSubmitMax <= kComputeWbPacket);
+    CHECK(kSubmitSlotArea + kComputeSubmitMax * kSubmitSlotSize <= kSubmitDataArea &&
+          kCorpusCount * kSubmitCodeSlot <= kSubmitSlotArea);
+
+    // Region writes: code words only as built, slots and data any, stage 23 only.
+    CHECK(submitWriteAllowed(0, kCorpusCode[0].code[0], 23) && !submitWriteAllowed(0, kCorpusCode[0].code[0] ^ 1, 23) &&
+          !submitWriteAllowed(0, kCorpusCode[0].code[0], 22));
+    CHECK(submitWriteAllowed(kCorpusCode[1].dwords * 4 + kSubmitCodeSlot, 0, 23) &&
+          !submitWriteAllowed(kCorpusCode[1].dwords * 4 + kSubmitCodeSlot, 1, 23));
+    CHECK(!submitWriteAllowed(kCorpusCount * kSubmitCodeSlot, 0, 23) && submitWriteAllowed(kSubmitSlotArea, 7, 23) &&
+          submitWriteAllowed(kSubmitSize - 4, 7, 23) && !submitWriteAllowed(kSubmitSize, 7, 23) &&
+          !submitWriteAllowed(kSubmitDataArea + 2, 7, 23));
+    // Work-area writes: the submission frames and their ends from stage 23 only.
+    const uint32_t frame = kComputeRingPage + kComputeSubmitFirst * 4;
+    CHECK(gfxWorkWriteAllowed(frame, 0x1234, 23) && !gfxWorkWriteAllowed(frame, 0x1234, 22) &&
+          !gfxWorkWriteAllowed(frame + kComputeSubmitMax * kComputeSubmitFrameDwords * 4, 0x1234, 23));
+    CHECK(computePollWriteAllowed(kComputeWbPage + kComputeWbPoll, 384, 23) &&
+          computePollWriteAllowed(kComputeWbPage + kComputeWbPoll, 896, 23) &&
+          !computePollWriteAllowed(kComputeWbPage + kComputeWbPoll, 1024, 23) &&
+          !computePollWriteAllowed(kComputeWbPage + kComputeWbPoll, 384, 22) &&
+          !computePollWriteAllowed(kComputeWbPage + kComputeWbPoll, 385, 23));
+
+    // Requests: what each refusal catches.
+    uint32_t reason = 9, index = 9;
+    const ComputeRequest good = corpusRequest(1, 256, 1, 4, 1, {{0, 4096}, {4096, 4096}, {8192, 4096}});
+    CHECK(checkComputeRequest(good, 0, &reason, &index) == kOK && reason == kRefusedNone);
+    auto refused = [&](const ComputeRequest &request, uint32_t why, uint32_t at = 0, uint32_t submitted = 0) {
+        return checkComputeRequest(request, submitted, &reason, &index) == kComputeRefused && reason == why &&
+               index == at;
+    };
+    CHECK(refused(good, kRefusedCount, 0, kComputeSubmitMax));
+    CHECK(refused(corpusRequest(5, 64, 1, 1, 1, {{0, 256}}), kRefusedKernel));
+    CHECK(refused(corpusRequest(0, 0, 1, 1, 1, {{0, 256}}), kRefusedGroup));
+    CHECK(refused(corpusRequest(0, 64, 32, 1, 1, {{0, 8192}}), kRefusedGroup)); // 2048 threads
+    CHECK(refused(corpusRequest(0, 64, 1, 0, 1, {{0, 256}}), kRefusedGrid));
+    CHECK(refused(corpusRequest(0, 1024, 1, 1025, 1, {{0, 4096}}), kRefusedGrid)); // over 2^20 threads
+    CHECK(refused(corpusRequest(0, 64, 1, 1, 1, {{0, 256}}, 512), kRefusedLds));   // none for store_index
+    CHECK(refused(corpusRequest(2, 256, 1, 1, 1, {{0, 1024}, {1024, 4}}, 512), kRefusedLds)); // 1 KiB needed
+    CHECK(refused(corpusRequest(2, 256, 1, 1, 1, {{0, 1024}, {1024, 4}}, 65536 + 512), kRefusedLds)); // over 64 KiB
+    CHECK(checkComputeRequest(corpusRequest(2, 256, 1, 1, 1, {{0, 1024}, {1024, 4}}, 1024), 0, &reason, &index) == kOK);
+    CHECK(refused(corpusRequest(0, 64, 1, 1, 1, {{2, 256}}), kRefusedBuffer));
+    CHECK(refused(corpusRequest(0, 64, 1, 1, 1, {{kSubmitDataSize - 252, 256}}), kRefusedBuffer));
+    CHECK(refused(corpusRequest(0, 64, 1, 1, 1, {{0, 0}}), kRefusedBuffer));
+    CHECK(refused(corpusRequest(0, 64, 1, 2, 1, {{0, 256}}), kRefusedLength));
+    CHECK(refused(corpusRequest(1, 64, 1, 1, 1, {{0, 256}, {256, 256}, {300, 256}}), kRefusedOverlap, 2));
+    CHECK(refused(corpusRequest(1, 64, 1, 1, 1, {{0, 256}, {256, 252}, {512, 256}}), kRefusedLength, 1));
+    CHECK(checkComputeRequest(corpusRequest(3, 64, 1, 4, 1, {{0, 4}}), 0, &reason, &index) == kOK); // one word
+    CHECK(refused(corpusRequest(4, 16, 16, 8, 4, {{0, 32764}}), kRefusedLength)); // 128 x 64 words
+
+    // A frame: ACQUIRE_MEM, the SH registers, DISPATCH_DIRECT, fence n.
+    const ComputeRequest sum = corpusRequest(2, 256, 1, 64, 1, {{0x50000, 0x10000}, {0x60000, 256}}, 1024);
+    CHECK(computeSubmitWord(sum, 2, 0) == 0xC0055800u && computeSubmitWord(sum, 2, 1) == 0x28C40000u &&
+          computeSubmitWord(sum, 2, 6) == 0xA);
+    CHECK(computeSubmitWord(sum, 2, 12) == 0xF440B020u && computeSubmitWord(sum, 2, 13) == 0); // code slot 2
+    CHECK(computeSubmitWord(sum, 2, 16) == kCorpusCode[2].rsrc1 &&
+          computeSubmitWord(sum, 2, 17) == (kCorpusCode[2].rsrc2 | (2u << kRsrc2LdsShift))); // 1 KiB: 2 granules
+    CHECK(computeSubmitWord(sum, 2, 26) == 256 && computeSubmitWord(sum, 2, 27) == 1);
+    CHECK(computeSubmitWord(sum, 2, 29) == pm4(kPm4SetShReg, 8));
+    CHECK(computeSubmitWord(sum, 2, 35) == 0x40B10400u && computeSubmitWord(sum, 2, 37) == 0x40B10500u &&
+          computeSubmitWord(sum, 2, 38) == 0xF4); // slot 2's packet and kernarg
+    CHECK(computeSubmitWord(sum, 2, 39) == pm4(kPm4DispatchDirect, 3) && computeSubmitWord(sum, 2, 40) == 64);
+    CHECK(computeSubmitWord(sum, 2, 44) == 0xC0064900u && computeSubmitWord(sum, 2, 47) == 0x40A07130u &&
+          computeSubmitWord(sum, 2, 49) == 3); // fence 2 = 3
+    CHECK(computeSubmitWord(sum, 2, 52) == pm4(kPm4Nop, kComputeSubmitFrameDwords - 52 - 2));
+    const ComputeRequest count = corpusRequest(3, 64, 1, 4, 1, {{0x70000, 4}});
+    CHECK(computeSubmitWord(count, 0, 29) == pm4(kPm4SetShReg, 6) && computeSubmitWord(count, 0, 35) == 0x40B10100u &&
+          computeSubmitWord(count, 0, 37) == pm4(kPm4DispatchDirect, 3)); // no dispatch packet: kernarg in 4-5
+    // The slot: the packet's sizes, then the buffers' GPU addresses.
+    CHECK(computeSlotWord(sum, 2, 0) == (3u << 16) && computeSlotWord(sum, 2, 4) == (256u | (1u << 16)) &&
+          computeSlotWord(sum, 2, 12) == 256 * 64 && computeSlotWord(sum, 2, 28) == 1024);
+    CHECK(computeSlotWord(sum, 2, kSubmitKernarg) == 0x40B70000u && computeSlotWord(sum, 2, kSubmitKernarg + 4) == 0xF4 &&
+          computeSlotWord(sum, 2, kSubmitKernarg + 8) == 0x40B80000u && computeSlotWord(sum, 2, kSubmitKernarg + 16) == 0);
+
+    // A whole session against the fakes: the five kernels, in order.
+    {
+        ComputeRig c(23);
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, value = 0, scratch = 0, fence = 0, rptr = 0, commit = 0;
+        CHECK(c.start(&writes, &index, &value) == kOK && c.test(&scratch, &fence, &rptr, &commit) == kOK);
+        // Inputs and cleared outputs, as the tool writes them.
+        std::vector<uint32_t> words(0x8000);
+        for (uint32_t i = 0; i < 0x8000; i++) {
+            const float a = float(i), b = float(2 * i);
+            std::memcpy(&words[i], &a, 4);
+            CHECK(writeComputeData(c.regionWriter(), 23, 0x10000 + 4 * i, &words[i], 1) == kOK);
+            std::memcpy(&words[i], &b, 4);
+            CHECK(writeComputeData(c.regionWriter(), 23, 0x30000 + 4 * i, &words[i], 1) == kOK);
+        }
+        for (uint32_t i = 0; i < 0x4000; i++) CHECK(writeComputeData(c.regionWriter(), 23, 0x70000 + 4 * i, &i, 1) == kOK);
+        const uint32_t zero = 0;
+        CHECK(writeComputeData(c.regionWriter(), 23, 0x81000, &zero, 1) == kOK);
+        const ComputeRequest requests[] = {
+            corpusRequest(0, 256, 1, 64, 1, {{0x00000, 0x10000}}),
+            corpusRequest(1, 256, 1, 128, 1, {{0x10000, 0x20000}, {0x30000, 0x20000}, {0x50000, 0x20000}}),
+            corpusRequest(2, 256, 1, 64, 1, {{0x70000, 0x10000}, {0x80000, 256}}, 1024),
+            corpusRequest(3, 256, 1, 64, 1, {{0x81000, 4}}),
+            corpusRequest(4, 16, 16, 8, 4, {{0x82000, 0x8000}}),
+        };
+        for (uint32_t n = 0; n < kComputeSubmitMax; n++) {
+            CHECK(c.submit_(requests[n], n, commit, &fence, &rptr, &reason, &index) == kOK && fence == n + 1 &&
+                  rptr == kComputeSubmitFirst + (n + 1) * kComputeSubmitFrameDwords);
+        }
+        CHECK(c.g.r.acquires == 5 && c.g.r.corpusRuns == std::vector<uint32_t>({0, 1, 2, 3, 4}));
+        bool exact = true;
+        for (uint32_t i = 0; i < 0x4000; i++) exact = exact && c.data(4 * i) == i;
+        for (uint32_t i = 0; i < 0x8000; i++) {
+            float got;
+            const uint32_t word = c.data(0x50000 + 4 * i);
+            std::memcpy(&got, &word, 4);
+            exact = exact && got == float(3 * i);
+        }
+        for (uint32_t g = 0; g < 64; g++) exact = exact && c.data(0x80000 + 4 * g) == 256 * 256 * g + 255 * 128;
+        exact = exact && c.data(0x81000) == 0x4000;
+        for (uint32_t y = 0; y < 64; y++)
+            for (uint32_t x = 0; x < 128; x++) exact = exact && c.data(0x82000 + 4 * (y * 128 + x)) == ((y << 16) | x);
+        CHECK(exact);
+        uint32_t back[2] = {};
+        CHECK(readComputeData(c.region(), 23, 0x81000, back, 2) == kOK && back[0] == 0x4000);
+        CHECK(readComputeData(c.region(), 23, kSubmitDataSize - 4, back, 2) == kRegisterNotAllowed &&
+              writeComputeData(c.regionWriter(), 23, kSubmitDataSize, back, 1) == kRegisterNotAllowed &&
+              readComputeData(c.region(), 22, 0, back, 1) == kRegisterNotAllowed);
+        // A sixth: refused before anything is written.
+        CHECK(c.submit_(requests[0], kComputeSubmitMax, commit, &fence, &rptr, &reason, &index) == kComputeRefused &&
+              reason == kRefusedCount);
+        CHECK(c.restore(&index, &value) == kOK && c.q(kRegCpHqdActive) == 0);
+    }
+    {
+        // Method B, a wrong kernel, then a dispatch that never completes.
+        ComputeRig c(23);
+        c.g.r.mecIgnoresPoll = true;
+        c.g.r.kernelWrong = true;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, value = 0, scratch = 0, fence = 0, rptr = 0, commit = 0;
+        CHECK(c.start(&writes, &index, &value) == kOK && c.test(&scratch, &fence, &rptr, &commit) == kOK &&
+              commit == kCommitRegister);
+        CHECK(c.submit_(corpusRequest(0, 64, 1, 4, 1, {{0, 1024}}), 0, commit, &fence, &rptr, &reason, &index) == kOK &&
+              c.data(0) == 1 && fence == 1); // the core does not judge outputs; the tool does
+        c.g.r.dispatchHang = true;
+        CHECK(c.submit_(corpusRequest(0, 64, 1, 4, 1, {{0, 1024}}), 1, commit, &fence, &rptr, &reason, &index) ==
+                  kGfxFenceTimeout &&
+              fence == 0 && rptr == kComputeSubmitFirst + kComputeSubmitFrameDwords + 44);
+        CHECK(c.restore(&index, &value) == kOK);
+    }
+    {
+        // Stage 22 sessions cannot submit, and a refused request writes nothing.
+        ComputeRig c;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, value = 0, scratch = 0, fence = 0, rptr = 0, commit = 0;
+        CHECK(c.start(&writes, &index, &value) == kOK && c.test(&scratch, &fence, &rptr, &commit) == kOK);
+        CHECK(c.submit_(corpusRequest(0, 64, 1, 1, 1, {{0, 256}}), 0, commit, &fence, &rptr, &reason, &index) ==
+              kRegisterNotAllowed);
+        ComputeRig d(23);
+        CHECK(d.rlc() == kOK);
+        CHECK(d.start(&writes, &index, &value) == kOK && d.test(&scratch, &fence, &rptr, &commit) == kOK);
+        CHECK(d.submit_(corpusRequest(0, 64, 1, 2, 1, {{0, 256}}), 0, commit, &fence, &rptr, &reason, &index) ==
+                  kComputeRefused &&
+              reason == kRefusedLength && d.submit[0] == 0x5A5A5A5Au && d.g.r.corpusRuns.empty());
+        CHECK(d.submit_(corpusRequest(0, 64, 1, 1, 1, {{0, 256}}), 0, kCommitNone, &fence, &rptr, &reason, &index) ==
+              kComputeNoProgress);
+    }
+}
+
 int main()
 {
     testValidDevice();
@@ -3723,6 +4027,7 @@ int main()
     testFlip();
     testGfx();
     testCompute();
+    testCorpus();
     if (failures == 0) std::printf("core tests passed\n");
     return failures == 0 ? 0 : 1;
 }

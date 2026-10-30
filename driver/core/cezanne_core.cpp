@@ -118,6 +118,7 @@ const char *statusName(Status status)
     case kGfxOutOfOrder: return "gfx-out-of-order";
     case kComputeNoProgress: return "compute-no-progress";
     case kComputeMismatch: return "compute-mismatch";
+    case kComputeRefused: return "compute-refused";
     }
     return "unknown";
 }
@@ -2631,7 +2632,11 @@ uint32_t gfxWorkSize(uint32_t stage)
 bool gfxWorkWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
 {
     if (stage < kGfxStage || (offset & 3) != 0 || offset >= gfxWorkSize(stage)) return false;
-    return value == gfxWorkWord(offset) || computePollWriteAllowed(offset, value, stage);
+    if (value == gfxWorkWord(offset) || computePollWriteAllowed(offset, value, stage)) return true;
+    // Stage 23: the submission frames, which the core builds per request.
+    const uint32_t frames = kComputeRingPage + kComputeSubmitFirst * 4;
+    return stage >= kCorpusStage && offset >= frames &&
+           offset < frames + kComputeSubmitMax * kComputeSubmitFrameDwords * 4;
 }
 
 static Status writeGfxWorkWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
@@ -2704,8 +2709,10 @@ Status checkGfxTargets(const RegisterReader &registers, uint64_t apertureLength,
         uint64_t offset, gpu, physical;
         uint32_t size;
     } buffers[] = {{kGfxFwCarveoutOffset, kGfxFwGpuAddress, kGfxFwPhysical, kGfxFwCheckSize},
-                   {kGfxWorkCarveoutOffset, kGfxWorkGpuAddress, kGfxWorkPhysical, kGfxWorkCheckSize}};
+                   {kGfxWorkCarveoutOffset, kGfxWorkGpuAddress, kGfxWorkPhysical, kGfxWorkCheckSize},
+                   {kSubmitCarveoutOffset, kSubmitGpuAddress, kSubmitPhysical, kSubmitSize}};
     for (const auto &buffer : buffers) {
+        if (buffer.offset == kSubmitCarveoutOffset && stage < kCorpusStage) continue; // stage 23's region
         MetricsTarget target;
         Status status = checkCarveoutPage(registers, apertureLength, stage, buffer.offset, buffer.size, ranges, rangeCount,
                                           &target);
@@ -3121,7 +3128,13 @@ bool computePollWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
     if (stage < kComputeStage) return false;
     if (offset == kComputeWbPage + kComputeWbPoll + 4) return value == 0;
     if (offset != kComputeWbPage + kComputeWbPoll) return false;
-    return value == kComputeFrameStarts[0] || value == kComputeFrameStarts[1] || value == kComputeFrameStarts[2];
+    if (value == kComputeFrameStarts[0] || value == kComputeFrameStarts[1] || value == kComputeFrameStarts[2])
+        return true;
+    // Stage 23: the end of submission n's frame.
+    for (uint32_t n = 0; stage >= kCorpusStage && n < kComputeSubmitMax; n++) {
+        if (value == kComputeSubmitFirst + (n + 1) * kComputeSubmitFrameDwords) return true;
+    }
+    return false;
 }
 
 static Status writeComputePollWord(const MemoryWriter &writer, uint32_t stage, uint32_t offset, uint32_t value)
@@ -3155,7 +3168,9 @@ bool computeWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage, const 
         for (const GfxWrite &write : kComputeQueueExtraWrites) {
             if (write.offset == offset && value == masked(snapshot->queue[i], write)) return true;
         }
-        return false;
+        // Stage 23, method B: the end of a submission frame.
+        return offset == kRegCpHqdPqWptrLo && computePollWriteAllowed(kComputeWbPage + kComputeWbPoll, value, stage) &&
+               value > kComputeSubmitFirst;
     }
     return false;
 }
@@ -3464,6 +3479,219 @@ Status restoreCompute(const RegisterReader &registers, uint64_t apertureLength, 
     }
     *index = *value = 0;
     return kOK;
+}
+
+// Stage 23.
+
+bool submitWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage)
+{
+    if (stage < kCorpusStage || (offset & 3) != 0 || offset >= kSubmitSize) return false;
+    if (offset >= kSubmitSlotArea) return true; // the slots (built by the core) and the data
+    const uint32_t kernel = offset / kSubmitCodeSlot, i = (offset % kSubmitCodeSlot) / 4;
+    if (kernel >= kCorpusCount) return false;
+    return value == (i < kCorpusCode[kernel].dwords ? kCorpusCode[kernel].code[i] : 0);
+}
+
+static uint64_t touched(const CorpusBuffer &buffer, uint64_t threads, uint64_t groups)
+{
+    const uint64_t elements = buffer.extent == kPerThread ? threads : buffer.extent == kPerGroup ? groups : 1;
+    return elements * buffer.elementBytes;
+}
+
+Status checkComputeRequest(const ComputeRequest &request, uint32_t submitted, uint32_t *reason, uint32_t *index)
+{
+    *reason = *index = 0;
+    auto refuse = [reason](uint32_t why) {
+        *reason = why;
+        return kComputeRefused;
+    };
+    if (submitted >= kComputeSubmitMax) return refuse(kRefusedCount);
+    if (request.kernel >= kCorpusCount) return refuse(kRefusedKernel);
+    const CorpusArgs &args = kCorpusArgs[request.kernel];
+    uint64_t perGroup = 1, groups = 1;
+    for (uint32_t d = 0; d < 3; d++) {
+        if (request.group[d] == 0 || request.group[d] > kComputeMaxGroupThreads) return refuse(kRefusedGroup);
+        perGroup *= request.group[d];
+        if (request.groups[d] == 0 || request.groups[d] > kComputeMaxGroups) return refuse(kRefusedGrid);
+        groups *= request.groups[d];
+    }
+    if (perGroup > kComputeMaxGroupThreads) return refuse(kRefusedGroup);
+    const uint64_t threads = perGroup * groups;
+    if (threads > kComputeMaxThreads) return refuse(kRefusedGrid);
+    const uint64_t lds = uint64_t(kCorpusCode[request.kernel].staticLds) + request.ldsBytes;
+    if (args.ldsPerThread == 0 ? request.ldsBytes != 0 : request.ldsBytes < args.ldsPerThread * perGroup)
+        return refuse(kRefusedLds);
+    if (lds > kComputeMaxLds) return refuse(kRefusedLds);
+    for (uint32_t i = 0; i < args.buffers; i++) {
+        *index = i;
+        const uint64_t offset = request.offset[i], length = request.length[i];
+        if ((offset & 3) != 0 || (length & 3) != 0 || length == 0 || offset + length > kSubmitDataSize)
+            return refuse(kRefusedBuffer);
+        if (length < touched(args.buffer[i], threads, groups)) return refuse(kRefusedLength);
+        for (uint32_t j = 0; j < i; j++) {
+            if (offset < uint64_t(request.offset[j]) + request.length[j] && request.offset[j] < offset + length)
+                return refuse(kRefusedOverlap);
+        }
+    }
+    *index = 0;
+    return kOK;
+}
+
+static uint64_t slotGpuAddress(uint32_t n)
+{
+    return kSubmitGpuAddress + kSubmitSlotArea + uint64_t(n) * kSubmitSlotSize;
+}
+
+// The frame before its NOP padding: gfx_v9_0_emit_mem_sync, stage 22's
+// SET_SH_REG writes for this kernel and grid, DISPATCH_DIRECT, then fence n
+// by RELEASE_MEM (gfx_v9_0_ring_emit_fence). Returns the dword count.
+static uint32_t computeSubmitWords(const ComputeRequest &request, uint32_t n, uint32_t *w)
+{
+    const CorpusCode &code = kCorpusCode[request.kernel];
+    const uint64_t pgm = kSubmitGpuAddress + uint64_t(request.kernel) * kSubmitCodeSlot;
+    const uint32_t lds = code.staticLds + request.ldsBytes;
+    const uint32_t rsrc2 = (code.rsrc2 & ~kRsrc2LdsMask) |
+                           ((((lds + kLdsGranule - 1) / kLdsGranule) << kRsrc2LdsShift) & kRsrc2LdsMask);
+    const uint64_t packet = slotGpuAddress(n), kernarg = packet + kSubmitKernarg;
+    uint32_t c = 0;
+    w[c++] = pm4(kPm4AcquireMem, 5);
+    w[c++] = kAcquireMemCoher;
+    w[c++] = 0xffffffff; // CP_COHER_SIZE
+    w[c++] = 0x00ffffff; // CP_COHER_SIZE_HI
+    w[c++] = 0;          // CP_COHER_BASE
+    w[c++] = 0;          // CP_COHER_BASE_HI
+    w[c++] = 0x0000000a; // POLL_INTERVAL
+    w[c++] = pm4(kPm4SetShReg, 1);
+    w[c++] = kShComputeStaticThreadMgmtSe0 - kSetShRegStart;
+    w[c++] = 0xffffffff;
+    w[c++] = pm4(kPm4SetShReg, 2);
+    w[c++] = kShComputePgmLo - kSetShRegStart;
+    w[c++] = uint32_t(pgm >> 8);
+    w[c++] = uint32_t(pgm >> 40);
+    w[c++] = pm4(kPm4SetShReg, 2);
+    w[c++] = kShComputePgmRsrc1 - kSetShRegStart;
+    w[c++] = code.rsrc1;
+    w[c++] = rsrc2;
+    w[c++] = pm4(kPm4SetShReg, 1);
+    w[c++] = kShComputeTmpringSize - kSetShRegStart;
+    w[c++] = 0;
+    w[c++] = pm4(kPm4SetShReg, 1);
+    w[c++] = kShComputeResourceLimits - kSetShRegStart;
+    w[c++] = 0;
+    w[c++] = pm4(kPm4SetShReg, 3);
+    w[c++] = kShComputeNumThreadX - kSetShRegStart;
+    w[c++] = request.group[0];
+    w[c++] = request.group[1];
+    w[c++] = request.group[2];
+    // The private segment buffer (no scratch), the dispatch packet if the
+    // kernel reads it, then kernarg.
+    const bool dispatchPtr = (code.properties & kCodeDispatchPtr) != 0;
+    w[c++] = pm4(kPm4SetShReg, dispatchPtr ? 8 : 6);
+    w[c++] = kShComputeUserData0 - kSetShRegStart;
+    for (uint32_t i = 0; i < 4; i++) w[c++] = 0;
+    if (dispatchPtr) {
+        w[c++] = uint32_t(packet);
+        w[c++] = uint32_t(packet >> 32);
+    }
+    w[c++] = uint32_t(kernarg);
+    w[c++] = uint32_t(kernarg >> 32);
+    w[c++] = pm4(kPm4DispatchDirect, 3);
+    w[c++] = request.groups[0];
+    w[c++] = request.groups[1];
+    w[c++] = request.groups[2];
+    w[c++] = kDispatchInitiator;
+    for (uint32_t i = 0; i < 8; i++) w[c++] = computeEopFenceWord(i, kComputeWbSubmitFence + 8 * n, n + 1);
+    return c;
+}
+
+uint32_t computeSubmitWord(const ComputeRequest &request, uint32_t n, uint32_t dword)
+{
+    if (request.kernel >= kCorpusCount || dword >= kComputeSubmitFrameDwords) return 0;
+    uint32_t words[kComputeSubmitFrameDwords];
+    const uint32_t count = computeSubmitWords(request, n, words);
+    return dword < count ? words[dword] : nopWord(dword, count, kComputeSubmitFrameDwords);
+}
+
+// hsa_kernel_dispatch_packet_t as far as the kernels read it (setup, the
+// workgroup and grid sizes in work-items, the group segment), then kernarg:
+// each buffer's GPU address.
+uint32_t computeSlotWord(const ComputeRequest &request, uint32_t n, uint32_t offset)
+{
+    (void)n;
+    if (request.kernel >= kCorpusCount || offset >= kSubmitSlotSize) return 0;
+    if (offset >= kSubmitKernarg) {
+        const uint32_t i = (offset - kSubmitKernarg) / 8;
+        if (i >= kCorpusArgs[request.kernel].buffers) return 0;
+        const uint64_t address = kSubmitGpuAddress + kSubmitDataArea + request.offset[i];
+        return (offset & 4) == 0 ? uint32_t(address) : uint32_t(address >> 32);
+    }
+    const uint32_t words[] = {3u << 16, // setup: three dimensions
+                              request.group[0] | (request.group[1] << 16),
+                              request.group[2],
+                              request.group[0] * request.groups[0],
+                              request.group[1] * request.groups[1],
+                              request.group[2] * request.groups[2],
+                              0, // private segment
+                              kCorpusCode[request.kernel].staticLds + request.ldsBytes};
+    return offset / 4 < sizeof(words) / sizeof(words[0]) ? words[offset / 4] : 0;
+}
+
+static Status writeSubmitWord(const MemoryWriter &region, uint32_t stage, uint32_t offset, uint32_t value)
+{
+    if (!submitWriteAllowed(offset, value, stage)) return kRegisterNotAllowed;
+    return region.write32(region.context, offset, value) ? kOK : kRegisterWriteFailed;
+}
+
+Status writeComputeData(const MemoryWriter &region, uint32_t stage, uint32_t offset, const uint32_t *words,
+                        uint32_t count)
+{
+    if (stage < kCorpusStage || (offset & 3) != 0 || uint64_t(offset) + 4ull * count > kSubmitDataSize)
+        return kRegisterNotAllowed;
+    for (uint32_t i = 0; i < count; i++) {
+        Status status = writeSubmitWord(region, stage, kSubmitDataArea + offset + 4 * i, words[i]);
+        if (status != kOK) return status;
+    }
+    return kOK;
+}
+
+Status readComputeData(const MemoryReader &region, uint32_t stage, uint32_t offset, uint32_t *words, uint32_t count)
+{
+    if (stage < kCorpusStage || (offset & 3) != 0 || uint64_t(offset) + 4ull * count > kSubmitDataSize)
+        return kRegisterNotAllowed;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!region.read32(region.context, kSubmitDataArea + offset + 4 * i, &words[i])) return kRegisterReadFailed;
+    }
+    return kOK;
+}
+
+Status submitCompute(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                     const MemoryWriter &workWriter, const MemoryReader &work, const MemoryWriter &region,
+                     uint32_t stage, const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t commit,
+                     const ComputeRequest &request, uint32_t n, uint32_t *fence, uint32_t *rptr, uint32_t *reason,
+                     uint32_t *index)
+{
+    *fence = *rptr = *reason = *index = 0;
+    if (stage < kCorpusStage || snapshot == nullptr) return kRegisterNotAllowed;
+    if (commit != kCommitPoll && commit != kCommitRegister) return kComputeNoProgress;
+    Status status = checkComputeRequest(request, n, reason, index);
+    if (status != kOK) return status;
+    // The kernel's code slot, the submission's slot, then its frame.
+    const CorpusCode &code = kCorpusCode[request.kernel];
+    for (uint32_t i = 0; status == kOK && i < code.dwords; i++)
+        status = writeSubmitWord(region, stage, request.kernel * kSubmitCodeSlot + 4 * i, code.code[i]);
+    const uint32_t slot = kSubmitSlotArea + n * kSubmitSlotSize;
+    for (uint32_t at = 0; status == kOK && at < kSubmitSlotSize; at += 4)
+        status = writeSubmitWord(region, stage, slot + at, computeSlotWord(request, n, at));
+    const uint32_t start = kComputeSubmitFirst + n * kComputeSubmitFrameDwords;
+    for (uint32_t d = 0; status == kOK && d < kComputeSubmitFrameDwords; d++)
+        status = writeGfxWorkWord(workWriter, stage, kComputeRingPage + 4 * (start + d), computeSubmitWord(request, n, d));
+    if (status == kOK)
+        status = commitCompute(writer, workWriter, stage, gfxSnapshot, snapshot, commit,
+                               start + kComputeSubmitFrameDwords);
+    if (status != kOK) return status;
+    status = pollWork(work, writer, kComputeWbPage + kComputeWbSubmitFence + 8 * n, n + 1, kGfxDrawPauses, fence);
+    Status read = queueRptr(registers, apertureLength, writer, stage, gfxSnapshot, snapshot, rptr);
+    return status != kOK ? status : read;
 }
 
 } // namespace cezanne

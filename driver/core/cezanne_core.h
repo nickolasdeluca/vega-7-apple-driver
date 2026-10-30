@@ -23,6 +23,8 @@
 
 #include <stdint.h>
 
+#include "cezanne_corpus.h"
+
 namespace cezanne {
 
 const uint16_t kVendorAMD = 0x1002;
@@ -31,7 +33,7 @@ const uint8_t kRevisionTarget = 0xc9;
 
 // Highest stage this build implements. The test EFI's cezanne-stage boot
 // argument selects a stage up to this value.
-const uint32_t kMaxStage = 22;
+const uint32_t kMaxStage = 23;
 
 const uint8_t kRegisterBar = 0x24; // BAR5 configuration offset
 
@@ -1530,6 +1532,85 @@ struct ComputeState {
 // How the write pointer reached the MEC (ring test report).
 enum ComputeCommit : uint32_t { kCommitNone = 0, kCommitPoll = 1, kCommitRegister = 2 };
 
+// Stage 23 (docs/test-boot.md, "Stage 23: a compute submission path and a
+// kernel corpus"): stage 22's queue and ring test, then up to
+// kComputeSubmitMax submissions of corpus kernels (cezanne_corpus.h, by
+// index), each one ring frame with its own buffers and fence. No new MMIO
+// register: kernel state goes through SET_SH_REG as in stage 22.
+const uint32_t kCorpusStage = 23;
+// The submission region: 1 MiB of carveout between stage 21's work area and
+// the pattern region, checked placed and stable at the check.
+const uint64_t kSubmitCarveoutOffset = 0x40b00000ull;
+const uint64_t kSubmitGpuAddress = (uint64_t(kExpectedFbLocationBase) << 24) + kSubmitCarveoutOffset;
+const uint64_t kSubmitPhysical = (uint64_t(kExpectedFbOffset) << 24) + kSubmitCarveoutOffset;
+const uint32_t kSubmitSize = 0x100000;
+// Its layout: corpus code (one 4 KiB slot per kernel), per-submission slots
+// (the dispatch packet at +0, kernarg at +0x100), then the data buffers.
+const uint32_t kSubmitCodeSlot = 0x1000, kSubmitSlotArea = 0x10000, kSubmitSlotSize = 0x200,
+               kSubmitKernarg = 0x100, kSubmitDataArea = 0x20000;
+const uint32_t kSubmitDataSize = kSubmitSize - kSubmitDataArea;
+// Five 128-dword frames from dword 256 end at 896: the write pointer never
+// reaches the ring's end (1024), so it never wraps.
+const uint32_t kComputeSubmitMax = 5, kComputeSubmitFrameDwords = 128;
+const uint32_t kComputeSubmitFirst = 256; // kComputeFrameStarts[2]
+// Fence n (value n + 1) at write-back +0x120 + 8n, by RELEASE_MEM.
+const uint32_t kComputeWbSubmitFence = 0x120;
+const uint32_t kComputeMaxBuffers = 4;
+const uint32_t kComputeChunkBytes = 2048; // ComputeWrite and ComputeRead
+const uint32_t kComputeMaxGroupThreads = 1024, kComputeMaxGroups = 65535, kComputeMaxThreads = 1u << 20;
+const uint32_t kComputeMaxLds = 65536, kLdsGranule = 512; // RSRC2.LDS_SIZE counts 128 dwords on gfx9
+const uint32_t kRsrc2LdsShift = 15, kRsrc2LdsMask = 0x00ff8000;
+// gfx_v9_0_emit_mem_sync: ACQUIRE_MEM with SH_ICACHE, SH_KCACHE, TC, TCL1 and
+// TC_WB actions over the full range, poll interval 0xA (soc15d.h, v6.12).
+const uint32_t kPm4AcquireMem = 0x58, kAcquireMemCoher = 0x28c40000;
+// Descriptor code properties: bit 1, the dispatch packet is a user SGPR pair.
+const uint32_t kCodeDispatchPtr = 0x2;
+
+// What each corpus kernel's buffer arguments (slots 0..) touch: one element
+// per thread, per group, or a single element.
+enum CorpusExtent : uint32_t { kPerThread = 0, kPerGroup = 1, kSingle = 2 };
+struct CorpusBuffer {
+    uint32_t extent, elementBytes;
+};
+struct CorpusArgs {
+    uint32_t buffers;
+    CorpusBuffer buffer[kComputeMaxBuffers];
+    uint32_t ldsPerThread; // the threadgroup buffer's bytes per thread (0: none)
+};
+// In kCorpusCode order (tools/build_corpus.py: KERNELS).
+const CorpusArgs kCorpusArgs[] = {
+    {1, {{kPerThread, 4}}, 0},                                 // store_index(out)
+    {3, {{kPerThread, 4}, {kPerThread, 4}, {kPerThread, 4}}, 0}, // vector_add(a, b, c)
+    {2, {{kPerThread, 4}, {kPerGroup, 4}}, 4},                 // group_sum(in, out, partial)
+    {1, {{kSingle, 4}}, 0},                                    // atomic_count(counter)
+    {1, {{kPerThread, 4}}, 0},                                 // grid_2d(out)
+};
+static_assert(sizeof(kCorpusArgs) / sizeof(kCorpusArgs[0]) == kCorpusCount, "one description per corpus kernel");
+
+// A submission: the kernel, the threads per group and the groups per grid
+// (x, y, z), the threadgroup buffer's bytes, and each buffer's offset and
+// length in the data area.
+struct ComputeRequest {
+    uint32_t kernel;
+    uint32_t group[3];
+    uint32_t groups[3];
+    uint32_t ldsBytes;
+    uint32_t offset[kComputeMaxBuffers];
+    uint32_t length[kComputeMaxBuffers];
+};
+// Why checkComputeRequest refused (kComputeRefused); index: the buffer.
+enum ComputeRefusal : uint32_t {
+    kRefusedNone = 0,
+    kRefusedKernel = 1,  // not a corpus index
+    kRefusedGroup = 2,   // a zero dimension or more than 1024 threads
+    kRefusedGrid = 3,    // a zero or too large dimension, or more than 2^20 threads
+    kRefusedLds = 4,     // too little for the kernel, any for one without, or over 64 KiB
+    kRefusedBuffer = 5,  // misaligned, empty or outside the data area
+    kRefusedLength = 6,  // shorter than what the grid touches
+    kRefusedOverlap = 7, // two buffers overlap
+    kRefusedCount = 8,   // a sixth submission
+};
+
 // The IP discovery binary sits DISCOVERY_TMR_OFFSET below the top of VRAM and
 // is DISCOVERY_TMR_SIZE long (amdgpu_discovery.h, v6.12).
 const uint32_t kDiscoveryTmrOffset = 64 << 10;
@@ -1665,6 +1746,7 @@ enum Status : uint32_t {
     // Stage 22.
     kComputeNoProgress, // neither write-pointer method moved the queue's read pointer
     kComputeMismatch,   // the dispatch finished but the output is not 0..255
+    kComputeRefused,    // stage 23: a submission outside its kernel's bounds (ComputeRefusal)
 };
 
 const char *statusName(Status status);
@@ -1783,7 +1865,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 19;
+const uint32_t kDiagnosticVersion = 20;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value
@@ -1869,7 +1951,11 @@ enum DiagnosticSelector : uint32_t {
     kDiagnosticComputeStart = 53,    // out: Status, writes made, index, value
     kDiagnosticComputeTest = 54,     // out: Status, SCRATCH_REG0, fence 3, read-pointer write-back, ComputeCommit
     kDiagnosticComputeDispatch = 55, // out: Status, fence 4, wrong outputs, first wrong index, its value
-    kDiagnosticSelectorCount = 56,
+    // Stage 23, after a passing compute ring test.
+    kDiagnosticComputeWrite = 56,  // in: data-area offset, then ComputeChunk; out: Status
+    kDiagnosticComputeSubmit = 57, // in: ComputeRequest; out: Status, fence, read pointer, refusal, index
+    kDiagnosticComputeRead = 58,   // in: data-area offset, bytes; out: Status, ComputeChunk
+    kDiagnosticSelectorCount = 59,
 };
 const uint32_t kScratchStage = 6;
 const uint32_t kDiagnosticStage = 4; // first stage that offers the interface
@@ -2620,6 +2706,35 @@ Status dispatchCompute(const RegisterReader &registers, uint64_t apertureLength,
 Status restoreCompute(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
                       uint32_t stage, const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t *index,
                       uint32_t *value);
+
+// Stage 23.
+struct ComputeChunk {
+    uint32_t bytes;
+    uint32_t words[kComputeChunkBytes / 4];
+};
+// A CPU write to the submission region: corpus code words in the code area,
+// anything the core builds in the slots, and the tool's data.
+bool submitWriteAllowed(uint32_t offset, uint32_t value, uint32_t stage);
+// Checks a request against its kernel's description (kComputeRefused with
+// the ComputeRefusal and the buffer index); submitted is how many ran.
+Status checkComputeRequest(const ComputeRequest &request, uint32_t submitted, uint32_t *reason, uint32_t *index);
+// Submission n's ring frame (dword within it) and slot (byte offset within
+// it), for a checked request.
+uint32_t computeSubmitWord(const ComputeRequest &request, uint32_t n, uint32_t dword);
+uint32_t computeSlotWord(const ComputeRequest &request, uint32_t n, uint32_t offset);
+// The tool's data, in whole words, within the data area (offset relative to
+// it; kRegisterNotAllowed outside).
+Status writeComputeData(const MemoryWriter &region, uint32_t stage, uint32_t offset, const uint32_t *words,
+                        uint32_t count);
+Status readComputeData(const MemoryReader &region, uint32_t stage, uint32_t offset, uint32_t *words, uint32_t count);
+// Submission n: checks the request, writes the kernel's code, the slot and
+// the frame, commits by the ring test's method, waits for fence n
+// (kGfxFenceTimeout) and reads the queue's read pointer.
+Status submitCompute(const RegisterReader &registers, uint64_t apertureLength, const RegisterWriter &writer,
+                     const MemoryWriter &workWriter, const MemoryReader &work, const MemoryWriter &region,
+                     uint32_t stage, const uint32_t *gfxSnapshot, const ComputeSnapshot *snapshot, uint32_t commit,
+                     const ComputeRequest &request, uint32_t n, uint32_t *fence, uint32_t *rptr, uint32_t *reason,
+                     uint32_t *index);
 
 } // namespace cezanne
 
