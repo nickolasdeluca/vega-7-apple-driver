@@ -4567,6 +4567,24 @@ it differs from the text above, this wins:
    --gfxoff-disallow --compute-corpus --psp-state`.
 3. Shut down fully and return to the normal EFI.
 
+#### Revision: the submission region's read-only check (after boot 44)
+
+Boot 44 (log below) stopped at the gfx check with `register-not-allowed`,
+before any GC write. The kext's `withCarveoutMemory`, which maps a carveout
+range read-only for a stability checksum, accepts only the ranges in its own
+allowlist, and `kSubmitPhysical` was not in it.
+
+- **Fix:** `kSubmitPhysical` is added to that allowlist. Its size is still
+  bounded by the call (`kSubmitSize`), and nothing else changes.
+- **Test:** `tests/test_kext.py` now requires every range passed to
+  `withCarveoutMemory` to be in the helper's allowlist. It fails on the boot
+  44 source.
+- **Checks:** every module except `tests/test_core.py`'s mutants (the change
+  is outside `driver/core/`), and the core's unit tests. 84 tests, OK.
+- The boot 44 builds are kept as `superseded-*-stage23-carveout`.
+
+**Boot steps (boot 45):** as for boot 44, with `boot-45-stage23`.
+
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 
 **Approved by the user on 2026-10-22, together with the AGENTS.md exception,
@@ -6718,6 +6736,26 @@ boot-43-stage22 --gfxoff-disallow --gfx-compute --psp-state`; diag v19,
     - doorbells and interrupts from the MEC;
     - the graphics CP (still the stall from boots 32–38).
 - Captures are in ignored `out/test-efi/boot-43-stage22/`.
+
+**Boot 44, 2026-10-30, stage 23**
+(`out/test-efi/usb-stage23`; cold boot; `tools/capture_boot.sh
+boot-44-stage23 --gfxoff-disallow --compute-corpus --psp-state`; diag v20,
+**exit 1**).
+
+- **GfxOff disallow, ring creation and `SETUP_TMR` (fence 1): ok.**
+- **gfx 1/7 check: `register-not-allowed`, before any GC write.** The kext's
+  `withCarveoutMemory` holds its own allowlist of the physical ranges it may
+  map read-only. Stage 23 added the submission region's checksum to the
+  check but not `kSubmitPhysical` to that allowlist, so the check refused
+  before reading the region. Nothing was written to the GC: the snapshot
+  printed as in boot 43 (`GRBM_STATUS` `0x00003028`, `CP_MEC_CNTL`
+  `0x50000000`, `GRBM_GFX_CNTL` 0).
+- **The PSP teardown fenced** (`DESTROY_TMR` fence 2, rings destroyed).
+- **Cause:** an adapter defect, not a hardware result. The core's tests do
+  not reach the kext's helper, and `tests/test_kext.py` pinned the old
+  allowlist text. Fixed within the stage; see "Revision: the submission
+  region's read-only check (after boot 44)".
+- Captures are in ignored `out/test-efi/boot-44-stage23/`.
 
 ## Unknowns and limits
 

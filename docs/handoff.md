@@ -254,8 +254,11 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    2026-10-30 (test-boot.md, "Stage 23 implementation"): five MSL kernels
    from `shaders/corpus/`, built by `tools/build_corpus.py`, each submitted
    with its own grid, buffers and `RELEASE_MEM` fence in one session.
-   **Next: boot 44** (`tools/update_stick.sh 23`, then
-   `tools/capture_boot.sh boot-44-stage23 --gfxoff-disallow
+   Boot 44 (2026-10-30) stopped at the gfx check before any GC write: the
+   kext's read-only carveout helper did not allow the submission region
+   (fixed within the stage, "Revision: the submission region's read-only
+   check"). **Next: boot 45** (`tools/update_stick.sh 23`, then
+   `tools/capture_boot.sh boot-45-stage23 --gfxoff-disallow
    --compute-corpus --psp-state`). A compute queue on the MEC, brought up like Linux's
    KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
    polling), runs a ring test and dispatches the `store_index` kernel that
