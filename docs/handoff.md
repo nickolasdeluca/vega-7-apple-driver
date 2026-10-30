@@ -263,8 +263,11 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    check"). **Boot 45 (2026-10-30): stage 23 succeeded** (exit 0). All five
    kernels gave exact results, fences 1–5 landed in order, the read pointer
    ended at 896, and the restore left the GC idle. The user chose user VMIDs before M2
-   (2026-10-30). **Next: the user's approval of "Stage 24: a user VMID with
-   its own page table, and uploaded code"** (test-boot.md). A compute queue on the MEC, brought up like Linux's
+   (2026-10-30). "Stage 24: a user VMID with its own page table, and uploaded
+   code" was approved and implemented 2026-10-30 (test-boot.md, "Stage 24
+   implementation"). **Next: boot 46**, `tools/update_stick.sh 24`, then
+   `tools/capture_boot.sh boot-46-stage24 --gfxoff-disallow --compute-vm
+   --psp-state` on the stick. A compute queue on the MEC, brought up like Linux's
    KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
    polling), runs a ring test and dispatches the `store_index` kernel that
    Apple's frontend and our lowering produced; see "Stage 22: a compute queue

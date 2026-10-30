@@ -4585,7 +4585,7 @@ allowlist, and `kSubmitPhysical` was not in it.
 
 **Boot steps (boot 45):** as for boot 44, with `boot-45-stage23`.
 
-### Stage 24: a user VMID with its own page table, and uploaded code (proposed 2026-10-30; needs approval)
+### Stage 24: a user VMID with its own page table, and uploaded code (approved 2026-10-30)
 
 **Goal.** Run compute work under a VMID other than 0, translated by a page
 table the driver builds. Each submission then reaches only the pages the
@@ -4835,6 +4835,131 @@ end `0xa4b4`, engine 17 request `0xa2d0` and ACK `0xa318`, L1 TLB
 - Scratch and private memory, the IH ring for VM faults, doorbells and MEC
   interrupts.
 - The Metal bundle (M2), which this stage prepares.
+
+#### Stage 24 implementation (2026-10-30)
+
+Implemented as proposed, with these choices and deviations:
+
+- **Where the check runs.** `checkVmBoot` runs inside the gfx check, after
+  `checkGfxBoot` and before any write, and keeps its reading
+  (`VmSnapshot`). The one exception is VMID 1's `SH_MEM_CONFIG` and
+  `SH_MEM_BASES`. They can only be read with VMID 1 selected, which is a
+  `GRBM_GFX_CNTL` write, so the VM start reads them under that selection
+  before writing them. The kext adds `kGfxExpectCount` to a VM check's
+  index, so the tool can tell the two lists apart.
+- **One kind of session per load.** The VM start needs a passing compute
+  ring test and no corpus submission (`kGfxComputeTested`). After it, the
+  corpus selector refuses, and data writes and reads stay allowed.
+- **Uploaded code:** slots 5–15 (`kDiagnosticComputeCode`) accept any words,
+  from stage 24 only. Slots 0–4 still accept only the corpus as built, so a
+  stage 23 session cannot run uploaded code. Uploaded code runs only at
+  VMID 1, because only `submitVm` points `COMPUTE_PGM` at a slot above 4,
+  and only through the VMID 1 window.
+- **Per submission:** the core writes the submission's page, then all 256
+  PTEs (its code slot, its page and its buffers' pages valid, everything
+  else 0), then flushes VMID 1 through engine 17. Only after the ACK does it
+  write and commit the 32-dword frame. A flush without an ACK returns
+  `vm-flush-timeout` before the frame, so nothing runs on stale PTEs.
+- **The report** (`VmReport`) holds:
+  - the fence and the read pointer;
+  - the refusal and its buffer index;
+  - `VM_L2_PROTECTION_FAULT_STATUS` and the fault address;
+  - the number of non-zero words in the default page;
+  - the compute state.
+- **The restore** (`restoreVm`, before stage 22's queue restore):
+  1. context 1 back to its reading;
+  2. a VMID 1 flush, while L2 is still on;
+  3. VMID 1's `SH_MEM_*` back, under its selection;
+  4. `kVmWrites` in reverse;
+  5. `FaultCntl | 1`, which clears the latched fault, then `FaultCntl` as
+     read;
+  6. everything read back. Index `i` < 19 is a `kVmWrites` entry, 19 the
+     fault control, 20 and 21 `SH_MEM_*`. A flush timeout is reported last,
+     after everything else is restored.
+- **Allowlists:** `vmWriteAllowed` admits only:
+  - each `kVmWrites` register's reading or its masked value;
+  - the fault control as read or with bit 0;
+  - `kVmInvalidateReq` to engine 17;
+  - `GRBM_GFX_CNTL` selecting VMID 1;
+  - VMID 1's `SH_MEM_*` values, once read.
+
+  `vmTableWriteAllowed` admits 0 or `vmPte(page)` in each table half. The
+  kext's `registerWrite` checks `vmWriteAllowed` independently, with the
+  page set only. The work-area mapping grows to `gfxWorkSize(stage)`
+  (48 KiB at stage 24). There are 13 write sites; the new one is
+  `writeVmRegister`.
+- **Interface:** diagnostic version 21. The new selectors are:
+  - 59, `ComputeVmStart`: writes made, index and value, with a
+    `ComputeState`;
+  - 60, `ComputeCode`: slot, byte offset and chunk;
+  - 61, `ComputeVmSubmit`: a `VmRequest` in, a `VmReport` out.
+- **`saxpy`:** `shaders/upload/saxpy.metal` (`constant float &a`, x, y).
+  `tools/build_corpus.py` builds it into `tools/diag/cezanne_upload.h`,
+  which the kext never includes. It is 32 dwords, `RSRC1` `0x00af0040`,
+  `RSRC2` `0x00000090`, properties `0xb`.
+- **Tool:** `cezanne-diag --compute-vm` (stage 24, `pspSdma` mode 9) runs
+  stage 22's steps through the ring test, then:
+  1. the VM start;
+  2. the code (the corpus into slots 5–9, `saxpy` into slot 10) and the data
+     (stage 23's plan, plus `saxpy`'s a, x and y at `+0x8a000`, `+0x8b000`
+     and `+0x8c000`);
+  3. eight submissions:
+     - 1–5: the corpus;
+     - 6: `saxpy` (4 × 256, y = 2i + 1);
+     - 7: the fault probe. `store_index` runs 2048 threads with one page at
+       `+0`. Before it, that page is cleared and the next page (mapped by
+       submission 1, so a stale TLB entry would let writes land there) is
+       filled with `0xc0ffee00`. It passes when the first 1024 outputs are
+       exact, the canary is intact, and a fault is latched for VMID 1;
+     - 8: `store_index` again (16 × 64 at `+0x8d000`), after the fault;
+  4. the restore and the teardown.
+
+  Each output is checked on the CPU. Submissions 1–6 must leave the fault
+  status 0.
+- **Tests:**
+  - the core's fake GC hub banks `SH_MEM_*` per VMID 1, models the engine 17
+    ACK (which empties its TLB for VMID 1) and the fault clear, and
+    translates VMID 1 through context 1 and a TLB filled from the table;
+  - a fault latches the status once and redirects to the default page. The
+    fake does not model the PTE access bits (a write to a read-only page),
+    which the proposal listed; on hardware the probe writes only to an
+    unmapped page, so it does not depend on them;
+  - the fake MEC runs an `INDIRECT_BUFFER` at VMID 1, fetching it through
+    the hub. Corpus kernels are recognised by their code at the `PGM`
+    address. The fake does not run `saxpy` (unknown code still fences), so
+    its result is checked only on hardware;
+  - cases:
+    - the constants;
+    - every refusal;
+    - the PTEs and the table writes;
+    - the frame and page words;
+    - the allowlists;
+    - each check refusal;
+    - a whole session: the corpus exact at VMID 1, unknown code, the fault
+      probe with its canary on a page still in the TLB from submission 1,
+      store_index after the fault, a ninth submission refused;
+    - the restore and its read-back;
+    - a flush without an ACK;
+    - a register that does not restore;
+    - stage 23 unable to do any of it;
+  - 16 new mutants in `tests/test_core.py`. They cover:
+    - the flush;
+    - the ACK timeout;
+    - the table allowlist;
+    - the three descriptor refusals;
+    - page overlap and alignment;
+    - engine 17's request value;
+    - the stage gate;
+    - the restore read-back, fault clear and `SH_MEM` restore;
+    - the check;
+    - unmapped PTEs;
+    - the default-page count.
+
+**Boot steps (boot 46):**
+1. `tools/update_stick.sh 24`, then shut down fully and boot the stick.
+2. In macOS on the stick: `tools/capture_boot.sh boot-46-stage24
+   --gfxoff-disallow --compute-vm --psp-state`.
+3. Shut down fully and return to the normal EFI.
 
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 

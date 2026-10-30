@@ -70,8 +70,10 @@ python3 tools/build_corpus.py [--from-metal] [--check]
 
 Builds stage 23's kernel corpus (`shaders/corpus/*.metal`, with Apple's AIR
 checked in as `*.ll`) through `air_lower.py` and LLVM 20.1.7 into
-`driver/core/cezanne_corpus.h`. `--from-metal` regenerates the AIR first
-(needs the Metal Toolchain); `--check` compares instead of writing.
+`driver/core/cezanne_corpus.h`, and stage 24's uploaded kernels
+(`shaders/upload/`) into `tools/diag/cezanne_upload.h`, which only the tool
+uses. `--from-metal` regenerates the AIR first (needs the Metal Toolchain);
+`--check` compares instead of writing.
 
 ## Check firmware headers
 
@@ -125,7 +127,11 @@ brings up a compute queue on the MEC, runs a ring test and dispatches the
 `store_index` kernel lowered from Apple's AIR, checks its 256 outputs and
 restores; `--compute-corpus` (stage 23) runs stage 22's steps through the
 ring test, then submits the five corpus kernels one by one, each with its
-own grid, buffers and fence, checks every output on the CPU and restores.
+own grid, buffers and fence, checks every output on the CPU and restores;
+`--compute-vm` (stage 24) runs stage 22's steps through the ring test, then
+enables the GC hub's VM for VMID 1 with a flat page table over the
+submission region, uploads the corpus and `saxpy`, runs them at VMID 1 as
+indirect buffers, then a fault probe, checks every output and restores.
 Building the kext needs that firmware in ignored
 `out/firmware-provenance/fw/` (see
 [firmware provenance](docs/firmware-provenance.md)).

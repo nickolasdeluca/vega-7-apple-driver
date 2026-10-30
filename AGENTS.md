@@ -71,7 +71,11 @@ Experimental booting is available only through the USB test EFI in
   23, approved 2026-10-30, stage 22 through its ring test, then up to five
   submissions of kernels from the embedded corpus, each with its own grid,
   buffers and fence in a checked 1 MiB carveout region, then every register
-  written back, on request).
+  written back, on request; and stage 24, approved 2026-10-30, stage 22
+  through its ring test, then the GC hub's VM enabled for VMID 1 with a flat
+  page table over that region, code uploaded by the tool into its code slots,
+  up to eight submissions run at VMID 1 as indirect buffers (one a fault
+  probe), then VMID 1's VM and every register written back, on request).
   Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS
