@@ -261,7 +261,7 @@ void f(IOPCIDevice *p, Aperture *a) {
                       "        physical != cezanne::kPspTmrPhysical && physical != cezanne::kSdmaFwPhysical &&\n"
                       "        physical != cezanne::kSdmaWorkPhysical && physical != cezanne::kGartWorkPhysical &&\n"
                       "        physical != cezanne::kPatternPhysical && physical != cezanne::kGfxFwPhysical &&\n"
-                      "        physical != cezanne::kGfxWorkPhysical) {", source)
+                      "        physical != cezanne::kGfxWorkPhysical && physical != cezanne::kSubmitPhysical) {", source)
         self.assertEqual(sorted(re.findall(r"withCarveoutMemory\(cezanne::(\w+), cezanne::(\w+),", source)),
                          [("kGartWorkPhysical", "kGartWorkCheckSize"), ("kGartWorkPhysical", "kGartWorkCheckSize"),
                           ("kGartWorkPhysical", "kGartWorkCheckSize"), ("kGartWorkPhysical", "kGartWorkCheckSize"),
@@ -281,6 +281,11 @@ void f(IOPCIDevice *p, Aperture *a) {
                           ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"),
                           ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"),
                           ("kSubmitPhysical", "kSubmitSize")])
+        # Boot 44: every region checked must also be in the helper's own
+        # allowlist, or the check refuses before it reads.
+        helper = re.search(r"static cezanne::Status withCarveoutMemory\(.*?\n}\n", source, re.S).group(0)
+        for physical in set(re.findall(r"withCarveoutMemory\(cezanne::(\w+),", source)):
+            self.assertIn("physical != cezanne::%s" % physical, helper)
         # A PSP ring created by a connection is destroyed if it closes early.
         abandon = re.search(r"void CezanneGPU::scratchAbandon\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("pspDestroyLocked(&response, &mailbox)", abandon)

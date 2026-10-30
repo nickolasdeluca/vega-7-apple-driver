@@ -1144,7 +1144,7 @@ template <typename Check> static cezanne::Status withCarveoutMemory(UInt64 physi
         physical != cezanne::kPspTmrPhysical && physical != cezanne::kSdmaFwPhysical &&
         physical != cezanne::kSdmaWorkPhysical && physical != cezanne::kGartWorkPhysical &&
         physical != cezanne::kPatternPhysical && physical != cezanne::kGfxFwPhysical &&
-        physical != cezanne::kGfxWorkPhysical) {
+        physical != cezanne::kGfxWorkPhysical && physical != cezanne::kSubmitPhysical) {
         return cezanne::kRegisterNotAllowed;
     }
     IODeviceMemory *memory = IODeviceMemory::withRange(physical, length);
