@@ -1385,8 +1385,8 @@ void printComputeState(const ComputeState &state)
     for (uint32_t i = 0; i < kComputeGlobalStateCount; i++)
         std::printf("    %-30s 0x%08x%s", registerName(kComputeGlobalStateRegisters[i]), state.global[i],
                     i % 2 == 1 || i + 1 == kComputeGlobalStateCount ? "\n" : "");
-    std::printf("    write-back: read pointer %u, poll %u, fence 3 %u, fence 4 %u\n", state.rptr, state.poll,
-                state.fence3, state.fence4);
+    std::printf("    write-back: read pointer %u, poll %u, fence 3 %u, fence 4 %u, fence 5 %u\n", state.rptr,
+                state.poll, state.fence3, state.fence4, state.fence5);
 }
 
 // Stage 22 after the RLC start: the compute queue, its ring test, the
@@ -1419,7 +1419,7 @@ bool computeQueue(io_connect_t connection)
     if (ok) {
         uint64_t test[5] = {};
         step("gfx 5/7 compute ring test: SCRATCH_REG0 <- 0xCAFEDEAD; frame 1 (SET_UCONFIG_REG SCRATCH_REG0\n"
-             "  0xDEADBEEF, fence 3) committed by the polled write pointer (method A), then, if the queue's read\n"
+             "  0xDEADBEEF, fence 3 by WRITE_DATA) committed by the polled write pointer (method A), then, if the queue's read\n"
              "  pointer has not moved, also by CP_HQD_PQ_WPTR_LO (method B)");
         ok = callReport(connection, kDiagnosticComputeTest, test, 5, &state);
         if (ok) {
@@ -1436,7 +1436,8 @@ bool computeQueue(io_connect_t connection)
         uint64_t dispatch[5] = {};
         step("gfx 6/7 dispatch: frame 2 (SET_SH_REG COMPUTE_*: code 0xf440a08000, RSRC1 0x00af0040, RSRC2 0x90,\n"
              "  64x1x1 threads, user data: dispatch packet and kernarg; DISPATCH_DIRECT 4x1x1; CS partial flush;\n"
-             "  fence 4); then the output at 0xf440a09000 must read 0..255");
+             "  fence 4 by WRITE_DATA; fence 5 by RELEASE_MEM, the end-of-pipe probe); then the output at\n"
+             "  0xf440a09000 must read 0..255, read even without fence 4");
         ok = callReport(connection, kDiagnosticComputeDispatch, dispatch, 5, &state);
         if (ok) {
             std::printf("%s, fence 4 = %llu, %llu wrong outputs", statusName(static_cast<Status>(dispatch[0])),
