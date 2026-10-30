@@ -172,6 +172,8 @@ struct FakeRegisters {
     bool mecIgnoresPoll = false;     // the MEC never reads the poll address (method A fails)
     bool mecHang = false;            // the MEC never fetches
     bool kernelWrong = false;        // the kernel stores its index plus one
+    bool eopHang = false;            // RELEASE_MEM's end-of-pipe event never retires (boot 41)
+    bool dispatchHang = false;       // DISPATCH_DIRECT never completes: nothing after it runs
     uint32_t hqdStuck = 0;           // a per-queue register whose writes are lost
     static bool perQueue(uint32_t offset)
     {
@@ -183,7 +185,6 @@ struct FakeRegisters {
     void presetCompute()
     {
         gc[kRegRlcCpSchedulers] = 0x12345600; // another field the RMW must keep
-        gc[kRegCpPqWptrPollCntl] = 0x00000001; // PERIOD
         gc[kRegShMemConfig] = 0x00001001;      // RETRY_DISABLE and ADDRESS_MODE as read
         gc[kRegShMemBases] = 0x00010002;
         gc[kRegCpCpcBusyStat] = gc[kRegCpCpcStalledStat1] = 0;
@@ -193,6 +194,7 @@ struct FakeRegisters {
         hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdEopControl] = 0x00000040;
         hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdPersistentState] = 0x00000001;
         hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdPqDoorbellControl] = 0x40000000;
+        hqd[(uint64_t(kComputeSelect) << 32) | kRegCpPqWptrPollCntl] = 0x00000001; // PERIOD
     }
     void presetGfx()
     {
@@ -1100,7 +1102,8 @@ struct FakeWriter {
     // The MEC on the KIQ slot (ME 2, pipe 1, queue 0): runs the ring from the
     // queue's read pointer to its write pointer, which it takes from the poll
     // address (if polling is on) or CP_HQD_PQ_WPTR_LO. SET_UCONFIG_REG
-    // (SCRATCH_REG0), SET_SH_REG, RELEASE_MEM, and DISPATCH_DIRECT, which runs
+    // (SCRATCH_REG0), SET_SH_REG, WRITE_DATA to memory, RELEASE_MEM (unless
+    // its event hangs, as on boot 41), and DISPATCH_DIRECT, which runs
     // store_index the way its code does: the workgroup size from the dispatch
     // packet (USER_DATA 4-5), the output address from kernarg (6-7).
     static void runMec(FakeRegisters *r)
@@ -1114,7 +1117,7 @@ struct FakeWriter {
             return;
         uint32_t *m = r->gfxWork->words;
         uint32_t to = q(kRegCpHqdPqWptrLo);
-        if ((r->gc[kRegCpPqWptrPollCntl] & kCpPqWptrPollEn) != 0 && !r->mecIgnoresPoll)
+        if ((q(kRegCpPqWptrPollCntl) & kCpPqWptrPollEn) != 0 && !r->mecIgnoresPoll)
             to = std::max(to, m[(kComputeWbPage + kComputeWbPoll) / 4]);
         uint32_t from = q(kRegCpHqdPqRptr);
         if (to <= from) return;
@@ -1134,7 +1137,10 @@ struct FakeWriter {
                 r->gc[kRegScratchReg0] = ring(d + 2);
             } else if (op == kPm4SetShReg) {
                 for (uint32_t k = 0; k + 2 < length; k++) r->sh[kSetShRegStart + ring(d + 1) + k] = ring(d + 2 + k);
-            } else if (op == kPm4ReleaseMem) {
+            } else if (op == kPm4WriteData && ring(d + 1) == kWriteDataMemory) {
+                uint32_t *word = at((uint64_t(ring(d + 3)) << 32) | ring(d + 2));
+                if (word != nullptr) *word = ring(d + 4);
+            } else if (op == kPm4ReleaseMem && !r->eopHang) {
                 uint32_t *word = at((uint64_t(ring(d + 4)) << 32) | ring(d + 3));
                 if (word != nullptr) *word = ring(d + 5);
             } else if (op == kPm4DispatchDirect && r->sh[kShComputePgmLo] == uint32_t(kComputeCodeGpuAddress >> 8) &&
@@ -1151,6 +1157,11 @@ struct FakeWriter {
                             if (word != nullptr) *word = r->kernelWrong ? id + 1 : id;
                         }
                     }
+                }
+                if (r->dispatchHang) {
+                    r->hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdPqRptr] = d + length;
+                    r->mecHang = true; // and stays there
+                    return;
                 }
             }
             d += length;
@@ -3473,7 +3484,7 @@ struct ComputeRig {
 static void testCompute()
 {
     // The pinned values (docs/test-boot.md, stage 22).
-    CHECK(kMaxStage == 22 && kComputeStage == 22 && kDiagnosticSelectorCount == 56 && kDiagnosticVersion == 18);
+    CHECK(kMaxStage == 22 && kComputeStage == 22 && kDiagnosticSelectorCount == 56 && kDiagnosticVersion == 19);
     CHECK(kRegCpHqdActive == 0xC91Cu && kRegCpPqWptrPollCntl == 0xC20Cu && kRegShMemConfig == 0x8C34u &&
           kRegRlcCpSchedulers == 0x3B2A8u && kRegCpHqdPqWptrLo == 0xC9ECu && kRegCpHqdEopControl == 0xC9B0u);
     CHECK(kComputeWorkSize <= kGfxWorkCheckSize && kComputeRingPage == kGfxWorkSize && kComputeCodePage % 256 == 0);
@@ -3488,10 +3499,11 @@ static void testCompute()
         CHECK(paged);
         CHECK(registerAllowed(offset, 22) && !registerAllowed(offset, 21) && gfxGated(offset));
     }
-    // The ring: the ring test and fence 3, then the dispatch and fence 4.
-    const uint32_t test[] = {0xC0017900u, 0x40, 0xDEADBEEFu, 0xC0064900u, 0x00238514u, 0x20000000u, 0x40A07100u, 0xF4, 3};
-    for (uint32_t i = 0; i < 9; i++) CHECK(computeRingWord(i) == test[i]);
-    CHECK(computeRingWord(11) == pm4(kPm4Nop, 64 - 11 - 2));
+    // The ring: the ring test and fence 3 (the KIQ's WRITE_DATA), then the
+    // dispatch, fence 4 the same way, and fence 5 by RELEASE_MEM.
+    const uint32_t test[] = {0xC0017900u, 0x40, 0xDEADBEEFu, 0xC0033700u, 0x00100500u, 0x40A07100u, 0xF4, 3};
+    for (uint32_t i = 0; i < 8; i++) CHECK(computeRingWord(i) == test[i]);
+    CHECK(computeRingWord(8) == pm4(kPm4Nop, 64 - 8 - 2));
     CHECK(computeRingWord(64) == 0xC0017600u && computeRingWord(65) == 0x216 && computeRingWord(66) == 0xffffffffu);
     CHECK(computeRingWord(68) == 0x20C && computeRingWord(69) == 0xF440A080u && computeRingWord(70) == 0); // PGM_HI: (address >> 8) >> 32
     CHECK(computeRingWord(73) == kComputePgmRsrc1 && computeRingWord(74) == kComputePgmRsrc2);
@@ -3499,7 +3511,11 @@ static void testCompute()
     while (computeRingWord(dispatchAt) != pm4(kPm4DispatchDirect, 3)) dispatchAt++;
     CHECK(computeRingWord(dispatchAt + 1) == 4 && computeRingWord(dispatchAt + 4) == kDispatchInitiator);
     CHECK(computeRingWord(dispatchAt + 5) == 0xC0004600u && computeRingWord(dispatchAt + 6) == 0x407);
-    CHECK(computeRingWord(dispatchAt + 10) == 0x40A07108u && computeRingWord(dispatchAt + 12) == 4);
+    CHECK(computeRingWord(dispatchAt + 7) == 0xC0033700u && computeRingWord(dispatchAt + 8) == 0x00100500u &&
+          computeRingWord(dispatchAt + 9) == 0x40A07108u && computeRingWord(dispatchAt + 11) == 4);
+    CHECK(computeRingWord(dispatchAt + 12) == 0xC0064900u && computeRingWord(dispatchAt + 13) == 0x00238514u &&
+          computeRingWord(dispatchAt + 15) == 0x40A07110u && computeRingWord(dispatchAt + 17) == 5 &&
+          computeRingWord(dispatchAt + 20) == pm4(kPm4Nop, kComputeFrameStarts[2] - (dispatchAt + 20) - 2));
     for (uint32_t d = 0, f = 1; d < kComputeFrameStarts[2];) {
         d += ((computeRingWord(d) >> 16) & 0x3fff) + 2;
         if (d >= kComputeFrameStarts[f]) CHECK(d == kComputeFrameStarts[f++]);
@@ -3526,7 +3542,7 @@ static void testCompute()
               !computeWriteAllowed(kRegRlcCpSchedulers, 0x020000c9u, 22, &snap) &&
               !computeWriteAllowed(kRegRlcCpSchedulers, 0x02000048u, 21, &snap) &&
               !computeWriteAllowed(kRegRlcCpSchedulers, 0x02000048u, 22, nullptr));
-        CHECK(computeWriteAllowed(kRegCpMecCntl, 0x06000000u & ~kCpMecHalts, 22, &snap) &&
+        CHECK(computeWriteAllowed(kRegCpMecCntl, 0x05000000u & ~kCpMecHalts, 22, &snap) &&
               !computeWriteAllowed(kRegCpMecCntl, 0x12345678u, 22, &snap));
         CHECK(computeWriteAllowed(kRegCpHqdActive, 1, 22, &snap) && computeWriteAllowed(kRegCpHqdActive, 0, 22, &snap) &&
               !computeWriteAllowed(kRegCpHqdActive, 3, 22, &snap));
@@ -3547,7 +3563,8 @@ static void testCompute()
               c.q(kRegCpHqdEopControl) == 0x49 && c.q(kRegCpHqdPersistentState) == 0x5301 &&
               c.q(kRegCpHqdPqDoorbellControl) == 0 && c.q(kRegCpHqdEopBaseAddr) == 0xF440A060u &&
               c.q(kRegCpMqdBaseAddr) == 0x40A05000u && c.q(kRegCpHqdPqWptrPollAddr) == 0x40A07008u);
-        CHECK(c.g.r.gc[kRegRlcCpSchedulers] == 0x123456c8u && c.g.r.gc[kRegCpPqWptrPollCntl] == 0x80000001u &&
+        CHECK(c.g.r.gc[kRegRlcCpSchedulers] == 0x123456c8u && c.q(kRegCpPqWptrPollCntl) == 0x80000001u &&
+              c.g.r.hqd[kRegCpPqWptrPollCntl] == 0 && // not selected: another bank, as boot 41 read it
               c.g.r.gc[kRegShMemConfig] == 0x00001018u && c.g.r.gc[kRegShMemBases] == 0 &&
               c.g.r.gc[kRegCpMecCntl] == 0 && (c.g.r.gc[kRegGrbmGfxCntl] & kGrbmGfxCntlMask) == 0);
         // The selection was set for the queue's writes only.
@@ -3560,7 +3577,8 @@ static void testCompute()
         ComputeState state;
         CHECK(readComputeState(c.g.r.reader(), 0x80000, c.g.w.writer(), c.g.gfxWork.reader(), 22, c.g.snapshot,
                                &c.snapshot, &state) == kOK);
-        CHECK(state.queue[0] == 1 && state.queue[1] == 256 && state.fence3 == 3 && state.fence4 == 4 && state.poll == 256);
+        CHECK(state.queue[0] == 1 && state.queue[1] == 256 && state.fence3 == 3 && state.fence4 == 4 &&
+              state.fence5 == 5 && state.poll == 256);
         CHECK(c.restore(&index, &value) == kOK && index == 0 && value == 0);
         for (uint32_t i = 0; i < kComputeQueueCount; i++) CHECK(c.q(kComputeQueueRegisters[i]) == c.snapshot.queue[i]);
         for (uint32_t i = 0; i < kComputeGlobalCount; i++)
@@ -3578,6 +3596,35 @@ static void testCompute()
         CHECK(c.test(&scratch, &fence, &rptr, &commit) == kOK && commit == kCommitRegister && fence == 3);
         uint32_t wrong = 9, first = 9, firstValue = 9;
         CHECK(c.dispatch(commit, &fence, &wrong, &first, &firstValue) == kOK && wrong == 0);
+        CHECK(c.restore(&index, &value) == kOK);
+    }
+    {
+        // Boot 41: RELEASE_MEM's event never retires. The WRITE_DATA fences
+        // and the output do not depend on it; fence 5 shows it.
+        ComputeRig c;
+        c.g.r.eopHang = true;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, index = 0, value = 0, scratch = 0, fence = 0, rptr = 0, commit = 0;
+        CHECK(c.start(&writes, &index, &value) == kOK);
+        CHECK(c.test(&scratch, &fence, &rptr, &commit) == kOK && fence == 3 && commit == kCommitPoll);
+        uint32_t wrong = 9, first = 9, firstValue = 9;
+        CHECK(c.dispatch(commit, &fence, &wrong, &first, &firstValue) == kOK && fence == 4 && wrong == 0);
+        ComputeState state;
+        CHECK(readComputeState(c.g.r.reader(), 0x80000, c.g.w.writer(), c.g.gfxWork.reader(), 22, c.g.snapshot,
+                               &c.snapshot, &state) == kOK);
+        CHECK(state.fence4 == 4 && state.fence5 == 0);
+        CHECK(c.restore(&index, &value) == kOK);
+    }
+    {
+        // A dispatch that never completes after writing its output: no fence
+        // 4, and the output is still read and reported.
+        ComputeRig c;
+        c.g.r.dispatchHang = true;
+        CHECK(c.rlc() == kOK);
+        uint32_t writes = 0, index = 0, value = 0, scratch = 0, fence = 0, rptr = 0, commit = 0;
+        CHECK(c.start(&writes, &index, &value) == kOK && c.test(&scratch, &fence, &rptr, &commit) == kOK);
+        uint32_t wrong = 9, first = 9, firstValue = 9;
+        CHECK(c.dispatch(commit, &fence, &wrong, &first, &firstValue) == kGfxFenceTimeout && fence == 0 && wrong == 0);
         CHECK(c.restore(&index, &value) == kOK);
     }
     {
@@ -3638,7 +3685,7 @@ static void testCompute()
         uint32_t writes = 0, index = 0, value = 0, scratch = 0, fence = 0, rptr = 0, commit = 0;
         CHECK(c.start(&writes, &index, &value) == kOK && c.test(&scratch, &fence, &rptr, &commit) == kOK);
         c.g.r.hqdStuck = kRegCpHqdEopBaseAddr;
-        CHECK(c.restore(&index, &value) == kGfxNotRestored && index == 0 && value == 0xF440A060u);
+        CHECK(c.restore(&index, &value) == kGfxNotRestored && index == 1 && value == 0xF440A060u);
         CHECK(c.g.r.gc[kRegCpMecCntl] == kCpMecHalts && (c.g.r.gc[kRegGrbmGfxCntl] & kGrbmGfxCntlMask) == 0);
     }
 }

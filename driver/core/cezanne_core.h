@@ -1399,7 +1399,7 @@ const uint32_t kComputeRingPage = 0x4000, kComputeMqdPage = 0x5000, kComputeEopP
                kComputeWbPage = 0x7000, kComputeCodePage = 0x8000, kComputeOutPage = 0x9000;
 const uint32_t kComputeWorkSize = 0xa000;
 const uint32_t kComputeWbRptr = 0x000, kComputeWbPoll = 0x008, kComputeWbFence3 = 0x100, kComputeWbFence4 = 0x108,
-               kComputeWbPacket = 0x200, kComputeWbKernarg = 0x300;
+               kComputeWbFence5 = 0x110, kComputeWbPacket = 0x200, kComputeWbKernarg = 0x300;
 const uint64_t kComputeRingGpuAddress = kGfxWorkGpuAddress + kComputeRingPage;
 const uint64_t kComputeMqdGpuAddress = kGfxWorkGpuAddress + kComputeMqdPage;
 const uint64_t kComputeEopGpuAddress = kGfxWorkGpuAddress + kComputeEopPage;
@@ -1410,13 +1410,18 @@ const uint64_t kComputeKernargGpuAddress = kGfxWorkGpuAddress + kComputeWbPage +
 const uint64_t kComputeCodeGpuAddress = kGfxWorkGpuAddress + kComputeCodePage;
 const uint64_t kComputeOutGpuAddress = kGfxWorkGpuAddress + kComputeOutPage;
 const uint32_t kComputeRingDwords = 1024; // 4 KiB: QUEUE_SIZE 9
-const uint32_t kComputeFrameStarts[] = {0, 64, 256}; // frame 1: ring test and fence 3; frame 2: the dispatch
+// Frame 1: the ring test and fence 3; frame 2: the dispatch, fence 4, and
+// fence 5 by RELEASE_MEM (the end-of-pipe probe, boot 41).
+const uint32_t kComputeFrameStarts[] = {0, 64, 256};
 const uint32_t kComputeGroups = 4, kComputeGroupSize = 64, kComputeOutDwords = kComputeGroups * kComputeGroupSize;
 const uint32_t kComputeOutBefore = 0xffffffff;
 
 // PM4 (soc15d.h, v6.12) for the dispatch, as gfx_v9_0_do_edc_gpr_workarounds
 // emits it.
 const uint32_t kPm4DispatchDirect = 0x15, kPm4EventWrite = 0x46, kPm4SetShReg = 0x76;
+// gfx_v9_0_ring_emit_fence_kiq, the KIQ's fence: WRITE_DATA with
+// ENGINE_SEL(0) | DST_SEL(5) (memory) | WR_CONFIRM.
+const uint32_t kPm4WriteData = 0x37, kWriteDataMemory = 0x00100500;
 const uint32_t kSetShRegStart = 0x2c00;     // PACKET3_SET_SH_REG_START (dwords)
 const uint32_t kCsPartialFlush = 0x00000407; // EVENT_TYPE(7) | EVENT_INDEX(4)
 const uint32_t kDispatchInitiator = 0x1;    // COMPUTE_DISPATCH_INITIATOR.COMPUTE_SHADER_EN
@@ -1444,13 +1449,15 @@ const uint32_t kShMemAlignmentUnaligned = 0x00000018, kShMemRetryDisable = 0x000
 const uint32_t kCpHqdActive = 0x1;
 // The registers stage 22 writes that are not per queue, in this order; the
 // compute start reads them (GRBM_GFX_CNTL first, then with it at 0).
-const uint32_t kComputeGlobalRegisters[] = {kRegGrbmGfxCntl, kRegRlcCpSchedulers, kRegCpPqWptrPollCntl,
-                                            kRegShMemConfig, kRegShMemBases, kRegCpMecCntl};
+const uint32_t kComputeGlobalRegisters[] = {kRegGrbmGfxCntl, kRegRlcCpSchedulers, kRegShMemConfig, kRegShMemBases,
+                                            kRegCpMecCntl};
 const uint32_t kComputeGlobalCount = sizeof(kComputeGlobalRegisters) / sizeof(kComputeGlobalRegisters[0]);
 // The per-queue registers, read under the selection, written in
-// kiq_init_register's order and restored in this order.
+// kiq_init_register's order and restored in this order. Boot 41 showed
+// CP_PQ_WPTR_POLL_CNTL is one of them: EN written under the selection reads
+// 0 without it, while the MEC polled.
 const uint32_t kComputeQueueRegisters[] = {
-    kRegCpHqdEopBaseAddr, kRegCpHqdEopBaseAddrHi, kRegCpHqdEopControl, kRegCpHqdPqDoorbellControl,
+    kRegCpPqWptrPollCntl, kRegCpHqdEopBaseAddr, kRegCpHqdEopBaseAddrHi, kRegCpHqdEopControl, kRegCpHqdPqDoorbellControl,
     kRegCpMqdBaseAddr,    kRegCpMqdBaseAddrHi,    kRegCpMqdControl,    kRegCpHqdPqBase,
     kRegCpHqdPqBaseHi,    kRegCpHqdPqControl,     kRegCpHqdPqRptrReportAddr, kRegCpHqdPqRptrReportAddrHi,
     kRegCpHqdPqWptrPollAddr, kRegCpHqdPqWptrPollAddrHi, kRegCpHqdPqWptrLo, kRegCpHqdPqWptrHi,
@@ -1466,13 +1473,13 @@ struct ComputeSnapshot {
 const GfxWrite kComputeGlobalWrites[] = {
     {kRegRlcCpSchedulers, kRlcKiqMask, kComputeKiq},
     {kRegRlcCpSchedulers, kRlcKiqMask, kComputeKiq | kRlcKiqEnable},
-    {kRegCpPqWptrPollCntl, kCpPqWptrPollEn, kCpPqWptrPollEn}, // method A: the MEC polls the write pointer
     {kRegGrbmGfxCntl, kGrbmGfxCntlMask, kComputeSelect},
     {kRegShMemConfig, ~kShMemRetryDisable, kShMemAlignmentUnaligned}, // constants_init, VMID 0
     {kRegShMemBases, 0xFFFFFFFF, 0},
     {kRegCpMecCntl, kCpMecHalts, 0}, // gfx_v9_0_cp_compute_enable(true)
 };
 const GfxWrite kComputeQueueWrites[] = {
+    {kRegCpPqWptrPollCntl, kCpPqWptrPollEn, kCpPqWptrPollEn}, // method A: the MEC polls the write pointer
     {kRegCpHqdEopBaseAddr, 0xFFFFFFFF, uint32_t(kComputeEopGpuAddress >> 8)},
     {kRegCpHqdEopBaseAddrHi, 0xFFFFFFFF, uint32_t(kComputeEopGpuAddress >> 40)},
     {kRegCpHqdEopControl, 0x3f, 9}, // EOP_SIZE: 2^(9+1) dwords, GFX9_MEC_HPD_SIZE
@@ -1506,20 +1513,20 @@ const GfxWrite kComputeQueueExtraWrites[] = {
 };
 // What a stage 22 report shows (ComputeState): per queue (under the
 // selection), then not per queue, then the write-back.
-const uint32_t kComputeQueueStateRegisters[] = {kRegCpHqdActive, kRegCpHqdPqRptr, kRegCpHqdPqWptrLo,
-                                                kRegCpHqdPqControl, kRegCpHqdDequeueRequest};
+const uint32_t kComputeQueueStateRegisters[] = {kRegCpHqdActive,    kRegCpHqdPqRptr,         kRegCpHqdPqWptrLo,
+                                                kRegCpHqdPqControl, kRegCpHqdDequeueRequest, kRegCpPqWptrPollCntl};
 const uint32_t kComputeQueueStateCount =
     sizeof(kComputeQueueStateRegisters) / sizeof(kComputeQueueStateRegisters[0]);
 const uint32_t kComputeGlobalStateRegisters[] = {kRegCpMecCntl,       kRegCpCpcStatus,     kRegCpCpcBusyStat,
-                                                 kRegCpCpcStalledStat1, kRegCpMec1InstrPntr, kRegCpPqWptrPollCntl,
-                                                 kRegRlcCpSchedulers, kRegShMemConfig,    kRegScratchReg0,
+                                                 kRegCpCpcStalledStat1, kRegCpMec1InstrPntr, kRegRlcCpSchedulers,
+                                                 kRegShMemConfig,     kRegScratchReg0,
                                                  kRegGrbmStatus,      kRegCpcUtcl1Status,  kRegGcVmL2ProtectionFaultStatus};
 const uint32_t kComputeGlobalStateCount =
     sizeof(kComputeGlobalStateRegisters) / sizeof(kComputeGlobalStateRegisters[0]);
 struct ComputeState {
     uint32_t queue[kComputeQueueStateCount];
     uint32_t global[kComputeGlobalStateCount];
-    uint32_t rptr, poll, fence3, fence4; // the write-back page
+    uint32_t rptr, poll, fence3, fence4, fence5; // the write-back page
 };
 // How the write pointer reached the MEC (ring test report).
 enum ComputeCommit : uint32_t { kCommitNone = 0, kCommitPoll = 1, kCommitRegister = 2 };
@@ -1777,7 +1784,7 @@ Status readDiagnosticRegister(const RegisterReader &registers, uint64_t aperture
                               uint32_t offset, uint32_t *value);
 
 // Diagnostic interface (IOUserClient selectors and their scalars).
-const uint32_t kDiagnosticVersion = 18;
+const uint32_t kDiagnosticVersion = 19;
 enum DiagnosticSelector : uint32_t {
     kDiagnosticGetInfo = 0,       // out: version, stage
     kDiagnosticReadRegister = 1,  // in: offset; out: Status, value

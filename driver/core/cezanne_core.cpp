@@ -2997,9 +2997,19 @@ Status restoreGfx(const RegisterReader &registers, uint64_t apertureLength, cons
 
 // Stage 22.
 
-// gfx_v9_0_ring_emit_fence on the compute ring: RELEASE_MEM writing seq at a
-// compute write-back offset.
+// gfx_v9_0_ring_emit_fence_kiq: WRITE_DATA writing seq at a compute
+// write-back offset (5 dwords).
 static uint32_t computeFenceWord(uint32_t i, uint32_t at, uint32_t seq)
+{
+    const uint64_t address = kGfxWorkGpuAddress + kComputeWbPage + at;
+    const uint32_t words[] = {pm4(kPm4WriteData, 3), kWriteDataMemory, uint32_t(address), uint32_t(address >> 32), seq};
+    return words[i];
+}
+
+// gfx_v9_0_ring_emit_fence on a compute ring: RELEASE_MEM writing seq at a
+// compute write-back offset once the end-of-pipe event retires (8 dwords).
+// On the KIQ slot it never did in boot 41, so it is a probe after fence 4.
+static uint32_t computeEopFenceWord(uint32_t i, uint32_t at, uint32_t seq)
 {
     const uint64_t address = kGfxWorkGpuAddress + kComputeWbPage + at;
     const uint32_t words[] = {pm4(kPm4ReleaseMem, 6), kReleaseMemEvent, kReleaseMemData, uint32_t(address),
@@ -3009,7 +3019,7 @@ static uint32_t computeFenceWord(uint32_t i, uint32_t at, uint32_t seq)
 
 // Frame 2 before its NOP padding, as gfx_v9_0_do_edc_gpr_workarounds emits a
 // dispatch: the SH registers, DISPATCH_DIRECT, a CS partial flush, then fence
-// 4. Returns the dword count (at most kComputeFrameStarts[2] - [1]).
+// 4 and the end-of-pipe probe, fence 5. Returns the dword count (at most kComputeFrameStarts[2] - [1]).
 static uint32_t computeDispatchWords(uint32_t *w)
 {
     uint32_t n = 0;
@@ -3054,7 +3064,8 @@ static uint32_t computeDispatchWords(uint32_t *w)
     w[n++] = kDispatchInitiator;
     w[n++] = pm4(kPm4EventWrite, 0);
     w[n++] = kCsPartialFlush;
-    for (uint32_t i = 0; i < 8; i++) w[n++] = computeFenceWord(i, kComputeWbFence4, 4);
+    for (uint32_t i = 0; i < 5; i++) w[n++] = computeFenceWord(i, kComputeWbFence4, 4);
+    for (uint32_t i = 0; i < 8; i++) w[n++] = computeEopFenceWord(i, kComputeWbFence5, 5);
     return n;
 }
 
@@ -3064,8 +3075,8 @@ uint32_t computeRingWord(uint32_t dword)
         // Frame 1: gfx_v9_0_ring_test_ring, then fence 3.
         const uint32_t test[] = {pm4(kPm4SetUconfigReg, 1), kRegScratchReg0 / 4 - 0xc000, kScratchRingTest};
         if (dword < 3) return test[dword];
-        if (dword < 11) return computeFenceWord(dword - 3, kComputeWbFence3, 3);
-        return nopWord(dword, 11, kComputeFrameStarts[1]);
+        if (dword < 8) return computeFenceWord(dword - 3, kComputeWbFence3, 3);
+        return nopWord(dword, 8, kComputeFrameStarts[1]);
     }
     if (dword < kComputeFrameStarts[2]) {
         uint32_t words[192]; // kComputeFrameStarts[2] - [1]
@@ -3216,7 +3227,8 @@ Status readComputeState(const RegisterReader &registers, uint64_t apertureLength
         uint32_t at;
         uint32_t *value;
     } words[] = {{kComputeWbRptr, &state->rptr}, {kComputeWbPoll, &state->poll}, {kComputeWbFence3, &state->fence3},
-                 {kComputeWbFence4, &state->fence4}};
+                 {kComputeWbFence4, &state->fence4},
+                   {kComputeWbFence5, &state->fence5}};
     for (const auto &word : words) {
         if (!work.read32(work.context, kComputeWbPage + word.at, word.value)) return kRegisterReadFailed;
     }
@@ -3276,7 +3288,6 @@ Status startCompute(const RegisterReader &registers, uint64_t apertureLength, co
     status = selectQueue(writer, stage, gfxSnapshot, snapshot, true);
     if (status != kOK) return status;
     (*writes)++;
-    status = global(kComputeGlobalWrites[2]);
     for (uint32_t i = 0; status == kOK && i < sizeof(kComputeQueueWrites) / sizeof(kComputeQueueWrites[0]); i++) {
         const GfxWrite &write = kComputeQueueWrites[i];
         status = writeComputeRegister(writer, stage, gfxSnapshot, snapshot, write.offset,
@@ -3288,7 +3299,7 @@ Status startCompute(const RegisterReader &registers, uint64_t apertureLength, co
     if (status != kOK) return status;
     if (back != kOK) return back;
     // constants_init's SH_MEM_* for VMID 0, then gfx_v9_0_cp_compute_enable.
-    for (uint32_t i = 4; status == kOK && i < sizeof(kComputeGlobalWrites) / sizeof(kComputeGlobalWrites[0]); i++)
+    for (uint32_t i = 3; status == kOK && i < sizeof(kComputeGlobalWrites) / sizeof(kComputeGlobalWrites[0]); i++)
         status = global(kComputeGlobalWrites[i]);
     if (status != kOK) return status;
     writer.pause(writer.context); // udelay(50)
@@ -3381,8 +3392,10 @@ Status dispatchCompute(const RegisterReader &, uint64_t, const RegisterWriter &w
     Status status =
         commitCompute(writer, workWriter, stage, gfxSnapshot, snapshot, commit, kComputeFrameStarts[2]);
     if (status != kOK) return status;
-    status = pollWork(work, writer, kComputeWbPage + kComputeWbFence4, 4, kGfxDrawPauses, fence);
-    if (status != kOK) return status;
+    // The output is read even without fence 4: what the kernel wrote is the
+    // finding either way.
+    const Status fenced = pollWork(work, writer, kComputeWbPage + kComputeWbFence4, 4, kGfxDrawPauses, fence);
+    if (fenced == kRegisterReadFailed) return fenced;
     for (uint32_t i = 0; i < kComputeOutDwords; i++) {
         uint32_t value = 0;
         if (!work.read32(work.context, kComputeOutPage + 4 * i, &value)) return kRegisterReadFailed;
@@ -3391,6 +3404,7 @@ Status dispatchCompute(const RegisterReader &, uint64_t, const RegisterWriter &w
             *firstValue = value;
         }
     }
+    if (fenced != kOK) return fenced;
     return *wrong == 0 ? kOK : kComputeMismatch;
 }
 
