@@ -13,13 +13,15 @@
 // (--display-pattern), and the stage 20 SDMA fill and flip interrupt
 // (--sdma-flip), and the stage 21 graphics engine start and drawing
 // (--gfx-start), and the stage 22 compute queue and dispatch (--gfx-compute),
-// and the stage 23 kernel corpus (--compute-corpus).
+// and the stage 23 kernel corpus (--compute-corpus), and the stage 24 user
+// VMID with uploaded code (--compute-vm).
 // --psp-state (stage 10) and --inventory16 (stage 16) only read.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
 //                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--sdma-inventory]
 //                          [--sdma-copy] [--gart-ih] [--ih-intr] [--sdma-flip] [--gfx-start]
-//                          [--gfx-compute] [--compute-corpus] [--display-pattern] [--psp-state] [--inventory16]
+//                          [--gfx-compute] [--compute-corpus] [--compute-vm] [--display-pattern] [--psp-state]
+//                          [--inventory16]
 #include <IOKit/IOKitLib.h>
 
 #include <algorithm>
@@ -33,6 +35,7 @@
 #include <vector>
 
 #include "cezanne_core.h"
+#include "cezanne_upload.h"
 
 using namespace cezanne;
 
@@ -362,7 +365,7 @@ void usage(FILE *out)
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
                       "                         [--psp-sdma] [--sdma-inventory] [--sdma-copy] [--gart-ih]\n"
                       "                         [--ih-intr] [--sdma-flip] [--gfx-start] [--gfx-compute]\n"
-                      "                         [--compute-corpus] [--display-pattern] [--psp-state]\n"
+                      "                         [--compute-corpus] [--compute-vm] [--display-pattern] [--psp-state]\n"
                       "                         [--inventory16]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
@@ -397,6 +400,10 @@ void usage(FILE *out)
                       "--compute-corpus does --gfx-compute up to its ring test, then runs the five corpus kernels\n"
                       "(store_index, vector_add, group_sum, atomic_count, grid_2d) on their own buffers, checks\n"
                       "every output on the CPU, restores and tears down.\n"
+                      "--compute-vm does --gfx-compute up to its ring test, then enables the GC hub's VM for VMID 1\n"
+                      "(a flat page table over the submission region), uploads the corpus and saxpy, runs them at\n"
+                      "VMID 1, then a fault probe (store_index past its one mapped page), checks every output on\n"
+                      "the CPU, restores and tears down.\n"
                       "--display-pattern draws a test pattern in the carveout, shows it on pipe 0 for 5 s by\n"
                       "flipping its surface address, verifies, and flips back to the boot framebuffer.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n"
@@ -1400,8 +1407,9 @@ void printComputeState(const ComputeState &state)
 // Stage 22 after the RLC start: the compute queue, its ring test, the
 // dispatch. Returns whether all three passed.
 bool corpusRun(io_connect_t connection);
+bool vmRun(io_connect_t connection);
 
-bool computeQueue(io_connect_t connection, bool corpus)
+bool computeQueue(io_connect_t connection, bool corpus, bool vm)
 {
     static const char *const commits[] = {"none", "polled write pointer (method A)",
                                           "CP_HQD_PQ_WPTR_LO (method B)"};
@@ -1443,6 +1451,7 @@ bool computeQueue(io_connect_t connection, bool corpus)
         }
     }
     if (ok && corpus) return corpusRun(connection);
+    if (ok && vm) return vmRun(connection);
     if (ok) {
         uint64_t dispatch[5] = {};
         step("gfx 6/7 dispatch: frame 2 (SET_SH_REG COMPUTE_*: code 0xf440a08000, RSRC1 0x00af0040, RSRC2 0x90,\n"
@@ -1623,12 +1632,195 @@ bool corpusRun(io_connect_t connection)
     return ok;
 }
 
+// Stage 24: code into a slot (5-15) of the submission region, in
+// kComputeChunkBytes pieces.
+bool vmCode(io_connect_t connection, uint32_t slot, const uint32_t *words, uint32_t count)
+{
+    for (uint32_t at = 0; at < count;) {
+        ComputeChunk chunk = {};
+        const uint32_t n = std::min<uint32_t>(count - at, kComputeChunkBytes / 4);
+        chunk.bytes = n * 4;
+        for (uint32_t i = 0; i < n; i++) chunk.words[i] = words[at + i];
+        uint64_t in[2] = {slot, 4ull * at}, out = 0;
+        uint32_t outCount = 1;
+        kern_return_t result = IOConnectCallMethod(connection, kDiagnosticComputeCode, in, 2, &chunk, sizeof(chunk),
+                                                   &out, &outCount, nullptr, nullptr);
+        if (result != KERN_SUCCESS || outCount != 1 || out != kOK) {
+            std::printf("code write to slot %u at +0x%x: call 0x%08x, %s\n", slot, 4 * at, result,
+                        result == KERN_SUCCESS ? statusName(static_cast<Status>(out)) : "-");
+            return false;
+        }
+        at += n;
+    }
+    return true;
+}
+
+VmRequest vmCase(const CorpusCode &code, uint32_t slot, uint32_t sx, uint32_t sy, uint32_t gx, uint32_t gy,
+                 uint32_t lds, std::initializer_list<std::pair<uint32_t, uint32_t>> buffers)
+{
+    VmRequest request = {};
+    request.slot = slot;
+    request.rsrc1 = code.rsrc1;
+    request.rsrc2 = code.rsrc2;
+    request.properties = code.properties;
+    request.group[0] = sx;
+    request.group[1] = sy;
+    request.group[2] = 1;
+    request.groups[0] = gx;
+    request.groups[1] = gy;
+    request.groups[2] = 1;
+    request.ldsBytes = lds;
+    for (const auto &buffer : buffers) {
+        request.offset[request.buffers] = buffer.first;
+        request.length[request.buffers++] = buffer.second;
+    }
+    return request;
+}
+
+// The VMID 1 data plan beyond stage 23's: saxpy's a, x and y; the fault
+// probe's output and, after it, store_index's again. The probe's canary is
+// the page after its output, which submission 1 mapped: a stale TLB entry
+// would let the overflow land there.
+const uint32_t kSaxpyA = 0x8a000, kSaxpyX = 0x8b000, kSaxpyY = 0x8c000, kProbeOut = 0x00000, kProbeCanary = 0x01000,
+               kAgainOut = 0x8d000;
+const uint32_t kSaxpyItems = 1024, kProbeThreads = 2048, kCanary = 0xc0ffee00u;
+const uint32_t kUploadSlot = kVmCodeSlotFirst + kCorpusCount; // saxpy, after the corpus
+
+// Stage 24 after a passing compute ring test: the VM start, the code and data,
+// then the eight submissions at VMID 1, each checked on the CPU. Stops at the
+// first failed submission (the driver refuses more), after reading what it left.
+bool vmRun(io_connect_t connection)
+{
+    static const char *const names[] = {"store_index", "vector_add", "group_sum", "atomic_count", "grid_2d"};
+    static const char *const refusals[] = {"none",   "kernel", "group",   "grid",  "lds",
+                                           "buffer", "length", "overlap", "count", "descriptor"};
+    uint64_t start[4] = {};
+    ComputeState state = {};
+    step("gfx 6/7 VM start: GRBM_GFX_CNTL selects VMID 1; its SH_MEM_CONFIG (unaligned) and SH_MEM_BASES\n"
+         "  0x20001000; then the GC hub as gfxhub_v1_0_gart_enable: default page 0xf440a0b000, L2 and L1 TLB on,\n"
+         "  identity aperture off, engine 17's range, VMID 1's context (flat, 0x1_0000_0000 + 1 MiB, table at\n"
+         "  0x600a0a000)");
+    bool ok = callReport(connection, kDiagnosticComputeVmStart, start, 4, &state);
+    if (!ok) return false;
+    std::printf("%s, %llu writes, index %llu, value 0x%08llx\n", statusName(static_cast<Status>(start[0])),
+                static_cast<unsigned long long>(start[1]), static_cast<unsigned long long>(start[2]),
+                static_cast<unsigned long long>(start[3]));
+    printComputeState(state);
+    if (start[0] != kOK) return false;
+
+    step("gfx 6/7 VM code and data: the corpus into slots 5-9, saxpy into slot 10; stage 23's inputs, saxpy's\n"
+         "  a = 2, x[i] = i, y[i] = 1, every output 0xffffffff");
+    for (uint32_t k = 0; ok && k < kCorpusCount; k++)
+        ok = vmCode(connection, kVmCodeSlotFirst + k, kCorpusCode[k].code, kCorpusCode[k].dwords);
+    if (ok) ok = vmCode(connection, kUploadSlot, kUploadCode[0].code, kUploadCode[0].dwords);
+    std::vector<uint32_t> a(kAddItems), b(kAddItems), in(kStoreItems), x(kSaxpyItems);
+    for (uint32_t i = 0; i < kAddItems; i++) {
+        a[i] = floatBits(float(i));
+        b[i] = floatBits(float(2 * i));
+    }
+    for (uint32_t i = 0; i < kStoreItems; i++) in[i] = i;
+    for (uint32_t i = 0; i < kSaxpyItems; i++) x[i] = floatBits(float(i));
+    ok = ok && corpusWrite(connection, kAddA, a) && corpusWrite(connection, kAddB, b) &&
+         corpusWrite(connection, kSumIn, in) && corpusWrite(connection, kCounter, std::vector<uint32_t>(1, 0)) &&
+         corpusWrite(connection, kStoreOut, std::vector<uint32_t>(kStoreItems, kComputeOutBefore)) &&
+         corpusWrite(connection, kAddC, std::vector<uint32_t>(kAddItems, kComputeOutBefore)) &&
+         corpusWrite(connection, kSumOut, std::vector<uint32_t>(kSumGroups, kComputeOutBefore)) &&
+         corpusWrite(connection, kGridOut, std::vector<uint32_t>(kGridW * kGridH, kComputeOutBefore)) &&
+         corpusWrite(connection, kSaxpyA, std::vector<uint32_t>(1, floatBits(2.0f))) &&
+         corpusWrite(connection, kSaxpyX, x) &&
+         corpusWrite(connection, kSaxpyY, std::vector<uint32_t>(kSaxpyItems, floatBits(1.0f))) &&
+         corpusWrite(connection, kAgainOut, std::vector<uint32_t>(1024, kComputeOutBefore));
+    std::printf("%s\n", ok ? "ok" : "failed");
+    if (!ok) return false;
+
+    const struct {
+        VmRequest request;
+        const char *name, *what;
+        uint32_t out, words;
+    } cases[] = {
+        {vmCase(kCorpusCode[0], 5, 256, 1, 64, 1, 0, {{kStoreOut, 4 * kStoreItems}}), names[0],
+         "64 groups of 256; out[i] == i", kStoreOut, kStoreItems},
+        {vmCase(kCorpusCode[1], 6, 256, 1, 128, 1, 0, {{kAddA, 4 * kAddItems}, {kAddB, 4 * kAddItems}, {kAddC, 4 * kAddItems}}),
+         names[1], "128 groups of 256; c[i] == 3i", kAddC, kAddItems},
+        {vmCase(kCorpusCode[2], 7, 256, 1, kSumGroups, 1, 1024, {{kSumIn, 4 * kStoreItems}, {kSumOut, 4 * kSumGroups}}),
+         names[2], "64 groups of 256, 1 KiB of LDS; out[g] == the sum of its inputs", kSumOut, kSumGroups},
+        {vmCase(kCorpusCode[3], 8, 256, 1, 64, 1, 0, {{kCounter, 4}}), names[3], "counter == 16384", kCounter, 1},
+        {vmCase(kCorpusCode[4], 9, 16, 16, kGridW / 16, kGridH / 16, 0, {{kGridOut, 4 * kGridW * kGridH}}), names[4],
+         "out[y * 128 + x] == (y << 16) | x", kGridOut, kGridW * kGridH},
+        {vmCase(kUploadCode[0], kUploadSlot, 256, 1, kSaxpyItems / 256, 1, 0,
+                {{kSaxpyA, 4}, {kSaxpyX, 4 * kSaxpyItems}, {kSaxpyY, 4 * kSaxpyItems}}),
+         "saxpy", "4 groups of 256, uploaded code; y[i] == 2i + 1", kSaxpyY, kSaxpyItems},
+        {vmCase(kCorpusCode[0], 5, 256, 1, kProbeThreads / 256, 1, 0, {{kProbeOut, 0x1000}}), "fault probe",
+         "store_index, 2048 threads, one page mapped; out[i] == i for 1024, the next page keeps its canary, a fault\n"
+         "  latched for VMID 1",
+         kProbeOut, 2048},
+        {vmCase(kCorpusCode[0], 5, 64, 1, 16, 1, 0, {{kAgainOut, 0x1000}}), names[0],
+         "after the fault, 16 groups of 64; out[i] == i", kAgainOut, 1024},
+    };
+    const uint32_t count = sizeof(cases) / sizeof(cases[0]);
+    for (uint32_t n = 0; n < count; n++) {
+        // Before the probe: its page cleared (submission 1 left i there), the next one the canary.
+        if (n == 6 && !(corpusWrite(connection, kProbeOut, std::vector<uint32_t>(1024, kComputeOutBefore)) &&
+                        corpusWrite(connection, kProbeCanary, std::vector<uint32_t>(1024, kCanary))))
+            return false;
+        std::printf("gfx 6/7 VMID 1 %u/%u %s (slot %u): %s ... ", n + 1, count, cases[n].name, cases[n].request.slot,
+                    cases[n].what);
+        std::fflush(stdout);
+        uint64_t out = 0;
+        uint32_t outCount = 1;
+        VmReport report = {};
+        size_t size = sizeof(report);
+        kern_return_t result = IOConnectCallMethod(connection, kDiagnosticComputeVmSubmit, nullptr, 0, &cases[n].request,
+                                                   sizeof(cases[n].request), &out, &outCount, &report, &size);
+        if (result != KERN_SUCCESS || outCount != 1 || size != sizeof(report)) {
+            std::printf("call failed 0x%08x\n", result);
+            return false;
+        }
+        std::printf("%s, fence %u, CP_HQD_PQ_RPTR %u", statusName(static_cast<Status>(out)), report.fence, report.rptr);
+        if (out == kComputeRefused)
+            std::printf(" (refused: %s, buffer %u)", report.reason < 10 ? refusals[report.reason] : "?", report.index);
+        std::printf("\n  GC hub: fault status 0x%08x, address page 0x%08x%08x; %u non-zero default-page words",
+                    report.faultStatus, report.faultAddrHi, report.faultAddrLo, report.defaultWords);
+        std::vector<uint32_t> got(cases[n].words);
+        if (out != kComputeRefused && corpusRead(connection, cases[n].out, &got)) {
+            uint32_t wrong = 0, first = 0, firstValue = 0, expected = 0;
+            for (uint32_t i = 0; i < cases[n].words; i++) {
+                uint32_t want = i;
+                if (n == 1) want = floatBits(float(3 * i));
+                if (n == 2) want = 65536 * i + 32640;
+                if (n == 3) want = kStoreItems;
+                if (n == 4) want = ((i / kGridW) << 16) | (i % kGridW);
+                if (n == 5) want = floatBits(float(2 * i + 1));
+                if (n == 6 && i >= 1024) want = kCanary; // the canary page, never mapped by the probe
+                if (got[i] != want && wrong++ == 0) {
+                    first = i;
+                    firstValue = got[i];
+                    expected = want;
+                }
+            }
+            std::printf(", %u wrong outputs", wrong);
+            if (wrong != 0) std::printf(" (first: [%u] = 0x%08x, expected 0x%08x)", first, firstValue, expected);
+            if (wrong != 0 && out == kOK) ok = false;
+        }
+        // Until the probe nothing may fault; the probe must fault, as VMID 1.
+        const bool vmid1 = ((report.faultStatus >> 20) & 0xf) == kVmid;
+        if (out == kOK && (n < 6 ? report.faultStatus != 0 : n == 6 && (report.faultStatus == 0 || !vmid1))) {
+            std::printf(" (unexpected fault status)");
+            ok = false;
+        }
+        std::printf("\n");
+        printComputeState(report.state);
+        if (out != kOK) return false;
+    }
+    return ok;
+}
+
 // The stage 21 steps after a passing SETUP_TMR: check, load, RLC start, CP
 // start, ring test and fence, draw (and flip), a 5 s hold, verify, restore.
 // With compute (stage 22), the compute queue, its ring test and the dispatch
 // replace the CP start. The restore runs whenever the RLC start or the flip
 // was sent; the PSP teardown that follows would also run it.
-bool gfxEngine(io_connect_t connection, bool compute, bool corpus)
+bool gfxEngine(io_connect_t connection, bool compute, bool corpus, bool vm)
 {
     static const char *const files[] = {"green_sardine_ce.bin", "green_sardine_pfp.bin", "green_sardine_me.bin",
                                         "green_sardine_mec.bin", "green_sardine_rlc.bin"};
@@ -1642,6 +1834,12 @@ bool gfxEngine(io_connect_t connection, bool compute, bool corpus)
     if (check[0] == kGfxUnexpectedState && check[1] < kGfxExpectCount)
         std::printf(" (%s reads 0x%08llx; expected 0x%08x under mask 0x%08x)", registerName(kGfxExpect[check[1]].offset),
                     static_cast<unsigned long long>(check[2]), kGfxExpect[check[1]].value, kGfxExpect[check[1]].mask);
+    if (check[0] == kGfxUnexpectedState && check[1] >= kGfxExpectCount && check[1] - kGfxExpectCount < kVmExpectCount) {
+        // Stage 24's GC hub check, after stage 21's list.
+        const GfxExpect &expect = kVmExpect[check[1] - kGfxExpectCount];
+        std::printf(" (GC hub 0x%05x reads 0x%08llx; expected 0x%08x under mask 0x%08x)", expect.offset,
+                    static_cast<unsigned long long>(check[2]), expect.value, expect.mask);
+    }
     if (check[0] == kDisplayUnexpectedState) printDisplayCheckEntry(check[1], check[2]);
     std::printf("\n  GC state at the check (the first %u are the snapshot):\n", kGfxSnapshotCount);
     printGfxState(checked);
@@ -1673,7 +1871,7 @@ bool gfxEngine(io_connect_t connection, bool compute, bool corpus)
         printGfxState(state);
         ok = rlc[0] == kOK;
     }
-    if (ok && compute) ok = computeQueue(connection, corpus);
+    if (ok && compute) ok = computeQueue(connection, corpus, vm);
     if (ok && !compute) {
         uint64_t cp[4] = {};
         step("gfx 4/5 CP start: ring 0xf440a00000 (8 KiB), no doorbell, CP_ME_CNTL halts cleared; frame 0 (clear\n"
@@ -1694,7 +1892,8 @@ bool gfxEngine(io_connect_t connection, bool compute, bool corpus)
     // (kDiagnosticGfxTest, GfxDraw, GfxVerify) and are unused here.
     uint64_t restore[4] = {};
     gfxStep(compute, compute ? 7 : 5,
-            compute ? "restore: the queue dequeued and its registers (the poll control among them), SH_MEM_*\n"
+            compute ? "restore: VMID 1's GC hub VM and SH_MEM_* if started (a flush, then the reading back); the\n"
+                      "  queue dequeued and its registers (the poll control among them), SH_MEM_*\n"
                       "  and the MEC halted back; then CP_ME_CNTL halted, rlc_stop, every written GC register back to\n"
                       "  the check's reading"
                     : "restore: flip back; CP_ME_CNTL halted, rlc_stop, every written GC register back to the check's\n"
@@ -1767,9 +1966,9 @@ bool pspSdma(io_connect_t connection, int mode)
         tmrTeardown(connection, "sdma teardown: DESTROY_TMR if fenced, then DESTROY_RINGS");
         return false;
     }
-    if (mode == 6 || mode == 7 || mode == 8) {
-        // Stage 21 (or, mode 7, stage 22; mode 8, stage 23) instead of the SDMA load.
-        bool started = gfxEngine(connection, mode >= 7, mode == 8);
+    if (mode == 6 || mode == 7 || mode == 8 || mode == 9) {
+        // Stage 21 (or, mode 7, stage 22; mode 8, stage 23; mode 9, stage 24) instead of the SDMA load.
+        bool started = gfxEngine(connection, mode >= 7, mode == 8, mode == 9);
         bool torn = tmrTeardown(connection, "gfx teardown: DESTROY_TMR as the next frame if the last fenced, then "
                                             "DESTROY_RINGS");
         return started && torn;
@@ -1904,7 +2103,7 @@ int main(int argc, char **argv)
     bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
          inventory = false, copy = false, psp = false, inventory16Flag = false, gartFlag = false,
          intrFlag = false, displayFlag = false, flipFlag = false, gfxFlag = false, computeFlag = false,
-         corpusFlag = false;
+         corpusFlag = false, vmFlag = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -1960,6 +2159,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--compute-corpus") == 0) {
             corpusFlag = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--compute-vm") == 0) {
+            vmFlag = true;
             continue;
         }
         if (std::strcmp(argv[i], "--sdma-flip") == 0) {
@@ -2147,6 +2350,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!pspSdma(connection, 7)) failures++;
+    }
+    if (vmFlag) {
+        if (info[1] < kVmStage) {
+            std::fprintf(stderr, "cezanne-diag: --compute-vm needs driver stage %u\n", kVmStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspSdma(connection, 9)) failures++;
     }
     if (corpusFlag) {
         if (info[1] < kCorpusStage) {
