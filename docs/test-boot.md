@@ -4317,6 +4317,155 @@ The changes:
   the fake MEC runs the MEC1 slot.
 - The boot 42 builds are kept as `superseded-*-stage22-kiq`.
 
+### Stage 23: a compute submission path and a kernel corpus (proposed 2026-10-30; needs approval)
+
+**Goal.** Turn stage 22's single fixed dispatch into a submission path. The
+queue stays up for a session that runs several kernels, each with its own
+grid, buffers and fence. This bridges the hardware to Metal: M2's
+pipelines will need this path. Kernels come from a reviewed corpus built
+from MSL, so the stage tests the whole frontend-to-hardware chain on more
+than one kernel.
+
+**Why a corpus and not arbitrary code.** Stage 22 runs at VMID 0, and a
+kernel there can reach the whole carveout through the system aperture: the
+PSP's TMR, firmware and the display surface. Until a user VMID with its own
+page tables isolates submitted code (a later stage), the kext runs only
+kernels embedded in it. A submission names one by index and never uploads
+code. For each corpus kernel the kext holds a description of its arguments,
+and it bounds every buffer from that description.
+
+#### What runs, in order
+
+1. **Stage 22 as is, up to and including the ring test:** the loads, the RLC
+   start, the MEC1 queue (`GRBM_GFX_CNTL` `0x4`), and the ring test with
+   fence 3. Stage 22's own dispatch (frame 2) is not run in a stage 23
+   session.
+2. **The submission region.** At the check, as stage 21 does for its work
+   area, the region is placed and checked stable: 1 MiB of carveout at
+   offset `0x40B00000` (GPU `0xF440B00000`), between stage 21's work area
+   (`0x40A00000`, 64 KiB checked) and the pattern region (`0x41000000`).
+   Its layout:
+   - `+0x00000`: corpus code, 64 KiB, written by the kext once per session,
+     each kernel 256-byte aligned;
+   - `+0x10000`: per-submission dispatch packet and kernarg, 512 bytes per
+     slot, 7 slots;
+   - `+0x20000` … `+0xFFFFF`: 896 KiB of data buffers, written and read by
+     the tool through the kext in 4 KiB chunks.
+3. **Up to seven submissions per session**, one ring frame of 128 dwords
+   each at dwords 256, 384, … 1024. That fills the 4 KiB ring without
+   wrapping, and an eighth is refused. Each frame is:
+   - `ACQUIRE_MEM` exactly as `gfx_v9_0_emit_mem_sync` (`0x58`; `SH_ICACHE`,
+     `SH_KCACHE`, `TC`, `TCL1` and `TC_WB` actions, the full range, poll
+     interval `0xA`), so the GPU reads the inputs the CPU just wrote;
+   - the `SET_SH_REG` writes of stage 22's frame 2 for that kernel:
+     - the code address;
+     - `RSRC1`, and `RSRC2` with `LDS_SIZE` from the request (at most the
+       64 KiB GC 9.3.0 gives a workgroup);
+     - `NUM_THREAD_X/Y/Z` from the request;
+     - user data: the dispatch packet and kernarg slot;
+   - `DISPATCH_DIRECT` with the requested grid;
+   - `RELEASE_MEM` as `gfx_v9_0_ring_emit_fence` writes it on a compute
+     ring, as fence `n` at write-back `+0x120 + 8n`. Boot 43 showed it retires
+     on MEC1.
+4. **Read back, then the stage 22 restore and teardown**, unchanged.
+
+#### The corpus (`shaders/corpus/`, MSL, with Apple's AIR checked in)
+
+Each kernel is built offline by the existing chain (Apple `metal` to AIR,
+`tools/air_lower.py`, LLVM 20.1.7 for gfx90c). The tool checks each output
+on the CPU, and the inputs are chosen so every expected value is exact:
+
+| Kernel | What it exercises | Check |
+|---|---|---|
+| `store_index` | stage 22's kernel, now with a larger grid (64 groups of 256) | `out[i] == i` for 16 384 items |
+| `vector_add` | three device buffers, float math | `c[i] == a[i] + b[i]` for 32 768 floats, inputs small integers (exact) |
+| `group_sum` | a threadgroup buffer (dynamic LDS) and `threadgroup_barrier`, a tree reduction | `out[g]` equals the integer sum of the group's 256 inputs, 64 groups |
+| `atomic_count` | a relaxed `atomic_fetch_add` on one device word | the counter equals the thread count (16 384) |
+| `grid_2d` | a 2-D grid and `thread_position_in_grid` as `uint2` | `out[y * w + x] == (y << 16) | x` for 128 × 64 |
+
+#### Bounds
+
+The kext holds each kernel's arguments as a list of buffers and scalars.
+Each buffer is indexed per thread, per group or as a single word, with an
+element size. A request gives the group size, the grid, and a region offset
+and length per buffer. The kext refuses the request if:
+- the kernel index is unknown;
+- any length is below what the grid touches (threads, groups or 1, times
+  the element size);
+- any buffer leaves the data area or overlaps another;
+- the group exceeds 1024 threads;
+- LDS exceeds 64 KiB;
+- it would be the eighth submission;
+- the session has not passed its ring test.
+
+The kext writes the kernarg itself: buffer GPU addresses computed from the
+offsets, then the scalars. It also writes the dispatch packet's sizes.
+
+#### Interface and tool
+
+- **New selectors:**
+  - `ComputeWrite` (56): a region offset and up to 4 KiB into the data area;
+  - `ComputeSubmit` (57): the kernel index, group and grid sizes, buffer
+    offsets and lengths, scalars, and LDS bytes. It returns the status,
+    the fence and the queue's read pointer;
+  - `ComputeRead` (58): up to 4 KiB out of the data area.
+
+  Diagnostic version 20.
+- **Tool:** `cezanne-diag --compute-corpus` (stage 23) runs the stage 22
+  bring-up and ring test, then the five kernels in order, and prints each
+  status, fence and mismatch count with the first mismatch. Then it
+  restores and tears down.
+- The stage 22 path (`--gfx-compute`) stays as it is.
+
+#### Register, message and memory changes
+
+- **No new MMIO register writes and no new SMU or PSP messages.** Every
+  register written is stage 22's, with the same values. Kernel state goes
+  through `SET_SH_REG` packets as in stage 22.
+- **New:**
+  - CPU writes to the 1 MiB region at carveout `0x40B00000`;
+  - the GPU reading and writing it;
+  - the `ACQUIRE_MEM` packet;
+  - `RELEASE_MEM` used as the fence.
+
+#### Success criteria and outcomes
+
+- **Success:**
+  - all five kernels produce exact results;
+  - fences 0–4 land in order;
+  - the queue's read pointer ends at the last frame;
+  - the restore reads back and leaves the GC idle (as in boot 43);
+  - the PSP teardown fences.
+- **Partial results are findings in themselves:**
+  - `vector_add` failing alone points at multiple buffers or the
+    `ACQUIRE_MEM` path;
+  - `group_sum` alone points at LDS or barriers;
+  - `atomic_count` alone points at atomics through L2;
+  - `grid_2d` alone points at the 2-D built-ins or the `NUM_THREAD_Y` setup.
+- A hang shows in the read pointer and `CP_CPC_*`, as in boots 41–42, and the
+  restore still runs.
+
+#### Tests before the boot
+
+- **Corpus:** a tool regenerates the corpus code from the checked-in AIR, and
+  a test requires it to match the kext's embedded words byte for byte (as
+  `tests/test_compute_kernel.py` does now).
+- **The core's fake MEC:**
+  - it executes `ACQUIRE_MEM` and `RELEASE_MEM`;
+  - it models each corpus kernel by index, and refuses any memory access
+    outside the request's buffers;
+  - it covers every refusal above, a kernel that never completes, and a
+    wrong result per kernel.
+- The full suite, before the stick build.
+
+#### Not in stage 23
+
+- Arbitrary or uploaded code, user VMIDs and page tables (the next stage on
+  this path, which lifts the corpus restriction).
+- Doorbells, MEC interrupts, scratch and private memory, textures, and
+  multiple queues.
+- The Metal bundle (M2).
+
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 
 **Approved by the user on 2026-10-22, together with the AGENTS.md exception,
