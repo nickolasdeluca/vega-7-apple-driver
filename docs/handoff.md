@@ -265,9 +265,11 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    ended at 896, and the restore left the GC idle. The user chose user VMIDs before M2
    (2026-10-30). "Stage 24: a user VMID with its own page table, and uploaded
    code" was approved and implemented 2026-10-30 (test-boot.md, "Stage 24
-   implementation"). **Next: boot 46**, `tools/update_stick.sh 24`, then
-   `tools/capture_boot.sh boot-46-stage24 --gfxoff-disallow --compute-vm
-   --psp-state` on the stick. A compute queue on the MEC, brought up like Linux's
+   implementation"). Boot 46 (2026-10-30) stopped at the gfx check before any write:
+   VMID 1's GDS size reads `0x10000` at boot (fixed within the stage, "Revision:
+   VMID 1's GDS at boot"). **Next: boot 47**, `tools/update_stick.sh 24`,
+   then `tools/capture_boot.sh boot-47-stage24 --gfxoff-disallow
+   --compute-vm --psp-state` on the stick. A compute queue on the MEC, brought up like Linux's
    KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
    polling), runs a ring test and dispatches the `store_index` kernel that
    Apple's frontend and our lowering produced; see "Stage 22: a compute queue

@@ -4961,6 +4961,35 @@ Implemented as proposed, with these choices and deviations:
    --gfxoff-disallow --compute-vm --psp-state`.
 3. Shut down fully and return to the normal EFI.
 
+#### Revision: VMID 1's GDS at boot (after boot 46)
+
+Boot 46 (log below) stopped at the gfx check with `gfx-unexpected-state`,
+before any write. `GDS_VMID1_SIZE` (`0xcc0c`) read `0x00010000`: VMID 1 has
+the whole 64 KiB GDS at boot. Base (`0xcc08`) read 0, as required. The check
+had required all four of VMID 1's GDS registers to be 0, which is the state
+Linux leaves *after* `gfx_v9_0_init_gds_vmid` writes them. It is not the
+boot state, and that write is not part of this stage.
+
+- **Fix, within the stage's scope (no new write):** the check still
+  requires `GDS_VMID1_BASE` 0. `GDS_VMID1_SIZE`, `GDS_GWS_VMID1` and
+  `GDS_OA_VMID1` are only read, not required (`kVmExpect` drops to 25
+  entries; the indices before them are unchanged).
+- **What this concedes:** a kernel at VMID 1 could use the GDS, GWS and OA
+  that boot gives VMID 1. They are on-chip (GDS memory, wave barriers and
+  ordered-append counters), not system memory, so the page table still
+  bounds every memory access. Nothing else uses them in the test boot.
+  Denying them needs `init_gds_vmid`'s four writes and their restore, which
+  would be a new stage.
+- **Tool:** the register dump at the end of a stage 24 run now also reads
+  the GC hub's VM block and VMID 1's GDS (`kStage24Registers`), so the next
+  capture records GWS and OA as booted. The check's failure line names the
+  register.
+- **Tests:** the core test now refuses a non-zero GDS base (index 24) and
+  accepts the boot 46 size with non-zero GWS and OA.
+- The boot 46 builds are kept as `superseded-*-stage24-gds`.
+
+**Boot steps (boot 47):** as for boot 46, with `boot-47-stage24`.
+
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 
 **Approved by the user on 2026-10-22, together with the AGENTS.md exception,
@@ -7174,6 +7203,24 @@ boot-45-stage23 --gfxoff-disallow --compute-corpus --psp-state`; diag v20,
   - scratch, textures, doorbells and MEC interrupts;
   - the graphics CP.
 - Captures are in ignored `out/test-efi/boot-45-stage23/`.
+
+**Boot 46, 2026-10-30, stage 24**
+(`out/test-efi/usb-stage24`; cold boot; `tools/capture_boot.sh
+boot-46-stage24 --gfxoff-disallow --compute-vm --psp-state`; diag v21,
+**exit 1**).
+
+- **GfxOff disallow, ring creation and `SETUP_TMR` (fence 1): ok.**
+- **gfx 1/7 check: `gfx-unexpected-state`, before any write.** Stage 21's
+  check and the GC hub's VM block passed (`VM_L2_CNTL` `0x00080602`,
+  `VM_CONTEXT0_CNTL` `0x007ffe80`, L1 TLB `0x2501`, fault status 0, and
+  every entry up to VMID 1's GDS base). The refusal was VMID 1's GDS size,
+  `GDS_VMID1_SIZE` (`0xcc0c`) = `0x00010000`, where the check required 0.
+  GWS and OA were not reached.
+- **The PSP teardown fenced** (`DESTROY_TMR` fence 2, rings destroyed).
+- **Cause:** the check's expectation was Linux's state after
+  `gfx_v9_0_init_gds_vmid`, not the boot state. Fixed within the stage; see
+  "Revision: VMID 1's GDS at boot (after boot 46)".
+- Captures are in ignored `out/test-efi/boot-46-stage24/`.
 
 ## Unknowns and limits
 
