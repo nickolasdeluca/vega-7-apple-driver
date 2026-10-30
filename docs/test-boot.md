@@ -6431,6 +6431,44 @@ boot-42-stage22 --gfxoff-disallow --gfx-compute --psp-state`; diag v19, exit
   MEC1". It needs the user's approval because it selects a new queue.
 - Captures are in ignored `out/test-efi/boot-42-stage22/`.
 
+**Boot 43, 2026-10-30, stage 22 with the queue on MEC1**
+(`out/test-efi/usb-stage22`, rebuilt; cold boot; `tools/capture_boot.sh
+boot-43-stage22 --gfxoff-disallow --gfx-compute --psp-state`; diag v19,
+**exit 0**).
+
+- **Compute start: ok, 27 writes.** MEC1 pipe 0 queue 0 was idle in the
+  snapshot. Afterwards `CP_HQD_ACTIVE` read 1, and `RLC_CP_SCHEDULERS` read
+  `0x58504840`, untouched (no KIQ).
+  - `CP_PQ_WPTR_POLL_CNTL`, read under the selection, was `0xc0000001` (`EN`,
+    `POLL_ACTIVE`, `PERIOD` 1) right after the start, and `0x80000001` once
+    the poll was served.
+  - This confirms boot 41's reading: the register is per queue.
+- **Ring test: ok.** Method A (polling), `SCRATCH_REG0` `0xDEADBEEF`,
+  `CP_HQD_PQ_RPTR` 64, fence 3 = 3.
+- **Dispatch: ok. `store_index` ran and all 256 outputs read 0..255.**
+  - fence 4 (`WRITE_DATA`) = 4;
+  - **fence 5 (`RELEASE_MEM`, `CACHE_FLUSH_AND_INV_TS_EVENT`) = 5**: the
+    end-of-pipe event retires on a MEC1 queue, so it was only the KIQ slot
+    that never retired it;
+  - `CP_HQD_PQ_RPTR` 256 (the whole ring), `CP_CPC_STATUS` 0,
+    `CP_CPC_BUSY_STAT` 0, no VM fault.
+- **Restore: ok, flip back ok.** The dequeue, every queue and global
+  register, and stage 21's 39 registers read back. The GC is idle after it
+  (`GRBM_STATUS` `0x00003028`, `GRBM_STATUS2` `0x00000008`, `CP_CPC_STATUS`
+  0). The PSP teardown fenced (`DESTROY_TMR` fence 11).
+- **What this proves:** the milestone "known shader with correct results".
+  - **The kernel's path:** a kernel written in MSL, compiled to AIR by
+    Apple's frontend, lowered by `tools/air_lower.py` and LLVM 20.1.7 to
+    gfx90c, ran on this GPU from our driver's queue.
+  - **Its output** reached the carveout and is visible to the CPU after the
+    CS partial flush, without the `RELEASE_MEM` cache actions.
+  - **Not proven:**
+    - other kernels, a larger grid, or scratch, LDS and barriers;
+    - user VMIDs and page tables (VMID 0 only);
+    - doorbells and interrupts from the MEC;
+    - the graphics CP (still the stall from boots 32–38).
+- Captures are in ignored `out/test-efi/boot-43-stage22/`.
+
 ## Unknowns and limits
 
 - The firmware lists both partitions `eraseDisk … GPT` creates. Partition 1 is

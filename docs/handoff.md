@@ -6,8 +6,8 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 
 ## Current checkpoint
 
-Current checkpoint, 2026-10-22, branch `cezanne-discovery`: **driver stages
-0–21 succeeded on the USB test EFI**, stage 21 as dialled down (boots 1–38; see the
+Current checkpoint, 2026-10-30, branch `cezanne-discovery`: **driver stages
+0–22 succeeded on the USB test EFI**, stage 21 as dialled down (boots 1–43; see the
 [test boot log](test-boot.md#test-boot-log)). The driver can do the
 following:
 - read the GPU, the discovery table and the engine state;
@@ -25,7 +25,12 @@ following:
 - have SDMA0 draw that surface, then flip to it with HUBP0's flip interrupt
   arriving as an MSI, then flip back (boot 31);
 - load the GFX firmware, start the RLC and start the CP, which fetches 152
-  dwords of the clear-state preamble before it stalls (boot 38).
+  dwords of the clear-state preamble before it stalls (boot 38);
+- **run a compute queue on MEC1 and dispatch the `store_index` kernel**
+  (MSL through Apple's frontend, lowered by `tools/air_lower.py` and LLVM).
+  All 256 outputs were correct and every fence landed, including
+  `RELEASE_MEM`. This is the milestone "known shader with correct results"
+  (boot 43).
 
 Stage 17 (GART and the IH ring) succeeded in boot 25: an SDMA copy read
 through a driver-built GART page table, its trap arrived in IH ring 0, and
@@ -241,9 +246,10 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    GC idle. The dispatch was consumed (`CP_HQD_PQ_RPTR` 101) but never
    launched: no output, `MEC2_LOAD_BUSY`. The revision "the queue on MEC1"
    (`GRBM_GFX_CNTL` `0x4`, no KIQ designation; Linux dispatches on MEC1 only)
-   was approved and implemented 2026-10-30. **Next is boot 43**
-   (`tools/update_stick.sh 22`, cold boot, then `tools/capture_boot.sh
-   boot-43-stage22 --gfxoff-disallow --gfx-compute --psp-state`). A compute queue on the MEC, brought up like Linux's
+   was approved and implemented 2026-10-30. **Boot 43 (2026-10-30): stage 22
+   succeeded** (exit 0). The kernel wrote 0..255, fences 3, 4 and 5 landed,
+   and the restore left the GC idle. **Next: the user's choice of the next
+   stage or track** (see test-boot.md, "Boot 43"). A compute queue on the MEC, brought up like Linux's
    KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
    polling), runs a ring test and dispatches the `store_index` kernel that
    Apple's frontend and our lowering produced; see "Stage 22: a compute queue
