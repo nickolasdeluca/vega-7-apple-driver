@@ -166,7 +166,7 @@ struct FakeRegisters {
     uint32_t gcStuck = 0;            // a GC register whose writes are lost
     int fillDropGfx = -1;            // a DMA_DATA fill (by its order) the CP drops
     // Stage 22: per-queue registers, keyed by GRBM_GFX_CNTL's selection, and a
-    // MEC that runs the selected KIQ slot's ring from gfxWork.
+    // MEC that runs the selected queue's (MEC1, pipe 0, queue 0) ring from gfxWork.
     std::map<uint64_t, uint32_t> hqd;
     std::map<uint32_t, uint32_t> sh; // SH registers the MEC was given
     bool mecIgnoresPoll = false;     // the MEC never reads the poll address (method A fails)
@@ -184,11 +184,11 @@ struct FakeRegisters {
     uint64_t hqdKey(uint32_t offset) { return (uint64_t(gc[kRegGrbmGfxCntl] & kGrbmGfxCntlMask) << 32) | offset; }
     void presetCompute()
     {
-        gc[kRegRlcCpSchedulers] = 0x12345600; // another field the RMW must keep
+        gc[kRegRlcCpSchedulers] = 0x12345600; // never written: the queue is not a KIQ
         gc[kRegShMemConfig] = 0x00001001;      // RETRY_DISABLE and ADDRESS_MODE as read
         gc[kRegShMemBases] = 0x00010002;
         gc[kRegCpCpcBusyStat] = gc[kRegCpCpcStalledStat1] = 0;
-        // Every queue slot reads its reset values; the KIQ slot's are distinct.
+        // Every queue slot reads its reset values; the selected slot's are distinct.
         for (uint32_t q : kComputeQueueRegisters) hqd[(uint64_t(kComputeSelect) << 32) | q] = 0;
         hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdPqControl] = 0x00308509;
         hqd[(uint64_t(kComputeSelect) << 32) | kRegCpHqdEopControl] = 0x00000040;
@@ -1099,7 +1099,7 @@ struct FakeWriter {
         if (r->cpStopAt == 0) m[(kGfxWbPage + kGfxWbRptr) / 4] = to;
         r->gc[kRegCpRb0Rptr] = fetched;
     }
-    // The MEC on the KIQ slot (ME 2, pipe 1, queue 0): runs the ring from the
+    // The MEC on the selected slot (ME 1, pipe 0, queue 0): runs the ring from the
     // queue's read pointer to its write pointer, which it takes from the poll
     // address (if polling is on) or CP_HQD_PQ_WPTR_LO. SET_UCONFIG_REG
     // (SCRATCH_REG0), SET_SH_REG, WRITE_DATA to memory, RELEASE_MEM (unless
@@ -3485,6 +3485,7 @@ static void testCompute()
 {
     // The pinned values (docs/test-boot.md, stage 22).
     CHECK(kMaxStage == 22 && kComputeStage == 22 && kDiagnosticSelectorCount == 56 && kDiagnosticVersion == 19);
+    CHECK(kComputeSelect == 0x4); // MEC1, pipe 0, queue 0 (after boot 42)
     CHECK(kRegCpHqdActive == 0xC91Cu && kRegCpPqWptrPollCntl == 0xC20Cu && kRegShMemConfig == 0x8C34u &&
           kRegRlcCpSchedulers == 0x3B2A8u && kRegCpHqdPqWptrLo == 0xC9ECu && kRegCpHqdEopControl == 0xC9B0u);
     CHECK(kComputeWorkSize <= kGfxWorkCheckSize && kComputeRingPage == kGfxWorkSize && kComputeCodePage % 256 == 0);
@@ -3537,12 +3538,14 @@ static void testCompute()
         ComputeSnapshot snap = {};
         for (uint32_t i = 0; i < kComputeGlobalCount; i++) snap.global[i] = 0x01000000u * (i + 1);
         for (uint32_t i = 0; i < kComputeQueueCount; i++) snap.queue[i] = 0x00010000u * (i + 1);
-        CHECK(computeWriteAllowed(kRegRlcCpSchedulers, 0x02000048u, 22, &snap) &&
-              computeWriteAllowed(kRegRlcCpSchedulers, 0x020000c8u, 22, &snap) &&
-              !computeWriteAllowed(kRegRlcCpSchedulers, 0x020000c9u, 22, &snap) &&
-              !computeWriteAllowed(kRegRlcCpSchedulers, 0x02000048u, 21, &snap) &&
-              !computeWriteAllowed(kRegRlcCpSchedulers, 0x02000048u, 22, nullptr));
-        CHECK(computeWriteAllowed(kRegCpMecCntl, 0x05000000u & ~kCpMecHalts, 22, &snap) &&
+        // No KIQ: RLC_CP_SCHEDULERS is never written.
+        CHECK(!computeWriteAllowed(kRegRlcCpSchedulers, 0x00000048u, 22, &snap) &&
+              !computeWriteAllowed(kRegRlcCpSchedulers, 0x000000c8u, 22, &snap));
+        CHECK(computeWriteAllowed(kRegGrbmGfxCntl, 0x01000004u, 22, &snap) &&
+              !computeWriteAllowed(kRegGrbmGfxCntl, 0x01000009u, 22, &snap) &&
+              !computeWriteAllowed(kRegGrbmGfxCntl, 0x01000004u, 22, nullptr) &&
+              !computeWriteAllowed(kRegGrbmGfxCntl, 0x01000004u, 21, &snap));
+        CHECK(computeWriteAllowed(kRegCpMecCntl, 0x04000000u & ~kCpMecHalts, 22, &snap) &&
               !computeWriteAllowed(kRegCpMecCntl, 0x12345678u, 22, &snap));
         CHECK(computeWriteAllowed(kRegCpHqdActive, 1, 22, &snap) && computeWriteAllowed(kRegCpHqdActive, 0, 22, &snap) &&
               !computeWriteAllowed(kRegCpHqdActive, 3, 22, &snap));
@@ -3558,12 +3561,12 @@ static void testCompute()
         ComputeRig c;
         CHECK(c.rlc() == kOK);
         uint32_t writes = 0, index = 9, value = 9;
-        CHECK(c.start(&writes, &index, &value) == kOK && c.taken && writes == 29);
+        CHECK(c.start(&writes, &index, &value) == kOK && c.taken && writes == 27);
         CHECK(c.q(kRegCpHqdActive) == 1 && c.q(kRegCpHqdPqBase) == 0xF440A040u && c.q(kRegCpHqdPqControl) == 0xc0308909u &&
               c.q(kRegCpHqdEopControl) == 0x49 && c.q(kRegCpHqdPersistentState) == 0x5301 &&
               c.q(kRegCpHqdPqDoorbellControl) == 0 && c.q(kRegCpHqdEopBaseAddr) == 0xF440A060u &&
               c.q(kRegCpMqdBaseAddr) == 0x40A05000u && c.q(kRegCpHqdPqWptrPollAddr) == 0x40A07008u);
-        CHECK(c.g.r.gc[kRegRlcCpSchedulers] == 0x123456c8u && c.q(kRegCpPqWptrPollCntl) == 0x80000001u &&
+        CHECK(c.g.r.gc[kRegRlcCpSchedulers] == 0x12345600u && c.q(kRegCpPqWptrPollCntl) == 0x80000001u &&
               c.g.r.hqd[kRegCpPqWptrPollCntl] == 0 && // not selected: another bank, as boot 41 read it
               c.g.r.gc[kRegShMemConfig] == 0x00001018u && c.g.r.gc[kRegShMemBases] == 0 &&
               c.g.r.gc[kRegCpMecCntl] == 0 && (c.g.r.gc[kRegGrbmGfxCntl] & kGrbmGfxCntlMask) == 0);

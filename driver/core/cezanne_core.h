@@ -1341,9 +1341,10 @@ const uint32_t kGfxPageCount = sizeof(kGfxPages) / sizeof(kGfxPages[0]);
 
 // Stage 22 (docs/test-boot.md, "Stage 22: a compute queue on the MEC runs our
 // kernel"): stage 21's check, loads and RLC start (not its graphics CP start),
-// then one compute queue on the MEC brought up as Linux brings up the KIQ
-// (gfx_v9_0_kiq_setting, gfx_v9_0_mqd_init, gfx_v9_0_kiq_init_register), a
-// ring test, and one dispatch of the store_index kernel. Offsets from
+// then one compute queue on MEC1 with the registers Linux programs for a
+// queue (gfx_v9_0_mqd_init, written as gfx_v9_0_kiq_init_register and the
+// KFD's hqd_load write them), a ring test, and one dispatch of the
+// store_index kernel. Offsets from
 // gc_9_0_offset.h; PM4 from soc15d.h (Linux v6.12).
 const uint32_t kComputeStage = 22;
 // Per queue: read and written only with GRBM_GFX_CNTL selecting the queue.
@@ -1388,10 +1389,11 @@ const uint32_t kStage22Registers[] = {
     kRegCpCpcStalledStat1};
 const uint32_t kStage22RegisterCount = sizeof(kStage22Registers) / sizeof(kStage22Registers[0]);
 
-// The queue: amdgpu_gfx_kiq_acquire's choice with two MECs (ME 2, pipe 1,
-// queue 0), announced to the RLC as gfx_v9_0_kiq_setting does.
-const uint32_t kComputeSelect = 0x00000009; // GRBM_GFX_CNTL: PIPEID 1, MEID 2, QUEUEID 0, VMID 0
-const uint32_t kComputeKiq = 0x48, kRlcKiqMask = 0xff, kRlcKiqEnable = 0x80; // (me << 5) | (pipe << 3) | queue
+// The queue: compute ring 0's slot, MEC1 (ME 1), pipe 0, queue 0
+// (amdgpu_gfx_compute_queue_acquire: compute rings on MEC1 only). Boots 41
+// and 42 used the KIQ slot (ME 2, pipe 1), which ran the ring test but never
+// launched the dispatch. Not announced to the RLC: it is not a KIQ.
+const uint32_t kComputeSelect = 0x00000004; // GRBM_GFX_CNTL: PIPEID 0, MEID 1, QUEUEID 0, VMID 0
 
 // The memory, in stage 21's work area after its 16 KiB (its 64 KiB are
 // checked free): ring, MQD, EOP buffer, write-back, code, output.
@@ -1449,8 +1451,7 @@ const uint32_t kShMemAlignmentUnaligned = 0x00000018, kShMemRetryDisable = 0x000
 const uint32_t kCpHqdActive = 0x1;
 // The registers stage 22 writes that are not per queue, in this order; the
 // compute start reads them (GRBM_GFX_CNTL first, then with it at 0).
-const uint32_t kComputeGlobalRegisters[] = {kRegGrbmGfxCntl, kRegRlcCpSchedulers, kRegShMemConfig, kRegShMemBases,
-                                            kRegCpMecCntl};
+const uint32_t kComputeGlobalRegisters[] = {kRegGrbmGfxCntl, kRegShMemConfig, kRegShMemBases, kRegCpMecCntl};
 const uint32_t kComputeGlobalCount = sizeof(kComputeGlobalRegisters) / sizeof(kComputeGlobalRegisters[0]);
 // The per-queue registers, read under the selection, written in
 // kiq_init_register's order and restored in this order. Boot 41 showed
@@ -1468,11 +1469,9 @@ struct ComputeSnapshot {
     uint32_t global[kComputeGlobalCount];
     uint32_t queue[kComputeQueueCount];
 };
-// The bring-up, in kiq_setting then kiq_init_register order (GfxWrite:
-// offset, mask, value against the snapshot).
+// The bring-up, in kiq_init_register order (GfxWrite: offset, mask, value
+// against the snapshot).
 const GfxWrite kComputeGlobalWrites[] = {
-    {kRegRlcCpSchedulers, kRlcKiqMask, kComputeKiq},
-    {kRegRlcCpSchedulers, kRlcKiqMask, kComputeKiq | kRlcKiqEnable},
     {kRegGrbmGfxCntl, kGrbmGfxCntlMask, kComputeSelect},
     {kRegShMemConfig, ~kShMemRetryDisable, kShMemAlignmentUnaligned}, // constants_init, VMID 0
     {kRegShMemBases, 0xFFFFFFFF, 0},

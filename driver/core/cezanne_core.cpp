@@ -3008,7 +3008,8 @@ static uint32_t computeFenceWord(uint32_t i, uint32_t at, uint32_t seq)
 
 // gfx_v9_0_ring_emit_fence on a compute ring: RELEASE_MEM writing seq at a
 // compute write-back offset once the end-of-pipe event retires (8 dwords).
-// On the KIQ slot it never did in boot 41, so it is a probe after fence 4.
+// On the KIQ slot it never did in boot 41, so it is a probe after fence 4,
+// and fences 3 and 4 use the KIQ's form, which landed in boot 42.
 static uint32_t computeEopFenceWord(uint32_t i, uint32_t at, uint32_t seq)
 {
     const uint64_t address = kGfxWorkGpuAddress + kComputeWbPage + at;
@@ -3279,11 +3280,7 @@ Status startCompute(const RegisterReader &registers, uint64_t apertureLength, co
         if (result == kOK) (*writes)++;
         return result;
     };
-    // gfx_v9_0_kiq_setting.
-    status = global(kComputeGlobalWrites[0]);
-    if (status == kOK) status = global(kComputeGlobalWrites[1]);
-    if (status != kOK) return status;
-    // gfx_v9_0_kiq_init_register under the selection: the poll control
+    // gfx_v9_0_kiq_init_register's order under the selection: the poll control
     // (here enabled: method A), then the HQD, ACTIVE last.
     status = selectQueue(writer, stage, gfxSnapshot, snapshot, true);
     if (status != kOK) return status;
@@ -3299,7 +3296,7 @@ Status startCompute(const RegisterReader &registers, uint64_t apertureLength, co
     if (status != kOK) return status;
     if (back != kOK) return back;
     // constants_init's SH_MEM_* for VMID 0, then gfx_v9_0_cp_compute_enable.
-    for (uint32_t i = 3; status == kOK && i < sizeof(kComputeGlobalWrites) / sizeof(kComputeGlobalWrites[0]); i++)
+    for (uint32_t i = 1; status == kOK && i < sizeof(kComputeGlobalWrites) / sizeof(kComputeGlobalWrites[0]); i++)
         status = global(kComputeGlobalWrites[i]);
     if (status != kOK) return status;
     writer.pause(writer.context); // udelay(50)
