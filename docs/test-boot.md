@@ -4266,7 +4266,7 @@ region; the same write-back page):
   dispatch that never completes (no fence 4, the output still checked).
 - The boot 41 builds are kept as `superseded-*-stage22-releasemem`.
 
-#### Proposed revision: the queue on MEC1 (after boot 42; needs approval)
+#### Revision: the queue on MEC1 (after boot 42; approved 2026-10-30)
 
 Boot 42 (log below) passed the ring test on the KIQ slot. The dispatch was
 taken (`CP_HQD_PQ_RPTR` 101, just past `DISPATCH_DIRECT` at dwords 96–100),
@@ -4304,6 +4304,18 @@ The changes:
   That would be a separate proposal.
 - **Not in it:** doorbells, MAP_QUEUES through the KIQ, interrupts, other
   pipes or queues.
+
+**Implemented 2026-10-30.** The user approved it on 2026-10-30.
+- `kComputeSelect` is `0x4`.
+- `RLC_CP_SCHEDULERS` left both the write list and the global snapshot, so
+  it is not written at all, not even by the restore. It stays in the
+  allowlist and the reports as a read.
+- The compute start makes 27 writes.
+- Fences 3 and 4 stay `WRITE_DATA`, the form that landed in boot 42, and
+  fence 5 stays the `RELEASE_MEM` probe.
+- Tests: `RLC_CP_SCHEDULERS` and the old selection `0x9` are refused, and
+  the fake MEC runs the MEC1 slot.
+- The boot 42 builds are kept as `superseded-*-stage22-kiq`.
 
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 
