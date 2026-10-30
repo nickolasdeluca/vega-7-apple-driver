@@ -4266,6 +4266,45 @@ region; the same write-back page):
   dispatch that never completes (no fence 4, the output still checked).
 - The boot 41 builds are kept as `superseded-*-stage22-releasemem`.
 
+#### Proposed revision: the queue on MEC1 (after boot 42; needs approval)
+
+Boot 42 (log below) passed the ring test on the KIQ slot. The dispatch was
+taken (`CP_HQD_PQ_RPTR` 101, just past `DISPATCH_DIRECT` at dwords 96–100),
+but the kernel never wrote its output, and the MEC stayed busy at the next
+packet. Linux never dispatches on that slot:
+- `gfx_v9_0_sw_init` sets two MECs for GC 9.3.0 (`num_mec = 2`);
+- `amdgpu_gfx_kiq_acquire` puts the KIQ on MEC2;
+- `amdgpu_gfx_compute_queue_acquire` puts every compute ring "on MEC1 only".
+
+A KIQ handles queue management, and compute work runs on MEC1 queues. The
+proposal moves stage 22's queue to compute ring 0's slot: **MEC1 (ME 1),
+pipe 0, queue 0**, programmed directly, the way the KFD's
+`kgd_gfx_v9_hqd_load` loads an MQD's registers.
+
+The changes:
+- **Selection:** `GRBM_GFX_CNTL` `0x4` (MEID 1, PIPEID 0, QUEUEID 0) instead
+  of `0x9`. This is the new value that needs approval. The register is
+  already written, and the selection is undone the same way.
+- **No KIQ designation:** both `RLC_CP_SCHEDULERS` writes are dropped (27
+  writes instead of 29), and its restore remains a no-op check.
+- **Unchanged:**
+  - the same per-queue registers and values, under the new selection
+    (Linux's `gfx_v9_0_mqd_init` produces the same fields for a KIQ and a
+    compute queue);
+  - the same memory, frames, kernel and checks;
+  - the snapshot's `CP_HQD_ACTIVE` must read 0, and the restore and its
+    read-back run as now.
+- **What it answers:**
+  - whether a MEC1 queue runs the dispatch and the kernel writes 0..255;
+  - whether `RELEASE_MEM` (fence 5) retires there.
+
+  If the output stays untouched on MEC1 too, the queue slot is ruled out,
+  and the next suspect is the shader-side setup Linux runs before any
+  dispatch (the rest of `constants_init`, the CU masks and power gating).
+  That would be a separate proposal.
+- **Not in it:** doorbells, MAP_QUEUES through the KIQ, interrupts, other
+  pipes or queues.
+
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 
 **Approved by the user on 2026-10-22, together with the AGENTS.md exception,
@@ -6343,6 +6382,42 @@ is empty.
 - **Fixed within the stage**: see "Revision: the KIQ's fences and the banked
   poll control".
 - Captures are in ignored `out/test-efi/boot-41-stage22/`.
+
+**Boot 42, 2026-10-30, stage 22 after the fence revision**
+(`out/test-efi/usb-stage22`, rebuilt; cold boot; `tools/capture_boot.sh
+boot-42-stage22 --gfxoff-disallow --gfx-compute --psp-state`; diag v19, exit
+1).
+
+- **Up to the compute start: as boot 41** (29 writes, the queue idle before,
+  `CP_HQD_ACTIVE` 1 after, `CP_CPC_STATUS` 0).
+- **The ring test passed, the first full stage 22 step:**
+  - method A (polling): `SCRATCH_REG0` `0xDEADBEEF`, `CP_HQD_PQ_RPTR` 64;
+  - **fence 3 = 3**: the KIQ's `WRITE_DATA` fence landed, and the MEC came
+    back idle (`CP_CPC_STATUS` 0, `CP_CPC_BUSY_STAT` 0).
+- **The dispatch did not run: `gfx-fence-timeout`, fence 4 = 0, all 256
+  outputs still `0xffffffff`.**
+  - `CP_HQD_PQ_RPTR` 101 (`0x65`): the MEC consumed frame 2 up to and
+    including `DISPATCH_DIRECT` (dwords 96–100) and went no further.
+  - The CS partial flush, fence 4 and fence 5 were never reached, so fence 5
+    says nothing about end-of-pipe events here.
+  - `CP_CPC_STATUS` `0xa0000082`: `CPC_BUSY`, `CPG_CPC_BUSY`, `MEC2_BUSY`,
+    `ROQ2_BUSY`. `CP_CPC_BUSY_STAT` `0x00010000`: `MEC2_LOAD_BUSY`.
+    `CP_HQD_PQ_CONTROL` lost `PQ_EMPTY` (`0xc0300909`), as a queue with work
+    pending should.
+  - No VM fault, `CPC_UTCL1_STATUS` 0, and `GRBM_STATUS` `0xa0003028` with
+    neither `SPI_BUSY` nor any shader block busy. That fits a wave that was
+    never launched rather than one that hung.
+- **Restore: ok, and this time the GC came back idle.** The dequeue and every
+  register read back. After the restore `GRBM_STATUS` read `0x00003028`, and
+  `GRBM_STATUS2`, `CP_CPF_STATUS` and `CP_CPC_STATUS` read idle, unlike boot
+  41 and boots 32–38. The poll control's restore under the selection read
+  back as well. The PSP teardown fenced (`DESTROY_TMR` fence 11).
+- **Reading.** Packet fetch, register writes, `WRITE_DATA` to memory and
+  the dequeue all work on the KIQ slot. A dispatch issued there is never
+  launched. Linux never dispatches on that slot (it puts compute rings on
+  MEC1 only), so the next step is the proposed revision "the queue on
+  MEC1". It needs the user's approval because it selects a new queue.
+- Captures are in ignored `out/test-efi/boot-42-stage22/`.
 
 ## Unknowns and limits
 

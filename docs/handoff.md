@@ -236,9 +236,12 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    `RELEASE_MEM` fence's end-of-pipe event never retired on the KIQ. Fixed
    within the stage (KIQ fences by `WRITE_DATA`, `RELEASE_MEM` kept as a
    fence 5 probe, banked `CP_PQ_WPTR_POLL_CNTL`; test-boot.md, "Revision:
-   the KIQ's fences and the banked poll control"). **Next is boot 42**
-   (`tools/update_stick.sh 22`, cold boot, then `tools/capture_boot.sh
-   boot-42-stage22 --gfxoff-disallow --gfx-compute --psp-state`). A compute queue on the MEC, brought up like Linux's
+   the KIQ's fences and the banked poll control"). Boot 42 (2026-10-30):
+   the ring test passed (fence 3 by `WRITE_DATA`), and the restore left the
+   GC idle. The dispatch was consumed (`CP_HQD_PQ_RPTR` 101) but never
+   launched: no output, `MEC2_LOAD_BUSY`. **Next: the user's decision on the
+   proposed revision "the queue on MEC1"** (test-boot.md; `GRBM_GFX_CNTL`
+   `0x4`, no KIQ designation), since Linux dispatches on MEC1 only. A compute queue on the MEC, brought up like Linux's
    KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
    polling), runs a ring test and dispatches the `store_index` kernel that
    Apple's frontend and our lowering produced; see "Stage 22: a compute queue
