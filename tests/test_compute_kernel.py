@@ -82,6 +82,24 @@ class CorpusTests(unittest.TestCase):
             self.assertTrue((ROOT / "shaders" / "corpus" / (name + ".metal")).exists(), name)
             self.assertTrue((ROOT / "shaders" / "corpus" / (name + ".ll")).exists(), name)
 
+    def test_upload_header_shape(self):
+        # Stage 24's uploaded kernels: the tool's only, never the kext's.
+        text = (ROOT / "tools" / "diag" / "cezanne_upload.h").read_text()
+        rows = re.findall(r"\{kUpload_(\w+), (\d+), (0x[0-9a-f]+), (0x[0-9a-f]+), (\d+), (\d+), (0x[0-9a-f]+)\}", text)
+        self.assertEqual([row[0] for row in rows], ["saxpy"])
+        self.assertIn("const uint32_t kUploadCount = 1;", text)
+        for name, dwords, rsrc1, rsrc2, _, _, properties in rows:
+            self.assertEqual(int(properties, 16), 0xb, name)
+            self.assertEqual(int(rsrc2, 16) & 1, 0, name)
+            self.assertEqual((int(rsrc2, 16) >> 1) & 0x1f, 8, name)  # the user SGPRs the core sets up
+            self.assertEqual(int(rsrc1, 16) & ((1 << 20) | (1 << 22) | (1 << 25)), 0, name)
+            self.assertLessEqual(int(dwords) * 4, 0x1000, name)
+            self.assertTrue((ROOT / "shaders" / "upload" / (name + ".metal")).exists(), name)
+            self.assertTrue((ROOT / "shaders" / "upload" / (name + ".ll")).exists(), name)
+        for path in (ROOT / "driver").rglob("*"):
+            if path.is_file():
+                self.assertNotIn("cezanne_upload.h", path.read_text(errors="replace"), path)
+
     @unittest.skipUnless((LLVM_BIN / "llc").exists(), "the study's LLVM 20.1.7 is not in out/")
     def test_corpus_header_matches_the_build(self):
         run = subprocess.run(["python3", str(ROOT / "tools" / "build_corpus.py"), "--check"],
