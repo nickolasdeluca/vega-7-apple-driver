@@ -113,6 +113,19 @@ Experimental booting is available only through the USB test EFI in
 
 - Verify each batch before committing. Run checks appropriate to the change
   and use concise commit messages explaining its purpose.
+- **When to run the full suite** (`python3 -m unittest discover -s tests`,
+  about 13 minutes, nearly all of it `tests/test_core.py`'s mutants, which
+  rebuild the core with sanitizers per mutant):
+  - while editing, run only the fast checks: build and run
+    `tests/core/core_test.cpp`, plus the fast Python modules the change
+    touches;
+  - run the full suite once before every build that goes to the USB stick,
+    not only at the end of a stage. The mutants guard the register
+    allowlists and the restore checks, and every boot runs on real hardware;
+  - when a stick build's changes do not touch `driver/core/`, the mutants
+    may be skipped for that build;
+  - never edit files while the suite runs, because each mutant re-reads
+    the core. Run one build or one test suite at a time.
 - Test diagnostic parsing and failure paths using controlled inputs. Compare
   the captured baseline with independent system queries. Preserve raw evidence
   locally so reported values can be audited.

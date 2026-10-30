@@ -4231,6 +4231,41 @@ Built 2026-10-22. Where it differs from the text above, this wins:
    --gfxoff-disallow --gfx-compute --psp-state`.
 3. Shut down fully and return to the normal EFI.
 
+#### Revision: the KIQ's fences and the banked poll control (after boot 41)
+
+Boot 41 (log below) ran the ring test's packet on the MEC, and its fence never
+landed. Two fixes, both within the stage (no new register, value or memory
+region; the same write-back page):
+
+- **Fences 3 and 4 use the KIQ's own fence form.** Linux never sends
+  `RELEASE_MEM` on the KIQ: its fence is `gfx_v9_0_ring_emit_fence_kiq`,
+  `WRITE_DATA` (`0x37`) with `ENGINE_SEL(0) | DST_SEL(5) | WR_CONFIRM`
+  (`0x00100500`), the address and the sequence number. Frame 1 is now the
+  scratch write and that fence 3 (8 dwords, then a NOP). Frame 2 is the
+  dispatch, the CS partial flush, fence 4 the same way, then **fence 5 by
+  `RELEASE_MEM`** (`CACHE_FLUSH_AND_INV_TS_EVENT`, as before, at write-back
+  `+0x110`). Fence 5 is a probe: it is last in the ring, so if its
+  end-of-pipe event again never retires, nothing waits on it. Every report
+  shows it.
+- **The dispatch reads the output even without fence 4.** The 256 dwords are
+  compared either way; the step still fails on a missing fence.
+- **`CP_PQ_WPTR_POLL_CNTL` is per queue.** Boot 41 wrote `EN` under the
+  selection, and the MEC then took the write pointer from the poll address
+  (method A). Every report read the register without the selection as
+  `0x00000000`, so the unselected read is another bank. That also means the
+  restore wrote the snapshot back to the wrong bank and left `EN` set on the
+  queue's. The register moves from the global list to the front of
+  `kComputeQueueRegisters` and `kComputeQueueWrites`. It is snapshotted,
+  written, reported and restored under the selection like the HQD
+  registers. The write count stays 29.
+- **Interface:** diagnostic version 19, because `ComputeState` gains
+  `fence5` and the poll control moves to the per-queue part of the report.
+- **Tests:** the fake banks the poll control by selection. Its MEC executes
+  `WRITE_DATA`, and two new cases cover end-of-pipe events that never
+  retire (boot 41: the WRITE_DATA fences pass, fence 5 stays 0) and a
+  dispatch that never completes (no fence 4, the output still checked).
+- The boot 41 builds are kept as `superseded-*-stage22-releasemem`.
+
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 
 **Approved by the user on 2026-10-22, together with the AGENTS.md exception,
@@ -6258,6 +6293,56 @@ work, and real answers to the vendor messages above.
 **Back on the known-good EFI** (2026-10-22, after boot 40): `csrutil status`
 reports enabled, `nvram boot-args` is `-NRedRBPlus`, and `/Library/GPUBundles`
 is empty.
+
+**Boot 41, 2026-10-30, stage 22** (`out/test-efi/usb-stage22`; cold boot;
+`tools/capture_boot.sh boot-41-stage22 --gfxoff-disallow --gfx-compute
+--psp-state`; diag exit 1). Boot args as built (`cezanne-stage=22`), and
+`kmutil` lists `org.cezanne-driver.gpu` 0.1.0 loaded.
+
+- **Everything up to the RLC start passed as at boot 38:**
+  - `DisallowGfxOff`;
+  - `SETUP_TMR` (fence 1);
+  - the nine GFX images (last fence 10);
+  - the RLC start (26 writes, serdes idle).
+- **Compute start: ok, 29 writes.**
+  - The KIQ slot's HQD was idle (`CP_HQD_ACTIVE` 0 in the snapshot).
+  - Afterwards `CP_HQD_ACTIVE` read 1, `CP_HQD_PQ_CONTROL` `0xc0308909`,
+    `RLC_CP_SCHEDULERS` `0x585048c8` (KIQ byte `0xc8`), `CP_MEC_CNTL` 0, and
+    `CP_CPC_STATUS` 0.
+- **The ring test's packet ran: the first PM4 packet our MEC executed.**
+  - Committed by polling (method A): the MEC took the write pointer 64 from
+    the poll dword (`CP_HQD_PQ_WPTR_LO` then read `0x40`).
+  - It fetched the whole frame: `CP_HQD_PQ_RPTR` 64, and the read-pointer
+    write-back 64. **The CP wrote to our memory.**
+  - `SET_UCONFIG_REG` changed `SCRATCH_REG0` from `0xCAFEDEAD` to
+    `0xDEADBEEF`.
+- **Fence 3 (`RELEASE_MEM`) never landed: `gfx-fence-timeout`, fence 3 = 0.**
+  - `CP_CPC_STATUS` read `0x80000002` (`CPC_BUSY`, `MEC2_BUSY`).
+  - `CP_CPC_BUSY_STAT` read `0x08100000`: `MEC2_EOP_QUEUE_BUSY` (bit 20) and
+    `MEC2_PIPE1_BUSY` (bit 27), decoded with `gc_9_0_sh_mask.h`.
+  - Nothing else was busy: `CP_CPC_STALLED_STAT1` 0, `CPC_UTCL1_STATUS` 0,
+    no VM fault, and `GRBM_STATUS` `0xa0003028` as at the compute start.
+  - So the packet was taken into the end-of-pipe queue, and its event never
+    retired.
+  - The dispatch did not run, since it needs a passing ring test.
+- **Restore: ok, flip back ok.** Every queue and global register read back
+  as snapshotted, and the stage 21 restore passed. The PSP teardown fenced
+  (`DESTROY_TMR` fence 11). As with the graphics CP at boots 32–38, busy bits
+  stay set after the halt: `CP_CPC_STATUS` `0x80000002`, `CP_CPF_STATUS`
+  `0xa0000001`, `GRBM_STATUS2` `0x30000008` (`CPF_BUSY`, `CPC_BUSY`).
+- **A restore gap, found in the reports:** `CP_PQ_WPTR_POLL_CNTL` read
+  `0x00000000` in every report, including right after `EN` was set and while
+  the MEC polled. It is banked by the selection, so its restore went to the
+  wrong bank.
+- **Reading.** Our MEC fetches, parses and executes our packets, and writes
+  memory: the queue setup, the poll path and the GC hub all work. What does
+  not complete is an end-of-pipe event on the KIQ, a path Linux never uses
+  there (its KIQ fence is `WRITE_DATA`). Whether end-of-pipe events retire
+  at all on this GC, outside the KIQ, is not known. That question may connect
+  to the graphics CP's stall.
+- **Fixed within the stage**: see "Revision: the KIQ's fences and the banked
+  poll control".
+- Captures are in ignored `out/test-efi/boot-41-stage22/`.
 
 ## Unknowns and limits
 

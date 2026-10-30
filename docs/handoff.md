@@ -231,9 +231,14 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    pre-check already showed MSL → AIR working on our device class in-process,
    with pipeline creation left to the vendor class.
 4. **Stage 22, redirected to compute (2026-10-22, the user's choice):
-   approved and implemented; next is boot 41** (`tools/update_stick.sh 22`,
-   then `tools/capture_boot.sh boot-41-stage22 --gfxoff-disallow --gfx-compute
-   --psp-state`; test-boot.md, "Stage 22 implementation"). A compute queue on the MEC, brought up like Linux's
+   approved and implemented. Boot 41 (2026-10-30): the MEC executed our
+   ring-test packet (`SCRATCH_REG0` `0xDEADBEEF`, read pointer 64), but the
+   `RELEASE_MEM` fence's end-of-pipe event never retired on the KIQ. Fixed
+   within the stage (KIQ fences by `WRITE_DATA`, `RELEASE_MEM` kept as a
+   fence 5 probe, banked `CP_PQ_WPTR_POLL_CNTL`; test-boot.md, "Revision:
+   the KIQ's fences and the banked poll control"). **Next is boot 42**
+   (`tools/update_stick.sh 22`, cold boot, then `tools/capture_boot.sh
+   boot-42-stage22 --gfxoff-disallow --gfx-compute --psp-state`). A compute queue on the MEC, brought up like Linux's
    KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
    polling), runs a ring test and dispatches the `store_index` kernel that
    Apple's frontend and our lowering produced; see "Stage 22: a compute queue
