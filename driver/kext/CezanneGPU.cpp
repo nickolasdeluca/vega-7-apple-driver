@@ -132,6 +132,7 @@ struct WritePage {
     UInt32 stage;
     const uint32_t *gfxSnapshot; // stage 21: the check's snapshot, for kGfxPageSet only
     const cezanne::ComputeSnapshot *computeSnapshot; // stage 22: the queue's snapshot, for kGfxPageSet only
+    const cezanne::VmSnapshot *vmSnapshot;           // stage 24: the GC hub's reading, for kGfxPageSet only
 };
 
 // One device operation run by CezanneGPU::accessDevice with the checks done
@@ -238,6 +239,11 @@ public:
     cezanne::Status computeSubmit(const void *owner, const cezanne::ComputeRequest *request, uint32_t out[4],
                                   cezanne::ComputeState *state);
     cezanne::Status computeRead(const void *owner, uint32_t offset, uint32_t bytes, cezanne::ComputeChunk *chunk);
+    // Stage 24, after a passing computeTest instead of corpus submissions:
+    // VMID 1's VM, uploaded code, submissions at VMID 1.
+    cezanne::Status computeVmStart(const void *owner, uint32_t out[3], cezanne::ComputeState *state);
+    cezanne::Status computeCode(const void *owner, uint32_t slot, uint32_t offset, const cezanne::ComputeChunk *chunk);
+    cezanne::Status computeVmSubmit(const void *owner, const cezanne::VmRequest *request, cezanne::VmReport *report);
 
 private:
     enum ScratchState { kScratchIdle, kScratchChecked, kScratchWritten };
@@ -373,6 +379,9 @@ private:
         kGfxDispatched,
         // Stage 23, after kGfxComputeTested.
         kGfxSubmitted,
+        // Stage 24, after kGfxComputeTested instead of kGfxSubmitted.
+        kGfxVmStarted,
+        kGfxVmSubmitted,
     };
     GfxStep gfxStep_ = kGfxIdle;
     bool gfxPassed_ = false; // the last stage 21 step passed
@@ -384,7 +393,16 @@ private:
     bool computeTaken_ = false;  // the queue snapshot was read: its restore is owed
     uint32_t computeCommit_ = 0; // the ring test's write-pointer method
     uint32_t computeSubmitted_ = 0; // stage 23 submissions written to the ring
+    cezanne::VmSnapshot vmSnapshot_ = {}; // stage 24: the gfx check's reading of the GC hub
+    bool vmStarted_ = false;              // the VM start wrote: its restore is owed
+    uint32_t vmSubmitted_ = 0;            // stage 24 submissions written to the ring
     bool gfxRestoreOwed() const;
+    // Stage 23 and 24: when the tool's data may go in and come out.
+    bool dataStep() const
+    {
+        return gfxStep_ == kGfxComputeTested || gfxStep_ == kGfxSubmitted || gfxStep_ == kGfxVmStarted ||
+               gfxStep_ == kGfxVmSubmitted;
+    }
     cezanne::Status gfxRestoreLocked(uint32_t out[3], cezanne::GfxState *state);
     cezanne::Status flipRestoreLocked(uint32_t *index, uint32_t *value, uint32_t *rptr, cezanne::FlipReport *report);
     cezanne::Status sdmaStopLocked(uint32_t *f32Cntl, uint32_t *downResponse, uint32_t *fence, uint32_t *ringResponse);
@@ -490,7 +508,9 @@ static bool registerWrite(void *context, uint32_t offset, uint32_t value)
     if (!cezanne::writeAllowed(offset, value, page->stage) &&
         !(page->gfxSnapshot != nullptr && cezanne::gfxWriteAllowed(offset, value, page->stage, page->gfxSnapshot)) &&
         !(page->computeSnapshot != nullptr &&
-          cezanne::computeWriteAllowed(offset, value, page->stage, page->computeSnapshot))) {
+          cezanne::computeWriteAllowed(offset, value, page->stage, page->computeSnapshot)) &&
+        !(page->vmSnapshot != nullptr &&
+          cezanne::vmWriteAllowed(offset, value, page->stage, page->vmSnapshot, page->computeSnapshot))) {
         return false;
     }
     for (uint32_t i = 0; i < page->count; i++) {
@@ -890,7 +910,7 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
     IODeviceMemory *pageMemories[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     IOMemoryMap *pageMaps[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     WritePage page = {{nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}, {0, 0, 0, 0, 0, 0}, 0, stage_, nullptr,
-                      nullptr};
+                      nullptr, nullptr};
     if (writablePage == cezanne::kSdmaPageSet || writablePage == cezanne::kGartPageSet) {
         page.count = 3;
         for (uint32_t i = 0; i < 3; i++) {
@@ -909,6 +929,7 @@ cezanne::Status CezanneGPU::accessDevice(uint32_t writablePage, DeviceOperation 
         }
         page.gfxSnapshot = gfxSnapshot_;
         page.computeSnapshot = stage_ >= cezanne::kComputeStage ? &computeSnapshot_ : nullptr;
+        page.vmSnapshot = stage_ >= cezanne::kVmStage ? &vmSnapshot_ : nullptr;
     } else if (writablePage != 0) {
         page.count = 1;
         page.pageOffset[0] = writablePage;
@@ -1321,10 +1342,9 @@ template <typename Use> static cezanne::Status withGfxMemory(UInt32 stage, bool 
     }
     IODeviceMemory *gfxMemory = nullptr;
     if (work) {
-        // Stage 22 adds the compute pages (cezanne::gfxWorkSize).
-        gfxMemory = IODeviceMemory::withRange(cezanne::kGfxWorkPhysical, stage >= cezanne::kComputeStage
-                                                                              ? cezanne::kComputeWorkSize
-                                                                              : cezanne::kGfxWorkSize);
+        // Stage 22 adds the compute pages, stage 24 the page table and the
+        // default page (cezanne::gfxWorkSize).
+        gfxMemory = IODeviceMemory::withRange(cezanne::kGfxWorkPhysical, cezanne::gfxWorkSize(stage));
     } else {
         gfxMemory = IODeviceMemory::withRange(cezanne::kGfxFwPhysical, cezanne::kGfxFwBufferSize);
     }
@@ -3365,6 +3385,7 @@ struct GfxArgument {
     const cezanne::Range *ranges;
     uint32_t rangeCount;
     uint32_t *snapshot, *display;
+    cezanne::VmSnapshot *vm; // stage 24: the GC hub's reading, at the check
     uint32_t *out;  // the step's scalars
     uint32_t flipFrames;
     uint32_t *frames;
@@ -3389,6 +3410,13 @@ static cezanne::Status gfxCheckOperation(UInt32 stage, const cezanne::RegisterRe
     cezanne::Status status = cezanne::checkGfxFiles(gfxFiles(), index);
     if (status == cezanne::kOK) {
         status = cezanne::checkGfxBoot(registers, length, stage, gfx->snapshot, index, value);
+    }
+    if (status == cezanne::kOK && stage >= cezanne::kVmStage) {
+        status = cezanne::checkVmBoot(registers, length, stage, gfx->vm, index, value);
+        // Its index past stage 21's list, so the tool can tell them apart.
+        if (status == cezanne::kGfxUnexpectedState) {
+            *index += cezanne::kGfxExpectCount;
+        }
     }
     uint32_t frames = 0;
     if (status == cezanne::kOK) {
@@ -3575,7 +3603,8 @@ bool CezanneGPU::gfxRestoreOwed() const
 {
     return gfxStep_ == kGfxRlcStarted || gfxStep_ == kGfxCpStarted || gfxStep_ == kGfxTested ||
            gfxStep_ == kGfxDrawn || gfxStep_ == kGfxVerified || gfxStep_ == kGfxComputeStarted ||
-           gfxStep_ == kGfxComputeTested || gfxStep_ == kGfxDispatched || gfxStep_ == kGfxSubmitted;
+           gfxStep_ == kGfxComputeTested || gfxStep_ == kGfxDispatched || gfxStep_ == kGfxSubmitted ||
+           gfxStep_ == kGfxVmStarted || gfxStep_ == kGfxVmSubmitted;
 }
 
 struct ComputeArgument {
@@ -3726,8 +3755,7 @@ cezanne::Status CezanneGPU::computeWrite(const void *owner, uint32_t offset, con
 {
     IOLockLock(lock_);
     cezanne::Status status = cezanne::kGfxOutOfOrder;
-    if (stage_ >= cezanne::kCorpusStage && (gfxStep_ == kGfxComputeTested || gfxStep_ == kGfxSubmitted) &&
-        gfxPassed_ && pspOwner_ == owner) {
+    if (stage_ >= cezanne::kCorpusStage && dataStep() && gfxPassed_ && pspOwner_ == owner) {
         status = cezanne::kRegisterNotAllowed;
         const uint32_t bytes = chunk->bytes;
         if (bytes != 0 && bytes <= cezanne::kComputeChunkBytes && bytes % 4 == 0) {
@@ -3772,8 +3800,7 @@ cezanne::Status CezanneGPU::computeRead(const void *owner, uint32_t offset, uint
     IOLockLock(lock_);
     cezanne::Status status = cezanne::kGfxOutOfOrder;
     // Also after a failed submission: what it left is the finding.
-    if (stage_ >= cezanne::kCorpusStage && (gfxStep_ == kGfxComputeTested || gfxStep_ == kGfxSubmitted) &&
-        pspOwner_ == owner) {
+    if (stage_ >= cezanne::kCorpusStage && dataStep() && pspOwner_ == owner) {
         status = cezanne::kRegisterNotAllowed;
         if (bytes != 0 && bytes <= cezanne::kComputeChunkBytes && bytes % 4 == 0) {
             status = withSubmitMemory(stage_, [&](const cezanne::MemoryReader &region, const cezanne::MemoryWriter &) {
@@ -3783,6 +3810,119 @@ cezanne::Status CezanneGPU::computeRead(const void *owner, uint32_t offset, uint
                 chunk->bytes = bytes;
             }
         }
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+struct VmArgument {
+    ComputeArgument compute;
+    cezanne::VmSnapshot *vm;
+    const cezanne::VmRequest *request;
+    uint32_t n;
+    cezanne::VmReport *report;
+};
+
+static cezanne::Status computeVmStartOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                               const cezanne::RegisterWriter *writer, void *argument)
+{
+    VmArgument *vm = static_cast<VmArgument *>(argument);
+    ComputeArgument *compute = &vm->compute;
+    cezanne::Status status = cezanne::startVm(registers, length, *writer, stage, compute->gfxSnapshot,
+                                              compute->snapshot, vm->vm, &compute->out[0], &compute->out[1],
+                                              &compute->out[2]);
+    return withGfxMemory(stage, true, [&](const cezanne::MemoryReader &work, const cezanne::MemoryWriter &) {
+        return withComputeState(status, stage, registers, length, writer, work, compute);
+    });
+}
+
+static cezanne::Status computeVmSubmitOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                                const cezanne::RegisterWriter *writer, void *argument)
+{
+    VmArgument *vm = static_cast<VmArgument *>(argument);
+    ComputeArgument *compute = &vm->compute;
+    return withGfxMemory(stage, true, [&](const cezanne::MemoryReader &work, const cezanne::MemoryWriter &memory) {
+        return withSubmitMemory(stage, [&](const cezanne::MemoryReader &, const cezanne::MemoryWriter &region) {
+            return cezanne::submitVm(registers, length, *writer, memory, work, region, stage, compute->gfxSnapshot,
+                                     compute->snapshot, vm->vm, compute->commit, *vm->request, vm->n, vm->report);
+        });
+    });
+}
+
+static cezanne::Status vmRestoreOperation(UInt32 stage, const cezanne::RegisterReader &registers, UInt64 length,
+                                          const cezanne::RegisterWriter *writer, void *argument)
+{
+    VmArgument *vm = static_cast<VmArgument *>(argument);
+    ComputeArgument *compute = &vm->compute;
+    return cezanne::restoreVm(registers, length, *writer, stage, compute->gfxSnapshot, compute->snapshot, vm->vm,
+                              &compute->out[0], &compute->out[1]);
+}
+
+cezanne::Status CezanneGPU::computeVmStart(const void *owner, uint32_t out[3], cezanne::ComputeState *state)
+{
+    out[0] = out[1] = out[2] = 0;
+    *state = cezanne::ComputeState();
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kGfxOutOfOrder;
+    // After a passing ring test, before any corpus submission: one kind of
+    // session per load.
+    if (stage_ >= cezanne::kVmStage && gfxStep_ == kGfxComputeTested && gfxPassed_ && vmSnapshot_.checked &&
+        pspOwner_ == owner) {
+        VmArgument vm = {{gfxSnapshot_, &computeSnapshot_, &computeTaken_, out, computeCommit_, state},
+                         &vmSnapshot_, nullptr, 0, nullptr};
+        gfxStep_ = kGfxVmStarted;
+        vmStarted_ = true;
+        vmSubmitted_ = 0;
+        status = accessDevice(cezanne::kGfxPageSet, computeVmStartOperation, &vm);
+        gfxPassed_ = status == cezanne::kOK;
+        IOLog(LOG_PREFIX "VM start: %s, %u writes, index %u, value 0x%08x, SH_MEM %s\n", cezanne::statusName(status),
+              out[0], out[1], out[2], vmSnapshot_.shMemTaken ? "taken" : "not taken");
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::computeCode(const void *owner, uint32_t slot, uint32_t offset,
+                                        const cezanne::ComputeChunk *chunk)
+{
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kGfxOutOfOrder;
+    if (stage_ >= cezanne::kVmStage && (gfxStep_ == kGfxVmStarted || gfxStep_ == kGfxVmSubmitted) && gfxPassed_ &&
+        pspOwner_ == owner) {
+        status = cezanne::kRegisterNotAllowed;
+        const uint32_t bytes = chunk->bytes;
+        if (bytes != 0 && bytes <= cezanne::kComputeChunkBytes && bytes % 4 == 0) {
+            status = withSubmitMemory(stage_, [&](const cezanne::MemoryReader &, const cezanne::MemoryWriter &region) {
+                return cezanne::writeVmCode(region, stage_, slot, offset, chunk->words, bytes / 4);
+            });
+        }
+    }
+    IOLockUnlock(lock_);
+    return status;
+}
+
+cezanne::Status CezanneGPU::computeVmSubmit(const void *owner, const cezanne::VmRequest *request,
+                                            cezanne::VmReport *report)
+{
+    *report = cezanne::VmReport();
+    IOLockLock(lock_);
+    cezanne::Status status = cezanne::kGfxOutOfOrder;
+    if (stage_ >= cezanne::kVmStage && (gfxStep_ == kGfxVmStarted || gfxStep_ == kGfxVmSubmitted) && gfxPassed_ &&
+        pspOwner_ == owner) {
+        uint32_t out[3] = {};
+        VmArgument vm = {{gfxSnapshot_, &computeSnapshot_, &computeTaken_, out, computeCommit_, nullptr},
+                         &vmSnapshot_, request, vmSubmitted_, report};
+        status = accessDevice(cezanne::kGfxPageSet, computeVmSubmitOperation, &vm);
+        gfxStep_ = kGfxVmSubmitted;
+        // A refused request wrote nothing; anything else used its frame.
+        if (status != cezanne::kComputeRefused) {
+            vmSubmitted_++;
+            gfxPassed_ = status == cezanne::kOK;
+        }
+        IOLog(LOG_PREFIX "VM submit %u (slot %u): %s, fence %u, read pointer %u, refusal %u (buffer %u), fault 0x%08x "
+                         "at 0x%08x%08x, %u default-page words\n",
+              vm.n, request->slot, cezanne::statusName(status), report->fence, report->rptr, report->reason,
+              report->index, report->faultStatus, report->faultAddrHi, report->faultAddrLo, report->defaultWords);
     }
     IOLockUnlock(lock_);
     return status;
@@ -3817,8 +3957,12 @@ cezanne::Status CezanneGPU::gfxCheck(const void *owner, uint32_t *index, uint32_
         gfx.rangeCount = count;
         gfx.snapshot = gfxSnapshot_;
         gfx.display = gfxDisplay_;
+        gfx.vm = &vmSnapshot_;
         gfx.out = out;
         gfx.state = state;
+        vmSnapshot_ = cezanne::VmSnapshot();
+        vmStarted_ = false;
+        vmSubmitted_ = 0;
         status = accessDevice(0, gfxCheckOperation, &gfx);
         *index = out[0];
         *value = out[1];
@@ -3989,6 +4133,18 @@ cezanne::Status CezanneGPU::gfxRestoreLocked(uint32_t out[3], cezanne::GfxState 
     }
     // Stage 22: the queue first (dequeue, its registers, the MEC halted), as
     // gfx_v9_0_hw_fini does before the RLC stop.
+    // Stage 24: VMID 1's VM before the queue (its flush needs the GC hub as
+    // the session left it).
+    cezanne::Status vm = cezanne::kOK;
+    uint32_t vmOut[3] = {};
+    if (vmStarted_) {
+        VmArgument argument = {{gfxSnapshot_, &computeSnapshot_, &computeTaken_, vmOut, 0, nullptr},
+                               &vmSnapshot_, nullptr, 0, nullptr};
+        vm = accessDevice(cezanne::kGfxPageSet, vmRestoreOperation, &argument);
+        vmStarted_ = false;
+        IOLog(LOG_PREFIX "VM restore: %s, index %u, value 0x%08x\n", cezanne::statusName(vm), vmOut[0], vmOut[1]);
+        setProperty("CezanneGPU VM restore", cezanne::statusName(vm));
+    }
     cezanne::Status compute = cezanne::kOK;
     uint32_t computeOut[2] = {};
     if (computeTaken_) {
@@ -4013,6 +4169,12 @@ cezanne::Status CezanneGPU::gfxRestoreLocked(uint32_t out[3], cezanne::GfxState 
           out[1], cezanne::statusName(flip));
     setProperty("CezanneGPU GFX restore", cezanne::statusName(status));
     gfxStep_ = kGfxRestored;
+    if (vm != cezanne::kOK) {
+        // The VM's failure first, with its index and value.
+        out[0] = vmOut[0];
+        out[1] = vmOut[1];
+        return vm;
+    }
     if (compute != cezanne::kOK) {
         // The queue's failure is reported first, with its index and value.
         out[0] = computeOut[0];
@@ -4170,6 +4332,9 @@ private:
     static IOReturn computeWrite(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn computeSubmit(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
     static IOReturn computeRead(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn computeVmStart(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn computeCode(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
+    static IOReturn computeVmSubmit(OSObject *target, void *reference, IOExternalMethodArguments *arguments);
 };
 
 OSDefineMetaClassAndStructors(CezanneGPUUserClient, IOUserClient)
@@ -4841,6 +5006,39 @@ IOReturn CezanneGPUUserClient::computeRead(OSObject *target, void *, IOExternalM
     return putScalars(arguments, status, nullptr, 0);
 }
 
+IOReturn CezanneGPUUserClient::computeVmStart(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    uint32_t v[3] = {};
+    cezanne::ComputeState state;
+    cezanne::Status status = self->gpu_->computeVmStart(self, v, &state);
+    putStructure(arguments, state);
+    return putScalars(arguments, status, v, 3);
+}
+
+IOReturn CezanneGPUUserClient::computeCode(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    const uint64_t slot = arguments->scalarInput[0], offset = arguments->scalarInput[1];
+    cezanne::ComputeChunk chunk;
+    getStructure(arguments, &chunk);
+    cezanne::Status status = slot >= cezanne::kVmCodeSlots || offset >= cezanne::kSubmitCodeSlot
+                                 ? cezanne::kRegisterNotAllowed
+                                 : self->gpu_->computeCode(self, uint32_t(slot), uint32_t(offset), &chunk);
+    return putScalars(arguments, status, nullptr, 0);
+}
+
+IOReturn CezanneGPUUserClient::computeVmSubmit(OSObject *target, void *, IOExternalMethodArguments *arguments)
+{
+    CezanneGPUUserClient *self = static_cast<CezanneGPUUserClient *>(target);
+    cezanne::VmRequest request;
+    getStructure(arguments, &request);
+    cezanne::VmReport report;
+    cezanne::Status status = self->gpu_->computeVmSubmit(self, &request, &report);
+    putStructure(arguments, report);
+    return putScalars(arguments, status, nullptr, 0);
+}
+
 IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *arguments,
                                               IOExternalMethodDispatch *, OSObject *, void *reference)
 {
@@ -4905,6 +5103,9 @@ IOReturn CezanneGPUUserClient::externalMethod(uint32_t selector, IOExternalMetho
         {computeWrite, 1, sizeof(cezanne::ComputeChunk), 1, 0},    // kDiagnosticComputeWrite
         {computeSubmit, 0, sizeof(cezanne::ComputeRequest), 5, sizeof(cezanne::ComputeState)}, // kDiagnosticComputeSubmit
         {computeRead, 2, 0, 1, sizeof(cezanne::ComputeChunk)},     // kDiagnosticComputeRead
+        {computeVmStart, 0, 0, 4, sizeof(cezanne::ComputeState)},  // kDiagnosticComputeVmStart
+        {computeCode, 2, sizeof(cezanne::ComputeChunk), 1, 0},     // kDiagnosticComputeCode
+        {computeVmSubmit, 0, sizeof(cezanne::VmRequest), 1, sizeof(cezanne::VmReport)}, // kDiagnosticComputeVmSubmit
     };
     if (selector >= cezanne::kDiagnosticSelectorCount) {
         return kIOReturnUnsupported;

@@ -91,7 +91,7 @@ ALLOWED_STORES = (SCRATCH_STORE, WORK_STORE, FIRMWARE_STORE, SDMA_WORK_STORE, GA
                   GFX_FIRMWARE_STORE, GFX_WORK_STORE, SUBMIT_STORE)
 ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize", "cezanne::kPspWorkSize",
                        "cezanne::kSdmaFwBufferSize", "cezanne::kGartWorkSize", "cezanne::kPatternSize",
-                       "cezanne::kGfxWorkSize", "cezanne::kGfxFwBufferSize", "cezanne::kSubmitSize", "length")
+                       "cezanne::gfxWorkSize(stage)", "cezanne::kGfxFwBufferSize", "cezanne::kSubmitSize", "length")
 ALLOWED_VOLATILE = 16
 SDMA_FIRMWARE = ROOT / "out" / "firmware-provenance" / "fw" / "green_sardine_sdma.bin"
 
@@ -398,8 +398,9 @@ void f(IOPCIDevice *p, Aperture *a) {
         # snapshot-relative allowlist only for it.
         self.assertEqual(sorted(re.findall(r"accessDevice\(cezanne::kGfxPageSet, (\w+)", source)),
                          ["computeDispatchOperation", "computeRestoreOperation", "computeStartOperation",
-                          "computeSubmitOperation", "computeTestOperation", "gfxCpOperation", "gfxDrawOperation", "gfxRestoreOperation",
-                          "gfxRlcOperation", "gfxTestOperation"])
+                          "computeSubmitOperation", "computeTestOperation", "computeVmStartOperation",
+                          "computeVmSubmitOperation", "gfxCpOperation", "gfxDrawOperation", "gfxRestoreOperation",
+                          "gfxRlcOperation", "gfxTestOperation", "vmRestoreOperation"])
         self.assertIn("const uint32_t kGfxPages[] = {0x8000, 0x9000, 0xa000, 0xc000, 0x30000, 0x3b000};", header)
         self.assertEqual(source.count("page.gfxSnapshot = gfxSnapshot_;"), 1)
         # Stage 22: the queue snapshot's allowlist, only with the page set and
@@ -412,6 +413,21 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertLess(write.index("gfxWriteAllowed"), write.index(SCRATCH_STORE))
         self.assertIn("cezanne::computeWriteAllowed(offset, value, page->stage, page->computeSnapshot)", write)
         self.assertLess(write.index("computeWriteAllowed"), write.index(SCRATCH_STORE))
+        # Stage 24: the GC hub reading's allowlist, likewise.
+        self.assertEqual(source.count("page.vmSnapshot = stage_ >= cezanne::kVmStage ? &vmSnapshot_ : nullptr;"), 1)
+        self.assertIn("cezanne::vmWriteAllowed(offset, value, page->stage, page->vmSnapshot, page->computeSnapshot)",
+                      write)
+        self.assertLess(write.index("vmWriteAllowed"), write.index(SCRATCH_STORE))
+        # The VM start: after a passing ring test and the check's reading,
+        # never after corpus submissions; it owes the restore before it writes.
+        vm = re.search(r"cezanne::Status CezanneGPU::computeVmStart\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("gfxStep_ == kGfxComputeTested && gfxPassed_ && vmSnapshot_.checked", vm)
+        self.assertLess(vm.index("vmStarted_ = true;"), vm.index("computeVmStartOperation"))
+        corpus = re.search(r"cezanne::Status CezanneGPU::computeSubmit\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("(gfxStep_ == kGfxComputeTested || gfxStep_ == kGfxSubmitted)", corpus)
+        gfx_check = re.search(r"static cezanne::Status gfxCheckOperation\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("if (status == cezanne::kOK && stage >= cezanne::kVmStage) {", gfx_check)
+        self.assertLess(gfx_check.index("checkGfxBoot"), gfx_check.index("checkVmBoot"))
         # The compute start comes after a passing RLC start, owes the restore
         # before it writes, and the queue is restored before stage 21's set.
         start = re.search(r"cezanne::Status CezanneGPU::computeStart\(.*?\n}\n", source, re.S).group(0)
@@ -436,9 +452,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertIn("const uint64_t kSubmitCarveoutOffset = 0x40b00000ull;", header)
         helper = re.search(r"static cezanne::Status withGfxMemory\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("if (stage < cezanne::kGfxStage) {", helper)
-        self.assertIn("IODeviceMemory::withRange(cezanne::kGfxWorkPhysical, stage >= cezanne::kComputeStage", helper)
-        self.assertIn("? cezanne::kComputeWorkSize", helper)
-        self.assertIn(": cezanne::kGfxWorkSize);", helper)
+        self.assertIn("IODeviceMemory::withRange(cezanne::kGfxWorkPhysical, cezanne::gfxWorkSize(stage))", helper)
         self.assertIn("IODeviceMemory::withRange(cezanne::kGfxFwPhysical, cezanne::kGfxFwBufferSize)", helper)
         # The restore is owed before the RLC start writes anything, and the
         # GOP surface before the flip; it runs from its selector, before the
@@ -456,6 +470,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         restore = re.search(r"cezanne::Status CezanneGPU::gfxRestoreLocked\(.*?\n}\n", source, re.S).group(0)
         self.assertLess(restore.index("gfxFlipOperation"), restore.index("gfxRestoreOperation"))
         self.assertLess(restore.index("computeRestoreOperation"), restore.index("gfxRestoreOperation"))
+        self.assertLess(restore.index("vmRestoreOperation"), restore.index("computeRestoreOperation"))
         # The check needs a passing SETUP_TMR by this connection.
         check = re.search(r"cezanne::Status CezanneGPU::gfxCheck\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("pspState_ == kPspTmrSubmitted && pspTmrOk_ && pspOwner_ == owner", check)
@@ -480,7 +495,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertNotIn("com.apple.iokit.IOGraphicsFamily", info["OSBundleLibraries"])
         self.assertIn('allocClassWithName(kMetalNodeClass)', source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 23;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 24;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
