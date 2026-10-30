@@ -1,4 +1,4 @@
-"""Stage 22's embedded kernel is what tools/air_lower.py and LLVM 20.1.7 produce."""
+"""Stage 22's embedded kernel and stage 23's corpus are what tools/air_lower.py and LLVM 20.1.7 produce."""
 import importlib.util
 import re
 import struct
@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = ROOT / "driver" / "core" / "cezanne_core.h"
+CORPUS_HEADER = ROOT / "driver" / "core" / "cezanne_corpus.h"
 LLVM_BIN = ROOT / "out" / "shader-target" / "llvm" / "LLVM-20.1.7-macOS-X64" / "bin"
 spec = importlib.util.spec_from_file_location("test_air_lower", ROOT / "tests" / "test_air_lower.py")
 fixtures = importlib.util.module_from_spec(spec)
@@ -62,6 +63,30 @@ class ComputeKernelTests(unittest.TestCase):
         descriptor = found[".rodata"]
         _, got_rsrc1, got_rsrc2, properties = struct.unpack_from("<IIIH", descriptor, 44)
         self.assertEqual((got_rsrc1, got_rsrc2, properties), (rsrc1, rsrc2, 0xb))
+
+
+class CorpusTests(unittest.TestCase):
+    def test_corpus_header_shape(self):
+        text = CORPUS_HEADER.read_text()
+        rows = re.findall(r"\{kCorpus_(\w+), (\d+), (0x[0-9a-f]+), (0x[0-9a-f]+), (\d+), (\d+), (0x[0-9a-f]+)\}", text)
+        self.assertEqual([row[0] for row in rows], ["store_index", "vector_add", "group_sum", "atomic_count", "grid_2d"])
+        self.assertIn("const uint32_t kCorpusCount = 5;", text)
+        for name, dwords, _, rsrc2, _, _, properties in rows:
+            self.assertIn(int(properties, 16), (0xb, 0x9), name)
+            self.assertEqual(int(rsrc2, 16) & 1, 0, name)  # no scratch
+            self.assertLessEqual(int(dwords) * 4, 0x1000, name)
+        # store_index is stage 22's kernel, word for word.
+        code = re.search(r"const uint32_t kCorpus_store_index\[\] = \{([^}]*)\}", text).group(1)
+        self.assertEqual([int(w, 16) for w in re.findall(r"0x[0-9a-f]+", code)], header_constants()[0])
+        for name in (row[0] for row in rows):
+            self.assertTrue((ROOT / "shaders" / "corpus" / (name + ".metal")).exists(), name)
+            self.assertTrue((ROOT / "shaders" / "corpus" / (name + ".ll")).exists(), name)
+
+    @unittest.skipUnless((LLVM_BIN / "llc").exists(), "the study's LLVM 20.1.7 is not in out/")
+    def test_corpus_header_matches_the_build(self):
+        run = subprocess.run(["python3", str(ROOT / "tools" / "build_corpus.py"), "--check"],
+                             capture_output=True, text=True, timeout=600)
+        self.assertEqual(run.returncode, 0, run.stderr)
 
 
 if __name__ == "__main__":
