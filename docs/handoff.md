@@ -7,7 +7,7 @@ sequence are in [discovery-plan.md](discovery-plan.md).
 ## Current checkpoint
 
 Current checkpoint, 2026-10-30, branch `cezanne-discovery`: **driver stages
-0–22 succeeded on the USB test EFI**, stage 21 as dialled down (boots 1–43; see the
+0–23 succeeded on the USB test EFI**, stage 21 as dialled down (boots 1–45; see the
 [test boot log](test-boot.md#test-boot-log)). The driver can do the
 following:
 - read the GPU, the discovery table and the engine state;
@@ -30,7 +30,10 @@ following:
   (MSL through Apple's frontend, lowered by `tools/air_lower.py` and LLVM).
   All 256 outputs were correct and every fence landed, including
   `RELEASE_MEM`. This is the milestone "known shader with correct results"
-  (boot 43).
+  (boot 43);
+- **submit the five kernels of a corpus built from MSL** (several buffers,
+  threadgroup memory with barriers, a device atomic, a 2-D grid) in one queue
+  session, each with its own grid, buffers and fence, all exact (boot 45).
 
 Stage 17 (GART and the IH ring) succeeded in boot 25: an SDMA copy read
 through a driver-built GART page table, its trap arrived in IH ring 0, and
@@ -257,9 +260,11 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    Boot 44 (2026-10-30) stopped at the gfx check before any GC write: the
    kext's read-only carveout helper did not allow the submission region
    (fixed within the stage, "Revision: the submission region's read-only
-   check"). **Next: boot 45** (`tools/update_stick.sh 23`, then
-   `tools/capture_boot.sh boot-45-stage23 --gfxoff-disallow
-   --compute-corpus --psp-state`). A compute queue on the MEC, brought up like Linux's
+   check"). **Boot 45 (2026-10-30): stage 23 succeeded** (exit 0). All five
+   kernels gave exact results, fences 1–5 landed in order, the read pointer
+   ended at 896, and the restore left the GC idle. **Next: the user's choice**
+   between user VMIDs with page tables (the stage that lifts the corpus
+   restriction) and the Metal stage M2. A compute queue on the MEC, brought up like Linux's
    KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
    polling), runs a ring test and dispatches the `store_index` kernel that
    Apple's frontend and our lowering produced; see "Stage 22: a compute queue

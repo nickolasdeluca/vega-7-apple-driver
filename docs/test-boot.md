@@ -6757,6 +6757,48 @@ boot-44-stage23 --gfxoff-disallow --compute-corpus --psp-state`; diag v20,
   region's read-only check (after boot 44)".
 - Captures are in ignored `out/test-efi/boot-44-stage23/`.
 
+**Boot 45, 2026-10-30, stage 23 with the carveout check fixed**
+(`out/test-efi/usb-stage23`, rebuilt; cold boot; `tools/capture_boot.sh
+boot-45-stage23 --gfxoff-disallow --compute-corpus --psp-state`; diag v20,
+**exit 0**).
+
+- **Stage 22's steps through the ring test: ok**, as in boot 43:
+  - the check now places and checks the submission region;
+  - nine images loaded (last fence 10), and the RLC start made 26 writes;
+  - the compute start made 27 writes;
+  - the ring test ran by method A (`SCRATCH_REG0` `0xDEADBEEF`,
+    `CP_HQD_PQ_RPTR` 64, fence 3 = 3).
+- **All five corpus kernels gave exact results**, each from its own frame,
+  with its own `RELEASE_MEM` fence:
+
+  | Submission | Kernel | Grid | Fence | `CP_HQD_PQ_RPTR` | Wrong outputs |
+  |---|---|---|---|---|---|
+  | 1 | `store_index` | 64 × 256 | 1 | 384 | 0 of 16 384 |
+  | 2 | `vector_add` | 128 × 256 | 2 | 512 | 0 of 32 768 |
+  | 3 | `group_sum` | 64 × 256, 1 KiB LDS | 3 | 640 | 0 of 64 |
+  | 4 | `atomic_count` | 64 × 256 | 4 | 768 | counter 16 384 |
+  | 5 | `grid_2d` | 8 × 4 of 16 × 16 | 5 | 896 | 0 of 8 192 |
+
+  The read pointer ended at the last frame (896).
+- **Restore: ok, flip back ok.** The GC was idle afterwards
+  (`GRBM_STATUS` `0x00003028`, `CP_CPC_STATUS` 0), with no VM fault
+  (`VM_L2_PROTECTION_FAULT_STATUS_GC` 0). The PSP teardown fenced
+  (`DESTROY_TMR` fence 11).
+- **What this proves:**
+  - one queue session runs several kernels back to back, each with its own
+    grid, buffers and fence;
+  - `ACQUIRE_MEM` makes the CPU-written inputs visible to the kernel;
+  - the frontend-to-hardware chain holds beyond `store_index`: several
+    device buffers with float math, threadgroup memory (dynamic LDS) with
+    barriers, a device atomic, 2-D grids and `uint2` built-ins, and both
+    kernel-argument layouts (with and without the dispatch packet).
+- **Not proven:**
+  - code outside the embedded corpus;
+  - user VMIDs and page tables (still VMID 0);
+  - scratch, textures, doorbells and MEC interrupts;
+  - the graphics CP.
+- Captures are in ignored `out/test-efi/boot-45-stage23/`.
+
 ## Unknowns and limits
 
 - The firmware lists both partitions `eraseDisk … GPT` creates. Partition 1 is
