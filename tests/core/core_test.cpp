@@ -4348,8 +4348,15 @@ static void testVm()
         v.c.g.r.gc[kRegGcVmL2ProtectionFaultCntl] = 0x7ffffffc; // CRASH_ON_NO_RETRY_FAULT
         CHECK(checkVmBoot(v.c.g.r.reader(), 0x80000, 24, &vm, &index, &value) == kGfxUnexpectedState && index == 5);
         v.c.g.r.gc[kRegGcVmL2ProtectionFaultCntl] = 0x3ffffffc;
-        v.c.g.r.gc[kRegGdsGwsVmid1] = 1;
-        CHECK(checkVmBoot(v.c.g.r.reader(), 0x80000, 24, &vm, &index, &value) == kGfxUnexpectedState && index == 26);
+        v.c.g.r.gc[kRegGdsVmid1Base] = 0x100;
+        CHECK(checkVmBoot(v.c.g.r.reader(), 0x80000, 24, &vm, &index, &value) == kGfxUnexpectedState && index == 24 &&
+              kVmExpectCount == 25);
+        // Boot 46: the size, GWS and OA as read at boot are accepted.
+        v.c.g.r.gc[kRegGdsVmid1Base] = 0;
+        v.c.g.r.gc[kRegGdsVmid1Size] = 0x00010000;
+        v.c.g.r.gc[kRegGdsGwsVmid1] = 0x00400000;
+        v.c.g.r.gc[kRegGdsOaVmid1] = 0xffff;
+        CHECK(checkVmBoot(v.c.g.r.reader(), 0x80000, 24, &vm, &index, &value) == kOK);
     }
 
     // A whole session against the fakes: the corpus uploaded and run at VMID 1,

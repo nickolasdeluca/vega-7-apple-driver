@@ -1696,7 +1696,10 @@ const uint32_t kVmShMemBases = 0x20001000;
 // What the check requires (the MMHUB's boot 22 state, which stage 17 found):
 // offset, mask, value. A fault must redirect to the default page and never
 // halt (VM_L2_PROTECTION_FAULT_CNTL: the *_ENABLE_DEFAULT bits set, both
-// CRASH_ON_* clear); VMID 1's context off and empty; no GDS for VMID 1.
+// CRASH_ON_* clear); VMID 1's context off and empty; its GDS at base 0.
+// Boot 46: VMID 1's GDS size reads 0x10000 at boot (all 64 KiB; Linux's
+// gfx_v9_0_init_gds_vmid zeroes it, a write this stage does not make), so
+// its size, GWS and OA are only read, not required.
 const GfxExpect kVmExpect[] = {
     {kRegGcVmL2Cntl, 0xffffffff, 0x00080602},
     {kRegGcVmL2Cntl2, 0xffffffff, 0},
@@ -1723,9 +1726,6 @@ const GfxExpect kVmExpect[] = {
     {kRegGcVmContext1PageTableEndAddrLo32, 0xffffffff, 0},
     {kRegGcVmContext1PageTableEndAddrHi32, 0xffffffff, 0},
     {kRegGdsVmid1Base, 0xffffffff, 0},
-    {kRegGdsVmid1Size, 0xffffffff, 0},
-    {kRegGdsGwsVmid1, 0xffffffff, 0},
-    {kRegGdsOaVmid1, 0xffffffff, 0},
 };
 const uint32_t kVmExpectCount = sizeof(kVmExpect) / sizeof(kVmExpect[0]);
 // The enable (offset, mask, value against the check's reading), in
