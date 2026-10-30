@@ -249,9 +249,14 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    was approved and implemented 2026-10-30. **Boot 43 (2026-10-30): stage 22
    succeeded** (exit 0). The kernel wrote 0..255, fences 3, 4 and 5 landed,
    and the restore left the GC idle. The user chose the compute
-   submission path before M2 (2026-10-30). **Next: the user's approval of
-   "Stage 23: a compute submission path and a kernel corpus"**
-   (test-boot.md). A compute queue on the MEC, brought up like Linux's
+   submission path before M2 (2026-10-30). "Stage 23: a compute
+   submission path and a kernel corpus" was approved and implemented
+   2026-10-30 (test-boot.md, "Stage 23 implementation"): five MSL kernels
+   from `shaders/corpus/`, built by `tools/build_corpus.py`, each submitted
+   with its own grid, buffers and `RELEASE_MEM` fence in one session.
+   **Next: boot 44** (`tools/update_stick.sh 23`, then
+   `tools/capture_boot.sh boot-44-stage23 --gfxoff-disallow
+   --compute-corpus --psp-state`). A compute queue on the MEC, brought up like Linux's
    KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
    polling), runs a ring test and dispatches the `store_index` kernel that
    Apple's frontend and our lowering produced; see "Stage 22: a compute queue

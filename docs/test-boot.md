@@ -4317,7 +4317,7 @@ The changes:
   the fake MEC runs the MEC1 slot.
 - The boot 42 builds are kept as `superseded-*-stage22-kiq`.
 
-### Stage 23: a compute submission path and a kernel corpus (proposed 2026-10-30; needs approval)
+### Stage 23: a compute submission path and a kernel corpus (approved 2026-10-30)
 
 **Goal.** Turn stage 22's single fixed dispatch into a submission path. The
 queue stays up for a session that runs several kernels, each with its own
@@ -4465,6 +4465,107 @@ offsets, then the scalars. It also writes the dispatch packet's sizes.
 - Doorbells, MEC interrupts, scratch and private memory, textures, and
   multiple queues.
 - The Metal bundle (M2).
+
+#### Stage 23 implementation
+
+Built 2026-10-30, after the user approved the proposal the same day. Where
+it differs from the text above, this wins:
+
+- **At most five submissions, not seven.** Frames are 128 dwords from dword
+  256, so the 1024-dword ring has six slots. With five, the write pointer
+  stops at 896, short of the ring's end, so no write pointer ever equals
+  the ring size. The sixth request is refused (`kRefusedCount`) and writes
+  nothing. Fence `n` (0–4) is `n + 1` at write-back `+0x120 + 8n`.
+- **Buffers only, no scalars.** `air_lower` passes Metal's scalars as
+  pointers to constant buffers, so every corpus argument is a buffer: slot
+  `n` is the pointer at kernarg offset `8n`. `ComputeRequest` holds the
+  kernel, the group size, the group count per dimension, the dynamic LDS
+  bytes, and an offset and length for up to four buffers.
+- **Chunks are 2 KiB**, not 4 KiB: `ComputeChunk` is a byte count and 512
+  words, which keeps the structure under the user client's inline limit.
+- **Refusals:** `kComputeRefused` with a reason (`kRefusedKernel`,
+  `Group`, `Grid`, `Lds`, `Buffer`, `Length`, `Overlap`, `Count`) and the
+  buffer index. The limits are 1024 threads per group, 65535 groups per
+  dimension, 2^20 threads, and 64 KiB of LDS. A kernel without a
+  threadgroup argument must ask for no dynamic LDS, and `group_sum` needs at
+  least 4 bytes per thread. A refused request does not count, and it does
+  not fail the session.
+- **The kext refuses a submission** unless the session passed the ring test
+  (or the last submission), at stage 23, from the connection that owns the
+  PSP. A submission that fails (no fence, a hang) blocks the rest, and the
+  restore still runs. `ComputeRead` is allowed after a failed submission, so
+  the tool can report what landed.
+- **The corpus code is written with each submission**, the same words each
+  time: only the kernel's own code slot is written, with the embedded words
+  and zeros after them. `submitWriteAllowed` refuses any other value in the
+  code area. Slots and data take any value, since the core builds the slots
+  from the checked request.
+- **The work-area allowlist** accepts any value in the five submission
+  frames from stage 23, since the core builds them per request.
+  `computePollWriteAllowed` accepts the frame ends 384, 512, … 896.
+  Below stage 23 both stay as in stage 22, and so does the method B
+  `CP_HQD_PQ_WPTR_LO` allowlist.
+- **Two code-property layouts.** `atomic_count` reads no dispatch packet
+  (`kernel_code_properties` `0x9`), so its kernarg pointer is in user SGPRs
+  2–3 rather than 4–5. The core writes six user-data registers for it and
+  eight for the others. `tools/build_corpus.py` refuses any other layout,
+  scratch use, or code over 4 KiB.
+- **The corpus** is `shaders/corpus/NAME.metal` with Apple's AIR as
+  `NAME.ll` (`llvm-dis` output, without the ModuleID line or absolute
+  paths). `tools/build_corpus.py` lowers and compiles it into
+  `driver/core/cezanne_corpus.h`. `store_index`'s words equal stage 22's
+  `kComputeCode`.
+
+  | Kernel | Dwords | `RSRC2` | Properties |
+  |---|---|---|---|
+  | `store_index` | 18 | `0x00000090` | `0xb` |
+  | `vector_add` | 32 | `0x00000090` | `0xb` |
+  | `group_sum` | 61 | `0x00000090` | `0xb` |
+  | `atomic_count` | 17 | `0x0000008c` | `0x9` |
+  | `grid_2d` | 27 | `0x00000990` | `0xb` |
+- **`RLC_CP_SCHEDULERS`** is not restored, because since the MEC1 revision
+  nothing writes it.
+- **Interface:** diagnostic version 20. Selectors are 56 (`ComputeWrite`:
+  data-area offset and chunk), 57 (`ComputeSubmit`: the request, returning
+  the fence, the read pointer, the refusal and the buffer index, with a
+  `ComputeState`) and 58 (`ComputeRead`: data-area offset and byte count).
+- **Tool:** `cezanne-diag --compute-corpus` (stage 23) runs stage 22's
+  steps through the ring test, then `gfx 6/7 corpus n/5` for each kernel,
+  then the restore and the teardown. The data plan:
+  - `store_index`: 64 × 256, out at `+0`;
+  - `vector_add`: 128 × 256, a, b and c at `+0x10000`, `+0x30000` and
+    `+0x50000`;
+  - `group_sum`: 64 × 256, in at `+0x70000` and out at `+0x80000`;
+  - `atomic_count`: 64 × 256, the counter at `+0x81000`;
+  - `grid_2d`: 8 × 4 groups of 16 × 16, out at `+0x82000`.
+
+  Each output is checked on the CPU, and the tool prints the mismatch count
+  and the first mismatch.
+- **Tests:**
+  - `tests/test_compute_kernel.py` runs `build_corpus.py --check` (when
+    LLVM 20.1.7 is in `out/`), and checks the header's shape;
+  - the core's fake MEC counts `ACQUIRE_MEM`. It identifies the kernel by
+    `COMPUTE_PGM_LO`, `RSRC1` and the code in its slot, then runs it as its
+    MSL does, with buffers from kernarg. Accesses outside the region are
+    dropped;
+  - cases:
+    - every refusal;
+    - the frame and slot words;
+    - a five-kernel session with exact results;
+    - a sixth submission refused;
+    - method B;
+    - a wrong result;
+    - a hang;
+    - stage 22 unable to submit;
+  - six new mutants in `tests/test_core.py`: the length check, the overlap
+    check, the code-area value check, the frame allowlist's stage gate, the
+    `ACQUIRE_MEM` actions, and the LDS limit.
+
+**Boot steps (boot 44):**
+1. `tools/update_stick.sh 23`, then shut down fully and boot the stick.
+2. In macOS on the stick: `tools/capture_boot.sh boot-44-stage23
+   --gfxoff-disallow --compute-corpus --psp-state`.
+3. Shut down fully and return to the normal EFI.
 
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 

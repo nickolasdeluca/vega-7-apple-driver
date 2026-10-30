@@ -64,6 +64,15 @@ into an `amdgcn-amd-amdhsa` module that public LLVM compiles for gfx90c.
 Compute kernels only; unsupported features are refused by name. It loads and
 dispatches nothing; see the [Metal frontend study](docs/metal-frontend.md).
 
+```sh
+python3 tools/build_corpus.py [--from-metal] [--check]
+```
+
+Builds stage 23's kernel corpus (`shaders/corpus/*.metal`, with Apple's AIR
+checked in as `*.ll`) through `air_lower.py` and LLVM 20.1.7 into
+`driver/core/cezanne_corpus.h`. `--from-metal` regenerates the AIR first
+(needs the Metal Toolchain); `--check` compares instead of writing.
+
 ## Check firmware headers
 
 ```sh
@@ -114,7 +123,10 @@ stalls; the stage is dialled down to end there), then restores every GC
 register; `--gfx-compute` (stage 22) does the same up to the RLC start, then
 brings up a compute queue on the MEC, runs a ring test and dispatches the
 `store_index` kernel lowered from Apple's AIR, checks its 256 outputs and
-restores. Building the kext needs that firmware in ignored
+restores; `--compute-corpus` (stage 23) runs stage 22's steps through the
+ring test, then submits the five corpus kernels one by one, each with its
+own grid, buffers and fence, checks every output on the CPU and restores.
+Building the kext needs that firmware in ignored
 `out/firmware-provenance/fw/` (see
 [firmware provenance](docs/firmware-provenance.md)).
 

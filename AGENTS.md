@@ -67,7 +67,11 @@ Experimental booting is available only through the USB test EFI in
   dialled down on 2026-10-13; and stage 22, approved 2026-10-22, stage 21 up
   to the RLC start, then a compute queue on MEC1 (pipe 0, queue 0; the KIQ
   slot until boot 42), a ring test and fence, and one dispatch of the store_index kernel with its
-  output checked, then every register written back, on request).
+  output checked, then every register written back, on request; and stage
+  23, approved 2026-10-30, stage 22 through its ring test, then up to five
+  submissions of kernels from the embedded corpus, each with its own grid,
+  buffers and fence in a checked 1 MiB carveout region, then every register
+  written back, on request).
   Advancing
   a stage needs a reviewed update to that document and the user's approval.
   Never modify the internal EFI partition, install driver code on the macOS
