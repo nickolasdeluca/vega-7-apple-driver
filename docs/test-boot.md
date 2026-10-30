@@ -4585,6 +4585,257 @@ allowlist, and `kSubmitPhysical` was not in it.
 
 **Boot steps (boot 45):** as for boot 44, with `boot-45-stage23`.
 
+### Stage 24: a user VMID with its own page table, and uploaded code (proposed 2026-10-30; needs approval)
+
+**Goal.** Run compute work under a VMID other than 0, translated by a page
+table the driver builds. Each submission then reaches only the pages the
+driver maps for it, and a kernel cannot reach the rest of the carveout. With
+that isolation in place, the kext can accept kernel code uploaded by the
+tool instead of only its embedded corpus. This is the restriction stage 23
+left in place, and Metal (M2) needs it lifted to run its own pipelines.
+
+**The model is Linux's amdgpu path, not the KFD's.** The kernel's compute
+ring stays at VMID 0. Stage 22's MEC1 queue, its ring, its fences and its
+restore are unchanged. User work runs as an `INDIRECT_BUFFER` whose control
+word carries the VMID:
+- `gfx_v9_0_ring_emit_ib_compute`: `INDIRECT_BUFFER_VALID | length |
+  vmid << 24`;
+- `PACKET3_INDIRECT_BUFFER` `0x3F` and `INDIRECT_BUFFER_VALID` `1 << 23`,
+  from `soc15d.h`, pinned.
+
+Everything the IB references (the IB itself, the code, the dispatch packet,
+kernarg and the buffers) is a virtual address in that VMID. This is also
+how a Metal driver's command buffers would run.
+
+**Why VMID 1:** amdgpu gives VMIDs 1–7 to this path, and KFD takes 8–15.
+
+#### What runs, in order
+
+1. **Stage 22 through its ring test**, as in stage 23.
+2. **The check, extended.** It is read-only, and it runs before any write
+   of the stage, at the gfx check. It reads the GC hub's VM block and
+   requires the state the MMHUB had before stage 17 (boot 22). We have
+   already seen that the GC hub matches the MMHUB in `VM_L2_CNTL`
+   `0x00080602`, `MC_VM_MX_L1_TLB_CNTL` `0x00002501` and `VM_CONTEXT0_CNTL`
+   `0x007ffe80`, as boots 33–45 read them. The check requires:
+   - `VM_L2_PROTECTION_FAULT_CNTL` with `CRASH_ON_NO_RETRY_FAULT` and
+     `CRASH_ON_RETRY_FAULT` clear, and every `*_ENABLE_DEFAULT` bit set (the
+     MMHUB read `0x3ffffffc`). A fault is then redirected to the default
+     page and halts nothing;
+   - `VM_CONTEXT1_CNTL` disabled, and its base, start and end 0;
+   - GDS, GWS and OA for VMID 1 all 0 (`GDS_VMID1_BASE`, `_SIZE`,
+     `GDS_GWS_VMID1`, `GDS_OA_VMID1`).
+
+   Any other reading refuses before the first write and prints the values.
+3. **The GC hub VM enable,** `gfxhub_v1_0_gart_enable` in Linux's order with
+   stage 17's values (which ran on the MMHUB at boot 25). It leaves out
+   context 0 and the GART aperture: VMID 0 keeps translating through the FB
+   and system apertures, as in stages 21–23.
+   - **Default page:** `VM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32/HI32` point
+     at the default page in the work area. `VM_L2_PROTECTION_FAULT_CNTL2`
+     goes `0x000a0000` → `0x000e0000`.
+   - **L1 TLB:** `MC_VM_MX_L1_TLB_CNTL` `0x00002501` → `0x00003d59`.
+   - **L2:** `VM_L2_CNTL` → `0x00080603` (L2 cache on), `VM_L2_CNTL2` →
+     `0x3`, `VM_L2_CNTL3` → `0x8014800c`, `VM_L2_CNTL4` → `0x1`.
+   - **Identity aperture off:** `VM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR`
+     → `0xffffffff` / `0xf`.
+   - **Invalidation engine 17's range:** `0xffffffff` / `0x1f`.
+   - **Context 1 (VMID 1),** `gfxhub_v1_0_setup_vmid_config` for one VMID:
+     - `VM_CONTEXT1_CNTL` → `0x007ffe01`: enabled, every fault redirected
+       to the default page, no retry. It is stage 17's context 0 value,
+       with the same depth 0;
+     - start and end are the VA window's first and last page;
+     - `VM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32/HI32 + 2 × 1` (base + 1, as
+       `gfxhub_v1_0_setup_vm_pt_regs`) is the page table's address, with
+       bit 0 set.
+   - **`SH_MEM_*` for VMID 1,** under `GRBM_GFX_CNTL` VMID 1 (`0x10`, a new
+       value of a register already written), as `gfx_v9_0_constants_init`
+       does for VMIDs 1–15:
+     - `SH_MEM_CONFIG` unaligned, with `RETRY_DISABLE` as read (stage 22's
+       rule for VMID 0);
+     - `SH_MEM_BASES` `0x20001000`: the private aperture at
+       `0x1000…`, the shared at `0x2000…`
+       (`gmc_v9_0`'s `private_aperture_start` and `shared_aperture_start`
+       >> 48). The VA window is then GPUVM, not an aperture.
+
+     Then `GRBM_GFX_CNTL` goes back to 0.
+4. **Submissions under VMID 1, at most eight per session.** For each one,
+   while the queue is idle (the last fence has landed):
+   1. the kext clears the previous submission's PTEs and writes this one's;
+   2. it flushes VMID 1's TLB by MMIO, as `gmc_v9_0_flush_gpu_tlb` does on
+      the GC hub (no semaphore on GFXHUB):
+      - `VM_INVALIDATE_ENG17_REQ` ← `gmc_v9_0_get_invalidate_req(1, 0)`
+        (`0x007c0002`);
+      - a dummy read of the request register (GC below 9.4.2);
+      - a poll of `VM_INVALIDATE_ENG17_ACK` bit 1, for at most 100 ms;
+   3. it commits one ring frame:
+      - `ACQUIRE_MEM` (as stage 23);
+      - `INDIRECT_BUFFER` (the IB's VA, its length, `VALID`, VMID 1);
+      - `RELEASE_MEM` as fence `n` at a VMID 0 write-back address.
+
+   Frames are 32 dwords from dword 256. The IB holds stage 23's `SET_SH_REG`
+   writes, with VAs in place of GPU addresses, then `DISPATCH_DIRECT`.
+5. **Read back, then the restore**, in the reverse order of the enable,
+   before stage 22's queue restore and stage 21's registers:
+   - context 1 off, then its base, start and end back;
+   - a VMID 1 flush;
+   - `SH_MEM_*` for VMID 1 back (under the selection);
+   - identity aperture, L2, L1 TLB, default page, `CNTL2` and engine 17's
+     range back;
+   - the latched fault status cleared, as `gmc_v9_0_process_interrupt`
+     does (`CLEAR_PROTECTION_FAULT_STATUS_ADDR`), then `CNTL` back to its
+     reading.
+
+   Each register then reads back the value the check read.
+
+**Every register is in stage 21's BAR5 pages:** the GC hub VM block at
+`0xA000` (`VM_CONTEXT1_CNTL` `0xa204`, its base `0xa3b4`, start `0xa434`,
+end `0xa4b4`, engine 17 request `0xa2d0` and ACK `0xa318`, L1 TLB
+`0xa61c`), `SH_MEM_*` at `0x8000`, and GDS at `0xC000`.
+
+#### Memory
+
+- **The VA window:** 1 MiB at VA `0x1_0000_0000`, so start page `0x100000`
+  and end page `0x1000ff`. VA `0x1_0000_0000 + x` maps offset `x` of stage
+  23's submission region, page by page, only where a PTE is valid. Addresses
+  outside the window take a range fault.
+- **The page table** is flat (depth 0), as stage 17's GART: 256 PTEs, 2 KiB,
+  in the work area at `+0xA000`. The default page is at `+0xB000`.
+  - Both lie outside the window's region, so no submission can map them. A
+    kernel cannot reach its own page table.
+  - The work area grows from 40 to 48 KiB at stage 24, inside its 64 KiB
+    check.
+- **PTEs** use stage 17's format (`kGartPte0`): physical address, `VALID`,
+  `SYSTEM`, `MTYPE_UC`. Access bits are per page:
+
+  | Page | Access |
+  |---|---|
+  | code | `READABLE` and `EXECUTABLE` |
+  | the submission's page (IB, dispatch packet, kernarg) | `READABLE` |
+  | buffers | `READABLE` and `WRITEABLE` |
+
+  A write to code or to the IB is then a write-protection fault.
+- **The region's layout** stays stage 23's:
+  - the code area holds 16 slots of 4 KiB;
+  - the slot area holds 16 pages, one per submission: the IB at `+0`, the
+    dispatch packet at `+0x100`, kernarg at `+0x180`;
+  - the data area is 896 KiB.
+
+  Buffers must start on a page boundary. Their pages are mapped whole, and
+  no page may belong to two buffers.
+
+#### Uploaded code
+
+- `ComputeCode` writes up to 4 KiB of code into a code slot. Code there runs
+  only under VMID 1. VMID 0 submissions (stage 23's path) still take only
+  the embedded corpus.
+- A VMID 1 request names a code slot and gives the descriptor fields. The
+  kext refuses:
+  - `RSRC1`: `PRIV`, `DEBUG_MODE` or `CDBG_USER`;
+  - `RSRC2`: `SCRATCH_EN`, `TRAP_PRESENT`, any `EXCP_EN` bit, or a
+    `USER_SGPR` count other than 8 for properties `0xb` and 6 for `0x9`;
+  - any other code-properties value.
+
+  The kext sets `LDS_SIZE` itself, as in stage 23.
+- **The bounds** come from the mapping. The request gives each buffer's
+  offset and length. The kext maps exactly those pages and writes their VAs
+  into kernarg. It no longer needs a per-kernel description of the
+  arguments: whatever a kernel computes, it reaches only those pages.
+
+#### Interface and tool
+
+- **New selectors:**
+  - `ComputeVmStart` (59): the check, then the enable;
+  - `ComputeCode` (60): a slot and a chunk of code;
+  - `ComputeVmSubmit` (61): the slot, `RSRC1`/`RSRC2`/properties, group,
+    grid, LDS, buffers. It returns the status, the fence, the read pointer
+    and `VM_L2_PROTECTION_FAULT_STATUS`.
+
+  `GfxRestore` runs the VM restore first. Diagnostic version 21.
+- **Tool:** `cezanne-diag --compute-vm` (stage 24). It runs stage 22's steps
+  through the ring test, then the VM start, then eight submissions:
+  1. **1–5:** the five corpus kernels, uploaded from the tool's copy and run
+     under VMID 1, with stage 23's data and checks;
+  2. **6:** `saxpy`, a new MSL kernel the kext has never seen:
+     `y[i] = a × x[i] + y[i]`, with `a` a `constant float &`, so it also
+     tests the scalar-as-constant-buffer path. The values are small
+     integers, so the result is exact;
+  3. **7: the fault probe.** `store_index` runs 2048 threads with a
+     one-page (1024-word) output buffer. The next page of the data area
+     holds a canary and is not mapped. Expected:
+     - words 0–1023 correct;
+     - the canary untouched;
+     - the fault status recording VMID 1 and a write;
+     - the overflow writes in the default page;
+     - the fence landing;
+  4. **8:** `store_index` again, which shows the queue survives the fault.
+
+  Then the restore and the teardown.
+- `tools/build_corpus.py` also builds `shaders/upload/` (`saxpy`) into a
+  header for the tool only. The kext never embeds it.
+
+#### Register, message and memory changes
+
+- **New MMIO writes:** the GC hub VM writes above (all on the GC hub,
+  mirroring stage 17's on the MMHUB), context 1, engine 17's request,
+  `SH_MEM_*` for VMID 1, and `GRBM_GFX_CNTL` `0x10`.
+  - Every one is restored, and the fault status is cleared.
+  - No SMU or PSP messages are new.
+- **New memory:** the page table and the default page in the work area, and
+  uploaded code in the region's code area.
+- **New reads:** the GC hub VM registers above, `SH_MEM_*` for VMID 1, and
+  the four GDS registers.
+
+#### Success criteria and outcomes
+
+- **Success:**
+  - the check passes;
+  - submissions 1–6 are exact under VMID 1;
+  - the fault probe matches its expectations;
+  - submission 8 is exact;
+  - the restore reads back;
+  - the GC is idle with the fault status 0;
+  - the PSP teardown fences.
+- **Partial results:**
+  - **the check refuses:** the GC hub's state differs from the MMHUB's. The
+    values go into a revision;
+  - **the flush never ACKs:** the GC hub's invalidation engine needs what
+    Linux does before it (the KIQ path), or L2 must be on earlier;
+  - **submission 1 never fences, with a fault status:** the walk itself (the
+    table's address, depth or PTE format) is wrong for the GC hub. The
+    status's VMID and address say which;
+  - **1–6 pass but the probe hangs:** faults are not safe without the IH
+    ring. The probe then moves behind an IH-enabled stage, and the rest
+    stands.
+
+#### Tests before the boot
+
+- **The core's fake GC hub:**
+  - it translates VMID 1 accesses through the flat table, and faults on an
+    invalid, write-protected or out-of-window page, redirecting to the
+    default page and latching the status;
+  - it models the engine 17 ACK, and runs IBs at the VMID from their
+    control word.
+- **Cases:**
+  - every refusal (`PRIV`, scratch, trap, the `USER_SGPR` count, misaligned
+    or shared buffer pages, the ninth submission, VMID 0 with uploaded code);
+  - the PTEs per submission, and the previous submission's PTEs cleared;
+  - a flush that never ACKs;
+  - the fault probe;
+  - each check refusal;
+  - the restore order and its read-back;
+  - stage 23 being unable to do any of it.
+- Mutants for the new allowlists, and the full suite before the stick build.
+
+#### Not in stage 24
+
+- Multi-level page tables, which Linux uses for 48-bit spaces; the flat
+  table covers this 1 MiB window. Also more than one user VMID and
+  per-process address spaces.
+- Scratch and private memory, the IH ring for VM faults, doorbells and MEC
+  interrupts.
+- The Metal bundle (M2), which this stage prepares.
+
 ### Metal track M1: does Metal admit our own device? (approved 2026-10-22)
 
 **Approved by the user on 2026-10-22, together with the AGENTS.md exception,

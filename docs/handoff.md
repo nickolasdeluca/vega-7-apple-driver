@@ -262,9 +262,9 @@ are expensive on this host (about 85 °C during a stalled boot, still near
    (fixed within the stage, "Revision: the submission region's read-only
    check"). **Boot 45 (2026-10-30): stage 23 succeeded** (exit 0). All five
    kernels gave exact results, fences 1–5 landed in order, the read pointer
-   ended at 896, and the restore left the GC idle. **Next: the user's choice**
-   between user VMIDs with page tables (the stage that lifts the corpus
-   restriction) and the Metal stage M2. A compute queue on the MEC, brought up like Linux's
+   ended at 896, and the restore left the GC idle. The user chose user VMIDs before M2
+   (2026-10-30). **Next: the user's approval of "Stage 24: a user VMID with
+   its own page table, and uploaded code"** (test-boot.md). A compute queue on the MEC, brought up like Linux's
    KIQ (ME 2, pipe 1, queue 0, direct HQD registers, write pointer by
    polling), runs a ring test and dispatches the `store_index` kernel that
    Apple's frontend and our lowering produced; see "Stage 22: a compute queue
