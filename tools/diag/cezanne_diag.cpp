@@ -12,20 +12,25 @@
 // delivery (--ih-intr), and the stage 19 display test pattern
 // (--display-pattern), and the stage 20 SDMA fill and flip interrupt
 // (--sdma-flip), and the stage 21 graphics engine start and drawing
-// (--gfx-start), and the stage 22 compute queue and dispatch (--gfx-compute).
+// (--gfx-start), and the stage 22 compute queue and dispatch (--gfx-compute),
+// and the stage 23 kernel corpus (--compute-corpus).
 // --psp-state (stage 10) and --inventory16 (stage 16) only read.
 //
 // Usage: sudo cezanne-diag [--repeat N] [--interval MS] [--scratch-test] [--smu-query] [--gfxoff-disallow]
 //                          [--smu-metrics] [--psp-ring] [--psp-tmr] [--psp-sdma] [--sdma-inventory]
 //                          [--sdma-copy] [--gart-ih] [--ih-intr] [--sdma-flip] [--gfx-start]
-//                          [--gfx-compute] [--display-pattern] [--psp-state] [--inventory16]
+//                          [--gfx-compute] [--compute-corpus] [--display-pattern] [--psp-state] [--inventory16]
 #include <IOKit/IOKitLib.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 #include "cezanne_core.h"
 
@@ -357,7 +362,7 @@ void usage(FILE *out)
                       "                         [--gfxoff-disallow] [--smu-metrics] [--psp-ring] [--psp-tmr]\n"
                       "                         [--psp-sdma] [--sdma-inventory] [--sdma-copy] [--gart-ih]\n"
                       "                         [--ih-intr] [--sdma-flip] [--gfx-start] [--gfx-compute]\n"
-                      "                         [--display-pattern] [--psp-state]\n"
+                      "                         [--compute-corpus] [--display-pattern] [--psp-state]\n"
                       "                         [--inventory16]\n"
                       "Reads every CezanneGPU diagnostic register N times (default 1), MS apart (default 1000).\n"
                       "--scratch-test first runs the stage 6 write test: writes 0xCAFEDEAD to SCRATCH_REG0,\n"
@@ -389,6 +394,9 @@ void usage(FILE *out)
                       "--gfx-compute does --gfx-start up to the RLC start, then, instead of the CP, brings up a\n"
                       "compute queue on MEC1 (pipe 0, queue 0), runs a ring test and fence, dispatches the\n"
                       "store_index kernel (256 work-items), checks the output is 0..255, restores and tears down.\n"
+                      "--compute-corpus does --gfx-compute up to its ring test, then runs the five corpus kernels\n"
+                      "(store_index, vector_add, group_sum, atomic_count, grid_2d) on their own buffers, checks\n"
+                      "every output on the CPU, restores and tears down.\n"
                       "--display-pattern draws a test pattern in the carveout, shows it on pipe 0 for 5 s by\n"
                       "flipping its surface address, verifies, and flips back to the boot framebuffer.\n"
                       "--psp-state first decodes the PSP ring mailbox and the memory-hub apertures (reads only).\n"
@@ -1391,7 +1399,9 @@ void printComputeState(const ComputeState &state)
 
 // Stage 22 after the RLC start: the compute queue, its ring test, the
 // dispatch. Returns whether all three passed.
-bool computeQueue(io_connect_t connection)
+bool corpusRun(io_connect_t connection);
+
+bool computeQueue(io_connect_t connection, bool corpus)
 {
     static const char *const commits[] = {"none", "polled write pointer (method A)",
                                           "CP_HQD_PQ_WPTR_LO (method B)"};
@@ -1432,6 +1442,7 @@ bool computeQueue(io_connect_t connection)
             ok = test[0] == kOK;
         }
     }
+    if (ok && corpus) return corpusRun(connection);
     if (ok) {
         uint64_t dispatch[5] = {};
         step("gfx 6/7 dispatch: frame 2 (SET_SH_REG COMPUTE_*: code 0xf440a08000, RSRC1 0x00af0040, RSRC2 0x90,\n"
@@ -1453,12 +1464,171 @@ bool computeQueue(io_connect_t connection)
     return ok;
 }
 
+// Stage 23: the tool's data in and out of the submission region's data area,
+// in kComputeChunkBytes pieces.
+bool corpusWrite(io_connect_t connection, uint32_t offset, const std::vector<uint32_t> &words)
+{
+    for (size_t at = 0; at < words.size();) {
+        ComputeChunk chunk = {};
+        const size_t count = std::min<size_t>(words.size() - at, kComputeChunkBytes / 4);
+        chunk.bytes = static_cast<uint32_t>(count * 4);
+        for (size_t i = 0; i < count; i++) chunk.words[i] = words[at + i];
+        uint64_t in = offset + 4 * at, out = 0;
+        uint32_t outCount = 1;
+        kern_return_t result = IOConnectCallMethod(connection, kDiagnosticComputeWrite, &in, 1, &chunk, sizeof(chunk),
+                                                   &out, &outCount, nullptr, nullptr);
+        if (result != KERN_SUCCESS || outCount != 1 || out != kOK) {
+            std::printf("data write at +0x%llx: call 0x%08x, %s\n", static_cast<unsigned long long>(in), result,
+                        result == KERN_SUCCESS ? statusName(static_cast<Status>(out)) : "-");
+            return false;
+        }
+        at += count;
+    }
+    return true;
+}
+
+bool corpusRead(io_connect_t connection, uint32_t offset, std::vector<uint32_t> *words)
+{
+    for (size_t at = 0; at < words->size();) {
+        const size_t count = std::min<size_t>(words->size() - at, kComputeChunkBytes / 4);
+        uint64_t in[2] = {offset + 4 * at, count * 4}, out = 0;
+        uint32_t outCount = 1;
+        ComputeChunk chunk = {};
+        size_t size = sizeof(chunk);
+        kern_return_t result =
+            IOConnectCallMethod(connection, kDiagnosticComputeRead, in, 2, nullptr, 0, &out, &outCount, &chunk, &size);
+        if (result != KERN_SUCCESS || outCount != 1 || out != kOK || chunk.bytes != count * 4) {
+            std::printf("data read at +0x%llx: call 0x%08x, %s\n", static_cast<unsigned long long>(in[0]), result,
+                        result == KERN_SUCCESS ? statusName(static_cast<Status>(out)) : "-");
+            return false;
+        }
+        for (size_t i = 0; i < count; i++) (*words)[at + i] = chunk.words[i];
+        at += count;
+    }
+    return true;
+}
+
+uint32_t floatBits(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, 4);
+    return bits;
+}
+
+// The data area's plan: each kernel's buffers at their own offsets.
+const uint32_t kStoreOut = 0x00000, kAddA = 0x10000, kAddB = 0x30000, kAddC = 0x50000, kSumIn = 0x70000,
+               kSumOut = 0x80000, kCounter = 0x81000, kGridOut = 0x82000;
+const uint32_t kStoreItems = 0x4000, kAddItems = 0x8000, kSumGroups = 64, kGridW = 128, kGridH = 64;
+
+ComputeRequest corpusCase(uint32_t kernel, uint32_t sx, uint32_t sy, uint32_t gx, uint32_t gy, uint32_t lds,
+                          std::initializer_list<std::pair<uint32_t, uint32_t>> buffers)
+{
+    ComputeRequest request = {};
+    request.kernel = kernel;
+    request.group[0] = sx;
+    request.group[1] = sy;
+    request.group[2] = 1;
+    request.groups[0] = gx;
+    request.groups[1] = gy;
+    request.groups[2] = 1;
+    request.ldsBytes = lds;
+    uint32_t i = 0;
+    for (const auto &buffer : buffers) {
+        request.offset[i] = buffer.first;
+        request.length[i++] = buffer.second;
+    }
+    return request;
+}
+
+// Stage 23 after a passing compute ring test: inputs and cleared outputs,
+// then the five corpus kernels, each checked on the CPU. Stops at the first
+// failed submission (the driver refuses more), after reading what it left.
+bool corpusRun(io_connect_t connection)
+{
+    static const char *const names[] = {"store_index", "vector_add", "group_sum", "atomic_count", "grid_2d"};
+    static const char *const refusals[] = {"none",   "kernel", "group",   "grid",  "lds",
+                                           "buffer", "length", "overlap", "count"};
+    step("gfx 6/7 corpus data: a[i] = i and b[i] = 2i (floats), group_sum's input i, the counter 0, every\n"
+         "  output 0xffffffff");
+    std::vector<uint32_t> a(kAddItems), b(kAddItems), in(kStoreItems);
+    for (uint32_t i = 0; i < kAddItems; i++) {
+        a[i] = floatBits(float(i));
+        b[i] = floatBits(float(2 * i));
+    }
+    for (uint32_t i = 0; i < kStoreItems; i++) in[i] = i;
+    bool ok = corpusWrite(connection, kAddA, a) && corpusWrite(connection, kAddB, b) &&
+              corpusWrite(connection, kSumIn, in) && corpusWrite(connection, kCounter, std::vector<uint32_t>(1, 0)) &&
+              corpusWrite(connection, kStoreOut, std::vector<uint32_t>(kStoreItems, kComputeOutBefore)) &&
+              corpusWrite(connection, kAddC, std::vector<uint32_t>(kAddItems, kComputeOutBefore)) &&
+              corpusWrite(connection, kSumOut, std::vector<uint32_t>(kSumGroups, kComputeOutBefore)) &&
+              corpusWrite(connection, kGridOut, std::vector<uint32_t>(kGridW * kGridH, kComputeOutBefore));
+    std::printf("%s\n", ok ? "ok" : "failed");
+    if (!ok) return false;
+    const struct {
+        ComputeRequest request;
+        const char *what;
+        uint32_t out, words;
+    } cases[] = {
+        {corpusCase(0, 256, 1, 64, 1, 0, {{kStoreOut, 4 * kStoreItems}}),
+         "64 groups of 256; out[i] == i", kStoreOut, kStoreItems},
+        {corpusCase(1, 256, 1, 128, 1, 0, {{kAddA, 4 * kAddItems}, {kAddB, 4 * kAddItems}, {kAddC, 4 * kAddItems}}),
+         "128 groups of 256; c[i] == a[i] + b[i] == 3i", kAddC, kAddItems},
+        {corpusCase(2, 256, 1, kSumGroups, 1, 1024, {{kSumIn, 4 * kStoreItems}, {kSumOut, 4 * kSumGroups}}),
+         "64 groups of 256, 1 KiB of LDS; out[g] == the sum of its 256 inputs", kSumOut, kSumGroups},
+        {corpusCase(3, 256, 1, 64, 1, 0, {{kCounter, 4}}), "64 groups of 256 add 1; counter == 16384", kCounter, 1},
+        {corpusCase(4, 16, 16, kGridW / 16, kGridH / 16, 0, {{kGridOut, 4 * kGridW * kGridH}}),
+         "8 x 4 groups of 16 x 16; out[y * 128 + x] == (y << 16) | x", kGridOut, kGridW * kGridH},
+    };
+    for (uint32_t n = 0; n < sizeof(cases) / sizeof(cases[0]); n++) {
+        std::printf("gfx 6/7 corpus %u/5 %s: %s ... ", n + 1, names[cases[n].request.kernel], cases[n].what);
+        std::fflush(stdout);
+        uint64_t out[5] = {};
+        uint32_t outCount = 5;
+        ComputeState state = {};
+        size_t size = sizeof(state);
+        kern_return_t result = IOConnectCallMethod(connection, kDiagnosticComputeSubmit, nullptr, 0, &cases[n].request,
+                                                   sizeof(cases[n].request), out, &outCount, &state, &size);
+        if (result != KERN_SUCCESS || outCount != 5 || size != sizeof(state)) {
+            std::printf("call failed 0x%08x\n", result);
+            return false;
+        }
+        std::printf("%s, fence %llu, CP_HQD_PQ_RPTR %llu", statusName(static_cast<Status>(out[0])),
+                    static_cast<unsigned long long>(out[1]), static_cast<unsigned long long>(out[2]));
+        if (out[0] == kComputeRefused)
+            std::printf(" (refused: %s, buffer %llu)", out[3] < 9 ? refusals[out[3]] : "?",
+                        static_cast<unsigned long long>(out[4]));
+        std::vector<uint32_t> got(cases[n].words);
+        if (out[0] != kComputeRefused && corpusRead(connection, cases[n].out, &got)) {
+            uint32_t wrong = 0, first = 0, firstValue = 0, expected = 0;
+            for (uint32_t i = 0; i < cases[n].words; i++) {
+                uint32_t want = i;
+                if (n == 1) want = floatBits(float(3 * i));
+                if (n == 2) want = 65536 * i + 32640; // 256 * 256 * g + (0 + ... + 255)
+                if (n == 3) want = kStoreItems;
+                if (n == 4) want = ((i / kGridW) << 16) | (i % kGridW);
+                if (got[i] != want && wrong++ == 0) {
+                    first = i;
+                    firstValue = got[i];
+                    expected = want;
+                }
+            }
+            std::printf(", %u wrong outputs", wrong);
+            if (wrong != 0) std::printf(" (first: [%u] = 0x%08x, expected 0x%08x)", first, firstValue, expected);
+            if (wrong != 0 && out[0] == kOK) ok = false;
+        }
+        std::printf("\n");
+        printComputeState(state);
+        if (out[0] != kOK) return false;
+    }
+    return ok;
+}
+
 // The stage 21 steps after a passing SETUP_TMR: check, load, RLC start, CP
 // start, ring test and fence, draw (and flip), a 5 s hold, verify, restore.
 // With compute (stage 22), the compute queue, its ring test and the dispatch
 // replace the CP start. The restore runs whenever the RLC start or the flip
 // was sent; the PSP teardown that follows would also run it.
-bool gfxEngine(io_connect_t connection, bool compute)
+bool gfxEngine(io_connect_t connection, bool compute, bool corpus)
 {
     static const char *const files[] = {"green_sardine_ce.bin", "green_sardine_pfp.bin", "green_sardine_me.bin",
                                         "green_sardine_mec.bin", "green_sardine_rlc.bin"};
@@ -1503,7 +1673,7 @@ bool gfxEngine(io_connect_t connection, bool compute)
         printGfxState(state);
         ok = rlc[0] == kOK;
     }
-    if (ok && compute) ok = computeQueue(connection);
+    if (ok && compute) ok = computeQueue(connection, corpus);
     if (ok && !compute) {
         uint64_t cp[4] = {};
         step("gfx 4/5 CP start: ring 0xf440a00000 (8 KiB), no doorbell, CP_ME_CNTL halts cleared; frame 0 (clear\n"
@@ -1597,9 +1767,9 @@ bool pspSdma(io_connect_t connection, int mode)
         tmrTeardown(connection, "sdma teardown: DESTROY_TMR if fenced, then DESTROY_RINGS");
         return false;
     }
-    if (mode == 6 || mode == 7) {
-        // Stage 21 (or, mode 7, stage 22) instead of the SDMA load.
-        bool started = gfxEngine(connection, mode == 7);
+    if (mode == 6 || mode == 7 || mode == 8) {
+        // Stage 21 (or, mode 7, stage 22; mode 8, stage 23) instead of the SDMA load.
+        bool started = gfxEngine(connection, mode >= 7, mode == 8);
         bool torn = tmrTeardown(connection, "gfx teardown: DESTROY_TMR as the next frame if the last fenced, then "
                                             "DESTROY_RINGS");
         return started && torn;
@@ -1733,7 +1903,8 @@ int main(int argc, char **argv)
     unsigned long repeat = 1, interval = 1000;
     bool scratch = false, smu = false, gfxoff = false, metrics = false, ring = false, tmr = false, sdma = false,
          inventory = false, copy = false, psp = false, inventory16Flag = false, gartFlag = false,
-         intrFlag = false, displayFlag = false, flipFlag = false, gfxFlag = false, computeFlag = false;
+         intrFlag = false, displayFlag = false, flipFlag = false, gfxFlag = false, computeFlag = false,
+         corpusFlag = false;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--scratch-test") == 0) {
             scratch = true;
@@ -1785,6 +1956,10 @@ int main(int argc, char **argv)
         }
         if (std::strcmp(argv[i], "--gfx-compute") == 0) {
             computeFlag = true;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--compute-corpus") == 0) {
+            corpusFlag = true;
             continue;
         }
         if (std::strcmp(argv[i], "--sdma-flip") == 0) {
@@ -1972,6 +2147,14 @@ int main(int argc, char **argv)
             return 1;
         }
         if (!pspSdma(connection, 7)) failures++;
+    }
+    if (corpusFlag) {
+        if (info[1] < kCorpusStage) {
+            std::fprintf(stderr, "cezanne-diag: --compute-corpus needs driver stage %u\n", kCorpusStage);
+            IOServiceClose(connection);
+            return 1;
+        }
+        if (!pspSdma(connection, 8)) failures++;
     }
     if (displayFlag) {
         if (info[1] < kDisplayStage) {
