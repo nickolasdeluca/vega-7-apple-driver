@@ -82,13 +82,17 @@ PATTERN_STORE = "pattern->base[offset / 4] = value;"
 GFX_MAP = "gfxMemory->map(kIOMapInhibitCache)"
 GFX_FIRMWARE_STORE = "gfxFirmware->base[offset / 4] = value;"
 GFX_WORK_STORE = "gfxWork->base[offset / 4] = value;"
-ALLOWED_MAPS = (SCRATCH_MAP, WORK_MAP, FIRMWARE_MAP, SDMA_WORK_MAP, GART_WORK_MAP, PATTERN_MAP, GFX_MAP)
+# Stage 23: the submission region (corpus code, dispatch slots, data).
+SUBMIT_MAP = "submitMemory->map(kIOMapInhibitCache)"
+SUBMIT_STORE = "submit->base[offset / 4] = value;"
+ALLOWED_MAPS = (SCRATCH_MAP, WORK_MAP, FIRMWARE_MAP, SDMA_WORK_MAP, GART_WORK_MAP, PATTERN_MAP, GFX_MAP,
+                SUBMIT_MAP)
 ALLOWED_STORES = (SCRATCH_STORE, WORK_STORE, FIRMWARE_STORE, SDMA_WORK_STORE, GART_WORK_STORE, PATTERN_STORE,
-                  GFX_FIRMWARE_STORE, GFX_WORK_STORE)
+                  GFX_FIRMWARE_STORE, GFX_WORK_STORE, SUBMIT_STORE)
 ALLOWED_RANGE_SIZES = ("cezanne::kDiscoveryTmrSize", "cezanne::kPageSize", "cezanne::kPspWorkSize",
                        "cezanne::kSdmaFwBufferSize", "cezanne::kGartWorkSize", "cezanne::kPatternSize",
-                       "cezanne::kGfxWorkSize", "cezanne::kGfxFwBufferSize", "length")
-ALLOWED_VOLATILE = 14
+                       "cezanne::kGfxWorkSize", "cezanne::kGfxFwBufferSize", "cezanne::kSubmitSize", "length")
+ALLOWED_VOLATILE = 16
 SDMA_FIRMWARE = ROOT / "out" / "firmware-provenance" / "fw" / "green_sardine_sdma.bin"
 
 
@@ -275,7 +279,8 @@ void f(IOPCIDevice *p, Aperture *a) {
                           ("kPspTmrPhysical", "kPspTmrSize"), ("kSdmaFwPhysical", "kSdmaFwCheckSize"),
                           ("kSdmaFwPhysical", "kSdmaFwCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"),
                           ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"),
-                          ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize")])
+                          ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"), ("kSdmaWorkPhysical", "kSdmaWorkCheckSize"),
+                          ("kSubmitPhysical", "kSubmitSize")])
         # A PSP ring created by a connection is destroyed if it closes early.
         abandon = re.search(r"void CezanneGPU::scratchAbandon\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("pspDestroyLocked(&response, &mailbox)", abandon)
@@ -388,7 +393,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         # snapshot-relative allowlist only for it.
         self.assertEqual(sorted(re.findall(r"accessDevice\(cezanne::kGfxPageSet, (\w+)", source)),
                          ["computeDispatchOperation", "computeRestoreOperation", "computeStartOperation",
-                          "computeTestOperation", "gfxCpOperation", "gfxDrawOperation", "gfxRestoreOperation",
+                          "computeSubmitOperation", "computeTestOperation", "gfxCpOperation", "gfxDrawOperation", "gfxRestoreOperation",
                           "gfxRlcOperation", "gfxTestOperation"])
         self.assertIn("const uint32_t kGfxPages[] = {0x8000, 0x9000, 0xa000, 0xc000, 0x30000, 0x3b000};", header)
         self.assertEqual(source.count("page.gfxSnapshot = gfxSnapshot_;"), 1)
@@ -415,6 +420,15 @@ void f(IOPCIDevice *p, Aperture *a) {
                              (GFX_WORK_STORE, "gfxWorkWriteAllowed(offset, value, gfxWork->stage)")):
             self.assertEqual(source.count(store), 1)
             self.assertLess(source.index(check), source.index(store))
+        # Stage 23: the submission region, a fixed range written only after
+        # the core's allowlist, from stage 23.
+        self.assertEqual(source.count(SUBMIT_MAP), 1)
+        self.assertEqual(source.count(SUBMIT_STORE), 1)
+        self.assertLess(source.index("submitWriteAllowed(offset, value, submit->stage)"), source.index(SUBMIT_STORE))
+        submit = re.search(r"static cezanne::Status withSubmitMemory\(.*?\n}\n", source, re.S).group(0)
+        self.assertIn("if (stage < cezanne::kCorpusStage) {", submit)
+        self.assertIn("IODeviceMemory::withRange(cezanne::kSubmitPhysical, cezanne::kSubmitSize)", submit)
+        self.assertIn("const uint64_t kSubmitCarveoutOffset = 0x40b00000ull;", header)
         helper = re.search(r"static cezanne::Status withGfxMemory\(.*?\n}\n", source, re.S).group(0)
         self.assertIn("if (stage < cezanne::kGfxStage) {", helper)
         self.assertIn("IODeviceMemory::withRange(cezanne::kGfxWorkPhysical, stage >= cezanne::kComputeStage", helper)
@@ -461,7 +475,7 @@ void f(IOPCIDevice *p, Aperture *a) {
         self.assertNotIn("com.apple.iokit.IOGraphicsFamily", info["OSBundleLibraries"])
         self.assertIn('allocClassWithName(kMetalNodeClass)', source)
         header = (CORE / "cezanne_core.h").read_text()
-        self.assertRegex(header, r"const uint32_t kMaxStage = 22;")
+        self.assertRegex(header, r"const uint32_t kMaxStage = 23;")
         self.assertRegex(header, r"kStage1Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize\}")
         self.assertRegex(header, r"kStage2Registers\[\] = \{kRegC2PMsg33, kRegConfigMemsize, kRegMcVmFbOffset\}")
         self.assertRegex(header, r"kDiscoveryTmrSize = 10 << 10;")
